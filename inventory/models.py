@@ -9,9 +9,10 @@ matching ADR 0001's "suggests, but admin can override; once set, static."
 """
 
 import ipaddress
+from typing import Any
 
 from django.conf import settings
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 
@@ -24,6 +25,25 @@ from .suggestions import (
     suggest_slot_address,
 )
 from .validators import validate_ipv4_cidr
+
+
+def _get_related(instance: Any, field_name: str) -> Any | None:
+    """Safely read FK ``field_name`` off ``instance``, ``None`` if unset.
+
+    Needed because Django admin's inline formsets set the FK's raw
+    ``<field>_id`` to ``None`` for a not-yet-saved parent — see
+    ``BaseInlineFormSet._construct_form``, which does this deliberately
+    so form validation doesn't choke on a pk that doesn't exist yet — even
+    though the actual related object is available on the instance. A plain
+    ``instance.<field>_id`` truthiness check would wrongly read as "no
+    parent assigned" while adding a new parent and its inline children in
+    the same admin submission; accessing the descriptor directly returns
+    the in-memory (possibly unsaved) object instead.
+    """
+    try:
+        return getattr(instance, field_name)
+    except ObjectDoesNotExist:
+        return None
 
 
 def _suggest_rack_slot_address(rack: "Rack | None", rack_slot: int | None, vlan_id: int) -> str | None:
@@ -41,6 +61,40 @@ def _suggest_rack_slot_address(rack: "Rack | None", rack_slot: int | None, vlan_
     return suggest_slot_address(rack_range.address_range, rack_slot)
 
 
+def _address_containment_error(
+    address: str, vlan: "VLAN", rack: "Rack | None", rack_slot: int | None
+) -> str | None:
+    """``None`` if ``address`` fits ``vlan``'s subnet (and, if racked with an
+    assigned ``RackVlanRange``, that range too); otherwise an error message.
+
+    Pure read — no exclusions/uniqueness here, so it doubles as the check
+    for re-validating an *already-saved* address after its equipment moves,
+    not just for a fresh/edited address row.
+    """
+    try:
+        validate_ipv4_cidr(vlan.subnet)
+    except ValidationError:
+        return None  # VLAN's own subnet is invalid; its own clean() will report that
+    try:
+        address_obj = ipaddress.IPv4Address(address)
+    except ValueError:
+        return None  # malformed value; the field's own validator already reports it
+
+    vlan_network = ipaddress.IPv4Network(vlan.subnet, strict=True)
+    if address_obj not in vlan_network:
+        return f"{address} is not within {vlan}'s subnet ({vlan.subnet})."
+
+    if rack is not None and rack_slot is not None:
+        try:
+            rack_range = rack.vlan_ranges.get(vlan_id=vlan.pk)
+        except RackVlanRange.DoesNotExist:
+            return None
+        range_network = ipaddress.IPv4Network(rack_range.address_range, strict=True)
+        if address_obj not in range_network:
+            return f"{address} is not within {rack}'s range on {vlan} ({rack_range.address_range})."
+    return None
+
+
 def _validate_static_address(
     address: str,
     vlan: "VLAN",
@@ -52,41 +106,15 @@ def _validate_static_address(
 ) -> None:
     """Shared static-address invariants for ``NetworkSwitchAddress``/``NetworkDevicePort``.
 
-    Validates containment within the VLAN's subnet (and, if a
-    ``RackVlanRange`` is already assigned for this rack/VLAN, within that
-    range too) and uniqueness against every other static address on the
-    same VLAN — switch or device port alike. No DB constraint can span
-    both tables, so the uniqueness half is an interim, full_clean-time-only
-    guard (same caveat as ``RackSlotAssignmentMixin``'s cross-table check).
+    Validates containment (see ``_address_containment_error``) and
+    uniqueness against every other static address on the same VLAN —
+    switch or device port alike. No DB constraint can span both tables, so
+    the uniqueness half is an interim, full_clean-time-only guard (same
+    caveat as ``RackSlotAssignmentMixin``'s cross-table check).
     """
-    try:
-        validate_ipv4_cidr(vlan.subnet)
-    except ValidationError:
-        return  # VLAN's own subnet is invalid; its own clean() will report that
-    try:
-        address_obj = ipaddress.IPv4Address(address)
-    except ValueError:
-        return  # malformed value; the field's own validator already reports it
-
-    vlan_network = ipaddress.IPv4Network(vlan.subnet, strict=True)
-    if address_obj not in vlan_network:
-        raise ValidationError({"address": f"{address} is not within {vlan}'s subnet ({vlan.subnet})."})
-
-    if rack is not None and rack_slot is not None:
-        try:
-            rack_range = rack.vlan_ranges.get(vlan_id=vlan.pk)
-        except RackVlanRange.DoesNotExist:
-            rack_range = None
-        if rack_range is not None:
-            range_network = ipaddress.IPv4Network(rack_range.address_range, strict=True)
-            if address_obj not in range_network:
-                raise ValidationError(
-                    {
-                        "address": (
-                            f"{address} is not within {rack}'s range on {vlan} ({rack_range.address_range})."
-                        )
-                    }
-                )
+    error = _address_containment_error(address, vlan, rack, rack_slot)
+    if error:
+        raise ValidationError({"address": error})
 
     switch_conflicts = NetworkSwitchAddress.objects.filter(vlan=vlan, address=address)
     if exclude_switch_address_pk is not None:
@@ -225,6 +253,30 @@ class VLAN(AuditedModel):
                             )
                         }
                     )
+            # Static assignments are allowed even without a RackVlanRange (they
+            # only need to fit the VLAN's own subnet in that case), so a
+            # subnet edit has to be checked against those directly too, not
+            # just against rack ranges.
+            for switch_address in self.switch_addresses.all():
+                try:
+                    address_obj = ipaddress.IPv4Address(switch_address.address)
+                except ValueError:
+                    continue
+                if address_obj not in vlan_network:
+                    raise ValidationError(
+                        f"subnet {self.subnet} no longer contains {switch_address.switch}'s existing "
+                        f"address ({switch_address.address}) on this VLAN; update or remove it first."
+                    )
+            for device_port in self.device_ports.filter(address__isnull=False):
+                try:
+                    address_obj = ipaddress.IPv4Address(device_port.address)
+                except ValueError:
+                    continue
+                if address_obj not in vlan_network:
+                    raise ValidationError(
+                        f"subnet {self.subnet} no longer contains {device_port.device}'s existing "
+                        f"address ({device_port.address}) on this VLAN; update or remove it first."
+                    )
 
 
 class Rack(AuditedModel):
@@ -299,18 +351,18 @@ class RackVlanRange(AuditedModel):
 
     def clean(self) -> None:
         super().clean()
-        if self.pk is None and not self.address_range and self.rack_id and self.vlan_id:
-            used_ranges = list(
-                self.vlan.rack_ranges.exclude(pk=self.pk).values_list("address_range", flat=True)
-            )
-            if self.vlan.dhcp_range:
-                used_ranges.append(self.vlan.dhcp_range)
+        rack = _get_related(self, "rack")
+        vlan = _get_related(self, "vlan")
+        if self.pk is None and not self.address_range and rack is not None and vlan is not None:
+            used_ranges = list(vlan.rack_ranges.exclude(pk=self.pk).values_list("address_range", flat=True))
+            if vlan.dhcp_range:
+                used_ranges.append(vlan.dhcp_range)
             try:
-                validate_ipv4_cidr(self.vlan.subnet)
+                validate_ipv4_cidr(vlan.subnet)
             except ValidationError:
                 pass  # VLAN's own subnet is invalid; nothing sensible to suggest
             else:
-                suggestion = suggest_rack_vlan_range(self.vlan.subnet, self.rack.slot_count, used_ranges)
+                suggestion = suggest_rack_vlan_range(vlan.subnet, rack.slot_count, used_ranges)
                 if suggestion:
                     self.address_range = suggestion
         if not self.address_range:
@@ -326,49 +378,80 @@ class RackVlanRange(AuditedModel):
         self._validate_range()
 
     def _validate_range(self) -> None:
+        vlan = _get_related(self, "vlan")
+        if vlan is None:
+            return  # vlan wasn't set at all; clean_fields() already reports the missing-field error
         try:
-            validate_ipv4_cidr(self.vlan.subnet)
+            validate_ipv4_cidr(vlan.subnet)
         except ValidationError:
             return  # VLAN's own subnet is invalid; its own clean() will report that
-        vlan_network = ipaddress.IPv4Network(self.vlan.subnet, strict=True)
+        vlan_network = ipaddress.IPv4Network(vlan.subnet, strict=True)
         range_network = ipaddress.IPv4Network(self.address_range, strict=True)
         if not range_network.subnet_of(vlan_network):
             raise ValidationError(
-                {
-                    "address_range": (
-                        f"{self.address_range} is not within {self.vlan}'s subnet ({self.vlan.subnet})."
-                    )
-                }
+                {"address_range": f"{self.address_range} is not within {vlan}'s subnet ({vlan.subnet})."}
             )
-        if self.rack_id and range_network.num_addresses < required_block_size(self.rack.slot_count):
+        rack = _get_related(self, "rack")
+        if rack is not None and range_network.num_addresses < required_block_size(rack.slot_count):
             raise ValidationError(
                 {
                     "address_range": (
-                        f"{self.address_range} isn't big enough for {self.rack} (slot_count "
-                        f"{self.rack.slot_count}): it needs {required_block_size(self.rack.slot_count)} "
+                        f"{self.address_range} isn't big enough for {rack} (slot_count "
+                        f"{rack.slot_count}): it needs {required_block_size(rack.slot_count)} "
                         "addresses (slots 1..slot_count, plus the block's own base and top addresses "
                         "reserved)."
                     )
                 }
             )
-        for other in self.vlan.rack_ranges.exclude(pk=self.pk):
+        for other in vlan.rack_ranges.exclude(pk=self.pk):
             if ranges_overlap(self.address_range, other.address_range):
                 raise ValidationError(
                     {
                         "address_range": (
                             f"{self.address_range} overlaps {other.rack}'s range "
-                            f"{other.address_range} on {self.vlan}."
+                            f"{other.address_range} on {vlan}."
                         )
                     }
                 )
-        if self.vlan.dhcp_range and ranges_overlap(self.address_range, self.vlan.dhcp_range):
+        if vlan.dhcp_range and ranges_overlap(self.address_range, vlan.dhcp_range):
             raise ValidationError(
-                {
-                    "address_range": (
-                        f"{self.address_range} overlaps {self.vlan}'s DHCP range ({self.vlan.dhcp_range})."
-                    )
-                }
+                {"address_range": f"{self.address_range} overlaps {vlan}'s DHCP range ({vlan.dhcp_range})."}
             )
+        # A range edit can leave already-assigned static addresses (switch or
+        # device) for this rack, on this VLAN, outside the new block — block
+        # the edit rather than silently orphaning them. Only meaningful once
+        # the rack itself is saved (nothing can reference an unsaved rack yet).
+        if rack is not None and rack.pk is not None:
+            for switch_address in NetworkSwitchAddress.objects.filter(switch__rack=rack, vlan=vlan):
+                try:
+                    addr = ipaddress.IPv4Address(switch_address.address)
+                except ValueError:
+                    continue
+                if addr not in range_network:
+                    raise ValidationError(
+                        {
+                            "address_range": (
+                                f"{self.address_range} would no longer contain {switch_address.switch}'s "
+                                f"existing address ({switch_address.address}); update or remove it first."
+                            )
+                        }
+                    )
+            for device_port in NetworkDevicePort.objects.filter(
+                device__rack=rack, vlan=vlan, address__isnull=False
+            ):
+                try:
+                    addr = ipaddress.IPv4Address(device_port.address)
+                except ValueError:
+                    continue
+                if addr not in range_network:
+                    raise ValidationError(
+                        {
+                            "address_range": (
+                                f"{self.address_range} would no longer contain {device_port.device}'s "
+                                f"existing address ({device_port.address}); update or remove it first."
+                            )
+                        }
+                    )
 
 
 class RackSlotAssignmentMixin:
@@ -389,6 +472,8 @@ class RackSlotAssignmentMixin:
     rack: Rack | None
     rack_slot: int | None
 
+    pk: int | None
+
     def clean(self) -> None:
         super().clean()  # type: ignore[misc]
         if (self.rack is None) != (self.rack_slot is None):
@@ -401,8 +486,16 @@ class RackSlotAssignmentMixin:
                     f"rack_slot {self.rack_slot} exceeds {self.rack}'s slot_count ({self.rack.slot_count})."
                 )
             self._check_rack_slot_not_occupied()
+        if self.pk is not None:
+            # Unracking or moving equipment that already has this-VLAN static
+            # addresses can't be validated inside those address rows' own
+            # clean() — they aren't part of this save — so re-check them here.
+            self._validate_existing_addresses_still_fit()
 
     def _check_rack_slot_not_occupied(self) -> None:
+        raise NotImplementedError
+
+    def _validate_existing_addresses_still_fit(self) -> None:
         raise NotImplementedError
 
 
@@ -463,6 +556,19 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
                 f"Rack slot {self.rack_slot} in {self.rack} is already occupied by a device."
             )
 
+    def _validate_existing_addresses_still_fit(self) -> None:
+        for address in self.addresses.all():
+            if address.address is None:
+                continue  # DB CheckConstraint guarantees this can't happen; satisfies mypy
+            if self.rack is None:
+                raise ValidationError(
+                    f"Cannot unrack {self}: it still has a static address ({address.address} on "
+                    f"{address.vlan}); remove or reassign its addresses first."
+                )
+            error = _address_containment_error(address.address, address.vlan, self.rack, self.rack_slot)
+            if error:
+                raise ValidationError(f"Moving {self} would leave an existing address invalid: {error}")
+
 
 class NetworkSwitchAddress(AuditedModel):
     """A switch's static address on one VLAN.
@@ -497,13 +603,15 @@ class NetworkSwitchAddress(AuditedModel):
 
     def clean(self) -> None:
         super().clean()
-        if self.switch_id and self.switch.rack_id is None:
+        switch = _get_related(self, "switch")
+        vlan = _get_related(self, "vlan")
+        if switch is not None and switch.rack is None:
             raise ValidationError(
                 "Unracked switches are spare pool (DHCP-configured per CONTEXT.md) and "
                 "don't get a static VLAN address; rack the switch first."
             )
-        if self.pk is None and not self.address and self.switch_id and self.vlan_id:
-            suggestion = _suggest_rack_slot_address(self.switch.rack, self.switch.rack_slot, self.vlan_id)
+        if self.pk is None and not self.address and switch is not None and vlan is not None:
+            suggestion = _suggest_rack_slot_address(switch.rack, switch.rack_slot, vlan.pk)
             if suggestion:
                 self.address = suggestion
         if not self.address:
@@ -516,12 +624,12 @@ class NetworkSwitchAddress(AuditedModel):
                     )
                 }
             )
-        if self.switch_id and self.vlan_id:
+        if switch is not None and vlan is not None:
             _validate_static_address(
                 self.address,
-                self.vlan,
-                self.switch.rack,
-                self.switch.rack_slot,
+                vlan,
+                switch.rack,
+                switch.rack_slot,
                 exclude_switch_address_pk=self.pk,
                 exclude_device_port_pk=None,
             )
@@ -624,6 +732,19 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                 f"Rack slot {self.rack_slot} in {self.rack} is already occupied by a switch."
             )
 
+    def _validate_existing_addresses_still_fit(self) -> None:
+        for port in self.ports.filter(address__isnull=False):
+            if port.address is None:
+                continue  # filtered out above; satisfies mypy
+            if self.rack is None:
+                raise ValidationError(
+                    f"Cannot unrack {self}: it still has a static address ({port.address} on "
+                    f"{port.vlan}); remove or reassign its addresses first."
+                )
+            error = _address_containment_error(port.address, port.vlan, self.rack, self.rack_slot)
+            if error:
+                raise ValidationError(f"Moving {self} would leave an existing address invalid: {error}")
+
 
 class NetworkDevicePort(AuditedModel):
     """A device port: one purpose (VLAN), one static address or DHCP.
@@ -677,23 +798,25 @@ class NetworkDevicePort(AuditedModel):
             if self.address or self.default_gateway:
                 raise ValidationError("DHCP ports must not have a static address or gateway.")
         else:
-            if self.device_id and self.device.rack_id is None:
+            device = _get_related(self, "device")
+            vlan = _get_related(self, "vlan")
+            if device is not None and device.rack is None:
                 raise ValidationError(
                     "Unracked devices are spare pool (DHCP-configured per CONTEXT.md); rack "
                     "the device first, or use is_dhcp for this port instead."
                 )
-            if self.pk is None and not self.address and self.device_id and self.vlan_id:
-                suggestion = _suggest_rack_slot_address(self.device.rack, self.device.rack_slot, self.vlan_id)
+            if self.pk is None and not self.address and device is not None and vlan is not None:
+                suggestion = _suggest_rack_slot_address(device.rack, device.rack_slot, vlan.pk)
                 if suggestion:
                     self.address = suggestion
             if not self.address:
                 raise ValidationError("Static ports must have an address.")
-            if self.device_id and self.vlan_id:
+            if device is not None and vlan is not None:
                 _validate_static_address(
                     self.address,
-                    self.vlan,
-                    self.device.rack,
-                    self.device.rack_slot,
+                    vlan,
+                    device.rack,
+                    device.rack_slot,
                     exclude_switch_address_pk=None,
                     exclude_device_port_pk=self.pk,
                 )

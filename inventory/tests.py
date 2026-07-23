@@ -288,6 +288,82 @@ class InlineFormsetSaveTests(TestCase):
         self.existing_range.refresh_from_db()
         self.assertEqual(self.existing_range.address_range, "10.200.1.32/27")
 
+    def test_blank_range_suggested_for_inline_on_unsaved_new_rack(self) -> None:
+        # Django's admin "Add" view validates inline formsets before the new
+        # parent is saved, so form.instance.rack_id is None even though
+        # form.instance.rack (the actual object) is set — see
+        # BaseInlineFormSet._construct_form. The suggestion must still work
+        # off the object, not the (not-yet-real) id.
+        unsaved_rack = Rack(name="New Rack", slot_count=4)
+        FormSet = inlineformset_factory(  # type: ignore[var-annotated]
+            Rack, RackVlanRange, fields=["vlan", "address_range"], extra=1, can_delete=True
+        )
+        data = {
+            "vlan_ranges-TOTAL_FORMS": "1",
+            "vlan_ranges-INITIAL_FORMS": "0",
+            "vlan_ranges-MIN_NUM_FORMS": "0",
+            "vlan_ranges-MAX_NUM_FORMS": "1000",
+            "vlan_ranges-0-vlan": str(self.vlan.pk),
+            "vlan_ranges-0-address_range": "",
+        }
+        formset = FormSet(data, instance=unsaved_rack, prefix="vlan_ranges")
+        self.assertTrue(formset.is_valid(), formset.errors)
+        self.assertEqual(formset.forms[0].instance.address_range, "10.200.0.0/29")
+
+
+class UnsavedParentInlineSuggestionTests(TestCase):
+    """Suggestions must work when adding a switch/device and its address
+    inline together on one admin "Add" page — not just when editing an
+    already-saved parent. See test above for the equivalent RackVlanRange
+    case and its explanation of why this is otherwise broken.
+    """
+
+    def setUp(self) -> None:
+        self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=4)
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.200.1.0/27")
+        self.switch_type = NetworkSwitchType.objects.create(
+            manufacturer="Cisco", model="SG300", port_count=10, port_type="1GbE"
+        )
+        self.device_type = NetworkDeviceType.objects.create(
+            manufacturer="Martin Audio", model="IK-42", port_count=1
+        )
+
+    def test_switch_address_suggested_for_inline_on_unsaved_new_switch(self) -> None:
+        unsaved_switch = NetworkSwitch(switch_type=self.switch_type, rack=self.rack, rack_slot=2)
+        FormSet = inlineformset_factory(  # type: ignore[var-annotated]
+            NetworkSwitch, NetworkSwitchAddress, fields=["vlan", "address"], extra=1
+        )
+        data = {
+            "addresses-TOTAL_FORMS": "1",
+            "addresses-INITIAL_FORMS": "0",
+            "addresses-MIN_NUM_FORMS": "0",
+            "addresses-MAX_NUM_FORMS": "1000",
+            "addresses-0-vlan": str(self.vlan.pk),
+            "addresses-0-address": "",
+        }
+        formset = FormSet(data, instance=unsaved_switch, prefix="addresses")
+        self.assertTrue(formset.is_valid(), formset.errors)
+        self.assertEqual(formset.forms[0].instance.address, "10.200.1.2")
+
+    def test_device_port_address_suggested_for_inline_on_unsaved_new_device(self) -> None:
+        unsaved_device = NetworkDevice(device_type=self.device_type, rack=self.rack, rack_slot=3)
+        FormSet = inlineformset_factory(  # type: ignore[var-annotated]
+            NetworkDevice, NetworkDevicePort, fields=["port_number", "vlan", "is_dhcp", "address"], extra=1
+        )
+        data = {
+            "ports-TOTAL_FORMS": "1",
+            "ports-INITIAL_FORMS": "0",
+            "ports-MIN_NUM_FORMS": "0",
+            "ports-MAX_NUM_FORMS": "1000",
+            "ports-0-port_number": "1",
+            "ports-0-vlan": str(self.vlan.pk),
+            "ports-0-address": "",
+        }
+        formset = FormSet(data, instance=unsaved_device, prefix="ports")
+        self.assertTrue(formset.is_valid(), formset.errors)
+        self.assertEqual(formset.forms[0].instance.address, "10.200.1.3")
+
 
 class SuggestionFunctionTests(TestCase):
     """Pure-function tests for inventory.suggestions — no DB involved."""
@@ -405,6 +481,32 @@ class VLANSuggestionTests(TestCase):
         with self.assertRaises(ValidationError):
             vlan.full_clean()
 
+    def test_editing_subnet_to_exclude_existing_switch_address_raises(self) -> None:
+        # A static address is allowed even without a RackVlanRange (it only
+        # has to fit the VLAN's subnet in that case), so a subnet edit has
+        # to be checked against it directly, not just against rack ranges.
+        vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        rack = Rack.objects.create(name="Rack 1", slot_count=4)
+        switch_type = NetworkSwitchType.objects.create(
+            manufacturer="Cisco", model="SG300", port_count=10, port_type="1GbE"
+        )
+        switch = NetworkSwitch.objects.create(switch_type=switch_type, rack=rack, rack_slot=1)
+        NetworkSwitchAddress.objects.create(switch=switch, vlan=vlan, address="10.200.5.1")
+        vlan.subnet = "10.205.0.0/21"
+        with self.assertRaises(ValidationError):
+            vlan.full_clean()
+
+    def test_editing_subnet_to_exclude_existing_device_port_address_raises(self) -> None:
+        vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="Martin Audio", model="IK-42", port_count=1
+        )
+        device = NetworkDevice.objects.create(device_type=device_type)
+        NetworkDevicePort.objects.create(device=device, port_number=1, vlan=vlan, address="10.200.5.2")
+        vlan.subnet = "10.205.0.0/21"
+        with self.assertRaises(ValidationError):
+            vlan.full_clean()
+
 
 class RackVlanRangeSuggestionTests(TestCase):
     def setUp(self) -> None:
@@ -464,6 +566,30 @@ class RackVlanRangeSuggestionTests(TestCase):
         with self.assertRaises(ValidationError):
             range_.full_clean()
 
+    def test_editing_range_to_exclude_existing_switch_address_raises(self) -> None:
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.200.0.0/27")
+        switch_type = NetworkSwitchType.objects.create(
+            manufacturer="Cisco", model="SG300", port_count=10, port_type="1GbE"
+        )
+        switch = NetworkSwitch.objects.create(switch_type=switch_type, rack=self.rack, rack_slot=1)
+        NetworkSwitchAddress.objects.create(switch=switch, vlan=self.vlan, address="10.200.0.1")
+        range_ = RackVlanRange.objects.get(rack=self.rack, vlan=self.vlan)
+        range_.address_range = "10.200.0.32/27"
+        with self.assertRaises(ValidationError):
+            range_.full_clean()
+
+    def test_editing_range_to_exclude_existing_device_port_address_raises(self) -> None:
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.200.0.0/27")
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="Martin Audio", model="IK-42", port_count=1
+        )
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=2)
+        NetworkDevicePort.objects.create(device=device, port_number=1, vlan=self.vlan, address="10.200.0.2")
+        range_ = RackVlanRange.objects.get(rack=self.rack, vlan=self.vlan)
+        range_.address_range = "10.200.0.32/27"
+        with self.assertRaises(ValidationError):
+            range_.full_clean()
+
 
 class RackSlotCountEditTests(TestCase):
     """Editing Rack.slot_count must be re-validated against what already
@@ -508,6 +634,58 @@ class RackSlotCountEditTests(TestCase):
         rack.slot_count = 2
         with self.assertRaises(ValidationError):
             rack.full_clean()
+
+
+class EquipmentMoveRevalidationTests(TestCase):
+    """Clearing or changing a switch/device's rack/rack_slot doesn't run the
+    address row's own clean() (it isn't part of this save), so it has to be
+    re-checked from the equipment side instead.
+    """
+
+    def setUp(self) -> None:
+        self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.rack_a = Rack.objects.create(name="Rack A", slot_count=4)
+        self.rack_b = Rack.objects.create(name="Rack B", slot_count=4)
+        RackVlanRange.objects.create(rack=self.rack_a, vlan=self.vlan, address_range="10.200.1.0/27")
+        RackVlanRange.objects.create(rack=self.rack_b, vlan=self.vlan, address_range="10.200.2.0/27")
+        self.switch_type = NetworkSwitchType.objects.create(
+            manufacturer="Cisco", model="SG300", port_count=10, port_type="1GbE"
+        )
+        self.device_type = NetworkDeviceType.objects.create(
+            manufacturer="Martin Audio", model="IK-42", port_count=1
+        )
+
+    def test_unracking_switch_with_existing_address_raises(self) -> None:
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack_a, rack_slot=1)
+        NetworkSwitchAddress.objects.create(switch=switch, vlan=self.vlan, address="10.200.1.1")
+        switch.rack = None
+        switch.rack_slot = None
+        with self.assertRaises(ValidationError):
+            switch.full_clean()
+
+    def test_moving_switch_to_another_racks_range_raises(self) -> None:
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack_a, rack_slot=1)
+        NetworkSwitchAddress.objects.create(switch=switch, vlan=self.vlan, address="10.200.1.1")
+        switch.rack = self.rack_b
+        switch.rack_slot = 1
+        with self.assertRaises(ValidationError):
+            switch.full_clean()
+
+    def test_unracking_device_with_existing_static_port_raises(self) -> None:
+        device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack_a, rack_slot=2)
+        NetworkDevicePort.objects.create(device=device, port_number=1, vlan=self.vlan, address="10.200.1.2")
+        device.rack = None
+        device.rack_slot = None
+        with self.assertRaises(ValidationError):
+            device.full_clean()
+
+    def test_moving_device_to_another_racks_range_raises(self) -> None:
+        device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack_a, rack_slot=2)
+        NetworkDevicePort.objects.create(device=device, port_number=1, vlan=self.vlan, address="10.200.1.2")
+        device.rack = self.rack_b
+        device.rack_slot = 2
+        with self.assertRaises(ValidationError):
+            device.full_clean()
 
 
 class RackSlotAddressSuggestionTests(TestCase):
