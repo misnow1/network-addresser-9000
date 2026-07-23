@@ -84,12 +84,22 @@ WSGI_APPLICATION = "config.wsgi.application"
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
+# Same fail-closed pattern as SECRET_KEY: a missing DB_PASSWORD outside DEBUG
+# mode should error loudly, not silently fall back to a dev-only credential
+# on a misconfigured shared/staging box.
+DB_PASSWORD = os.environ.get("DB_PASSWORD")
+if not DB_PASSWORD:
+    if DEBUG:
+        DB_PASSWORD = "na9000dev"  # noqa: S105
+    else:
+        raise ImproperlyConfigured("DB_PASSWORD environment variable must be set outside DJANGO_DEBUG=true.")
+
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.mysql",
         "NAME": os.environ.get("DB_NAME", "network_addresser_9000"),
         "USER": os.environ.get("DB_USER", "na9000"),
-        "PASSWORD": os.environ.get("DB_PASSWORD", "na9000dev"),
+        "PASSWORD": DB_PASSWORD,
         "HOST": os.environ.get("DB_HOST", "127.0.0.1"),
         "PORT": os.environ.get("DB_PORT", "3306"),
         "OPTIONS": {

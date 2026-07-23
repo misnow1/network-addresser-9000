@@ -37,6 +37,8 @@ class AuditedModelAdminMixin:
         self, request: HttpRequest, form: object, formset: BaseModelFormSet, change: bool
     ) -> None:
         instances = formset.save(commit=False)
+        for obj in formset.deleted_objects:
+            obj.delete()
         for instance in instances:
             if instance.pk is None:
                 instance.created_by = request.user

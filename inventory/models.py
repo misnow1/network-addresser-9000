@@ -126,6 +126,7 @@ class RackSlotAssignmentMixin:
     rack_slot: int | None
 
     def clean(self) -> None:
+        super().clean()  # type: ignore[misc]
         if (self.rack is None) != (self.rack_slot is None):
             raise ValidationError(
                 "rack and rack_slot must both be set (racked) or both be empty (spare pool)."

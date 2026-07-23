@@ -10,9 +10,10 @@ from django.contrib.admin.sites import AdminSite
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
+from django.forms import inlineformset_factory
 from django.test import RequestFactory, TestCase
 
-from .admin import NetworkDeviceAdmin, VLANAdmin
+from .admin import NetworkDeviceAdmin, RackAdmin, VLANAdmin
 from .models import (
     VLAN,
     NetworkDevice,
@@ -22,6 +23,7 @@ from .models import (
     NetworkSwitchPort,
     NetworkSwitchType,
     Rack,
+    RackVlanRange,
 )
 
 User = get_user_model()
@@ -197,3 +199,58 @@ class AuditedModelAdminTests(TestCase):
         # not just on VLANAdmin.
         admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
         self.assertTrue(hasattr(admin, "save_formset"))
+
+
+class InlineFormsetSaveTests(TestCase):
+    """Regression tests for save_formset: formset.save(commit=False) doesn't
+    touch formset.deleted_objects, so a naive rewrite of the stock
+    ModelAdmin.save_formset (to populate created_by) can silently break
+    inline deletion. Exercised via a real inlineformset_factory formset,
+    matching what the admin actually builds and submits.
+    """
+
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(username="editor", password="x")
+        self.factory = RequestFactory()
+        self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=4)
+        self.existing_range = RackVlanRange.objects.create(
+            rack=self.rack, vlan=self.vlan, address_range="10.200.1.0/27"
+        )
+
+    def _request(self):
+        request = self.factory.post(f"/admin/inventory/rack/{self.rack.pk}/change/")
+        request.user = self.user
+        return request
+
+    def _formset(self, **extra_data: str):
+        FormSet = inlineformset_factory(  # type: ignore[var-annotated]
+            Rack, RackVlanRange, fields=["vlan", "address_range"], extra=0, can_delete=True
+        )
+        data = {
+            "vlan_ranges-TOTAL_FORMS": "1",
+            "vlan_ranges-INITIAL_FORMS": "1",
+            "vlan_ranges-MIN_NUM_FORMS": "0",
+            "vlan_ranges-MAX_NUM_FORMS": "1000",
+            "vlan_ranges-0-id": str(self.existing_range.pk),
+            "vlan_ranges-0-rack": str(self.rack.pk),
+            "vlan_ranges-0-vlan": str(self.vlan.pk),
+            "vlan_ranges-0-address_range": self.existing_range.address_range,
+            **extra_data,
+        }
+        return FormSet(data, instance=self.rack, prefix="vlan_ranges")
+
+    def test_save_formset_deletes_rows_marked_for_deletion(self) -> None:
+        formset = self._formset(**{"vlan_ranges-0-DELETE": "on"})
+        self.assertTrue(formset.is_valid(), formset.errors)
+        admin = RackAdmin(Rack, AdminSite())
+        admin.save_formset(self._request(), form=None, formset=formset, change=True)
+        self.assertFalse(RackVlanRange.objects.filter(pk=self.existing_range.pk).exists())
+
+    def test_save_formset_still_saves_undeleted_rows(self) -> None:
+        formset = self._formset(**{"vlan_ranges-0-address_range": "10.200.1.32/27"})
+        self.assertTrue(formset.is_valid(), formset.errors)
+        admin = RackAdmin(Rack, AdminSite())
+        admin.save_formset(self._request(), form=None, formset=formset, change=True)
+        self.existing_range.refresh_from_db()
+        self.assertEqual(self.existing_range.address_range, "10.200.1.32/27")
