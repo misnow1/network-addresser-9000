@@ -2,7 +2,7 @@
 
 High-level phases only — day-to-day task tracking belongs in GitHub Issues once there's code to file issues against. This file exists so it's obvious what phase the project is in and what's next, even after a fresh start.
 
-**Current phase: 3 — not started.**
+**Current phase: 4 — not started.**
 
 ## 1. Foundation — done
 
@@ -18,12 +18,12 @@ High-level phases only — day-to-day task tracking belongs in GitHub Issues onc
 - [x] Initial migration
 - [x] Admin registration for all models
 
-## 3. Core domain logic — next up
+## 3. Core domain logic — done
 
-- [ ] Address-range suggestion (rack ranges, VLAN gateway/DHCP range) — see ADR 0001, ADR 0002
-- [ ] Overlap validation (rack ranges vs. each other and the DHCP block)
-- [ ] Device address default-and-override behavior — see ADR 0003
-- [ ] Removal semantics: block non-empty containers, unassign on leaf removal — see ADR 0007
+- [x] Address-range suggestion (rack ranges, VLAN gateway/DHCP range) — see ADR 0001, ADR 0002
+- [x] Overlap validation (rack ranges vs. each other and the DHCP block)
+- [x] Device address default-and-override behavior — see ADR 0003
+- [x] Removal semantics: block non-empty containers, unassign on leaf removal — see ADR 0007
 
 ## 4. Access and accountability
 

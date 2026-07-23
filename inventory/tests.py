@@ -6,10 +6,13 @@ that skip ``full_clean()``, since ``Model.clean()`` is not invoked by
 ``save()`` — only a DB-level ``CheckConstraint`` can guard those paths.
 """
 
+import ipaddress
+
 from django.contrib.admin.sites import AdminSite
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
+from django.db.models import ProtectedError
 from django.forms import inlineformset_factory
 from django.test import RequestFactory, TestCase
 
@@ -20,10 +23,18 @@ from .models import (
     NetworkDevicePort,
     NetworkDeviceType,
     NetworkSwitch,
+    NetworkSwitchAddress,
     NetworkSwitchPort,
     NetworkSwitchType,
     Rack,
     RackVlanRange,
+)
+from .suggestions import (
+    prefix_length_for_capacity,
+    suggest_default_gateway,
+    suggest_dhcp_range,
+    suggest_rack_vlan_range,
+    suggest_slot_address,
 )
 
 User = get_user_model()
@@ -276,3 +287,245 @@ class InlineFormsetSaveTests(TestCase):
         admin.save_formset(self._request(), form=None, formset=formset, change=True)
         self.existing_range.refresh_from_db()
         self.assertEqual(self.existing_range.address_range, "10.200.1.32/27")
+
+
+class SuggestionFunctionTests(TestCase):
+    """Pure-function tests for inventory.suggestions — no DB involved."""
+
+    def test_suggest_default_gateway_is_lowest_host_address(self) -> None:
+        self.assertEqual(suggest_default_gateway("10.200.0.0/21"), "10.200.0.1")
+
+    def test_suggest_dhcp_range_is_bottom_24_of_larger_subnet(self) -> None:
+        self.assertEqual(suggest_dhcp_range("10.200.0.0/21"), "10.200.0.0/24")
+
+    def test_suggest_dhcp_range_none_when_subnet_smaller_than_24(self) -> None:
+        self.assertIsNone(suggest_dhcp_range("10.200.1.0/27"))
+
+    def test_prefix_length_for_capacity_matches_worked_example(self) -> None:
+        # DESIGN.md's worked example: a rack sized for slots 1-30 gets a /27.
+        self.assertEqual(prefix_length_for_capacity(30), 27)
+
+    def test_prefix_length_for_capacity_single_slot(self) -> None:
+        self.assertEqual(prefix_length_for_capacity(1), 31)
+
+    def test_prefix_length_for_capacity_larger_rack(self) -> None:
+        self.assertEqual(prefix_length_for_capacity(62), 26)
+
+    def test_suggest_rack_vlan_range_first_block_when_nothing_used(self) -> None:
+        self.assertEqual(suggest_rack_vlan_range("10.200.0.0/21", 30, []), "10.200.0.0/27")
+
+    def test_suggest_rack_vlan_range_packs_sequentially_after_used_blocks(self) -> None:
+        result = suggest_rack_vlan_range("10.200.0.0/21", 30, ["10.200.0.0/27", "10.200.0.32/27"])
+        self.assertEqual(result, "10.200.0.64/27")
+
+    def test_suggest_rack_vlan_range_skips_dhcp_range(self) -> None:
+        result = suggest_rack_vlan_range("10.200.0.0/21", 30, ["10.200.0.0/24"])
+        self.assertEqual(result, "10.200.1.0/27")
+
+    def test_suggest_rack_vlan_range_none_when_rack_too_big_for_subnet(self) -> None:
+        self.assertIsNone(suggest_rack_vlan_range("10.200.1.0/27", 1000, []))
+
+    def test_suggest_rack_vlan_range_none_when_subnet_exhausted(self) -> None:
+        used = [str(n) for n in ipaddress.IPv4Network("10.200.0.0/21").subnets(new_prefix=27)]
+        self.assertIsNone(suggest_rack_vlan_range("10.200.0.0/21", 30, used))
+
+    def test_suggest_slot_address(self) -> None:
+        self.assertEqual(suggest_slot_address("10.200.1.0/27", 1), "10.200.1.1")
+        self.assertEqual(suggest_slot_address("10.200.1.0/27", 5), "10.200.1.5")
+
+
+class VLANSuggestionTests(TestCase):
+    def test_blank_gateway_and_dhcp_range_filled_on_create(self) -> None:
+        vlan = VLAN(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        vlan.full_clean()
+        self.assertEqual(vlan.default_gateway, "10.200.0.1")
+        self.assertEqual(vlan.dhcp_range, "10.200.0.0/24")
+
+    def test_explicit_values_are_preserved(self) -> None:
+        vlan = VLAN(
+            name="Control",
+            vlan_id=200,
+            subnet="10.200.0.0/21",
+            default_gateway="10.200.0.254",
+            dhcp_range="10.200.7.0/24",
+        )
+        vlan.full_clean()
+        self.assertEqual(vlan.default_gateway, "10.200.0.254")
+        self.assertEqual(vlan.dhcp_range, "10.200.7.0/24")
+
+    def test_dhcp_range_left_blank_for_subnet_smaller_than_24(self) -> None:
+        vlan = VLAN(name="Tiny", vlan_id=201, subnet="10.201.1.0/27")
+        vlan.full_clean()
+        self.assertEqual(vlan.dhcp_range, "")
+
+    def test_clearing_on_update_is_not_silently_refilled(self) -> None:
+        vlan = VLAN.objects.create(
+            name="Control", vlan_id=200, subnet="10.200.0.0/21", default_gateway="10.200.0.1"
+        )
+        vlan.default_gateway = None
+        vlan.full_clean()
+        self.assertIsNone(vlan.default_gateway)
+
+
+class RackVlanRangeSuggestionTests(TestCase):
+    def setUp(self) -> None:
+        self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=30)
+
+    def test_blank_range_is_suggested_on_create(self) -> None:
+        range_ = RackVlanRange(rack=self.rack, vlan=self.vlan)
+        range_.full_clean()
+        self.assertEqual(range_.address_range, "10.200.0.0/27")
+
+    def test_second_rack_gets_next_free_block(self) -> None:
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.200.0.0/27")
+        other_rack = Rack.objects.create(name="Rack 2", slot_count=30)
+        range_ = RackVlanRange(rack=other_rack, vlan=self.vlan)
+        range_.full_clean()
+        self.assertEqual(range_.address_range, "10.200.0.32/27")
+
+    def test_suggestion_skips_vlans_dhcp_range(self) -> None:
+        self.vlan.dhcp_range = "10.200.0.0/24"
+        self.vlan.save()
+        range_ = RackVlanRange(rack=self.rack, vlan=self.vlan)
+        range_.full_clean()
+        self.assertEqual(range_.address_range, "10.200.1.0/27")
+
+    def test_explicit_overlap_with_sibling_range_raises(self) -> None:
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.200.0.0/27")
+        other_rack = Rack.objects.create(name="Rack 2", slot_count=30)
+        range_ = RackVlanRange(rack=other_rack, vlan=self.vlan, address_range="10.200.0.16/28")
+        with self.assertRaises(ValidationError):
+            range_.full_clean()
+
+    def test_explicit_overlap_with_dhcp_range_raises(self) -> None:
+        self.vlan.dhcp_range = "10.200.0.0/24"
+        self.vlan.save()
+        range_ = RackVlanRange(rack=self.rack, vlan=self.vlan, address_range="10.200.0.0/27")
+        with self.assertRaises(ValidationError):
+            range_.full_clean()
+
+    def test_range_outside_vlan_subnet_raises(self) -> None:
+        range_ = RackVlanRange(rack=self.rack, vlan=self.vlan, address_range="10.201.0.0/27")
+        with self.assertRaises(ValidationError):
+            range_.full_clean()
+
+    def test_blank_range_raises_when_no_suggestion_possible(self) -> None:
+        tiny_vlan = VLAN.objects.create(name="Tiny", vlan_id=201, subnet="10.201.1.0/27")
+        huge_rack = Rack.objects.create(name="Huge Rack", slot_count=1000)
+        range_ = RackVlanRange(rack=huge_rack, vlan=tiny_vlan)
+        with self.assertRaises(ValidationError):
+            range_.full_clean()
+
+
+class RackSlotAddressSuggestionTests(TestCase):
+    """Suggestion behavior shared by NetworkSwitchAddress and NetworkDevicePort."""
+
+    def setUp(self) -> None:
+        self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=4)
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.200.1.0/27")
+        self.switch_type = NetworkSwitchType.objects.create(
+            manufacturer="Cisco", model="SG300", port_count=10, port_type="1GbE"
+        )
+        self.device_type = NetworkDeviceType.objects.create(
+            manufacturer="Martin Audio", model="IK-42", port_count=1
+        )
+
+    def test_switch_address_suggested_when_racked(self) -> None:
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=1)
+        address = NetworkSwitchAddress(switch=switch, vlan=self.vlan)
+        address.full_clean()
+        self.assertEqual(address.address, "10.200.1.1")
+
+    def test_switch_address_requires_manual_entry_when_unracked(self) -> None:
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type)
+        address = NetworkSwitchAddress(switch=switch, vlan=self.vlan)
+        with self.assertRaises(ValidationError):
+            address.full_clean()
+
+    def test_device_port_address_suggested_when_racked(self) -> None:
+        device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=2)
+        port = NetworkDevicePort(device=device, port_number=1, vlan=self.vlan)
+        port.full_clean()
+        self.assertEqual(port.address, "10.200.1.2")
+
+    def test_device_port_address_requires_manual_entry_without_rack_range(self) -> None:
+        other_vlan = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+        device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=2)
+        port = NetworkDevicePort(device=device, port_number=1, vlan=other_vlan)
+        with self.assertRaises(ValidationError):
+            port.full_clean()
+
+
+class RemovalSemanticsTests(TestCase):
+    """Locks in ADR 0007: containers block removal while non-empty; leaf
+    references (a switch a device is plugged into) unassign rather than
+    cascade-delete. These invariants come from the on_delete choices made
+    in the schema itself, not from clean()/full_clean() — so exercised via
+    plain .delete() calls rather than full_clean().
+    """
+
+    def setUp(self) -> None:
+        self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=4)
+        self.switch_type = NetworkSwitchType.objects.create(
+            manufacturer="Cisco", model="SG300", port_count=10, port_type="1GbE"
+        )
+        self.device_type = NetworkDeviceType.objects.create(
+            manufacturer="Martin Audio", model="IK-42", port_count=1
+        )
+
+    def test_rack_removal_blocked_while_switch_assigned(self) -> None:
+        NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=1)
+        with self.assertRaises(ProtectedError):
+            self.rack.delete()
+
+    def test_rack_removal_blocked_while_device_assigned(self) -> None:
+        NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=1)
+        with self.assertRaises(ProtectedError):
+            self.rack.delete()
+
+    def test_rack_removal_succeeds_once_empty(self) -> None:
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.200.1.0/27")
+        self.rack.delete()
+        self.assertFalse(Rack.objects.filter(pk=self.rack.pk).exists())
+
+    def test_vlan_removal_blocked_by_rack_vlan_range(self) -> None:
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.200.1.0/27")
+        with self.assertRaises(ProtectedError):
+            self.vlan.delete()
+
+    def test_vlan_removal_blocked_by_switch_address(self) -> None:
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=1)
+        NetworkSwitchAddress.objects.create(switch=switch, vlan=self.vlan, address="10.200.1.1")
+        with self.assertRaises(ProtectedError):
+            self.vlan.delete()
+
+    def test_vlan_removal_blocked_by_device_port(self) -> None:
+        device = NetworkDevice.objects.create(device_type=self.device_type)
+        NetworkDevicePort.objects.create(device=device, port_number=1, vlan=self.vlan, address="10.200.1.2")
+        with self.assertRaises(ProtectedError):
+            self.vlan.delete()
+
+    def test_switch_type_removal_blocked_while_switch_exists(self) -> None:
+        NetworkSwitch.objects.create(switch_type=self.switch_type)
+        with self.assertRaises(ProtectedError):
+            self.switch_type.delete()
+
+    def test_device_type_removal_blocked_while_device_exists(self) -> None:
+        NetworkDevice.objects.create(device_type=self.device_type)
+        with self.assertRaises(ProtectedError):
+            self.device_type.delete()
+
+    def test_deleting_switch_unassigns_rather_than_deletes_connected_device_port(self) -> None:
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type)
+        switch_port = NetworkSwitchPort.objects.create(switch=switch, port_number=1)
+        device = NetworkDevice.objects.create(device_type=self.device_type)
+        device_port = NetworkDevicePort.objects.create(
+            device=device, port_number=1, vlan=self.vlan, address="10.200.1.2", switch_port=switch_port
+        )
+        switch.delete()
+        device_port.refresh_from_db()
+        self.assertIsNone(device_port.switch_port)
+        self.assertTrue(NetworkDevice.objects.filter(pk=device.pk).exists())

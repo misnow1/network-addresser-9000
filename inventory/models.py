@@ -1,17 +1,43 @@
 """Domain models for Network Addresser 9000.
 
 Canonical terminology lives in CONTEXT.md; design rationale and trade-offs
-behind specific fields/relations are recorded as ADRs in docs/adr/. This
-module covers schema shape only — address-suggestion, overlap validation,
-and other domain logic land in later phases (see ROADMAP.md).
+behind specific fields/relations are recorded as ADRs in docs/adr/. Address
+suggestion and overlap validation (phase 3, see ROADMAP.md) live here too:
+suggestion arithmetic itself is in suggestions.py, wired into each model's
+``clean()`` so a blank suggested field is filled in on creation only —
+matching ADR 0001's "suggests, but admin can override; once set, static."
 """
+
+import ipaddress
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 
+from .suggestions import (
+    ranges_overlap,
+    suggest_default_gateway,
+    suggest_dhcp_range,
+    suggest_rack_vlan_range,
+    suggest_slot_address,
+)
 from .validators import validate_ipv4_cidr
+
+
+def _suggest_rack_slot_address(rack: "Rack | None", rack_slot: int | None, vlan_id: int) -> str | None:
+    """Suggested static address for a rack-slot occupant on ``vlan_id``.
+
+    ``None`` if unracked, or no ``RackVlanRange`` exists yet for that VLAN.
+    Shared by ``NetworkSwitchAddress`` and ``NetworkDevicePort``.
+    """
+    if rack is None or rack_slot is None:
+        return None
+    try:
+        rack_range = rack.vlan_ranges.get(vlan_id=vlan_id)
+    except RackVlanRange.DoesNotExist:
+        return None
+    return suggest_slot_address(rack_range.address_range, rack_slot)
 
 
 class AuditedModel(models.Model):
@@ -68,6 +94,20 @@ class VLAN(AuditedModel):
     def __str__(self) -> str:
         return f"{self.name} (VLAN {self.vlan_id})"
 
+    def clean(self) -> None:
+        super().clean()
+        if self.pk is None and self.subnet:
+            try:
+                validate_ipv4_cidr(self.subnet)
+            except ValidationError:
+                return  # subnet itself is invalid; clean_fields() already reports it
+            if not self.default_gateway:
+                self.default_gateway = suggest_default_gateway(self.subnet)
+            if not self.dhcp_range:
+                suggestion = suggest_dhcp_range(self.subnet)
+                if suggestion:
+                    self.dhcp_range = suggestion
+
 
 class Rack(AuditedModel):
     """A physical container with a fixed slot count.
@@ -95,7 +135,12 @@ class RackVlanRange(AuditedModel):
 
     rack = models.ForeignKey(Rack, on_delete=models.CASCADE, related_name="vlan_ranges")
     vlan = models.ForeignKey(VLAN, on_delete=models.PROTECT, related_name="rack_ranges")
-    address_range = models.CharField(max_length=18, validators=[validate_ipv4_cidr])
+    address_range = models.CharField(
+        max_length=18,
+        blank=True,
+        validators=[validate_ipv4_cidr],
+        help_text="Leave blank to suggest the next free block sized for the rack's slot_count.",
+    )
 
     class Meta:
         constraints = [
@@ -105,6 +150,68 @@ class RackVlanRange(AuditedModel):
 
     def __str__(self) -> str:
         return f"{self.rack} / {self.vlan}: {self.address_range}"
+
+    def clean(self) -> None:
+        super().clean()
+        if self.pk is None and not self.address_range and self.rack_id and self.vlan_id:
+            used_ranges = list(
+                self.vlan.rack_ranges.exclude(pk=self.pk).values_list("address_range", flat=True)
+            )
+            if self.vlan.dhcp_range:
+                used_ranges.append(self.vlan.dhcp_range)
+            try:
+                validate_ipv4_cidr(self.vlan.subnet)
+            except ValidationError:
+                pass  # VLAN's own subnet is invalid; nothing sensible to suggest
+            else:
+                suggestion = suggest_rack_vlan_range(self.vlan.subnet, self.rack.slot_count, used_ranges)
+                if suggestion:
+                    self.address_range = suggestion
+        if not self.address_range:
+            raise ValidationError(
+                {
+                    "address_range": (
+                        "This field is required — no suggestion could be computed "
+                        "automatically (check the VLAN's subnet is large enough for "
+                        "this rack), so it must be entered manually."
+                    )
+                }
+            )
+        self._validate_range()
+
+    def _validate_range(self) -> None:
+        try:
+            validate_ipv4_cidr(self.vlan.subnet)
+        except ValidationError:
+            return  # VLAN's own subnet is invalid; its own clean() will report that
+        vlan_network = ipaddress.IPv4Network(self.vlan.subnet, strict=True)
+        range_network = ipaddress.IPv4Network(self.address_range, strict=True)
+        if not range_network.subnet_of(vlan_network):
+            raise ValidationError(
+                {
+                    "address_range": (
+                        f"{self.address_range} is not within {self.vlan}'s subnet ({self.vlan.subnet})."
+                    )
+                }
+            )
+        for other in self.vlan.rack_ranges.exclude(pk=self.pk):
+            if ranges_overlap(self.address_range, other.address_range):
+                raise ValidationError(
+                    {
+                        "address_range": (
+                            f"{self.address_range} overlaps {other.rack}'s range "
+                            f"{other.address_range} on {self.vlan}."
+                        )
+                    }
+                )
+        if self.vlan.dhcp_range and ranges_overlap(self.address_range, self.vlan.dhcp_range):
+            raise ValidationError(
+                {
+                    "address_range": (
+                        f"{self.address_range} overlaps {self.vlan}'s DHCP range ({self.vlan.dhcp_range})."
+                    )
+                }
+            )
 
 
 class RackSlotAssignmentMixin:
@@ -204,22 +311,48 @@ class NetworkSwitchAddress(AuditedModel):
     """A switch's static address on one VLAN.
 
     Defaults to rack range base + rack slot (ADR 0003's computed-but-
-    stored pattern applies here too); the suggestion logic itself lands
-    in a later phase.
+    stored pattern applies here too) via ``clean()``, when the switch is
+    racked and a ``RackVlanRange`` already exists for the VLAN.
     """
 
     switch = models.ForeignKey(NetworkSwitch, on_delete=models.CASCADE, related_name="addresses")
     vlan = models.ForeignKey(VLAN, on_delete=models.PROTECT, related_name="switch_addresses")
-    address = models.GenericIPAddressField(protocol="IPv4")
+    address = models.GenericIPAddressField(
+        protocol="IPv4",
+        blank=True,
+        null=True,
+        help_text="Leave blank to suggest rack range base + rack slot.",
+    )
 
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=["switch", "vlan"], name="unique_switch_vlan_address"),
+            models.CheckConstraint(
+                condition=models.Q(address__isnull=False),
+                name="networkswitchaddress_address_required",
+            ),
         ]
         ordering = ["vlan", "address"]
 
     def __str__(self) -> str:
         return f"{self.switch} / {self.vlan}: {self.address}"
+
+    def clean(self) -> None:
+        super().clean()
+        if self.pk is None and not self.address and self.switch_id and self.vlan_id:
+            suggestion = _suggest_rack_slot_address(self.switch.rack, self.switch.rack_slot, self.vlan_id)
+            if suggestion:
+                self.address = suggestion
+        if not self.address:
+            raise ValidationError(
+                {
+                    "address": (
+                        "This field is required — no suggestion could be computed "
+                        "automatically (switch must be racked with a RackVlanRange "
+                        "already assigned for this VLAN), so it must be entered manually."
+                    )
+                }
+            )
 
 
 class NetworkSwitchPort(AuditedModel):
@@ -370,8 +503,13 @@ class NetworkDevicePort(AuditedModel):
         if self.is_dhcp:
             if self.address or self.default_gateway:
                 raise ValidationError("DHCP ports must not have a static address or gateway.")
-        elif not self.address:
-            raise ValidationError("Static ports must have an address.")
+        else:
+            if self.pk is None and not self.address and self.device_id and self.vlan_id:
+                suggestion = _suggest_rack_slot_address(self.device.rack, self.device.rack_slot, self.vlan_id)
+                if suggestion:
+                    self.address = suggestion
+            if not self.address:
+                raise ValidationError("Static ports must have an address.")
         if self.device_id and self.port_number and self.port_number > self.device.device_type.port_count:
             raise ValidationError(
                 f"port_number {self.port_number} exceeds {self.device.device_type}'s "

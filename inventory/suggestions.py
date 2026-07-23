@@ -1,0 +1,68 @@
+"""Pure IPv4 address-suggestion helpers for inventory models.
+
+These functions take already-known network primitives (CIDR strings, slot
+counts) and return suggested values. They perform no DB queries and raise
+no ``ValidationError``s — callers own translating an absent (``None``)
+result into whatever handling makes sense for their model.
+"""
+
+import ipaddress
+
+
+def suggest_default_gateway(subnet: str) -> str:
+    """Suggested default gateway: the lowest host address in ``subnet``."""
+    network = ipaddress.IPv4Network(subnet, strict=True)
+    return str(network.network_address + 1)
+
+
+def suggest_dhcp_range(subnet: str) -> str | None:
+    """Suggested DHCP range: the bottom /24 of ``subnet``.
+
+    ``None`` if ``subnet`` is smaller than a /24 — "bottom 256 addresses"
+    only equals "bottom /24" when the network is octet-aligned (ADR 0002).
+    """
+    network = ipaddress.IPv4Network(subnet, strict=True)
+    if network.prefixlen > 24:
+        return None
+    bottom_24 = next(network.subnets(new_prefix=24))
+    return str(bottom_24)
+
+
+def prefix_length_for_capacity(slot_count: int) -> int:
+    """Smallest IPv4 prefix length whose block can address slots 1..slot_count.
+
+    Slot N maps to ``network_address + N`` (see ``suggest_slot_address``),
+    so the block needs at least ``slot_count + 1`` addresses.
+    """
+    needed = slot_count + 1
+    host_bits = max(needed - 1, 0).bit_length()
+    return 32 - host_bits
+
+
+def suggest_rack_vlan_range(subnet: str, slot_count: int, used_ranges: list[str]) -> str | None:
+    """Next free block sized for ``slot_count``, within ``subnet``.
+
+    ``None`` if ``slot_count`` needs more addresses than ``subnet`` has, or
+    every same-sized block within ``subnet`` overlaps something in
+    ``used_ranges``.
+    """
+    network = ipaddress.IPv4Network(subnet, strict=True)
+    prefixlen = prefix_length_for_capacity(slot_count)
+    if prefixlen < network.prefixlen:
+        return None
+    used = [ipaddress.IPv4Network(r, strict=True) for r in used_ranges]
+    for candidate in network.subnets(new_prefix=prefixlen):
+        if not any(candidate.overlaps(block) for block in used):
+            return str(candidate)
+    return None
+
+
+def suggest_slot_address(range_cidr: str, slot: int) -> str:
+    """Suggested address for ``slot`` within ``range_cidr``: base + slot."""
+    network = ipaddress.IPv4Network(range_cidr, strict=True)
+    return str(network.network_address + slot)
+
+
+def ranges_overlap(a: str, b: str) -> bool:
+    """Whether two IPv4 CIDR ranges overlap at all."""
+    return ipaddress.IPv4Network(a, strict=True).overlaps(ipaddress.IPv4Network(b, strict=True))
