@@ -7,11 +7,14 @@ on:
 jobs:
   codex:
     # Forked-repo PRs don't receive secrets under `pull_request` (by GitHub's
-    # own design) — skip cleanly instead of a confusing failed run. Do NOT
-    # "fix" this with pull_request_target: that grants a write-scoped token
-    # and this repo's secrets to a job that also checks out the PR's own
-    # (untrusted, fork-controlled) code.
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    # own design) — skip cleanly instead of a confusing failed run. Dependabot
+    # PRs get the same secret-less treatment even though they're same-repo,
+    # not fork, PRs, so they need excluding separately. Do NOT "fix" either
+    # case with pull_request_target: that grants a write-scoped token and
+    # this repo's secrets to a job that also checks out untrusted PR code.
+    if: |
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
       contents: read
