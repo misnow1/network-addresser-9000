@@ -4,7 +4,7 @@ A backend service and web frontend for tracking IP addresses assigned to network
 
 ## Status
 
-Design phase — no application code yet. The domain model and key architectural decisions are settled; see the documentation below.
+Django scaffolding is in place (models, admin, migrations) and phase 3 (core domain logic) is next; see [`ROADMAP.md`](./ROADMAP.md) for what that covers. The domain model and key architectural decisions are settled; see the documentation below.
 
 ## Documentation
 
