@@ -16,6 +16,7 @@ jobs:
         with:
           ref: refs/pull/${{ github.event.pull_request.number }}/merge
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Run Codex
         id: run_codex
