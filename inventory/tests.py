@@ -590,6 +590,15 @@ class RackVlanRangeSuggestionTests(TestCase):
         with self.assertRaises(ValidationError):
             range_.full_clean()
 
+    def test_malformed_address_range_raises_validation_error_not_crash(self) -> None:
+        # clean() runs even after clean_fields() has already flagged a bad
+        # value, so _validate_range() must not blindly hand a malformed
+        # address_range to ipaddress.IPv4Network(strict=True) — that would
+        # raise a raw ValueError (-> uncaught 500) instead of ValidationError.
+        range_ = RackVlanRange(rack=self.rack, vlan=self.vlan, address_range="not-a-cidr")
+        with self.assertRaises(ValidationError):
+            range_.full_clean()
+
 
 class RackSlotCountEditTests(TestCase):
     """Editing Rack.slot_count must be re-validated against what already
@@ -724,6 +733,27 @@ class RackSlotAddressSuggestionTests(TestCase):
         other_vlan = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
         device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=2)
         port = NetworkDevicePort(device=device, port_number=1, vlan=other_vlan)
+        with self.assertRaises(ValidationError):
+            port.full_clean()
+
+    def test_switch_address_manually_entered_without_rack_range_still_raises(self) -> None:
+        # Racked equipment always requires an assigned RackVlanRange, even
+        # for a manually-typed address within the VLAN's subnet — otherwise
+        # it could land inside the DHCP range or on the gateway.
+        other_vlan = VLAN.objects.create(
+            name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21", dhcp_range="10.201.0.0/24"
+        )
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=1)
+        address = NetworkSwitchAddress(switch=switch, vlan=other_vlan, address="10.201.0.5")
+        with self.assertRaises(ValidationError):
+            address.full_clean()
+
+    def test_device_port_address_manually_entered_without_rack_range_still_raises(self) -> None:
+        other_vlan = VLAN.objects.create(
+            name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21", dhcp_range="10.201.0.0/24"
+        )
+        device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=2)
+        port = NetworkDevicePort(device=device, port_number=1, vlan=other_vlan, address="10.201.0.5")
         with self.assertRaises(ValidationError):
             port.full_clean()
 

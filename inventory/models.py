@@ -58,18 +58,26 @@ def _suggest_rack_slot_address(rack: "Rack | None", rack_slot: int | None, vlan_
         rack_range = rack.vlan_ranges.get(vlan_id=vlan_id)
     except RackVlanRange.DoesNotExist:
         return None
+    try:
+        validate_ipv4_cidr(rack_range.address_range)
+    except ValidationError:
+        return None  # that range's own malformed value; its own clean() would report it
     return suggest_slot_address(rack_range.address_range, rack_slot)
 
 
 def _address_containment_error(
     address: str, vlan: "VLAN", rack: "Rack | None", rack_slot: int | None
 ) -> str | None:
-    """``None`` if ``address`` fits ``vlan``'s subnet (and, if racked with an
-    assigned ``RackVlanRange``, that range too); otherwise an error message.
+    """``None`` if ``address`` fits ``vlan``'s subnet and, when racked, the
+    rack's assigned ``RackVlanRange``; otherwise an error message.
 
-    Pure read — no exclusions/uniqueness here, so it doubles as the check
-    for re-validating an *already-saved* address after its equipment moves,
-    not just for a fresh/edited address row.
+    Racked equipment always requires an assigned range — addresses aren't
+    allowed to free-float within just the VLAN subnet once racked, since
+    that could otherwise land inside the VLAN's DHCP range or on its
+    gateway (DESIGN.md's "addresses come from the rack's reserved range"
+    model). Pure read — no exclusions/uniqueness here, so it doubles as the
+    check for re-validating an *already-saved* address after its equipment
+    moves, not just for a fresh/edited address row.
     """
     try:
         validate_ipv4_cidr(vlan.subnet)
@@ -88,7 +96,14 @@ def _address_containment_error(
         try:
             rack_range = rack.vlan_ranges.get(vlan_id=vlan.pk)
         except RackVlanRange.DoesNotExist:
-            return None
+            return (
+                f"{rack} has no address range assigned for {vlan} yet — assign one via the "
+                "rack's VLAN ranges before addressing equipment on this VLAN."
+            )
+        try:
+            validate_ipv4_cidr(rack_range.address_range)
+        except ValidationError:
+            return None  # that range's own malformed value; its own clean() will report it
         range_network = ipaddress.IPv4Network(rack_range.address_range, strict=True)
         if address_obj not in range_network:
             return f"{address} is not within {rack}'s range on {vlan} ({rack_range.address_range})."
@@ -238,6 +253,10 @@ class VLAN(AuditedModel):
 
         if self.pk is not None:
             for rack_range in self.rack_ranges.all():
+                try:
+                    validate_ipv4_cidr(rack_range.address_range)
+                except ValidationError:
+                    continue  # that range's own malformed value; its own clean() will report it
                 range_network = ipaddress.IPv4Network(rack_range.address_range, strict=True)
                 if not range_network.subnet_of(vlan_network):
                     raise ValidationError(
@@ -354,9 +373,20 @@ class RackVlanRange(AuditedModel):
         rack = _get_related(self, "rack")
         vlan = _get_related(self, "vlan")
         if self.pk is None and not self.address_range and rack is not None and vlan is not None:
-            used_ranges = list(vlan.rack_ranges.exclude(pk=self.pk).values_list("address_range", flat=True))
+            used_ranges = []
+            for value in vlan.rack_ranges.exclude(pk=self.pk).values_list("address_range", flat=True):
+                try:
+                    validate_ipv4_cidr(value)
+                except ValidationError:
+                    continue  # that sibling range's own malformed value; its own clean() reports it
+                used_ranges.append(value)
             if vlan.dhcp_range:
-                used_ranges.append(vlan.dhcp_range)
+                try:
+                    validate_ipv4_cidr(vlan.dhcp_range)
+                except ValidationError:
+                    pass  # VLAN's own malformed dhcp_range; its own clean() reports it
+                else:
+                    used_ranges.append(vlan.dhcp_range)
             try:
                 validate_ipv4_cidr(vlan.subnet)
             except ValidationError:
@@ -385,6 +415,10 @@ class RackVlanRange(AuditedModel):
             validate_ipv4_cidr(vlan.subnet)
         except ValidationError:
             return  # VLAN's own subnet is invalid; its own clean() will report that
+        try:
+            validate_ipv4_cidr(self.address_range)
+        except ValidationError:
+            return  # address_range itself is invalid; clean_fields() already reports it
         vlan_network = ipaddress.IPv4Network(vlan.subnet, strict=True)
         range_network = ipaddress.IPv4Network(self.address_range, strict=True)
         if not range_network.subnet_of(vlan_network):
