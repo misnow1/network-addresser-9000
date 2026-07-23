@@ -9,9 +9,16 @@ result into whatever handling makes sense for their model.
 import ipaddress
 
 
-def suggest_default_gateway(subnet: str) -> str:
-    """Suggested default gateway: the lowest host address in ``subnet``."""
+def suggest_default_gateway(subnet: str) -> str | None:
+    """Suggested default gateway: the lowest host address in ``subnet``.
+
+    ``None`` for a /32 — a single-address network has no host address
+    distinct from the network address itself, and ``network_address + 1``
+    would overflow for the top-of-range case (255.255.255.255/32).
+    """
     network = ipaddress.IPv4Network(subnet, strict=True)
+    if network.num_addresses <= 1:
+        return None
     return str(network.network_address + 1)
 
 

@@ -366,6 +366,37 @@ class VLANSuggestionTests(TestCase):
         vlan.full_clean()
         self.assertIsNone(vlan.default_gateway)
 
+    def test_gateway_suggestion_skipped_for_slash_32_subnet(self) -> None:
+        vlan = VLAN(name="PointToPoint", vlan_id=202, subnet="10.202.0.1/32")
+        vlan.full_clean()  # must not raise ipaddress.AddressValueError
+        self.assertIsNone(vlan.default_gateway)
+
+    def test_gateway_outside_subnet_raises(self) -> None:
+        vlan = VLAN(name="Control", vlan_id=200, subnet="10.200.0.0/21", default_gateway="10.201.0.1")
+        with self.assertRaises(ValidationError):
+            vlan.full_clean()
+
+    def test_dhcp_range_outside_subnet_raises(self) -> None:
+        vlan = VLAN(name="Control", vlan_id=200, subnet="10.200.0.0/21", dhcp_range="10.201.0.0/24")
+        with self.assertRaises(ValidationError):
+            vlan.full_clean()
+
+    def test_editing_subnet_to_exclude_existing_rack_range_raises(self) -> None:
+        vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        rack = Rack.objects.create(name="Rack 1", slot_count=30)
+        RackVlanRange.objects.create(rack=rack, vlan=vlan, address_range="10.200.1.0/27")
+        vlan.subnet = "10.205.0.0/21"
+        with self.assertRaises(ValidationError):
+            vlan.full_clean()
+
+    def test_editing_dhcp_range_to_overlap_existing_rack_range_raises(self) -> None:
+        vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        rack = Rack.objects.create(name="Rack 1", slot_count=30)
+        RackVlanRange.objects.create(rack=rack, vlan=vlan, address_range="10.200.1.0/27")
+        vlan.dhcp_range = "10.200.1.0/24"
+        with self.assertRaises(ValidationError):
+            vlan.full_clean()
+
 
 class RackVlanRangeSuggestionTests(TestCase):
     def setUp(self) -> None:
@@ -414,6 +445,14 @@ class RackVlanRangeSuggestionTests(TestCase):
         tiny_vlan = VLAN.objects.create(name="Tiny", vlan_id=201, subnet="10.201.1.0/27")
         huge_rack = Rack.objects.create(name="Huge Rack", slot_count=1000)
         range_ = RackVlanRange(rack=huge_rack, vlan=tiny_vlan)
+        with self.assertRaises(ValidationError):
+            range_.full_clean()
+
+    def test_explicit_range_too_small_for_rack_slot_count_raises(self) -> None:
+        # A /30 has 4 addresses (0-3); a 4-slot rack needs slots 1-4, i.e.
+        # 5 addresses (base + slot N), so slot 4 would fall outside it.
+        four_slot_rack = Rack.objects.create(name="Rack 2", slot_count=4)
+        range_ = RackVlanRange(rack=four_slot_rack, vlan=self.vlan, address_range="10.200.0.0/30")
         with self.assertRaises(ValidationError):
             range_.full_clean()
 

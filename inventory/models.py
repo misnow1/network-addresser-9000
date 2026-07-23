@@ -96,17 +96,68 @@ class VLAN(AuditedModel):
 
     def clean(self) -> None:
         super().clean()
-        if self.pk is None and self.subnet:
-            try:
-                validate_ipv4_cidr(self.subnet)
-            except ValidationError:
-                return  # subnet itself is invalid; clean_fields() already reports it
+        if not self.subnet:
+            return
+        try:
+            validate_ipv4_cidr(self.subnet)
+        except ValidationError:
+            return  # subnet itself is invalid; clean_fields() already reports it
+        vlan_network = ipaddress.IPv4Network(self.subnet, strict=True)
+
+        if self.pk is None:
             if not self.default_gateway:
-                self.default_gateway = suggest_default_gateway(self.subnet)
+                suggestion = suggest_default_gateway(self.subnet)
+                if suggestion:
+                    self.default_gateway = suggestion
             if not self.dhcp_range:
                 suggestion = suggest_dhcp_range(self.subnet)
                 if suggestion:
                     self.dhcp_range = suggestion
+
+        # From here on, validate the final values regardless of whether they
+        # were just suggested, supplied by the admin, or (on an edit) already
+        # stored — a changed subnet can just as easily invalidate an existing
+        # gateway/DHCP range/rack range as a freshly-typed one.
+        if self.default_gateway:
+            try:
+                gateway_address = ipaddress.IPv4Address(self.default_gateway)
+            except ValueError:
+                pass  # malformed value; the field's own validator already reports it
+            else:
+                if gateway_address not in vlan_network:
+                    raise ValidationError(
+                        {"default_gateway": f"{self.default_gateway} is not within subnet {self.subnet}."}
+                    )
+
+        dhcp_network = None
+        if self.dhcp_range:
+            try:
+                dhcp_network = ipaddress.IPv4Network(self.dhcp_range, strict=True)
+            except ValueError:
+                pass  # malformed value; the field's own validator already reports it
+            else:
+                if not dhcp_network.subnet_of(vlan_network):
+                    raise ValidationError(
+                        {"dhcp_range": f"{self.dhcp_range} is not within subnet {self.subnet}."}
+                    )
+
+        if self.pk is not None:
+            for rack_range in self.rack_ranges.all():
+                range_network = ipaddress.IPv4Network(rack_range.address_range, strict=True)
+                if not range_network.subnet_of(vlan_network):
+                    raise ValidationError(
+                        f"subnet {self.subnet} no longer contains {rack_range.rack}'s existing range "
+                        f"({rack_range.address_range}) on this VLAN; update or remove that range first."
+                    )
+                if dhcp_network is not None and dhcp_network.overlaps(range_network):
+                    raise ValidationError(
+                        {
+                            "dhcp_range": (
+                                f"{self.dhcp_range} overlaps {rack_range.rack}'s existing range "
+                                f"({rack_range.address_range})."
+                            )
+                        }
+                    )
 
 
 class Rack(AuditedModel):
@@ -191,6 +242,16 @@ class RackVlanRange(AuditedModel):
                 {
                     "address_range": (
                         f"{self.address_range} is not within {self.vlan}'s subnet ({self.vlan.subnet})."
+                    )
+                }
+            )
+        if self.rack_id and range_network.num_addresses < self.rack.slot_count + 1:
+            raise ValidationError(
+                {
+                    "address_range": (
+                        f"{self.address_range} has room for {range_network.num_addresses - 1} slot(s) "
+                        f"(base address + slot N addressing), but {self.rack} needs "
+                        f"{self.rack.slot_count} (slot_count)."
                     )
                 }
             )
