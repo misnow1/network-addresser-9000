@@ -89,7 +89,7 @@ jobs:
                   commit_id: context.payload.pull_request.head.sha,
                   event: "COMMENT",
                   body: payload.summary || "Automated review",
-                  comments: comments.map((c) => ({ path: c.path, line: c.line, body: c.body })),
+                  comments: comments.map((c) => ({ path: c.path, line: c.line, side: "RIGHT", body: c.body })),
                 });
                 return;
               } catch (err) {
