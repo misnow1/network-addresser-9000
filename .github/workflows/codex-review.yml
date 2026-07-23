@@ -4,6 +4,13 @@ on:
   pull_request:
     types: [opened, reopened, synchronize]
 
+# A slow review of an older push shouldn't be able to finish after, and post
+# now-stale findings over, a newer push's review — supersede in-flight runs
+# for the same PR instead.
+concurrency:
+  group: codex-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   codex:
     # Forked-repo PRs don't receive secrets under `pull_request` (by GitHub's
