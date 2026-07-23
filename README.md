@@ -11,6 +11,7 @@ Design phase — no application code yet. The domain model and key architectural
 - [`DESIGN.md`](./DESIGN.md) — requirements and design narrative
 - [`CONTEXT.md`](./CONTEXT.md) — domain glossary (canonical terminology)
 - [`docs/adr/`](./docs/adr/) — architecture decision records
+- [`ROADMAP.md`](./ROADMAP.md) — current phase and what's next
 
 ## Planned stack
 
