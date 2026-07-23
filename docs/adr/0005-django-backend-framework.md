@@ -1,0 +1,3 @@
+# Django as the backend web framework
+
+The design doc suggested "a database framework that supports automatic schema upgrade/downgrade files, such as SQLAlchemy with Alembic," which reads as a nudge toward FastAPI or Flask paired with SQLAlchemy. Django was chosen instead: its own migration system satisfies the same underlying requirement, and its built-in admin panel, auth/permissions, and mature audit-history packages (`django-simple-history`, `django-auditlog`) map directly onto this tool's actual shape — CRUD-heavy screens for every entity, three-tier RBAC (Viewer/Editor/Admin), and per-mutation audit history (ADR 0004). Django's own ORM and migrations are used in place of SQLAlchemy/Alembic.

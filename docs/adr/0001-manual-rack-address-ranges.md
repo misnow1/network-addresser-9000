@@ -1,0 +1,3 @@
+# Manual assignment of rack address ranges, with system-suggested defaults
+
+Rack address ranges (one per VLAN) are stored explicitly per rack rather than derived from a fixed formula such as "third octet = rack number." The worked example's clean numbering is a convention some racks may follow, not a rule the system enforces — real installs need racks with uneven slot counts, several racks packed sequentially into the same third octet (e.g. `10.200.1.0/27`, `10.200.1.32/27`, `10.200.1.64/27`), and racks that get renumbered or relocated without their addresses changing. The system suggests the next free block of the right size when a rack is created, but an admin can override it, and once set the range is static and does not recompute automatically.

@@ -1,0 +1,3 @@
+# Removal blocks non-empty containers; leaf references unassign rather than cascade
+
+Removing a Rack, VLAN, or a Switch/Device Type is blocked while it still has dependents (devices/switches in the rack, racks holding a range on the VLAN, or instances of the type) — the admin must explicitly move or remove each dependent first, rather than one confirmation silently deleting a rack's worth of tracked equipment. Removing a leaf-level reference (a Switch that a device was plugged into) does not cascade-delete the device; it clears the port/switch reference, unassigning rather than destroying. This deliberately departs from Django's default cascade-on-delete behavior, because this tool's core job is to prevent equipment from silently vanishing from the inventory.

@@ -1,0 +1,3 @@
+# MariaDB as the database engine
+
+PostgreSQL's native `cidr`/`inet` types and `EXCLUDE` constraints would have made subnet-overlap validation elegant at the database level, but ADR 0001/0002 already commit this system to *suggesting* address ranges rather than strictly deriving them, so overlap checking has to live in Django application code (Python's `ipaddress` module) regardless of database engine — a DB-level constraint would only be a second line of defense, not something the design depends on. Given that, production operational familiarity with MySQL/MariaDB outweighs Postgres's schema-level nicety, so MariaDB was chosen as the database engine.

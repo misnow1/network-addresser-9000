@@ -1,0 +1,3 @@
+# Audit trail covers mutations, not just creation
+
+The design doc only calls for recording who created each object and when. That's insufficient once addresses are editable (ADR 0003) and overrides are meant to be discouraged but not forbidden — without a change history, an overridden address is indistinguishable from a computed one, and there's no way to see who changed it or why. The audit trail therefore also logs edits and removals, scoped to operationally meaningful events (address overrides, rack/slot reassignment, removals) rather than every field on every object — a typo fix to a port description doesn't need forensic tracking, but the events this tool exists to make traceable do.
