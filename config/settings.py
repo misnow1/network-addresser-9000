@@ -13,6 +13,8 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 import os
 from pathlib import Path
 
+from django.core.exceptions import ImproperlyConfigured
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -20,13 +22,21 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = "django-insecure-x!js+y9q*u)c!wzx$omnf&jv_nje7qo(+u)ukiz)w2=q9ypjrn"
-
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+# Off by default; opt into a local dev/test run explicitly via DJANGO_DEBUG=true.
+DEBUG = os.environ.get("DJANGO_DEBUG", "false").lower() == "true"
 
-ALLOWED_HOSTS: list[str] = []
+# SECURITY WARNING: keep the secret key used in production secret!
+# Must come from the environment outside DEBUG mode — a key baked into source
+# would be public (and identical across every checkout) the moment it's committed.
+SECRET_KEY = os.environ.get("SECRET_KEY")
+if not SECRET_KEY:
+    if DEBUG:
+        SECRET_KEY = "django-insecure-dev-only-do-not-use-in-production"  # noqa: S105
+    else:
+        raise ImproperlyConfigured("SECRET_KEY environment variable must be set outside DJANGO_DEBUG=true.")
+
+ALLOWED_HOSTS: list[str] = [h for h in os.environ.get("DJANGO_ALLOWED_HOSTS", "").split(",") if h]
 
 
 # Application definition

@@ -27,6 +27,7 @@ class AuditedModel(models.Model):
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
+        editable=False,
         related_name="+",
     )
 
@@ -106,6 +107,40 @@ class RackVlanRange(AuditedModel):
         return f"{self.rack} / {self.vlan}: {self.address_range}"
 
 
+class RackSlotAssignmentMixin:
+    """Shared ``clean()`` logic for equipment with a ``rack``/``rack_slot`` pair.
+
+    A slot is 1-based; ``rack`` and ``rack_slot`` are all-or-neither; when both
+    are set, ``rack_slot`` must fall within the rack's ``slot_count`` — this
+    last check is cross-table so it can't be expressed as a DB constraint.
+
+    Also cross-checks the *other* equipment table so a switch and a device
+    can't both claim the same physical slot. This is an interim, form/
+    full_clean-time guard, not a concurrency-safe one — a shared rack-
+    occupancy table would be needed to close the direct-ORM/race-condition
+    gap; that's a bigger schema change better suited to phase 3's "Overlap
+    validation" work (see ROADMAP.md) than a scaffolding fix.
+    """
+
+    rack: Rack | None
+    rack_slot: int | None
+
+    def clean(self) -> None:
+        if (self.rack is None) != (self.rack_slot is None):
+            raise ValidationError(
+                "rack and rack_slot must both be set (racked) or both be empty (spare pool)."
+            )
+        if self.rack is not None and self.rack_slot is not None:
+            if self.rack_slot > self.rack.slot_count:
+                raise ValidationError(
+                    f"rack_slot {self.rack_slot} exceeds {self.rack}'s slot_count ({self.rack.slot_count})."
+                )
+            self._check_rack_slot_not_occupied()
+
+    def _check_rack_slot_not_occupied(self) -> None:
+        raise NotImplementedError
+
+
 class NetworkSwitchType(AuditedModel):
     """A switch make/model. port_type describes the physical port mix."""
 
@@ -127,24 +162,41 @@ class NetworkSwitchType(AuditedModel):
         return f"{self.manufacturer} {self.model}"
 
 
-class NetworkSwitch(AuditedModel):
+class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
     """A physical switch instance. Unracked (rack is null) = spare pool."""
 
     switch_type = models.ForeignKey(NetworkSwitchType, on_delete=models.PROTECT, related_name="switches")
     hostname = models.CharField(max_length=255, blank=True)
     serial_number = models.CharField(max_length=100, blank=True)
     rack = models.ForeignKey(Rack, on_delete=models.PROTECT, null=True, blank=True, related_name="switches")
-    rack_slot = models.PositiveIntegerField(null=True, blank=True)
+    rack_slot = models.PositiveIntegerField(null=True, blank=True, validators=[MinValueValidator(1)])
     dhcp_server_enabled = models.BooleanField(default=False)
 
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=["rack", "rack_slot"], name="unique_switch_rack_slot"),
+            models.CheckConstraint(
+                condition=models.Q(rack_slot__isnull=True) | models.Q(rack_slot__gte=1),
+                name="networkswitch_rack_slot_gte_1",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(rack__isnull=True, rack_slot__isnull=True)
+                    | models.Q(rack__isnull=False, rack_slot__isnull=False)
+                ),
+                name="networkswitch_rack_and_slot_together",
+            ),
         ]
         ordering = ["hostname"]
 
     def __str__(self) -> str:
         return self.hostname or f"Switch #{self.pk}"
+
+    def _check_rack_slot_not_occupied(self) -> None:
+        if NetworkDevice.objects.filter(rack=self.rack, rack_slot=self.rack_slot).exists():
+            raise ValidationError(
+                f"Rack slot {self.rack_slot} in {self.rack} is already occupied by a device."
+            )
 
 
 class NetworkSwitchAddress(AuditedModel):
@@ -219,57 +271,96 @@ class NetworkDeviceType(AuditedModel):
         return f"{self.manufacturer} {self.model}"
 
 
-class NetworkDevice(AuditedModel):
+class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
     """An end-point device instance. Unracked (rack is null) = spare pool."""
 
     device_type = models.ForeignKey(NetworkDeviceType, on_delete=models.PROTECT, related_name="devices")
     hostname = models.CharField(max_length=255, blank=True)
     serial_number = models.CharField(max_length=100, blank=True)
     rack = models.ForeignKey(Rack, on_delete=models.PROTECT, null=True, blank=True, related_name="devices")
-    rack_slot = models.PositiveIntegerField(null=True, blank=True)
+    rack_slot = models.PositiveIntegerField(null=True, blank=True, validators=[MinValueValidator(1)])
 
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=["rack", "rack_slot"], name="unique_device_rack_slot"),
+            models.CheckConstraint(
+                condition=models.Q(rack_slot__isnull=True) | models.Q(rack_slot__gte=1),
+                name="networkdevice_rack_slot_gte_1",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(rack__isnull=True, rack_slot__isnull=True)
+                    | models.Q(rack__isnull=False, rack_slot__isnull=False)
+                ),
+                name="networkdevice_rack_and_slot_together",
+            ),
         ]
         ordering = ["hostname"]
 
     def __str__(self) -> str:
         return self.hostname or f"Device #{self.pk}"
 
+    def _check_rack_slot_not_occupied(self) -> None:
+        if NetworkSwitch.objects.filter(rack=self.rack, rack_slot=self.rack_slot).exists():
+            raise ValidationError(
+                f"Rack slot {self.rack_slot} in {self.rack} is already occupied by a switch."
+            )
+
 
 class NetworkDevicePort(AuditedModel):
-    """A device port: one purpose (VLAN), one static address or DHCP."""
+    """A device port: one purpose (VLAN), one static address or DHCP.
+
+    ``switch`` is not stored directly — it's redundant with (and could
+    contradict) ``switch_port``, so it's derived from it via a property.
+    ``switch_port`` is a one-to-one: a physical switch port can be claimed
+    by at most one device port.
+    """
 
     device = models.ForeignKey(NetworkDevice, on_delete=models.CASCADE, related_name="ports")
+    port_number = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    description = models.CharField(max_length=255, blank=True, help_text='e.g. "Dante Primary".')
     vlan = models.ForeignKey(VLAN, on_delete=models.PROTECT, related_name="device_ports")
     is_dhcp = models.BooleanField(default=False)
     address = models.GenericIPAddressField(protocol="IPv4", null=True, blank=True)
     default_gateway = models.GenericIPAddressField(protocol="IPv4", null=True, blank=True)
-    switch = models.ForeignKey(
-        NetworkSwitch,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="connected_device_ports",
-    )
-    switch_port = models.ForeignKey(
+    switch_port = models.OneToOneField(
         NetworkSwitchPort,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name="connected_device_ports",
+        related_name="connected_device_port",
     )
 
     class Meta:
-        ordering = ["device", "vlan"]
+        constraints = [
+            models.UniqueConstraint(fields=["device", "port_number"], name="unique_device_port_number"),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(is_dhcp=True, address__isnull=True, default_gateway__isnull=True)
+                    | models.Q(is_dhcp=False, address__isnull=False)
+                ),
+                name="device_port_dhcp_xor_static_address",
+            ),
+        ]
+        ordering = ["device", "port_number"]
 
     def __str__(self) -> str:
-        return f"{self.device} / {self.vlan}"
+        return f"{self.device} port {self.port_number}"
+
+    @property
+    def switch(self) -> "NetworkSwitch | None":
+        switch_port = self.switch_port
+        return switch_port.switch if switch_port is not None else None
 
     def clean(self) -> None:
+        super().clean()
         if self.is_dhcp:
             if self.address or self.default_gateway:
                 raise ValidationError("DHCP ports must not have a static address or gateway.")
         elif not self.address:
             raise ValidationError("Static ports must have an address.")
+        if self.device_id and self.port_number and self.port_number > self.device.device_type.port_count:
+            raise ValidationError(
+                f"port_number {self.port_number} exceeds {self.device.device_type}'s "
+                f"port_count ({self.device.device_type.port_count})."
+            )
