@@ -6,13 +6,19 @@ on:
 
 jobs:
   codex:
+    # Forked-repo PRs don't receive secrets under `pull_request` (by GitHub's
+    # own design) — skip cleanly instead of a confusing failed run. Do NOT
+    # "fix" this with pull_request_target: that grants a write-scoped token
+    # and this repo's secrets to a job that also checks out the PR's own
+    # (untrusted, fork-controlled) code.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
       final_message: ${{ steps.run_codex.outputs.final-message }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: refs/pull/${{ github.event.pull_request.number }}/merge
           persist-credentials: false
@@ -20,7 +26,7 @@ jobs:
 
       - name: Run Codex
         id: run_codex
-        uses: openai/codex-action@v1
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           permission-profile: ":workspace"
@@ -41,9 +47,19 @@ jobs:
             - Missing test coverage for new logic
             - Consistency with this repo's existing conventions
 
-            Post a concise, actionable review as separate inline comments where possible.
-            Skip nitpicks. If a prior review already covered a point and it's since been
-            fixed, don't re-raise it. If everything looks good, say so briefly.
+            Skip nitpicks. If a prior review already covered a point and it's since
+            been fixed, don't re-raise it.
+
+            Respond with ONLY a single JSON object — no prose, no markdown fences —
+            matching this shape:
+            {
+              "summary": "one or two sentence overview, or a short note if everything looks good",
+              "comments": [
+                {"path": "relative/file/path.py", "line": 42, "body": "finding text"}
+              ]
+            }
+            "line" must be a line number that appears in the diff's new (right-hand)
+            side for that path. Omit a comment rather than guessing at its line number.
 
   post_feedback:
     runs-on: ubuntu-latest
@@ -52,14 +68,40 @@ jobs:
     permissions:
       pull-requests: write
     steps:
-      - uses: actions/github-script@v7
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
-            github.rest.issues.createComment({
+            let payload = null;
+            try {
+              payload = JSON.parse(process.env.CODEX_FINAL_MESSAGE);
+            } catch (err) {
+              core.warning(`Codex output wasn't valid JSON, falling back to a plain comment: ${err}`);
+            }
+
+            const comments = Array.isArray(payload?.comments) ? payload.comments : [];
+
+            if (payload && comments.length > 0) {
+              try {
+                await github.rest.pulls.createReview({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: context.payload.pull_request.number,
+                  commit_id: context.payload.pull_request.head.sha,
+                  event: "COMMENT",
+                  body: payload.summary || "Automated review",
+                  comments: comments.map((c) => ({ path: c.path, line: c.line, body: c.body })),
+                });
+                return;
+              } catch (err) {
+                core.warning(`createReview failed, falling back to a plain comment: ${err}`);
+              }
+            }
+
+            await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.pull_request.number,
-              body: process.env.CODEX_FINAL_MESSAGE,
-            })
+              body: payload?.summary ?? process.env.CODEX_FINAL_MESSAGE,
+            });
         env:
           CODEX_FINAL_MESSAGE: ${{ needs.codex.outputs.final_message }}
