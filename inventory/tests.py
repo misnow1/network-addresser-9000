@@ -82,6 +82,28 @@ class RackSlotAssignmentTests(TestCase):
             )
 
 
+class NetworkSwitchPortTests(TestCase):
+    def setUp(self) -> None:
+        self.switch_type = NetworkSwitchType.objects.create(
+            manufacturer="Cisco", model="SG300", port_count=10, port_type="1GbE"
+        )
+        self.switch = NetworkSwitch.objects.create(switch_type=self.switch_type)
+
+    def test_port_number_must_be_at_least_one(self) -> None:
+        port = NetworkSwitchPort(switch=self.switch, port_number=0)
+        with self.assertRaises(ValidationError):
+            port.full_clean()
+
+    def test_port_number_cannot_exceed_switch_type_port_count(self) -> None:
+        port = NetworkSwitchPort(switch=self.switch, port_number=self.switch_type.port_count + 1)
+        with self.assertRaises(ValidationError):
+            port.full_clean()
+
+    def test_db_rejects_zero_port_number_bypassing_clean(self) -> None:
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            NetworkSwitchPort.objects.bulk_create([NetworkSwitchPort(switch=self.switch, port_number=0)])
+
+
 class NetworkDevicePortTests(TestCase):
     def setUp(self) -> None:
         self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")

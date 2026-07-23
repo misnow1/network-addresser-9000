@@ -230,7 +230,7 @@ class NetworkSwitchPort(AuditedModel):
         ACCESS = "access", "Access"
 
     switch = models.ForeignKey(NetworkSwitch, on_delete=models.CASCADE, related_name="ports")
-    port_number = models.PositiveIntegerField()
+    port_number = models.PositiveIntegerField(validators=[MinValueValidator(1)])
     description = models.CharField(max_length=255, blank=True)
     port_type = models.CharField(max_length=50, blank=True, help_text="e.g. 1GbE, 10GbE SFP+.")
     port_mode = models.CharField(max_length=10, choices=PortMode.choices, default=PortMode.ACCESS)
@@ -247,11 +247,23 @@ class NetworkSwitchPort(AuditedModel):
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=["switch", "port_number"], name="unique_switch_port_number"),
+            models.CheckConstraint(
+                condition=models.Q(port_number__gte=1),
+                name="networkswitchport_port_number_gte_1",
+            ),
         ]
         ordering = ["switch", "port_number"]
 
     def __str__(self) -> str:
         return f"{self.switch} port {self.port_number}"
+
+    def clean(self) -> None:
+        super().clean()
+        if self.switch_id and self.port_number and self.port_number > self.switch.switch_type.port_count:
+            raise ValidationError(
+                f"port_number {self.port_number} exceeds {self.switch.switch_type}'s "
+                f"port_count ({self.switch.switch_type.port_count})."
+            )
 
 
 class NetworkDeviceType(AuditedModel):
