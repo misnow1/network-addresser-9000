@@ -17,6 +17,7 @@ from django.db import models
 
 from .suggestions import (
     ranges_overlap,
+    required_block_size,
     suggest_default_gateway,
     suggest_dhcp_range,
     suggest_rack_vlan_range,
@@ -38,6 +39,72 @@ def _suggest_rack_slot_address(rack: "Rack | None", rack_slot: int | None, vlan_
     except RackVlanRange.DoesNotExist:
         return None
     return suggest_slot_address(rack_range.address_range, rack_slot)
+
+
+def _validate_static_address(
+    address: str,
+    vlan: "VLAN",
+    rack: "Rack | None",
+    rack_slot: int | None,
+    *,
+    exclude_switch_address_pk: int | None,
+    exclude_device_port_pk: int | None,
+) -> None:
+    """Shared static-address invariants for ``NetworkSwitchAddress``/``NetworkDevicePort``.
+
+    Validates containment within the VLAN's subnet (and, if a
+    ``RackVlanRange`` is already assigned for this rack/VLAN, within that
+    range too) and uniqueness against every other static address on the
+    same VLAN — switch or device port alike. No DB constraint can span
+    both tables, so the uniqueness half is an interim, full_clean-time-only
+    guard (same caveat as ``RackSlotAssignmentMixin``'s cross-table check).
+    """
+    try:
+        validate_ipv4_cidr(vlan.subnet)
+    except ValidationError:
+        return  # VLAN's own subnet is invalid; its own clean() will report that
+    try:
+        address_obj = ipaddress.IPv4Address(address)
+    except ValueError:
+        return  # malformed value; the field's own validator already reports it
+
+    vlan_network = ipaddress.IPv4Network(vlan.subnet, strict=True)
+    if address_obj not in vlan_network:
+        raise ValidationError({"address": f"{address} is not within {vlan}'s subnet ({vlan.subnet})."})
+
+    if rack is not None and rack_slot is not None:
+        try:
+            rack_range = rack.vlan_ranges.get(vlan_id=vlan.pk)
+        except RackVlanRange.DoesNotExist:
+            rack_range = None
+        if rack_range is not None:
+            range_network = ipaddress.IPv4Network(rack_range.address_range, strict=True)
+            if address_obj not in range_network:
+                raise ValidationError(
+                    {
+                        "address": (
+                            f"{address} is not within {rack}'s range on {vlan} ({rack_range.address_range})."
+                        )
+                    }
+                )
+
+    switch_conflicts = NetworkSwitchAddress.objects.filter(vlan=vlan, address=address)
+    if exclude_switch_address_pk is not None:
+        switch_conflicts = switch_conflicts.exclude(pk=exclude_switch_address_pk)
+    switch_conflict = switch_conflicts.first()
+    if switch_conflict is not None:
+        raise ValidationError(
+            {"address": f"{address} is already assigned to {switch_conflict.switch} on {vlan}."}
+        )
+
+    device_conflicts = NetworkDevicePort.objects.filter(vlan=vlan, address=address)
+    if exclude_device_port_pk is not None:
+        device_conflicts = device_conflicts.exclude(pk=exclude_device_port_pk)
+    device_conflict = device_conflicts.first()
+    if device_conflict is not None:
+        raise ValidationError(
+            {"address": f"{address} is already assigned to {device_conflict.device} on {vlan}."}
+        )
 
 
 class AuditedModel(models.Model):
@@ -176,6 +243,34 @@ class Rack(AuditedModel):
     def __str__(self) -> str:
         return self.name
 
+    def clean(self) -> None:
+        super().clean()
+        if self.pk is None:
+            return  # nothing assigned yet on a not-yet-created rack
+        if self.switches.filter(rack_slot__gt=self.slot_count).exists():
+            raise ValidationError(
+                {"slot_count": f"{self.slot_count} is smaller than the rack_slot of a switch assigned here."}
+            )
+        if self.devices.filter(rack_slot__gt=self.slot_count).exists():
+            raise ValidationError(
+                {"slot_count": f"{self.slot_count} is smaller than the rack_slot of a device assigned here."}
+            )
+        for rack_range in self.vlan_ranges.all():
+            try:
+                validate_ipv4_cidr(rack_range.address_range)
+            except ValidationError:
+                continue  # that range's own clean() will report its own malformed value
+            range_network = ipaddress.IPv4Network(rack_range.address_range, strict=True)
+            if range_network.num_addresses < required_block_size(self.slot_count):
+                raise ValidationError(
+                    {
+                        "slot_count": (
+                            f"{self.slot_count} no longer fits the existing {rack_range.address_range} "
+                            f"range on {rack_range.vlan}; update or remove that range first."
+                        )
+                    }
+                )
+
 
 class RackVlanRange(AuditedModel):
     """A Rack's reserved IPv4 address range on one VLAN.
@@ -245,13 +340,14 @@ class RackVlanRange(AuditedModel):
                     )
                 }
             )
-        if self.rack_id and range_network.num_addresses < self.rack.slot_count + 1:
+        if self.rack_id and range_network.num_addresses < required_block_size(self.rack.slot_count):
             raise ValidationError(
                 {
                     "address_range": (
-                        f"{self.address_range} has room for {range_network.num_addresses - 1} slot(s) "
-                        f"(base address + slot N addressing), but {self.rack} needs "
-                        f"{self.rack.slot_count} (slot_count)."
+                        f"{self.address_range} isn't big enough for {self.rack} (slot_count "
+                        f"{self.rack.slot_count}): it needs {required_block_size(self.rack.slot_count)} "
+                        "addresses (slots 1..slot_count, plus the block's own base and top addresses "
+                        "reserved)."
                     )
                 }
             )
@@ -388,6 +484,7 @@ class NetworkSwitchAddress(AuditedModel):
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=["switch", "vlan"], name="unique_switch_vlan_address"),
+            models.UniqueConstraint(fields=["vlan", "address"], name="unique_switch_vlan_address_value"),
             models.CheckConstraint(
                 condition=models.Q(address__isnull=False),
                 name="networkswitchaddress_address_required",
@@ -400,6 +497,11 @@ class NetworkSwitchAddress(AuditedModel):
 
     def clean(self) -> None:
         super().clean()
+        if self.switch_id and self.switch.rack_id is None:
+            raise ValidationError(
+                "Unracked switches are spare pool (DHCP-configured per CONTEXT.md) and "
+                "don't get a static VLAN address; rack the switch first."
+            )
         if self.pk is None and not self.address and self.switch_id and self.vlan_id:
             suggestion = _suggest_rack_slot_address(self.switch.rack, self.switch.rack_slot, self.vlan_id)
             if suggestion:
@@ -409,10 +511,19 @@ class NetworkSwitchAddress(AuditedModel):
                 {
                     "address": (
                         "This field is required — no suggestion could be computed "
-                        "automatically (switch must be racked with a RackVlanRange "
-                        "already assigned for this VLAN), so it must be entered manually."
+                        "automatically (a RackVlanRange must already be assigned for "
+                        "this VLAN), so it must be entered manually."
                     )
                 }
+            )
+        if self.switch_id and self.vlan_id:
+            _validate_static_address(
+                self.address,
+                self.vlan,
+                self.switch.rack,
+                self.switch.rack_slot,
+                exclude_switch_address_pk=self.pk,
+                exclude_device_port_pk=None,
             )
 
 
@@ -541,6 +652,7 @@ class NetworkDevicePort(AuditedModel):
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=["device", "port_number"], name="unique_device_port_number"),
+            models.UniqueConstraint(fields=["vlan", "address"], name="unique_device_port_vlan_address_value"),
             models.CheckConstraint(
                 condition=(
                     models.Q(is_dhcp=True, address__isnull=True, default_gateway__isnull=True)
@@ -565,12 +677,26 @@ class NetworkDevicePort(AuditedModel):
             if self.address or self.default_gateway:
                 raise ValidationError("DHCP ports must not have a static address or gateway.")
         else:
+            if self.device_id and self.device.rack_id is None:
+                raise ValidationError(
+                    "Unracked devices are spare pool (DHCP-configured per CONTEXT.md); rack "
+                    "the device first, or use is_dhcp for this port instead."
+                )
             if self.pk is None and not self.address and self.device_id and self.vlan_id:
                 suggestion = _suggest_rack_slot_address(self.device.rack, self.device.rack_slot, self.vlan_id)
                 if suggestion:
                     self.address = suggestion
             if not self.address:
                 raise ValidationError("Static ports must have an address.")
+            if self.device_id and self.vlan_id:
+                _validate_static_address(
+                    self.address,
+                    self.vlan,
+                    self.device.rack,
+                    self.device.rack_slot,
+                    exclude_switch_address_pk=None,
+                    exclude_device_port_pk=self.pk,
+                )
         if self.device_id and self.port_number and self.port_number > self.device.device_type.port_count:
             raise ValidationError(
                 f"port_number {self.port_number} exceeds {self.device.device_type}'s "

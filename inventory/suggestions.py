@@ -35,13 +35,23 @@ def suggest_dhcp_range(subnet: str) -> str | None:
     return str(bottom_24)
 
 
-def prefix_length_for_capacity(slot_count: int) -> int:
-    """Smallest IPv4 prefix length whose block can address slots 1..slot_count.
+def required_block_size(slot_count: int) -> int:
+    """Minimum address count a rack-VLAN-range block needs for ``slot_count`` slots.
 
-    Slot N maps to ``network_address + N`` (see ``suggest_slot_address``),
-    so the block needs at least ``slot_count + 1`` addresses.
+    Slot N maps to ``network_address + N`` for N in 1..slot_count (see
+    ``suggest_slot_address``); the block's own network address (index 0)
+    and its top address (index size-1) are both left unassigned — the
+    latter so the top slot doesn't end up looking like that block's
+    broadcast address, per DESIGN.md's guidance to avoid handing devices
+    addresses that read as reserved. So the block needs slots 1..slot_count
+    to sit strictly below its top index: ``slot_count + 2`` addresses.
     """
-    needed = slot_count + 1
+    return slot_count + 2
+
+
+def prefix_length_for_capacity(slot_count: int) -> int:
+    """Smallest IPv4 prefix length whose block satisfies ``required_block_size``."""
+    needed = required_block_size(slot_count)
     host_bits = max(needed - 1, 0).bit_length()
     return 32 - host_bits
 

@@ -306,10 +306,18 @@ class SuggestionFunctionTests(TestCase):
         self.assertEqual(prefix_length_for_capacity(30), 27)
 
     def test_prefix_length_for_capacity_single_slot(self) -> None:
-        self.assertEqual(prefix_length_for_capacity(1), 31)
+        # 1 slot needs the base address, slot 1, and a reserved top address: 3
+        # addresses, rounded up to the next power of two (/30, 4 addresses).
+        self.assertEqual(prefix_length_for_capacity(1), 30)
 
     def test_prefix_length_for_capacity_larger_rack(self) -> None:
         self.assertEqual(prefix_length_for_capacity(62), 26)
+
+    def test_prefix_length_for_capacity_reserves_top_address(self) -> None:
+        # A naive "slot_count + 1" rule would give slot_count=3 a /30 (4
+        # addresses), putting slot 3 on that block's own top/broadcast-like
+        # address. Reserving the top address too pushes it out to a /29.
+        self.assertEqual(prefix_length_for_capacity(3), 29)
 
     def test_suggest_rack_vlan_range_first_block_when_nothing_used(self) -> None:
         self.assertEqual(suggest_rack_vlan_range("10.200.0.0/21", 30, []), "10.200.0.0/27")
@@ -457,6 +465,51 @@ class RackVlanRangeSuggestionTests(TestCase):
             range_.full_clean()
 
 
+class RackSlotCountEditTests(TestCase):
+    """Editing Rack.slot_count must be re-validated against what already
+    depends on it: existing RackVlanRanges (raised too small) and already
+    -assigned equipment (rack_slot beyond the new, lower count).
+    """
+
+    def setUp(self) -> None:
+        self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.switch_type = NetworkSwitchType.objects.create(
+            manufacturer="Cisco", model="SG300", port_count=10, port_type="1GbE"
+        )
+        self.device_type = NetworkDeviceType.objects.create(
+            manufacturer="Martin Audio", model="IK-42", port_count=1
+        )
+
+    def test_increasing_slot_count_beyond_existing_range_capacity_raises(self) -> None:
+        rack = Rack.objects.create(name="Rack 1", slot_count=4)
+        # 10.200.1.0/29 has 8 addresses: room for a 4-slot rack (needs 6) but
+        # not a 10-slot one (needs 12).
+        RackVlanRange.objects.create(rack=rack, vlan=self.vlan, address_range="10.200.1.0/29")
+        rack.slot_count = 10
+        with self.assertRaises(ValidationError):
+            rack.full_clean()
+
+    def test_increasing_slot_count_within_existing_range_capacity_is_fine(self) -> None:
+        rack = Rack.objects.create(name="Rack 1", slot_count=4)
+        RackVlanRange.objects.create(rack=rack, vlan=self.vlan, address_range="10.200.1.0/27")
+        rack.slot_count = 6
+        rack.full_clean()  # must not raise
+
+    def test_decreasing_slot_count_below_assigned_switch_raises(self) -> None:
+        rack = Rack.objects.create(name="Rack 1", slot_count=4)
+        NetworkSwitch.objects.create(switch_type=self.switch_type, rack=rack, rack_slot=4)
+        rack.slot_count = 2
+        with self.assertRaises(ValidationError):
+            rack.full_clean()
+
+    def test_decreasing_slot_count_below_assigned_device_raises(self) -> None:
+        rack = Rack.objects.create(name="Rack 1", slot_count=4)
+        NetworkDevice.objects.create(device_type=self.device_type, rack=rack, rack_slot=4)
+        rack.slot_count = 2
+        with self.assertRaises(ValidationError):
+            rack.full_clean()
+
+
 class RackSlotAddressSuggestionTests(TestCase):
     """Suggestion behavior shared by NetworkSwitchAddress and NetworkDevicePort."""
 
@@ -495,6 +548,53 @@ class RackSlotAddressSuggestionTests(TestCase):
         port = NetworkDevicePort(device=device, port_number=1, vlan=other_vlan)
         with self.assertRaises(ValidationError):
             port.full_clean()
+
+    def test_unracked_switch_static_address_raises(self) -> None:
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type)
+        address = NetworkSwitchAddress(switch=switch, vlan=self.vlan, address="10.200.1.5")
+        with self.assertRaises(ValidationError):
+            address.full_clean()
+
+    def test_unracked_device_static_port_raises(self) -> None:
+        device = NetworkDevice.objects.create(device_type=self.device_type)
+        port = NetworkDevicePort(device=device, port_number=1, vlan=self.vlan, address="10.200.1.5")
+        with self.assertRaises(ValidationError):
+            port.full_clean()
+
+    def test_switch_address_outside_vlan_subnet_raises(self) -> None:
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=1)
+        address = NetworkSwitchAddress(switch=switch, vlan=self.vlan, address="10.201.0.1")
+        with self.assertRaises(ValidationError):
+            address.full_clean()
+
+    def test_switch_address_outside_rack_range_raises(self) -> None:
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=1)
+        # Within the VLAN's /21 subnet, but outside the rack's 10.200.1.0/27 range.
+        address = NetworkSwitchAddress(switch=switch, vlan=self.vlan, address="10.200.2.1")
+        with self.assertRaises(ValidationError):
+            address.full_clean()
+
+    def test_device_port_outside_rack_range_raises(self) -> None:
+        device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=2)
+        port = NetworkDevicePort(device=device, port_number=1, vlan=self.vlan, address="10.200.2.2")
+        with self.assertRaises(ValidationError):
+            port.full_clean()
+
+    def test_switch_addresses_cannot_collide_on_same_vlan(self) -> None:
+        switch_a = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=1)
+        switch_b = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=2)
+        NetworkSwitchAddress.objects.create(switch=switch_a, vlan=self.vlan, address="10.200.1.1")
+        conflicting = NetworkSwitchAddress(switch=switch_b, vlan=self.vlan, address="10.200.1.1")
+        with self.assertRaises(ValidationError):
+            conflicting.full_clean()
+
+    def test_device_port_address_cannot_collide_with_switch_address_on_same_vlan(self) -> None:
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=1)
+        NetworkSwitchAddress.objects.create(switch=switch, vlan=self.vlan, address="10.200.1.1")
+        device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=2)
+        conflicting = NetworkDevicePort(device=device, port_number=1, vlan=self.vlan, address="10.200.1.1")
+        with self.assertRaises(ValidationError):
+            conflicting.full_clean()
 
 
 class RemovalSemanticsTests(TestCase):
