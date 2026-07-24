@@ -1,3 +1,5 @@
 Django==6.0.7
 mysqlclient==2.2.8
 django-auditlog==3.4.1
+gunicorn==23.0.0
+whitenoise==6.8.2

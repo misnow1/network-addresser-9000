@@ -1,0 +1,52 @@
+# Brings up the app + MariaDB together (DESIGN.md's deployment requirement).
+# Copy .env.compose.example to .env and fill it in before running this.
+#
+# Self-hosted / VPN-only per DESIGN.md: no TLS or reverse proxy here — see
+# ADR 0009. Publishing the app port does not by itself make this VPN-only;
+# that boundary is your host firewall / VPN policy (see README).
+services:
+  db:
+    image: mariadb:11.4.5
+    environment:
+      MARIADB_DATABASE: ${DB_NAME}
+      MARIADB_USER: ${DB_USER}
+      MARIADB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required — see .env.compose.example}
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?MARIADB_ROOT_PASSWORD is required — see .env.compose.example}
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -u root -p\"$$MARIADB_ROOT_PASSWORD\" --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+    env_file:
+      - .env
+    environment:
+      # These two overrides mean a `.env` accidentally left in local-dev
+      # shape (DJANGO_DEBUG=true, DB_HOST=127.0.0.1) can never put this
+      # deployment into debug mode or point it at the wrong host — see
+      # PHASE_5_PLAN_REVIEW.md / ADR 0009.
+      DJANGO_DEBUG: "false"
+      DB_HOST: db
+      # Restated here (redundant with env_file) so Compose fails fast at
+      # `up`/`config` time on a missing secret, rather than only failing
+      # once Django's own settings import raises ImproperlyConfigured.
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required — see .env.compose.example}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required — see .env.compose.example}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      # Defaults to loopback-only (not reachable from other hosts). See
+      # HOST_BIND in .env.compose.example before changing this.
+      - "${HOST_BIND:-127.0.0.1}:8000:8000"
+    restart: unless-stopped
+
+volumes:
+  db_data:

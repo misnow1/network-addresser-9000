@@ -2,7 +2,7 @@
 
 High-level phases only — day-to-day task tracking belongs in GitHub Issues once there's code to file issues against. This file exists so it's obvious what phase the project is in and what's next, even after a fresh start.
 
-**Current phase: 5 — not started.**
+**Current phase: 6 — in progress.**
 
 ## 1. Foundation — done
 
@@ -31,16 +31,20 @@ High-level phases only — day-to-day task tracking belongs in GitHub Issues onc
 - [x] Mutation audit trail — see ADR 0004, ADR 0008
 - [x] "Big scary prompt" confirmation flows for removal
 
-## 5. Deployment
+## 5. Deployment — done
 
-- [ ] Dockerfile
-- [ ] docker-compose (app + MariaDB)
+- [x] Dockerfile
+- [x] docker-compose (app + MariaDB)
 
 ## 6. Process hardening
 
 - [x] Pre-commit hooks (formatting/linting)
 - [ ] GitHub Actions CI (tests, lint)
 - [ ] Branch protection on `main` — require PRs, block direct pushes
+
+## 7. Container publishing
+
+- [ ] GitHub Actions workflow: build and publish the Docker image to GHCR on `main` merges
 
 ## Later / not yet designed
 
