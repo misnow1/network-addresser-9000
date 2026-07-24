@@ -42,6 +42,10 @@ High-level phases only — day-to-day task tracking belongs in GitHub Issues onc
 - [ ] GitHub Actions CI (tests, lint)
 - [ ] Branch protection on `main` — require PRs, block direct pushes
 
+## 7. Container publishing
+
+- [ ] GitHub Actions workflow: build and publish the Docker image to GHCR on `main` merges
+
 ## Later / not yet designed
 
 - Purpose-built frontend beyond Django admin (rack visualizations, address-utilization views)
