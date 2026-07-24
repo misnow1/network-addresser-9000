@@ -1,0 +1,18 @@
+{% load i18n %}
+<div style="border: 2px solid #ba2121; background: #fbeaea; color: #ba2121; padding: 12px 16px; margin-bottom: 16px; font-weight: bold;">
+  {% translate "This action is permanent and cannot be undone." %}
+  {% if connected_device_ports %}
+    <p style="margin-bottom: 0; font-weight: normal;">
+      {% blocktranslate count counter=connected_device_ports|length %}
+        The following device port is plugged into this switch and routes its traffic through it. Deleting the switch will unassign — not delete — the device port:
+      {% plural %}
+        The following device ports are plugged into this switch and route their traffic through it. Deleting the switch will unassign — not delete — these device ports:
+      {% endblocktranslate %}
+    </p>
+    <ul>
+      {% for port in connected_device_ports %}
+        <li>{{ port.device }} — {{ port }}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+</div>

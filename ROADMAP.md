@@ -2,7 +2,7 @@
 
 High-level phases only — day-to-day task tracking belongs in GitHub Issues once there's code to file issues against. This file exists so it's obvious what phase the project is in and what's next, even after a fresh start.
 
-**Current phase: 4 — not started.**
+**Current phase: 5 — not started.**
 
 ## 1. Foundation — done
 
@@ -25,11 +25,11 @@ High-level phases only — day-to-day task tracking belongs in GitHub Issues onc
 - [x] Device address default-and-override behavior — see ADR 0003
 - [x] Removal semantics: block non-empty containers, unassign on leaf removal — see ADR 0007
 
-## 4. Access and accountability
+## 4. Access and accountability — done
 
-- [ ] Local auth, three roles (Viewer / Editor / Admin)
-- [ ] Mutation audit trail — see ADR 0004
-- [ ] "Big scary prompt" confirmation flows for removal
+- [x] Local auth, three roles (Viewer / Editor / Admin)
+- [x] Mutation audit trail — see ADR 0004, ADR 0008
+- [x] "Big scary prompt" confirmation flows for removal
 
 ## 5. Deployment
 

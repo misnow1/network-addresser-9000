@@ -20,7 +20,8 @@ repos:
     rev: v2.3.0
     hooks:
       - id: mypy
-        additional_dependencies: [Django==6.0.7, django-stubs==6.0.7, mysqlclient==2.2.8]
+        additional_dependencies:
+          [Django==6.0.7, django-stubs==6.0.7, mysqlclient==2.2.8, django-auditlog==3.4.1]
         args: [--config-file=pyproject.toml, config, inventory, manage.py]
         pass_filenames: false
         always_run: true

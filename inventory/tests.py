@@ -6,17 +6,21 @@ that skip ``full_clean()``, since ``Model.clean()`` is not invoked by
 ``save()`` — only a DB-level ``CheckConstraint`` can guard those paths.
 """
 
+import io
 import ipaddress
 
+from auditlog.models import LogEntry
 from django.contrib.admin.sites import AdminSite
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
+from django.core.management import call_command
 from django.db import IntegrityError, transaction
 from django.db.models import ProtectedError
 from django.forms import inlineformset_factory
 from django.test import RequestFactory, TestCase
 
-from .admin import NetworkDeviceAdmin, RackAdmin, VLANAdmin
+from .admin import NetworkDeviceAdmin, NetworkSwitchAdmin, RackAdmin, VLANAdmin
 from .models import (
     VLAN,
     NetworkDevice,
@@ -876,3 +880,267 @@ class RemovalSemanticsTests(TestCase):
         device_port.refresh_from_db()
         self.assertIsNone(device_port.switch_port)
         self.assertTrue(NetworkDevice.objects.filter(pk=device.pk).exists())
+
+
+class SyncRolesCommandTests(TestCase):
+    """Locks in the Viewer/Editor/Admin permission sets from CONTEXT.md's
+    Roles section, and that the command is idempotent (see ``sync_roles``'s
+    docstring for why this can't be a data migration instead).
+    """
+
+    def test_viewer_can_only_view(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        viewer = Group.objects.get(name="Viewer")
+        codenames = set(viewer.permissions.values_list("codename", flat=True))
+        self.assertIn("view_vlan", codenames)
+        self.assertIn("view_logentry", codenames)
+        self.assertNotIn("add_vlan", codenames)
+        self.assertNotIn("change_vlan", codenames)
+        self.assertNotIn("delete_vlan", codenames)
+
+    def test_editor_can_view_and_add_but_not_remove(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        editor = Group.objects.get(name="Editor")
+        codenames = set(editor.permissions.values_list("codename", flat=True))
+        self.assertIn("view_vlan", codenames)
+        self.assertIn("add_vlan", codenames)
+        self.assertIn("change_vlan", codenames)
+        self.assertNotIn("delete_vlan", codenames)
+
+    def test_admin_can_view_add_and_remove(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        admin_group = Group.objects.get(name="Admin")
+        codenames = set(admin_group.permissions.values_list("codename", flat=True))
+        self.assertIn("view_vlan", codenames)
+        self.assertIn("add_vlan", codenames)
+        self.assertIn("change_vlan", codenames)
+        self.assertIn("delete_vlan", codenames)
+
+    def test_idempotent(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        first_count = Group.objects.get(name="Admin").permissions.count()
+        call_command("sync_roles", stdout=io.StringIO())
+        self.assertEqual(Group.objects.count(), 3)
+        self.assertEqual(Group.objects.get(name="Admin").permissions.count(), first_count)
+
+
+class RBACAdminPermissionTests(TestCase):
+    """Exercises the actual admin views through the test client, proving the
+    three roles are enforced end-to-end rather than just by permission-set
+    membership (``SyncRolesCommandTests`` above).
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+
+        self.viewer = User.objects.create_user("viewer", password="testpass123", is_staff=True)
+        self.viewer.groups.add(Group.objects.get(name="Viewer"))
+
+        self.editor = User.objects.create_user("editor", password="testpass123", is_staff=True)
+        self.editor.groups.add(Group.objects.get(name="Editor"))
+
+        self.admin_user = User.objects.create_user("adminrole", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+
+    def test_viewer_can_view_but_not_add_or_delete(self) -> None:
+        self.client.login(username="viewer", password="testpass123")
+        self.assertEqual(self.client.get("/admin/inventory/vlan/").status_code, 200)
+        self.assertEqual(self.client.get("/admin/inventory/vlan/add/").status_code, 403)
+        self.assertEqual(self.client.get(f"/admin/inventory/vlan/{self.vlan.pk}/delete/").status_code, 403)
+
+    def test_editor_can_add_but_not_delete(self) -> None:
+        self.client.login(username="editor", password="testpass123")
+        self.assertEqual(self.client.get("/admin/inventory/vlan/add/").status_code, 200)
+        self.assertEqual(self.client.get(f"/admin/inventory/vlan/{self.vlan.pk}/delete/").status_code, 403)
+
+    def test_admin_can_delete(self) -> None:
+        self.client.login(username="adminrole", password="testpass123")
+        self.assertEqual(self.client.get(f"/admin/inventory/vlan/{self.vlan.pk}/delete/").status_code, 200)
+
+    def test_switch_bulk_delete_action_hidden_from_viewer_and_editor(self) -> None:
+        """The custom ``delete_selected`` shadow (``inventory/admin.py``)
+        must carry the same ``permissions=["delete"]`` metadata as the
+        built-in action it replaces — omitting it made the action visible
+        and invocable by Viewers/Editors too (caught by Codex review).
+        """
+        switch_admin = NetworkSwitchAdmin(NetworkSwitch, AdminSite())
+        factory = RequestFactory()
+
+        for username in ["viewer", "editor"]:
+            request = factory.get("/admin/inventory/networkswitch/")
+            request.user = getattr(self, username)
+            self.assertNotIn("delete_selected", switch_admin.get_actions(request))
+
+        admin_request = factory.get("/admin/inventory/networkswitch/")
+        admin_request.user = self.admin_user
+        self.assertIn("delete_selected", switch_admin.get_actions(admin_request))
+
+
+class AuditTrailScopingTests(TestCase):
+    """Locks in ADR 0004/0008's scoping: only address overrides, rack/slot
+    reassignment, and removals are tracked — not every field on every
+    object (a hostname rename, or a port description typo fix).
+    """
+
+    def setUp(self) -> None:
+        self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=4)
+        self.switch_type = NetworkSwitchType.objects.create(
+            manufacturer="Cisco", model="SG300", port_count=10, port_type="1GbE"
+        )
+        self.device_type = NetworkDeviceType.objects.create(
+            manufacturer="Martin Audio", model="IK-42", port_count=1
+        )
+        self.switch = NetworkSwitch.objects.create(
+            switch_type=self.switch_type, rack=self.rack, rack_slot=1, hostname="sw1"
+        )
+
+    def test_rack_slot_reassignment_is_logged(self) -> None:
+        LogEntry.objects.filter(object_pk=str(self.switch.pk)).delete()
+        self.switch.rack_slot = 2
+        self.switch.save()
+        entries = LogEntry.objects.filter(object_pk=str(self.switch.pk), action=LogEntry.Action.UPDATE)
+        self.assertEqual(entries.count(), 1)
+        self.assertIn("rack_slot", entries.first().changes_dict)
+
+    def test_hostname_only_edit_is_not_logged(self) -> None:
+        LogEntry.objects.filter(object_pk=str(self.switch.pk)).delete()
+        self.switch.hostname = "sw1-renamed"
+        self.switch.save()
+        self.assertFalse(
+            LogEntry.objects.filter(object_pk=str(self.switch.pk), action=LogEntry.Action.UPDATE).exists()
+        )
+
+    def test_delete_is_logged_with_identifying_object_repr(self) -> None:
+        pk = self.switch.pk
+        self.switch.delete()
+        entry = LogEntry.objects.get(object_pk=str(pk), action=LogEntry.Action.DELETE)
+        self.assertIn("sw1", entry.object_repr)
+
+    def test_switch_port_description_edit_is_not_logged(self) -> None:
+        port = NetworkSwitchPort.objects.create(switch=self.switch, port_number=1, description="uplink")
+        LogEntry.objects.filter(object_pk=str(port.pk)).delete()
+        port.description = "typo fix"
+        port.save()
+        self.assertFalse(
+            LogEntry.objects.filter(object_pk=str(port.pk), action=LogEntry.Action.UPDATE).exists()
+        )
+
+    def test_unracked_switch_removal_is_still_logged(self) -> None:
+        """A spare-pool switch has ``rack``/``rack_slot`` both null — the
+        very fields ``include_fields`` scopes edits to — so without
+        ``created_at`` also included, auditlog's delete diff would come back
+        empty and the removal would go unlogged (caught by Codex review).
+        """
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, hostname="spare1")
+        pk = switch.pk
+        switch.delete()
+        self.assertTrue(LogEntry.objects.filter(object_pk=str(pk), action=LogEntry.Action.DELETE).exists())
+
+    def test_dhcp_device_port_removal_is_still_logged(self) -> None:
+        """A DHCP port has ``address``/``default_gateway`` both null — same
+        empty-diff gap as the unracked-switch case above, but for
+        ``NetworkDevicePort``.
+        """
+        device = NetworkDevice.objects.create(device_type=self.device_type)
+        port = NetworkDevicePort.objects.create(device=device, port_number=1, vlan=self.vlan, is_dhcp=True)
+        pk = port.pk
+        port.delete()
+        self.assertTrue(LogEntry.objects.filter(object_pk=str(pk), action=LogEntry.Action.DELETE).exists())
+
+    def test_allowed_vlans_change_is_logged(self) -> None:
+        """``allowed_vlans`` is a ManyToManyField, which auditlog never diffs
+        as an ordinary field — it needs the explicit ``m2m_fields``
+        registration (caught by Codex review) to be tracked at all.
+        """
+        other_vlan = VLAN.objects.create(name="Media", vlan_id=201, subnet="10.201.0.0/21")
+        port = NetworkSwitchPort.objects.create(switch=self.switch, port_number=1)
+        LogEntry.objects.filter(object_pk=str(port.pk)).delete()
+
+        port.allowed_vlans.add(self.vlan, other_vlan)
+
+        entry = LogEntry.objects.get(object_pk=str(port.pk), action=LogEntry.Action.UPDATE)
+        self.assertEqual(entry.changes_dict["allowed_vlans"]["operation"], "add")
+
+
+class DeleteConfirmationTests(TestCase):
+    """The "big scary" removal confirmation (ROADMAP.md phase 4, DESIGN.md's
+    Removal semantics) — a generic warning on every delete, plus specific
+    callout when deleting a switch would unassign (not delete, per ADR 0007)
+    a connected device port.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.admin_user = User.objects.create_user("adminrole", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="adminrole", password="testpass123")
+
+        self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=4)
+        self.switch_type = NetworkSwitchType.objects.create(
+            manufacturer="Cisco", model="SG300", port_count=10, port_type="1GbE"
+        )
+        self.device_type = NetworkDeviceType.objects.create(
+            manufacturer="Martin Audio", model="IK-42", port_count=1
+        )
+
+    def test_generic_warning_banner_renders_for_plain_model(self) -> None:
+        response = self.client.get(f"/admin/inventory/rack/{self.rack.pk}/delete/")
+        self.assertContains(response, "permanent and cannot be undone")
+
+    def test_switch_delete_confirmation_lists_connected_device_port(self) -> None:
+        switch = NetworkSwitch.objects.create(
+            switch_type=self.switch_type, rack=self.rack, rack_slot=1, hostname="sw1"
+        )
+        switch_port = NetworkSwitchPort.objects.create(switch=switch, port_number=1)
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname="dev1", rack=self.rack, rack_slot=2
+        )
+        NetworkDevicePort.objects.create(
+            device=device,
+            port_number=1,
+            vlan=self.vlan,
+            address="10.200.1.2",
+            switch_port=switch_port,
+        )
+
+        response = self.client.get(f"/admin/inventory/networkswitch/{switch.pk}/delete/")
+        self.assertContains(response, "permanent and cannot be undone")
+        self.assertContains(response, "dev1")
+
+    def test_switch_delete_confirmation_omits_warning_without_connected_ports(self) -> None:
+        switch = NetworkSwitch.objects.create(
+            switch_type=self.switch_type, rack=self.rack, rack_slot=1, hostname="sw1"
+        )
+        response = self.client.get(f"/admin/inventory/networkswitch/{switch.pk}/delete/")
+        self.assertNotContains(response, "routes its traffic through it")
+
+    def test_bulk_delete_selected_also_lists_connected_device_port(self) -> None:
+        """The single-object ``delete_view`` warning (above) is easy to
+        bypass via the changelist's bulk "Delete selected" action — caught
+        by Codex review — so ``NetworkSwitchAdmin`` shadows that action too
+        (see ``delete_selected`` in ``inventory/admin.py``).
+        """
+        switch = NetworkSwitch.objects.create(
+            switch_type=self.switch_type, rack=self.rack, rack_slot=1, hostname="sw1"
+        )
+        switch_port = NetworkSwitchPort.objects.create(switch=switch, port_number=1)
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname="dev1", rack=self.rack, rack_slot=2
+        )
+        NetworkDevicePort.objects.create(
+            device=device,
+            port_number=1,
+            vlan=self.vlan,
+            address="10.200.1.2",
+            switch_port=switch_port,
+        )
+
+        response = self.client.post(
+            "/admin/inventory/networkswitch/",
+            {"action": "delete_selected", "_selected_action": [str(switch.pk)]},
+        )
+        self.assertContains(response, "permanent and cannot be undone")
+        self.assertContains(response, "dev1")

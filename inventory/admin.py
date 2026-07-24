@@ -1,6 +1,12 @@
+from typing import Any
+
+from auditlog.mixins import AuditlogHistoryAdminMixin
 from django.contrib import admin
+from django.contrib.admin.actions import delete_selected as default_delete_selected
+from django.db.models import QuerySet
 from django.forms import BaseModelFormSet
 from django.http import HttpRequest
+from django.template.response import TemplateResponse
 
 from .models import (
     VLAN,
@@ -67,42 +73,101 @@ class NetworkDevicePortInline(admin.TabularInline):
 
 
 @admin.register(VLAN)
-class VLANAdmin(AuditedModelAdminMixin, admin.ModelAdmin):
+class VLANAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
     list_display = ["name", "vlan_id", "subnet", "default_gateway", "dhcp_range"]
     search_fields = ["name", "vlan_id", "subnet"]
     ordering = ["vlan_id"]
+    show_auditlog_history_link = True
 
 
 @admin.register(Rack)
-class RackAdmin(AuditedModelAdminMixin, admin.ModelAdmin):
+class RackAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
     list_display = ["name", "slot_count"]
     search_fields = ["name"]
     inlines = [RackVlanRangeInline]
+    show_auditlog_history_link = True
 
 
 @admin.register(NetworkSwitchType)
-class NetworkSwitchTypeAdmin(AuditedModelAdminMixin, admin.ModelAdmin):
+class NetworkSwitchTypeAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
     list_display = ["manufacturer", "model", "port_count", "port_type"]
     search_fields = ["manufacturer", "model"]
+    show_auditlog_history_link = True
+
+
+def _connected_device_ports(switches: QuerySet) -> list[NetworkDevicePort]:
+    """Device ports plugged into any of ``switches``' ports.
+
+    ``NetworkDevicePort.switch_port`` is ``SET_NULL`` (ADR 0007: leaf
+    references unassign rather than cascade), so Django's own
+    ``get_deleted_objects`` walk — which only lists objects that will
+    themselves be deleted — never mentions them. Shared by the single-object
+    and bulk delete confirmation flows below.
+    """
+    return list(
+        NetworkDevicePort.objects.filter(switch_port__switch__in=switches).select_related(
+            "device", "switch_port"
+        )
+    )
+
+
+@admin.action(permissions=["delete"], description="Delete selected network switches")
+def delete_selected(modeladmin: "NetworkSwitchAdmin", request: HttpRequest, queryset: QuerySet) -> Any:
+    """Shadows the site-wide ``delete_selected`` action (same name, so
+    ``ModelAdmin._get_base_actions`` skips the default per Django's
+    documented override pattern) to add the same "other devices route
+    through it" warning as the single-object delete flow.
+
+    ``permissions=["delete"]`` matches the default action's own metadata
+    (``django.contrib.admin.actions.delete_selected``) — without it, this
+    replacement has no ``allowed_permissions`` at all, so
+    ``_filter_actions_by_permissions`` treats it as unrestricted and offers
+    it to Viewers/Editors too (caught by Codex review).
+    """
+    response = default_delete_selected(modeladmin, request, queryset)
+    if isinstance(response, TemplateResponse) and response.context_data is not None:
+        response.context_data["connected_device_ports"] = _connected_device_ports(queryset)
+    return response
 
 
 @admin.register(NetworkSwitch)
-class NetworkSwitchAdmin(AuditedModelAdminMixin, admin.ModelAdmin):
+class NetworkSwitchAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
     list_display = ["hostname", "switch_type", "serial_number", "rack", "rack_slot", "dhcp_server_enabled"]
     search_fields = ["hostname", "serial_number"]
     list_filter = ["rack", "switch_type"]
     inlines = [NetworkSwitchAddressInline, NetworkSwitchPortInline]
+    show_auditlog_history_link = True
+    actions = [delete_selected]
+
+    def delete_view(
+        self, request: HttpRequest, object_id: str, extra_context: dict[str, object] | None = None
+    ) -> Any:
+        """Surfaces device ports that would be silently unassigned by this delete.
+
+        The "big scary" confirmation template
+        (``admin/inventory/delete_confirmation.html``) renders the list this
+        adds to ``extra_context`` when present.
+        """
+        extra_context = dict(extra_context or {})
+        switch = self.get_object(request, object_id)
+        if switch is not None:
+            extra_context["connected_device_ports"] = _connected_device_ports(
+                NetworkSwitch.objects.filter(pk=switch.pk)
+            )
+        return super().delete_view(request, object_id, extra_context)
 
 
 @admin.register(NetworkDeviceType)
-class NetworkDeviceTypeAdmin(AuditedModelAdminMixin, admin.ModelAdmin):
+class NetworkDeviceTypeAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
     list_display = ["manufacturer", "model", "port_count", "port_type"]
     search_fields = ["manufacturer", "model"]
+    show_auditlog_history_link = True
 
 
 @admin.register(NetworkDevice)
-class NetworkDeviceAdmin(AuditedModelAdminMixin, admin.ModelAdmin):
+class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
     list_display = ["hostname", "device_type", "serial_number", "rack", "rack_slot"]
     search_fields = ["hostname", "serial_number"]
     list_filter = ["rack", "device_type"]
     inlines = [NetworkDevicePortInline]
+    show_auditlog_history_link = True
