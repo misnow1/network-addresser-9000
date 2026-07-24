@@ -13,10 +13,11 @@ attempt=0
 echo "Waiting for database at ${db_host}:${db_port}..."
 until python -c "
 import socket, sys
+host, port = sys.argv[1], int(sys.argv[2])
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.settimeout(1)
-sys.exit(0 if s.connect_ex(('${db_host}', ${db_port})) == 0 else 1)
-"; do
+sys.exit(0 if s.connect_ex((host, port)) == 0 else 1)
+" "${db_host}" "${db_port}"; do
     attempt=$((attempt + 1))
     if [ "${attempt}" -ge "${max_attempts}" ]; then
         echo "ERROR: database at ${db_host}:${db_port} not reachable after ${max_attempts} attempts." >&2
