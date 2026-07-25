@@ -2,11 +2,13 @@ from typing import Any
 
 from auditlog.mixins import AuditlogHistoryAdminMixin
 from django import forms
-from django.contrib import admin
+from django.contrib import admin, messages
 from django.contrib.admin.actions import delete_selected as default_delete_selected
+from django.core.exceptions import ValidationError
+from django.db import IntegrityError
 from django.db.models import QuerySet
 from django.forms import BaseInlineFormSet, BaseModelFormSet
-from django.http import HttpRequest
+from django.http import HttpRequest, HttpResponseRedirect
 from django.template.response import TemplateResponse
 
 from .models import (
@@ -34,6 +36,33 @@ class AuditedModelAdminMixin:
     is what actually sets it, both for the admin's own object and for
     child rows added through an inline formset.
     """
+
+    def changeform_view(
+        self,
+        request: HttpRequest,
+        object_id: str | None = None,
+        form_url: str = "",
+        extra_context: dict[str, Any] | None = None,
+    ) -> Any:
+        """Turns a ``ValidationError``/``IntegrityError`` raised from inside
+        ``save_model()``/``save_formset()`` into a redirect-with-message
+        instead of an unhandled-exception 500 page.
+
+        Some of this app's invariants (ADR 0010's locked-field and
+        profile-lock checks) are enforced inside ``Model.save()``/
+        ``delete()`` themselves, not only ``clean()`` — by design, since a
+        few of them (row-locking against a concurrent edit, or a
+        same-submission ordinal collision) can only be detected at save
+        time. Django's admin only turns ``clean()``-raised errors into a
+        form error automatically; anything a locked-field guard raises
+        later, from ``save()``/``delete()`` itself, would otherwise
+        propagate straight past the admin's normal error handling.
+        """
+        try:
+            return super().changeform_view(request, object_id, form_url, extra_context)  # type: ignore[misc]
+        except (ValidationError, IntegrityError) as exc:
+            messages.error(request, f"Could not save: {exc}")
+            return HttpResponseRedirect(request.path)
 
     def save_model(self, request: HttpRequest, obj: AuditedModel, form: object, change: bool) -> None:
         if not change:
@@ -263,6 +292,11 @@ class NetworkDevicePortInline(admin.TabularInline):
     readonly_fields = ["description", "port_number", "vlan", "port_type", "default_gateway"]
     extra = 0
 
+    def get_queryset(self, request: HttpRequest) -> QuerySet:
+        # ``vlan`` is readonly-displayed and ``default_gateway`` reads it
+        # live per row — without this, both N+1 across a device's ports.
+        return super().get_queryset(request).select_related("vlan")
+
     def has_add_permission(self, request: HttpRequest, obj: Any = None) -> bool:
         return False
 
@@ -295,7 +329,7 @@ class NetworkSwitchTypeAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, 
 
     def get_readonly_fields(self, request: HttpRequest, obj: Any = None) -> list[str]:
         if _profile_locked(obj, "switches"):
-            return ["port_count"]
+            return ["manufacturer", "model", "name", "port_count"]
         return []
 
 
@@ -377,7 +411,7 @@ class NetworkDeviceTypeAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, 
 
     def get_readonly_fields(self, request: HttpRequest, obj: Any = None) -> list[str]:
         if _profile_locked(obj, "devices"):
-            return ["port_count"]
+            return ["manufacturer", "model", "name", "port_count"]
         return []
 
 

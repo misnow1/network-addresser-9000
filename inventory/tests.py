@@ -15,6 +15,8 @@ from auditlog.models import LogEntry
 from django.contrib.admin.sites import AdminSite
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
+from django.contrib.messages import get_messages
+from django.contrib.messages.storage.fallback import FallbackStorage
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.db import IntegrityError, transaction
@@ -23,6 +25,7 @@ from django.forms import inlineformset_factory
 from django.test import RequestFactory, TestCase
 
 from .admin import (
+    AuditedModelAdminMixin,
     NetworkDeviceAdmin,
     NetworkDevicePortInline,
     NetworkDeviceTypeAdmin,
@@ -1632,6 +1635,157 @@ class PortProfileTemplateLockTests(TestCase):
         NetworkDevice.objects.create(device_type=device_type)
         admin = NetworkDeviceTypeAdmin(NetworkDeviceType, AdminSite())
         self.assertIn("port_count", admin.get_readonly_fields(RequestFactory().get("/"), device_type))
+
+    def test_switch_type_identity_readonly_in_admin_once_instance_exists(self) -> None:
+        """Review-council finding: the model locks manufacturer/model/name
+        alongside port_count once a profile has instances, but the admin
+        only marked port_count readonly — an admin could attempt an edit
+        the model would then reject.
+        """
+        switch_type = _make_switch_type(port_count=1)
+        NetworkSwitch.objects.create(switch_type=switch_type)
+        admin = NetworkSwitchTypeAdmin(NetworkSwitchType, AdminSite())
+        readonly = admin.get_readonly_fields(RequestFactory().get("/"), switch_type)
+        self.assertIn("manufacturer", readonly)
+        self.assertIn("model", readonly)
+        self.assertIn("name", readonly)
+
+    def test_device_type_identity_readonly_in_admin_once_instance_exists(self) -> None:
+        device_type = _make_device_type(port_count=1, vlan=self.vlan)
+        NetworkDevice.objects.create(device_type=device_type)
+        admin = NetworkDeviceTypeAdmin(NetworkDeviceType, AdminSite())
+        readonly = admin.get_readonly_fields(RequestFactory().get("/"), device_type)
+        self.assertIn("manufacturer", readonly)
+        self.assertIn("model", readonly)
+        self.assertIn("name", readonly)
+
+    def test_two_new_device_type_ports_in_one_submission_get_distinct_ordinals(self) -> None:
+        """Review-council/Codex finding: admin formsets run every row's
+        clean() before any row is saved, so two new ports added to the same
+        unlocked profile in one submission both used to compute the same
+        "next" ordinal via clean() and collide on
+        unique_device_type_port_ordinal at save() time. save() now
+        recomputes under the type-row lock instead of trusting clean()'s
+        pre-save guess.
+        """
+        device_type = _make_device_type(port_count=0)
+        port_a = NetworkDeviceTypePort(
+            device_type=device_type, description="Port A", port_type=PortType.GBE_RJ45, vlan=self.vlan
+        )
+        port_b = NetworkDeviceTypePort(
+            device_type=device_type, description="Port B", port_type=PortType.GBE_RJ45, vlan=self.vlan
+        )
+        # Simulate an admin formset: every row's clean() runs before any
+        # row is saved.
+        port_a.full_clean()
+        port_b.full_clean()
+        port_a.save()
+        port_b.save()  # must not raise IntegrityError
+        self.assertEqual(port_a.ordinal, 1)
+        self.assertEqual(port_b.ordinal, 2)
+
+    def test_switch_type_port_delete_checks_persisted_parent_not_reassigned_one(self) -> None:
+        """Review-council/Codex finding: delete() used the in-memory
+        ``switch_type`` (not the persisted one) to decide whether the lock
+        applies, so reassigning a locked type-port to a different, unlocked
+        profile in memory and then calling delete() bypassed the lock and
+        deleted the row out from under its real, locked parent.
+        """
+        switch_type = _make_switch_type(port_count=1)
+        NetworkSwitch.objects.create(switch_type=switch_type)
+        type_port = switch_type.type_ports.get()
+        other_type = _make_switch_type(port_count=0, name="Other")
+
+        type_port.switch_type = other_type
+        with self.assertRaises(ValidationError):
+            type_port.delete()
+        self.assertEqual(switch_type.type_ports.count(), 1)
+
+    def test_device_type_port_delete_checks_persisted_parent_not_reassigned_one(self) -> None:
+        device_type = _make_device_type(port_count=1, vlan=self.vlan)
+        NetworkDevice.objects.create(device_type=device_type)
+        type_port = device_type.type_ports.get()
+        other_type = _make_device_type(port_count=0, vlan=self.vlan, name="Other")
+
+        type_port.device_type = other_type
+        with self.assertRaises(ValidationError):
+            type_port.delete()
+        self.assertEqual(device_type.type_ports.count(), 1)
+
+
+class DeleteThenResaveMaterializationTests(TestCase):
+    """Review-council/Codex finding: ``Model.delete()`` resets ``pk`` to
+    ``None`` but never resets ``_state.adding`` back to ``True``, so a
+    plain ``self._state.adding`` check alone would (after this PR's own
+    earlier fix from ``self.pk is None`` to ``self._state.adding``)
+    incorrectly treat a re-``save()`` of the same in-memory instance as
+    "not new" — skipping the lock, validation, and materialization, and
+    silently inserting a switch/device with zero ports. ``is_new`` now
+    checks both.
+    """
+
+    def setUp(self) -> None:
+        self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+
+    def test_switch_rematerializes_ports_after_delete_and_resave(self) -> None:
+        switch_type = _make_switch_type(port_count=1)
+        switch = NetworkSwitch.objects.create(switch_type=switch_type)
+        switch.delete()
+        self.assertIsNone(switch.pk)
+        switch.save()
+        self.assertEqual(switch.ports.count(), 1)
+
+    def test_device_rematerializes_ports_after_delete_and_resave(self) -> None:
+        device_type = _make_device_type(port_count=1, vlan=self.vlan)
+        device = NetworkDevice.objects.create(device_type=device_type)
+        device.delete()
+        self.assertIsNone(device.pk)
+        device.save()
+        self.assertEqual(device.ports.count(), 1)
+
+
+class ChangeformSaveErrorHandlingTests(TestCase):
+    """Review-council finding: some of this app's invariants (locked-field
+    and profile-lock checks) are enforced inside ``Model.save()``/
+    ``delete()`` themselves, not only ``clean()`` — by design, since a few
+    can only be detected at save time (row-locking against a concurrent
+    edit, an ordinal collision). Django's admin only turns
+    ``clean()``-raised errors into a form error automatically; anything a
+    guard raises later, from ``save()``/``delete()`` itself, used to
+    propagate straight past the admin's normal error handling as an
+    unhandled 500. ``AuditedModelAdminMixin.changeform_view`` now catches
+    that and redirects with a message instead.
+    """
+
+    def _stub_admin(self, exc: Exception) -> AuditedModelAdminMixin:
+        class _StubBase:
+            def changeform_view(self, request, object_id=None, form_url="", extra_context=None):
+                raise exc
+
+        class _StubAdmin(AuditedModelAdminMixin, _StubBase):
+            pass
+
+        return _StubAdmin()
+
+    def _request_with_messages(self):
+        request = RequestFactory().post("/admin/inventory/networkswitchtype/1/change/")
+        request.session = {}
+        request._messages = FallbackStorage(request)
+        return request
+
+    def test_validation_error_becomes_redirect_with_message(self) -> None:
+        admin = self._stub_admin(ValidationError("profile is locked"))
+        request = self._request_with_messages()
+        response = admin.changeform_view(request, "1")
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(any("profile is locked" in str(m) for m in get_messages(request)))
+
+    def test_integrity_error_becomes_redirect_with_message(self) -> None:
+        admin = self._stub_admin(IntegrityError("duplicate entry"))
+        request = self._request_with_messages()
+        response = admin.changeform_view(request, "1")
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(any("duplicate entry" in str(m) for m in get_messages(request)))
 
 
 class MaterializedPortLockTests(TestCase):

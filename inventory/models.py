@@ -837,8 +837,9 @@ class NetworkSwitchTypePort(AuditedModel):
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
         with transaction.atomic():
-            _lock_type_rows(NetworkSwitchType, self.switch_type_id, self._persisted_switch_type_id())
-            if self._profile_locked() or self._persisted_profile_locked():
+            persisted_switch_type_id = self._persisted_switch_type_id()
+            _lock_type_rows(NetworkSwitchType, self.switch_type_id, persisted_switch_type_id)
+            if self._profile_locked() or self._persisted_profile_locked(persisted_switch_type_id):
                 raise ValidationError(
                     "This profile's ports are locked because it already has switch instances; "
                     "create a new named profile to change the port layout."
@@ -848,9 +849,14 @@ class NetworkSwitchTypePort(AuditedModel):
             )
 
     def delete(self, using=None, keep_parents=False) -> tuple[int, dict[str, int]]:
+        # Checks the *persisted* parent, not just the in-memory
+        # ``switch_type`` — reassigning this row to a different, unlocked
+        # profile in memory and then calling delete() would otherwise
+        # delete it out from under its real (locked) parent unchecked.
         with transaction.atomic():
-            _lock_type_rows(NetworkSwitchType, self.switch_type_id)
-            if self._profile_locked():
+            persisted_switch_type_id = self._persisted_switch_type_id()
+            _lock_type_rows(NetworkSwitchType, self.switch_type_id, persisted_switch_type_id)
+            if self._profile_locked() or self._persisted_profile_locked(persisted_switch_type_id):
                 raise ValidationError(
                     "This profile's ports are locked because it already has switch instances; "
                     "create a new named profile to change the port layout."
@@ -893,14 +899,17 @@ class NetworkSwitchTypePort(AuditedModel):
             .first()
         )
 
-    def _persisted_profile_locked(self) -> bool:
+    def _persisted_profile_locked(self, original_switch_type_id: int | None) -> bool:
         """Whether this row's *persisted* parent (before any in-memory
         reassignment) is locked. ``_profile_locked()`` alone only sees the
         in-memory ``switch_type`` — reassigning a locked type port to a
         different, unlocked profile would otherwise pass that check and
         silently move the row out from under the locked profile.
+
+        Takes the persisted parent id explicitly rather than recomputing it
+        via ``_persisted_switch_type_id()`` — every caller already needs
+        that value for ``_lock_type_rows()`` first.
         """
-        original_switch_type_id = self._persisted_switch_type_id()
         if original_switch_type_id is None:
             return False
         return NetworkSwitchType._default_manager.filter(
@@ -973,10 +982,14 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
         return self.hostname or f"Switch #{self.pk}"
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
-        # ``self._state.adding``, not ``self.pk is None`` — a pk can be
-        # pre-assigned (fixtures, scripted inserts) before the row actually
-        # exists, and self.pk is None would then wrongly skip materialization.
-        is_new = self._state.adding
+        # ``self.pk is None or self._state.adding``, not either alone:
+        # ``_state.adding`` alone is wrong when a pk is pre-assigned
+        # (fixtures, scripted inserts) before the row actually exists;
+        # ``pk is None`` alone is wrong after ``instance.delete()`` (which
+        # resets pk to None but leaves ``_state.adding`` False), which would
+        # otherwise silently skip materialization on a re-save of the same
+        # in-memory instance.
+        is_new = self.pk is None or self._state.adding
         with transaction.atomic():
             if not is_new:
                 _check_locked_fields_unchanged(
@@ -994,7 +1007,7 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
 
     def clean(self) -> None:
         super().clean()
-        if self._state.adding:
+        if self.pk is None or self._state.adding:
             switch_type = _get_related(self, "switch_type")
             if switch_type is not None and switch_type.pk is not None:
                 _validate_switch_type_port_profile(switch_type)
@@ -1345,21 +1358,30 @@ class NetworkDeviceTypePort(AuditedModel):
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
         with transaction.atomic():
-            _lock_type_rows(NetworkDeviceType, self.device_type_id, self._persisted_device_type_id())
-            if self._profile_locked() or self._persisted_profile_locked():
+            persisted_device_type_id = self._persisted_device_type_id()
+            _lock_type_rows(NetworkDeviceType, self.device_type_id, persisted_device_type_id)
+            if self._profile_locked() or self._persisted_profile_locked(persisted_device_type_id):
                 raise ValidationError(
                     "This profile's ports are locked because it already has device instances; "
                     "create a new named profile to change the port layout."
                 )
-            self._assign_ordinal_if_unset()
+            # ``force=True``: recompute under the lock rather than trusting
+            # whatever ``clean()`` may have already set — admin formsets run
+            # every row's ``clean()`` before any row is saved, so two new
+            # ports added to the same profile in one submission would
+            # otherwise both compute the same "next" ordinal and collide on
+            # ``unique_device_type_port_ordinal``.
+            self._assign_ordinal_if_unset(force=True)
             super().save(
                 force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
             )
 
     def delete(self, using=None, keep_parents=False) -> tuple[int, dict[str, int]]:
+        # Checks the *persisted* parent — see ``NetworkSwitchTypePort.delete()``.
         with transaction.atomic():
-            _lock_type_rows(NetworkDeviceType, self.device_type_id)
-            if self._profile_locked():
+            persisted_device_type_id = self._persisted_device_type_id()
+            _lock_type_rows(NetworkDeviceType, self.device_type_id, persisted_device_type_id)
+            if self._profile_locked() or self._persisted_profile_locked(persisted_device_type_id):
                 raise ValidationError(
                     "This profile's ports are locked because it already has device instances; "
                     "create a new named profile to change the port layout."
@@ -1388,20 +1410,24 @@ class NetworkDeviceTypePort(AuditedModel):
             .first()
         )
 
-    def _persisted_profile_locked(self) -> bool:
+    def _persisted_profile_locked(self, original_device_type_id: int | None) -> bool:
         """Whether this row's *persisted* parent (before any in-memory
         reassignment) is locked — see ``NetworkSwitchTypePort``'s version
-        for why ``_profile_locked()`` alone isn't enough.
+        for why ``_profile_locked()`` alone isn't enough. Takes the
+        persisted parent id explicitly — every caller already needs it for
+        ``_lock_type_rows()``.
         """
-        original_device_type_id = self._persisted_device_type_id()
         if original_device_type_id is None:
             return False
         return NetworkDeviceType._default_manager.filter(
             pk=original_device_type_id, devices__isnull=False
         ).exists()
 
-    def _assign_ordinal_if_unset(self) -> None:
-        if self.pk is not None or self.ordinal:
+    def _assign_ordinal_if_unset(self, *, force: bool = False) -> None:
+        # ``_state.adding``, not ``self.pk is not None`` — see
+        # ``NetworkSwitch.save()`` for why a pre-assigned pk (fixtures,
+        # scripted inserts) must not be mistaken for an existing row.
+        if not self._state.adding or (self.ordinal and not force):
             return
         device_type = _get_related(self, "device_type")
         if device_type is None or device_type.pk is None:
@@ -1446,8 +1472,8 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         return self.hostname or f"Device #{self.pk}"
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
-        # ``self._state.adding``, not ``self.pk is None`` — see NetworkSwitch.save().
-        is_new = self._state.adding
+        # ``self.pk is None or self._state.adding`` — see NetworkSwitch.save().
+        is_new = self.pk is None or self._state.adding
         with transaction.atomic():
             if not is_new:
                 _check_locked_fields_unchanged(
@@ -1465,7 +1491,7 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
 
     def clean(self) -> None:
         super().clean()
-        if self._state.adding:
+        if self.pk is None or self._state.adding:
             device_type = _get_related(self, "device_type")
             if device_type is not None and device_type.pk is not None:
                 _validate_device_type_port_profile(device_type)
