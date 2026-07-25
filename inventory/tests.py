@@ -24,8 +24,10 @@ from django.test import RequestFactory, TestCase
 
 from .admin import (
     NetworkDeviceAdmin,
+    NetworkDevicePortInline,
     NetworkDeviceTypeAdmin,
     NetworkSwitchAdmin,
+    NetworkSwitchPortInline,
     NetworkSwitchTypeAdmin,
     RackAdmin,
     VLANAdmin,
@@ -1698,6 +1700,12 @@ class MaterializedPortLockTests(TestCase):
         port.source_type_port = self.other_device.device_type.type_ports.get()
         with self.assertRaises(ValidationError):
             port.save()
+
+    def test_switch_port_number_readonly_in_admin(self) -> None:
+        self.assertIn("port_number", NetworkSwitchPortInline.readonly_fields)
+
+    def test_device_port_number_readonly_in_admin(self) -> None:
+        self.assertIn("port_number", NetworkDevicePortInline.readonly_fields)
 
     def test_device_port_dhcp_and_address_still_editable(self) -> None:
         rack = Rack.objects.create(name="Rack 1", slot_count=4)

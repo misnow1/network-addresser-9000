@@ -229,7 +229,7 @@ class NetworkSwitchPortInline(admin.TabularInline):
     model = NetworkSwitchPort
     form = NetworkSwitchPortForm
     # No explicit ``fields`` here either — see NetworkSwitchTypePortInline.
-    readonly_fields = ["port_type"]
+    readonly_fields = ["port_number", "port_type"]
     extra = 0
 
     def get_queryset(self, request: HttpRequest) -> QuerySet:
@@ -260,7 +260,7 @@ class NetworkDevicePortInline(admin.TabularInline):
         "default_gateway",
         "switch_port",
     ]
-    readonly_fields = ["description", "vlan", "port_type", "default_gateway"]
+    readonly_fields = ["description", "port_number", "vlan", "port_type", "default_gateway"]
     extra = 0
 
     def has_add_permission(self, request: HttpRequest, obj: Any = None) -> bool:
