@@ -45,6 +45,7 @@ At the top level are VLANs, each combining an 802.1Q VLAN ID with an IPv4 subnet
   * Hostname: mps-sg300-wpc-sr-upper
   * Manufacturer: Cisco
   * Model: SG300-10MP
+  * Type Name (profile): Default
   * Serial Number: tbd
   * Port Count: 8 1GbE Copper + 2 1GbE Combo
   * Rack: 1
@@ -59,6 +60,7 @@ At the top level are VLANs, each combining an 802.1Q VLAN ID with an IPv4 subnet
   * Hostname: tbd
   * Manufacturer: Martin Audio
   * Model: IK-42
+  * Type Name (profile): with Dante Card
   * Serial Number: tbd
   * Rack: Rack 1
   * Rack Slot: 2
@@ -85,31 +87,98 @@ The list of objects that the system will need to track includes, but is not limi
 * Rack: an abstract grouping of devices with an address range from which device addresses are computed. Has no "purpose" field — a rack of spare equipment is just an ordinary Rack (see `CONTEXT.md`).
     * Slot Count
     * IPv4 Address Range (per VLAN)
+A Network Switch/Device Type is a **purpose profile** built on a hardware model, not the bare hardware model itself: the same physical switch or device commonly needs several different profiles, because what each port is *used for* varies even though the hardware doesn't. For example, a Cisco SG350-10MP wired up for a drive rack (different VLAN per port) needs a different profile than the identical switch wired for an amp rack; a Martin Audio IK-42 with a Dante card needs a different profile (extra ports) than the same model without one. A Type is therefore identified by `(Manufacturer, Model, Name)`, where `Name` is a **required, non-blank** profile label (e.g. "For Drive Rack", "with Dante Card", "Default" for a model with only one profile) — this keeps the type selector unambiguous for an audience that may not have deep VLAN/subnetting knowledge.
+
+A Type's port list is fixed once any instance (switch/device) exists — editing or removing a Type Port at that point would silently leave existing instances holding a stale copy. To change a profile's port layout, create a new named profile instead.
+
 * Network Switch Type
     * Manufacturer
     * Model
-    * Port count and type
-* Network Switch (an instance of a Network Switch Type)
-    * ...
-    * Serial Number
-* Network Switch Port
+    * Name (profile label, required — see above)
+    * Port Count (must equal the number of Network Switch Type Ports defined for this profile)
+* Network Switch Type Port
     * Port Number
     * Port Description
-    * Port Type (10/100M, 1GbE, 1GbE Combo, 10GbE SFP+, etc.)
+    * Port Type — a structured choice, not free text: 10/100M RJ45, 1GbE RJ45 (copper), 1GbE SFP, 1GbE Combo (RJ45/SFP), 2.5GbE RJ45, 10GbE RJ45, 10GbE SFP+, 25GbE SFP28, Other/Unknown
     * Port Mode (Trunk, Access, etc.)
     * Primary (untagged) VLAN
     * Allowed VLANs
-* Network Device Type (amp, processor, mixer, etc.)
+* Network Switch (an instance of a Network Switch Type)
+    * ...
+    * Serial Number
+    * The switch's Type is fixed at creation and cannot be changed afterward. Re-typing a switch (e.g. moving it to a different profile) means removing and recreating it, not editing the Type field.
+* Network Switch Port: automatically populated from the switch's Type and its Type Ports, as a **one-time copy** made when the switch is first created — not kept in sync with later Type edits (which can't happen anyway, since the Type locks once the switch exists). **VLAN assignment is editable** in contrast to device port instances (see below), but the **physical Port Type is locked** — it's a hardware fact copied from the Type, not something that varies per switch. Conflict detection (such as incorrect VLAN assignment if a device is already connected) should be flagged, but this can be deferred to the custom UI.
+* Network Device Type (amp, processor, mixer, etc.) — also a purpose profile; see above. e.g. "Martin Audio IK-42 — with Dante Card" vs "— without Dante Card", or "Shure ULXD4Q — Split Mode" vs "— Redundant Mode".
     * Manufacturer
     * Model
-    * Port count and type
+    * Name (profile label, required)
+    * Ports: a list of "Network Device Type Port"
+* Network Device Type Port (a port definition for the port(s) that an instance of this device will always have)
+    * Port Number (optional - most devices have fixed numbers of ports with fixed purpose that aren't numbered)
+    * Port Description (required — this is the port's identity/purpose, e.g. "Dante Primary"; not optional the way Port Number is)
+    * Port VLAN (subnet) — required, one VLAN per port (see the deferred limitation below for the one case this doesn't cover)
+    * Port Type — same structured choice list as Network Switch Type Port, above
 * Network Device (an instance of a Network Device Type). Network Switch and Network Device are separate hierarchies, not a shared type — see `CONTEXT.md`. An unracked Network Device/Switch (`rack` is null) is in the **Spare Pool**: DHCP-configured, tracked by little more than serial number and hostname until it's racked.
     * ...
     * Serial Number
-* Network Device Port
-    * Purpose (Selected VLAN)
+    * The device's Type is fixed at creation and cannot be changed afterward, for the same reason as Network Switch above — e.g. adding a Dante card to an amp means removing and recreating that device entry, not editing it in place (expected to be very rare).
+* Network Device Port: description/purpose/VLAN/Port Type automatically populated (one-time copy, as with Network Switch Port above) when the device is created, from its Type's Network Device Type Ports. **Description, VLAN, and physical Port Type are immutable. Only the IP address/DHCP setting (and which switch port it's connected to) are editable.** Ports start out DHCP-configured when created; an operator gives one a static address afterward. A port's identity is `(Device, Description)` — Port Number, when present at all, is neither required nor unique.
     * IPv4 Address -OR- DHCP
-    * IPv4 Default Gateway -OR- NULL (if DHCP)
+    * IPv4 Default Gateway -OR- NULL (if DHCP) — always derived live from the port's VLAN's Default Gateway, not stored on the port itself
+
+### Concrete Device Examples
+
+**Power Amps**
+
+* Martin Audio IK-42 with Dante Card
+    * Control: Control Network
+    * Primary: Dante Primary
+    * Secondary: Dante Secondary
+* Martin Audio IK-42 without Dante Card
+    * Control: Control Network
+
+A caveat: the Dante card can be added and removed from an amp but that is *very* rare and I would say the easier option there is to destroy and recreate the device entry rather than allowing it to be edited/changed.
+
+**Processors**
+
+* Lake LM44 or Lake LM26
+    * Primary: Dante Primary
+    * Secondary: Dante Secondary
+
+**Shure Wireless Mic Receivers**
+
+* Shure ULXD4Q or ULXD4D Switched Mode (both Dante ports are bridged together)
+    * Primary: Dante Primary (Shure Control will ride on the Dante Primary network)
+    * Secondary: Dante Primary (Shure Control will ride on the Dante Primary network)
+* Shure ULXD4Q or ULXD4D Redundant Mode
+    * Primary: Dante Primary (Shure Control will ride on the Dante Primary network)
+    * Secondary: Dante Secondary
+* Shure ULXD4Q or ULXD4D Split Mode
+    * Primary: Shure Control
+    * Secondary: Dante Primary
+
+**Generic Dante Devices**
+
+* 1-port device (AVIO, etc.)
+    * Dante Primary
+* 2-port device Switched Mode (both ports are bridged together)
+    * Primary: Dante Primary
+    * Secondary: Dante Primary
+* 2-port device Redundant Mode
+    * Primary: Dante Primary
+    * Secondary: Dante Secondary
+
+**Deferred: Bridged Multi-Port Interfaces**
+
+Every port modeled above (including Shure **Redundant** Mode's Primary/Secondary, each on its own single VLAN) fits the "one physical port, one VLAN, one address" shape the current design supports. **Switched Mode is the one exception**, for both Shure and the generic 2-port case above: two separate physical jacks are bridged together in the hardware and share a single logical Dante interface — meaning one IP address across both jacks, not one address each. The current Network Device Type Port / Network Device Port model has no way to say "these two physical ports are one addressable interface"; each Type Port materializes into its own independently-addressable instance port. Modeling Switched Mode correctly would mean introducing a logical-interface concept distinct from the physical port/jack — deferred to a later phase (see [ADR 0010](./docs/adr/0010-port-profiles-and-materialization.md)). Until then, a Switched-Mode device's two ports can be tracked, but the system won't stop someone from giving them two different addresses, which wouldn't reflect the real hardware.
+
+**Generic Computer**
+
+A computer may have an arbitrary number of ports on arbitrary VLANs. This is a case where ports and VLANs should *probably* be mutable but that doesn't fit the current design constraints and may need to be punted to a future roadmap item.
+
+**Other Device Types**
+
+There are other device types, such as video devices, that have not been considered yet.
 
 ## Address Computation
 

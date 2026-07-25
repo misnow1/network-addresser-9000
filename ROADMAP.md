@@ -46,7 +46,16 @@ High-level phases only — day-to-day task tracking belongs in GitHub Issues onc
 
 - [ ] GitHub Actions workflow: build and publish the Docker image to GHCR on `main` merges
 
+## 8. Port profiles & materialization — done
+
+- [x] Network Switch/Device Type is a purpose profile: `(manufacturer, model, name)` identity — see ADR 0010
+- [x] `NetworkSwitchTypePort`/`NetworkDeviceTypePort` templates; materialized once into instance ports on creation
+- [x] Type immutable after creation; a profile's type ports lock once it has any instance
+- [x] `allowed_vlans` moved to an explicit `PROTECT`-FK through model (closes a VLAN-removal gap)
+- [x] Device port `default_gateway` is a derived read-only property, not a stored field
+
 ## Later / not yet designed
 
 - Purpose-built frontend beyond Django admin (rack visualizations, address-utilization views)
 - Device-replacement workflow (swapping a spare into an already-addressed slot) — flagged in ADR 0003, design deferred
+- Bridged multi-port logical interfaces (e.g. Shure ULXD4Q/D "Switched" mode) — flagged in ADR 0010, design deferred

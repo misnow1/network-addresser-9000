@@ -6,6 +6,17 @@ suggestion and overlap validation (phase 3, see ROADMAP.md) live here too:
 suggestion arithmetic itself is in suggestions.py, wired into each model's
 ``clean()`` so a blank suggested field is filled in on creation only —
 matching ADR 0001's "suggests, but admin can override; once set, static."
+
+Port profiles (phase 8, ADR 0010) live here too: a Network Switch/Device
+Type is a *purpose profile* built on a hardware model — the same hardware
+can have several profiles when what its ports are used for differs (see
+``NetworkSwitchType``/``NetworkDeviceType``). Each profile owns a list of
+``*TypePort`` template rows, which are copied exactly once into real
+``NetworkSwitchPort``/``NetworkDevicePort`` rows when an instance of that
+type is first created (``_materialize_ports``) — never re-synced
+afterward. A type is immutable once it has any instance, and a profile's
+type ports are locked once the profile has any instance, so "this profile"
+always means one fixed port layout.
 """
 
 import ipaddress
@@ -14,7 +25,7 @@ from typing import Any
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
-from django.db import models
+from django.db import models, transaction
 
 from .suggestions import (
     ranges_overlap,
@@ -25,6 +36,34 @@ from .suggestions import (
     suggest_slot_address,
 )
 from .validators import validate_ipv4_cidr
+
+
+class PortType(models.TextChoices):
+    """Structured physical port type: link speed + connector.
+
+    Shared by both Type Ports (the template) and instance ports (the
+    materialized copy) — see module docstring. ``OTHER`` is an explicit
+    safety valve so unlisted/uncommon hardware never blocks data entry; the
+    rest of the list is extended by release as new hardware shows up, not
+    meant to be exhaustive up front.
+    """
+
+    TEN_100M_RJ45 = "10_100m_rj45", "10/100M RJ45"
+    GBE_RJ45 = "1gbe_rj45", "1GbE RJ45 (copper)"
+    GBE_SFP = "1gbe_sfp", "1GbE SFP"
+    GBE_COMBO = "1gbe_combo", "1GbE Combo (RJ45/SFP)"
+    TWO_5GBE_RJ45 = "2_5gbe_rj45", "2.5GbE RJ45"
+    TEN_GBE_RJ45 = "10gbe_rj45", "10GbE RJ45"
+    TEN_GBE_SFP_PLUS = "10gbe_sfp_plus", "10GbE SFP+"
+    TWENTYFIVE_GBE_SFP28 = "25gbe_sfp28", "25GbE SFP28"
+    OTHER = "other", "Other / Unknown"
+
+
+class PortMode(models.TextChoices):
+    """Switch port L2 mode — shared by switch Type Ports and instance ports."""
+
+    TRUNK = "trunk", "Trunk"
+    ACCESS = "access", "Access"
 
 
 def _get_related(instance: Any, field_name: str) -> Any | None:
@@ -44,6 +83,129 @@ def _get_related(instance: Any, field_name: str) -> Any | None:
         return getattr(instance, field_name)
     except ObjectDoesNotExist:
         return None
+
+
+def _check_locked_fields_unchanged(
+    model_cls: type[models.Model],
+    pk: int,
+    current_values: dict[str, Any],
+    *,
+    update_fields: "list[str] | frozenset[str] | None",
+) -> None:
+    """Raise ``ValidationError`` if any of ``current_values`` differs from
+    what's actually persisted for ``pk``.
+
+    This is the enforcement mechanism for every "locked after creation"
+    invariant in this module (a switch/device's type, an instance port's
+    hardware/purpose fields, a type's declared ``port_count``). It runs
+    from inside ``save()`` itself — not just ``clean()`` — because Django
+    never calls ``clean()``/``full_clean()`` from ``save()``, so a plain
+    ``instance.save()`` with no ``full_clean()`` call would otherwise
+    silently bypass the invariant.
+
+    ``current_values`` keys must be actual field names as Django's
+    ``update_fields`` would name them (e.g. ``"switch_type"``, not
+    ``"switch_type_id"``) — ``QuerySet.values()`` accepts either and
+    returns the FK's raw id either way, so this stays consistent with
+    ``current_values`` holding raw ids (``self.switch_type_id``) for FK
+    fields.
+
+    If ``update_fields`` is given and none of ``current_values``' keys are
+    in it, this is a no-op: a ``save(update_fields=...)`` that explicitly
+    excludes a locked field isn't changing it, regardless of what the
+    in-memory instance happens to hold. Django's own ``update_fields``
+    validation accepts either a field's name or its attname (e.g. both
+    ``"switch_type"`` and ``"switch_type_id"``), so ``update_fields`` is
+    normalized to field names before this comparison — otherwise
+    ``save(update_fields=["switch_type_id"])`` would look like it excludes
+    the locked field when it doesn't.
+
+    Known gap (documented, not closed): ``QuerySet.update()`` and
+    ``bulk_create()`` bypass ``Model.save()`` entirely and are not guarded
+    by this at all. They are unsupported for locked fields on the models
+    below.
+
+    Known gap (documented, not closed), same root cause:
+    ``NetworkSwitchTypePort.allowed_vlans`` isn't itself a locked field
+    checked here, but a locked type port's allowed VLANs can still be
+    changed via ``.add()``/``.remove()``/``.set()``/``.clear()`` on the
+    M2M manager — those write ``NetworkSwitchTypePortAllowedVlan`` (the
+    through table) directly and never call ``NetworkSwitchTypePort.save()``
+    or its ``_profile_locked()`` check. Unsupported for now; see ADR 0010.
+    """
+    if update_fields is not None:
+        attname_to_name = {
+            field.attname: field.name
+            for field in model_cls._meta.concrete_fields
+            if field.attname != field.name
+        }
+        normalized_update_fields = {attname_to_name.get(name, name) for name in update_fields}
+        if not (set(current_values) & normalized_update_fields):
+            return
+    original = model_cls._default_manager.filter(pk=pk).values(*current_values.keys()).first()
+    if original is None:
+        return  # row not visible (e.g. mid-delete elsewhere) — nothing to compare against
+    changed = [field for field, value in current_values.items() if original[field] != value]
+    if changed:
+        raise ValidationError(
+            f"{', '.join(sorted(changed))} cannot be changed after creation on "
+            f"{model_cls.__name__} — remove and recreate this row instead."
+        )
+
+
+def _lock_type_rows(model_cls: type[models.Model], *pks: int | None) -> None:
+    """Acquire a row lock (``SELECT ... FOR UPDATE``) on the given type
+    rows — must run inside ``transaction.atomic()``.
+
+    Serializes a profile's first materialization against a concurrent edit
+    to its own port templates/count: without this, a switch/device create
+    (reading the profile's current port templates) and a type-port edit
+    (checking whether the profile is locked yet) can each independently
+    observe a stale "not locked yet" state and both proceed, leaving the
+    new instance's materialized ports out of sync with the profile it was
+    supposedly copied from.
+    """
+    ids = sorted({pk for pk in pks if pk is not None})
+    if ids:
+        list(model_cls._default_manager.select_for_update().filter(pk__in=ids))
+
+
+def _validate_switch_type_port_profile(switch_type: "NetworkSwitchType") -> None:
+    """Raise ``ValidationError`` if ``switch_type``'s port profile is
+    incomplete, or its port numbers don't form a contiguous ``1..port_count``
+    sequence.
+
+    Contiguity (not just count) matters here because ``port_count`` is
+    meant to describe the numbered physical range 1..N — three type ports
+    numbered 1, 2, and 99 would pass a bare count check but not actually
+    describe a real N-port switch.
+    """
+    numbers = sorted(switch_type.type_ports.values_list("port_number", flat=True))
+    if len(numbers) != switch_type.port_count:
+        raise ValidationError(
+            f"{switch_type} declares port_count {switch_type.port_count} but has "
+            f"{len(numbers)} Network Switch Type Port(s) defined — define all of them "
+            "before creating a switch of this type."
+        )
+    if numbers != list(range(1, switch_type.port_count + 1)):
+        raise ValidationError(
+            f"{switch_type}'s Network Switch Type Ports aren't numbered contiguously "
+            f"1..{switch_type.port_count} (found {numbers})."
+        )
+
+
+def _validate_device_type_port_profile(device_type: "NetworkDeviceType") -> None:
+    """Raise ``ValidationError`` if ``device_type``'s port profile is
+    incomplete. Device type ports have no numbering requirement (unlike
+    switch type ports) since ``port_number`` is optional for these.
+    """
+    count = device_type.type_ports.count()
+    if count != device_type.port_count:
+        raise ValidationError(
+            f"{device_type} declares port_count {device_type.port_count} but has "
+            f"{count} Network Device Type Port(s) defined — define all of them before "
+            "creating a device of this type."
+        )
 
 
 def _suggest_rack_slot_address(rack: "Rack | None", rack_slot: int | None, vlan_id: int) -> str | None:
@@ -534,28 +696,263 @@ class RackSlotAssignmentMixin:
 
 
 class NetworkSwitchType(AuditedModel):
-    """A switch make/model. port_type describes the physical port mix."""
+    """A switch make/model *profile* (ADR 0010).
+
+    The same physical hardware can have several profiles when what its
+    ports are used for differs — e.g. "SG350-10MP — For Drive Rack" vs
+    "SG350-10MP — For Amp Rack": identical hardware, different per-port
+    VLAN purposes. ``name`` is the required, non-blank profile label;
+    identity is ``(manufacturer, model, name)``, not just
+    ``(manufacturer, model)``. A single-profile model still needs a name
+    (conventionally "Default") so the type selector is never ambiguous for
+    a non-expert audience.
+    """
 
     manufacturer = models.CharField(max_length=100)
     model = models.CharField(max_length=100)
-    port_count = models.PositiveIntegerField()
-    port_type = models.CharField(
-        max_length=200,
-        help_text='e.g. "8x 1GbE Copper + 2x 1GbE Combo".',
+    name = models.CharField(
+        max_length=100,
+        help_text='Profile label, e.g. "For Drive Rack", or "Default" for a single-profile model.',
+    )
+    port_count = models.PositiveIntegerField(
+        help_text="Must equal the number of Network Switch Type Ports defined for this profile."
     )
 
     class Meta:
         constraints = [
-            models.UniqueConstraint(fields=["manufacturer", "model"], name="unique_switch_type"),
+            models.UniqueConstraint(fields=["manufacturer", "model", "name"], name="unique_switch_type"),
+            models.CheckConstraint(condition=~models.Q(name=""), name="networkswitchtype_name_not_blank"),
         ]
-        ordering = ["manufacturer", "model"]
+        ordering = ["manufacturer", "model", "name"]
 
     def __str__(self) -> str:
-        return f"{self.manufacturer} {self.model}"
+        return f"{self.manufacturer} {self.model} — {self.name}"
+
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        with transaction.atomic():
+            if self.pk is not None:
+                _lock_type_rows(NetworkSwitchType, self.pk)
+                if self.switches.exists():
+                    _check_locked_fields_unchanged(
+                        NetworkSwitchType,
+                        self.pk,
+                        {
+                            "manufacturer": self.manufacturer,
+                            "model": self.model,
+                            "name": self.name,
+                            "port_count": self.port_count,
+                        },
+                        update_fields=update_fields,
+                    )
+            super().save(
+                force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
+            )
+
+    def clean(self) -> None:
+        super().clean()
+        if self.pk is not None and self.switches.exists():
+            _check_locked_fields_unchanged(
+                NetworkSwitchType,
+                self.pk,
+                {
+                    "manufacturer": self.manufacturer,
+                    "model": self.model,
+                    "name": self.name,
+                    "port_count": self.port_count,
+                },
+                update_fields=None,
+            )
+
+
+class NetworkSwitchTypePortQuerySet(models.QuerySet):
+    """Blocks bulk ``QuerySet.delete()`` on a locked profile's type ports.
+
+    ``NetworkSwitchTypePort.delete()`` guards a single-row delete, but
+    Django's ``QuerySet.delete()`` (e.g. ``switch_type.type_ports.all()
+    .delete()``, or an admin bulk-delete action) is a bulk SQL DELETE that
+    never calls per-instance ``delete()`` — this closes that bypass without
+    introducing a signal, consistent with how every other invariant in this
+    module is enforced.
+    """
+
+    def delete(self):
+        with transaction.atomic():
+            type_ids = list(self.values_list("switch_type_id", flat=True).distinct())
+            _lock_type_rows(NetworkSwitchType, *type_ids)
+            if NetworkSwitchType._default_manager.filter(pk__in=type_ids, switches__isnull=False).exists():
+                raise ValidationError(
+                    "This profile's ports are locked because it already has switch instances; "
+                    "create a new named profile to change the port layout."
+                )
+            return super().delete()
+
+
+class NetworkSwitchTypePort(AuditedModel):
+    """A port definition template on a Network Switch Type (profile).
+
+    Copied exactly once into a real ``NetworkSwitchPort`` when a switch of
+    this type is first created (``NetworkSwitch._materialize_ports``) — not
+    kept in sync with later edits. Locked (see ``clean()``/``save()``/
+    ``delete()``) once the parent type has any switch instance, per ADR
+    0010 — change a profile's port layout by creating a new named profile
+    instead.
+
+    Known gap (documented, not closed): ``allowed_vlans.add()``/
+    ``.remove()``/``.set()``/``.clear()`` bypass this lock — see the
+    "Known gap" note on ``_check_locked_fields_unchanged`` and ADR 0010.
+    """
+
+    switch_type = models.ForeignKey(NetworkSwitchType, on_delete=models.CASCADE, related_name="type_ports")
+    port_number = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    description = models.CharField(max_length=255, blank=True)
+    port_type = models.CharField(max_length=20, choices=PortType.choices)
+    port_mode = models.CharField(max_length=10, choices=PortMode.choices, default=PortMode.ACCESS)
+    native_vlan = models.ForeignKey(
+        VLAN,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text="Primary (untagged) VLAN for this port.",
+    )
+    allowed_vlans: models.ManyToManyField = models.ManyToManyField(
+        VLAN, through="NetworkSwitchTypePortAllowedVlan", related_name="+", blank=True
+    )
+
+    objects = NetworkSwitchTypePortQuerySet.as_manager()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["switch_type", "port_number"], name="unique_switch_type_port_number"
+            ),
+            models.CheckConstraint(
+                condition=models.Q(port_number__gte=1), name="networkswitchtypeport_port_number_gte_1"
+            ),
+        ]
+        ordering = ["switch_type", "port_number"]
+
+    def __str__(self) -> str:
+        return f"{self.switch_type} type port {self.port_number}"
+
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        with transaction.atomic():
+            persisted_switch_type_id = self._persisted_switch_type_id()
+            _lock_type_rows(NetworkSwitchType, self.switch_type_id, persisted_switch_type_id)
+            if self._profile_locked() or self._persisted_profile_locked(persisted_switch_type_id):
+                raise ValidationError(
+                    "This profile's ports are locked because it already has switch instances; "
+                    "create a new named profile to change the port layout."
+                )
+            super().save(
+                force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
+            )
+
+    def delete(self, using=None, keep_parents=False) -> tuple[int, dict[str, int]]:
+        # Checks the *persisted* parent, not just the in-memory
+        # ``switch_type`` — reassigning this row to a different, unlocked
+        # profile in memory and then calling delete() would otherwise
+        # delete it out from under its real (locked) parent unchecked.
+        with transaction.atomic():
+            persisted_switch_type_id = self._persisted_switch_type_id()
+            _lock_type_rows(NetworkSwitchType, self.switch_type_id, persisted_switch_type_id)
+            if self._profile_locked() or self._persisted_profile_locked(persisted_switch_type_id):
+                raise ValidationError(
+                    "This profile's ports are locked because it already has switch instances; "
+                    "create a new named profile to change the port layout."
+                )
+            return super().delete(using=using, keep_parents=keep_parents)
+
+    def clean(self) -> None:
+        super().clean()
+        if self._profile_locked():
+            raise ValidationError(
+                "This profile's ports are locked because it already has switch instances; "
+                "create a new named profile to change the port layout."
+            )
+        switch_type = _get_related(self, "switch_type")
+        if (
+            switch_type is not None
+            and self.port_number
+            and switch_type.port_count
+            and self.port_number > switch_type.port_count
+        ):
+            raise ValidationError(
+                {
+                    "port_number": (
+                        f"port_number {self.port_number} exceeds {switch_type}'s port_count "
+                        f"({switch_type.port_count})."
+                    )
+                }
+            )
+
+    def _profile_locked(self) -> bool:
+        switch_type = _get_related(self, "switch_type")
+        return switch_type is not None and switch_type.pk is not None and switch_type.switches.exists()
+
+    def _persisted_switch_type_id(self) -> int | None:
+        if self.pk is None:
+            return None
+        return (
+            NetworkSwitchTypePort._default_manager.filter(pk=self.pk)
+            .values_list("switch_type_id", flat=True)
+            .first()
+        )
+
+    def _persisted_profile_locked(self, original_switch_type_id: int | None) -> bool:
+        """Whether this row's *persisted* parent (before any in-memory
+        reassignment) is locked. ``_profile_locked()`` alone only sees the
+        in-memory ``switch_type`` — reassigning a locked type port to a
+        different, unlocked profile would otherwise pass that check and
+        silently move the row out from under the locked profile.
+
+        Takes the persisted parent id explicitly rather than recomputing it
+        via ``_persisted_switch_type_id()`` — every caller already needs
+        that value for ``_lock_type_rows()`` first.
+        """
+        if original_switch_type_id is None:
+            return False
+        return NetworkSwitchType._default_manager.filter(
+            pk=original_switch_type_id, switches__isnull=False
+        ).exists()
+
+
+class NetworkSwitchTypePortAllowedVlan(AuditedModel):
+    """Explicit through model for ``NetworkSwitchTypePort.allowed_vlans``.
+
+    A plain M2M's auto-generated join table has no ``on_delete`` to set, so
+    it can't protect a VLAN from removal (ADR 0007) — this explicit model
+    gives the ``vlan`` side a real ``PROTECT`` FK, which Django's deletion
+    collector honors for both ``Model.delete()`` and bulk
+    ``QuerySet.delete()``/admin bulk-delete alike.
+    """
+
+    type_port = models.ForeignKey(
+        NetworkSwitchTypePort, on_delete=models.CASCADE, related_name="allowed_vlan_links"
+    )
+    vlan = models.ForeignKey(VLAN, on_delete=models.PROTECT, related_name="+")
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["type_port", "vlan"], name="unique_switch_type_port_allowed_vlan"
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.type_port} allows {self.vlan}"
 
 
 class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
-    """A physical switch instance. Unracked (rack is null) = spare pool."""
+    """A physical switch instance. Unracked (rack is null) = spare pool.
+
+    ``switch_type`` is fixed at creation (see ``save()``) — re-typing a
+    switch means removing and recreating it, not editing this field (ADR
+    0010): this keeps the port-profile guarantees on
+    ``NetworkSwitchTypePort`` meaningful, and avoids the alternative of
+    silently re-materializing (and thereby discarding DHCP-adjacent state,
+    connections, and per-port overrides on) an already-configured switch.
+    """
 
     switch_type = models.ForeignKey(NetworkSwitchType, on_delete=models.PROTECT, related_name="switches")
     hostname = models.CharField(max_length=255, blank=True)
@@ -583,6 +980,64 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
 
     def __str__(self) -> str:
         return self.hostname or f"Switch #{self.pk}"
+
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        # ``self.pk is None or self._state.adding``, not either alone:
+        # ``_state.adding`` alone is wrong when a pk is pre-assigned
+        # (fixtures, scripted inserts) before the row actually exists;
+        # ``pk is None`` alone is wrong after ``instance.delete()`` (which
+        # resets pk to None but leaves ``_state.adding`` False), which would
+        # otherwise silently skip materialization on a re-save of the same
+        # in-memory instance.
+        is_new = self.pk is None or self._state.adding
+        with transaction.atomic():
+            if not is_new:
+                _check_locked_fields_unchanged(
+                    NetworkSwitch, self.pk, {"switch_type": self.switch_type_id}, update_fields=update_fields
+                )
+            elif self.switch_type_id is not None:
+                # Locks the type row so a concurrent edit to its port
+                # templates/count can't interleave with this materialization.
+                _lock_type_rows(NetworkSwitchType, self.switch_type_id)
+            super().save(
+                force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
+            )
+            if is_new:
+                self._materialize_ports()
+
+    def clean(self) -> None:
+        super().clean()
+        if self.pk is None or self._state.adding:
+            switch_type = _get_related(self, "switch_type")
+            if switch_type is not None and switch_type.pk is not None:
+                _validate_switch_type_port_profile(switch_type)
+        else:
+            _check_locked_fields_unchanged(
+                NetworkSwitch, self.pk, {"switch_type": self.switch_type_id}, update_fields=None
+            )
+
+    def _materialize_ports(self) -> None:
+        """One-time copy of ``switch_type``'s Network Switch Type Ports into
+        real ``NetworkSwitchPort`` rows (ADR 0010). Runs inside the same
+        transaction as this switch's insert (see ``save()``), so an
+        incomplete profile or a failed child row leaves neither the switch
+        nor any partial ports behind.
+        """
+        _validate_switch_type_port_profile(self.switch_type)
+        for type_port in self.switch_type.type_ports.all():
+            port = NetworkSwitchPort.objects.create(
+                switch=self,
+                port_number=type_port.port_number,
+                description=type_port.description,
+                port_type=type_port.port_type,
+                port_mode=type_port.port_mode,
+                native_vlan=type_port.native_vlan,
+                source_type_port=type_port,
+                created_by=self.created_by,
+            )
+            vlan_ids = list(type_port.allowed_vlans.values_list("pk", flat=True))
+            if vlan_ids:
+                port.allowed_vlans.set(vlan_ids)
 
     def _check_rack_slot_not_occupied(self) -> None:
         if NetworkDevice.objects.filter(rack=self.rack, rack_slot=self.rack_slot).exists():
@@ -670,16 +1125,25 @@ class NetworkSwitchAddress(AuditedModel):
 
 
 class NetworkSwitchPort(AuditedModel):
-    """A single physical port on a switch — L2 config only, no address."""
+    """A single physical port on a switch — L2 config only, no address.
 
-    class PortMode(models.TextChoices):
-        TRUNK = "trunk", "Trunk"
-        ACCESS = "access", "Access"
+    Materialized exactly once from the switch's ``switch_type`` when the
+    switch is first created (``NetworkSwitch._materialize_ports``).
+    ``port_type`` is a locked hardware fact copied from the type port;
+    everything else here (VLAN purpose, description, mode) is editable per
+    switch — in contrast to ``NetworkDevicePort``, where purpose/VLAN are
+    locked too (ADR 0010).
+    """
 
     switch = models.ForeignKey(NetworkSwitch, on_delete=models.CASCADE, related_name="ports")
     port_number = models.PositiveIntegerField(validators=[MinValueValidator(1)])
     description = models.CharField(max_length=255, blank=True)
-    port_type = models.CharField(max_length=50, blank=True, help_text="e.g. 1GbE, 10GbE SFP+.")
+    port_type = models.CharField(
+        max_length=20,
+        choices=PortType.choices,
+        blank=True,
+        help_text="Physical hardware fact, copied from the switch's type — locked after creation.",
+    )
     port_mode = models.CharField(max_length=10, choices=PortMode.choices, default=PortMode.ACCESS)
     native_vlan = models.ForeignKey(
         VLAN,
@@ -689,7 +1153,18 @@ class NetworkSwitchPort(AuditedModel):
         related_name="+",
         help_text="Primary (untagged) VLAN for this port.",
     )
-    allowed_vlans = models.ManyToManyField(VLAN, blank=True, related_name="+")
+    allowed_vlans: models.ManyToManyField = models.ManyToManyField(
+        VLAN, through="NetworkSwitchPortAllowedVlan", related_name="+", blank=True
+    )
+    source_type_port = models.ForeignKey(
+        NetworkSwitchTypePort,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        editable=False,
+        related_name="materialized_ports",
+        help_text="Provenance only — never used to re-derive this port's fields (seed-once).",
+    )
 
     class Meta:
         constraints = [
@@ -704,35 +1179,271 @@ class NetworkSwitchPort(AuditedModel):
     def __str__(self) -> str:
         return f"{self.switch} port {self.port_number}"
 
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        if self.pk is not None:
+            _check_locked_fields_unchanged(
+                NetworkSwitchPort, self.pk, self._locked_fields(), update_fields=update_fields
+            )
+        super().save(
+            force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
+        )
+
     def clean(self) -> None:
         super().clean()
-        if self.switch_id and self.port_number and self.port_number > self.switch.switch_type.port_count:
-            raise ValidationError(
-                f"port_number {self.port_number} exceeds {self.switch.switch_type}'s "
-                f"port_count ({self.switch.switch_type.port_count})."
+        if self.pk is not None:
+            _check_locked_fields_unchanged(
+                NetworkSwitchPort, self.pk, self._locked_fields(), update_fields=None
             )
 
+    def _locked_fields(self) -> dict[str, Any]:
+        # ``switch``/``port_number``/``source_type_port`` identify which
+        # physical port this row represents (materialized once from the
+        # switch's type, ADR 0010) — only VLAN purpose/description/mode
+        # are meant to be editable per switch, so a plain save() must not
+        # be able to silently move or renumber a materialized port.
+        return {
+            "switch": self.switch_id,
+            "port_number": self.port_number,
+            "port_type": self.port_type,
+            "source_type_port": self.source_type_port_id,
+        }
 
-class NetworkDeviceType(AuditedModel):
-    """A device make/model — amp, processor, mixer, etc."""
 
-    manufacturer = models.CharField(max_length=100)
-    model = models.CharField(max_length=100)
-    port_count = models.PositiveIntegerField()
-    port_type = models.CharField(max_length=200, blank=True)
+class NetworkSwitchPortAllowedVlan(AuditedModel):
+    """Explicit through model for ``NetworkSwitchPort.allowed_vlans`` — see
+    ``NetworkSwitchTypePortAllowedVlan`` for why a plain M2M can't protect
+    a VLAN from removal.
+    """
+
+    port = models.ForeignKey(NetworkSwitchPort, on_delete=models.CASCADE, related_name="allowed_vlan_links")
+    vlan = models.ForeignKey(VLAN, on_delete=models.PROTECT, related_name="+")
 
     class Meta:
         constraints = [
-            models.UniqueConstraint(fields=["manufacturer", "model"], name="unique_device_type"),
+            models.UniqueConstraint(fields=["port", "vlan"], name="unique_switch_port_allowed_vlan"),
         ]
-        ordering = ["manufacturer", "model"]
 
     def __str__(self) -> str:
-        return f"{self.manufacturer} {self.model}"
+        return f"{self.port} allows {self.vlan}"
+
+
+class NetworkDeviceType(AuditedModel):
+    """A device make/model *profile* (ADR 0010) — see ``NetworkSwitchType``
+    for what "profile" means here. E.g. "Martin Audio IK-42 — with Dante
+    Card" vs "— without Dante Card", or "Shure ULXD4Q — Split Mode" vs
+    "— Redundant Mode": identical hardware, different port sets/purposes.
+    """
+
+    manufacturer = models.CharField(max_length=100)
+    model = models.CharField(max_length=100)
+    name = models.CharField(
+        max_length=100,
+        help_text='Profile label, e.g. "with Dante Card", or "Default" for a single-profile model.',
+    )
+    port_count = models.PositiveIntegerField(
+        help_text="Must equal the number of Network Device Type Ports defined for this profile."
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["manufacturer", "model", "name"], name="unique_device_type"),
+            models.CheckConstraint(condition=~models.Q(name=""), name="networkdevicetype_name_not_blank"),
+        ]
+        ordering = ["manufacturer", "model", "name"]
+
+    def __str__(self) -> str:
+        return f"{self.manufacturer} {self.model} — {self.name}"
+
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        with transaction.atomic():
+            if self.pk is not None:
+                _lock_type_rows(NetworkDeviceType, self.pk)
+                if self.devices.exists():
+                    _check_locked_fields_unchanged(
+                        NetworkDeviceType,
+                        self.pk,
+                        {
+                            "manufacturer": self.manufacturer,
+                            "model": self.model,
+                            "name": self.name,
+                            "port_count": self.port_count,
+                        },
+                        update_fields=update_fields,
+                    )
+            super().save(
+                force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
+            )
+
+    def clean(self) -> None:
+        super().clean()
+        if self.pk is not None and self.devices.exists():
+            _check_locked_fields_unchanged(
+                NetworkDeviceType,
+                self.pk,
+                {
+                    "manufacturer": self.manufacturer,
+                    "model": self.model,
+                    "name": self.name,
+                    "port_count": self.port_count,
+                },
+                update_fields=None,
+            )
+
+
+class NetworkDeviceTypePortQuerySet(models.QuerySet):
+    """Blocks bulk ``QuerySet.delete()`` on a locked profile's type ports —
+    see ``NetworkSwitchTypePortQuerySet`` for why this is needed alongside
+    the model's own ``delete()`` override.
+    """
+
+    def delete(self):
+        with transaction.atomic():
+            type_ids = list(self.values_list("device_type_id", flat=True).distinct())
+            _lock_type_rows(NetworkDeviceType, *type_ids)
+            if NetworkDeviceType._default_manager.filter(pk__in=type_ids, devices__isnull=False).exists():
+                raise ValidationError(
+                    "This profile's ports are locked because it already has device instances; "
+                    "create a new named profile to change the port layout."
+                )
+            return super().delete()
+
+
+class NetworkDeviceTypePort(AuditedModel):
+    """A port definition template on a Network Device Type (profile).
+
+    Copied exactly once into a real ``NetworkDevicePort`` when a device of
+    this type is first created — see ``NetworkDevice._materialize_ports``.
+    Locked once the parent type has any device instance (ADR 0010), same
+    as ``NetworkSwitchTypePort``. Unlike switch type ports, ``description``
+    (not ``port_number``) is the identity — most of these devices have a
+    fixed purpose per port but no meaningful port number (e.g. "Dante
+    Primary").
+    """
+
+    device_type = models.ForeignKey(NetworkDeviceType, on_delete=models.CASCADE, related_name="type_ports")
+    port_number = models.PositiveIntegerField(null=True, blank=True, validators=[MinValueValidator(1)])
+    description = models.CharField(
+        max_length=255, help_text='Required — this port\'s purpose/identity, e.g. "Dante Primary".'
+    )
+    port_type = models.CharField(max_length=20, choices=PortType.choices)
+    vlan = models.ForeignKey(VLAN, on_delete=models.PROTECT, related_name="+")
+    ordinal = models.PositiveIntegerField(
+        editable=False,
+        default=0,
+        help_text="Stable display order; auto-assigned.",
+    )
+
+    objects = NetworkDeviceTypePortQuerySet.as_manager()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["device_type", "description"], name="unique_device_type_port_description"
+            ),
+            models.UniqueConstraint(
+                fields=["device_type", "ordinal"], name="unique_device_type_port_ordinal"
+            ),
+            models.CheckConstraint(
+                condition=~models.Q(description=""), name="networkdevicetypeport_description_not_blank"
+            ),
+            models.CheckConstraint(
+                condition=models.Q(port_number__isnull=True) | models.Q(port_number__gte=1),
+                name="networkdevicetypeport_port_number_gte_1",
+            ),
+        ]
+        ordering = ["device_type", "ordinal"]
+
+    def __str__(self) -> str:
+        return f"{self.device_type} type port: {self.description}"
+
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        with transaction.atomic():
+            persisted_device_type_id = self._persisted_device_type_id()
+            _lock_type_rows(NetworkDeviceType, self.device_type_id, persisted_device_type_id)
+            if self._profile_locked() or self._persisted_profile_locked(persisted_device_type_id):
+                raise ValidationError(
+                    "This profile's ports are locked because it already has device instances; "
+                    "create a new named profile to change the port layout."
+                )
+            # ``force=True``: recompute under the lock rather than trusting
+            # whatever ``clean()`` may have already set — admin formsets run
+            # every row's ``clean()`` before any row is saved, so two new
+            # ports added to the same profile in one submission would
+            # otherwise both compute the same "next" ordinal and collide on
+            # ``unique_device_type_port_ordinal``.
+            self._assign_ordinal_if_unset(force=True)
+            super().save(
+                force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
+            )
+
+    def delete(self, using=None, keep_parents=False) -> tuple[int, dict[str, int]]:
+        # Checks the *persisted* parent — see ``NetworkSwitchTypePort.delete()``.
+        with transaction.atomic():
+            persisted_device_type_id = self._persisted_device_type_id()
+            _lock_type_rows(NetworkDeviceType, self.device_type_id, persisted_device_type_id)
+            if self._profile_locked() or self._persisted_profile_locked(persisted_device_type_id):
+                raise ValidationError(
+                    "This profile's ports are locked because it already has device instances; "
+                    "create a new named profile to change the port layout."
+                )
+            return super().delete(using=using, keep_parents=keep_parents)
+
+    def clean(self) -> None:
+        super().clean()
+        if self._profile_locked():
+            raise ValidationError(
+                "This profile's ports are locked because it already has device instances; "
+                "create a new named profile to change the port layout."
+            )
+        self._assign_ordinal_if_unset()
+
+    def _profile_locked(self) -> bool:
+        device_type = _get_related(self, "device_type")
+        return device_type is not None and device_type.pk is not None and device_type.devices.exists()
+
+    def _persisted_device_type_id(self) -> int | None:
+        if self.pk is None:
+            return None
+        return (
+            NetworkDeviceTypePort._default_manager.filter(pk=self.pk)
+            .values_list("device_type_id", flat=True)
+            .first()
+        )
+
+    def _persisted_profile_locked(self, original_device_type_id: int | None) -> bool:
+        """Whether this row's *persisted* parent (before any in-memory
+        reassignment) is locked — see ``NetworkSwitchTypePort``'s version
+        for why ``_profile_locked()`` alone isn't enough. Takes the
+        persisted parent id explicitly — every caller already needs it for
+        ``_lock_type_rows()``.
+        """
+        if original_device_type_id is None:
+            return False
+        return NetworkDeviceType._default_manager.filter(
+            pk=original_device_type_id, devices__isnull=False
+        ).exists()
+
+    def _assign_ordinal_if_unset(self, *, force: bool = False) -> None:
+        # ``_state.adding``, not ``self.pk is not None`` — see
+        # ``NetworkSwitch.save()`` for why a pre-assigned pk (fixtures,
+        # scripted inserts) must not be mistaken for an existing row.
+        if not self._state.adding or (self.ordinal and not force):
+            return
+        device_type = _get_related(self, "device_type")
+        if device_type is None or device_type.pk is None:
+            return
+        existing_max = device_type.type_ports.aggregate(models.Max("ordinal"))["ordinal__max"] or 0
+        self.ordinal = existing_max + 1
 
 
 class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
-    """An end-point device instance. Unracked (rack is null) = spare pool."""
+    """An end-point device instance. Unracked (rack is null) = spare pool.
+
+    ``device_type`` is fixed at creation — see ``NetworkSwitch`` for why
+    (ADR 0010): re-typing a device (e.g. adding a Dante card to an amp)
+    means removing and recreating it, not editing this field. This is
+    expected to be rare (DESIGN.md's "Concrete Device Examples").
+    """
 
     device_type = models.ForeignKey(NetworkDeviceType, on_delete=models.PROTECT, related_name="devices")
     hostname = models.CharField(max_length=255, blank=True)
@@ -760,6 +1471,56 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
     def __str__(self) -> str:
         return self.hostname or f"Device #{self.pk}"
 
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        # ``self.pk is None or self._state.adding`` — see NetworkSwitch.save().
+        is_new = self.pk is None or self._state.adding
+        with transaction.atomic():
+            if not is_new:
+                _check_locked_fields_unchanged(
+                    NetworkDevice, self.pk, {"device_type": self.device_type_id}, update_fields=update_fields
+                )
+            elif self.device_type_id is not None:
+                # Locks the type row so a concurrent edit to its port
+                # templates/count can't interleave with this materialization.
+                _lock_type_rows(NetworkDeviceType, self.device_type_id)
+            super().save(
+                force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
+            )
+            if is_new:
+                self._materialize_ports()
+
+    def clean(self) -> None:
+        super().clean()
+        if self.pk is None or self._state.adding:
+            device_type = _get_related(self, "device_type")
+            if device_type is not None and device_type.pk is not None:
+                _validate_device_type_port_profile(device_type)
+        else:
+            _check_locked_fields_unchanged(
+                NetworkDevice, self.pk, {"device_type": self.device_type_id}, update_fields=None
+            )
+
+    def _materialize_ports(self) -> None:
+        """One-time copy of ``device_type``'s Network Device Type Ports into
+        real ``NetworkDevicePort`` rows, materialized as DHCP (ADR 0010) —
+        an operator gives a port a static address afterward. Runs inside
+        the same transaction as this device's insert (see ``save()``).
+        """
+        _validate_device_type_port_profile(self.device_type)
+        for type_port in self.device_type.type_ports.order_by("ordinal"):
+            NetworkDevicePort.objects.create(
+                device=self,
+                port_number=type_port.port_number,
+                description=type_port.description,
+                vlan=type_port.vlan,
+                port_type=type_port.port_type,
+                ordinal=type_port.ordinal,
+                source_type_port=type_port,
+                is_dhcp=True,
+                address=None,
+                created_by=self.created_by,
+            )
+
     def _check_rack_slot_not_occupied(self) -> None:
         if NetworkSwitch.objects.filter(rack=self.rack, rack_slot=self.rack_slot).exists():
             raise ValidationError(
@@ -783,19 +1544,48 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
 class NetworkDevicePort(AuditedModel):
     """A device port: one purpose (VLAN), one static address or DHCP.
 
+    Materialized exactly once from the device's ``device_type`` when the
+    device is first created (``NetworkDevice._materialize_ports``),
+    starting out DHCP-configured (``is_dhcp=True``, ``address=None``) — an
+    operator gives it a static address afterward. ``description`` (this
+    port's purpose), ``vlan``, and ``port_type`` are locked hardware/
+    purpose facts copied from the type port (ADR 0010); only
+    ``is_dhcp``/``address``/``switch_port`` are editable. Identity is
+    ``(device, description)`` — ``port_number``, when present at all, is
+    neither required nor unique.
+
     ``switch`` is not stored directly — it's redundant with (and could
     contradict) ``switch_port``, so it's derived from it via a property.
     ``switch_port`` is a one-to-one: a physical switch port can be claimed
     by at most one device port.
+
+    Known limitation (deferred, see DESIGN.md and ADR 0010): a device port
+    is always single-VLAN/single-address. Hardware where two physical jacks
+    are bridged into one logical interface (e.g. Shure ULXD4Q/D "Switched"
+    mode) can be tracked as two ordinary ports here, but the system won't
+    stop them from being given two different addresses, which wouldn't
+    reflect the real, single-IP hardware.
     """
 
     device = models.ForeignKey(NetworkDevice, on_delete=models.CASCADE, related_name="ports")
-    port_number = models.PositiveIntegerField(validators=[MinValueValidator(1)])
-    description = models.CharField(max_length=255, blank=True, help_text='e.g. "Dante Primary".')
+    port_number = models.PositiveIntegerField(null=True, blank=True, validators=[MinValueValidator(1)])
+    description = models.CharField(
+        max_length=255, help_text='Required — this port\'s purpose, e.g. "Dante Primary".'
+    )
     vlan = models.ForeignKey(VLAN, on_delete=models.PROTECT, related_name="device_ports")
+    port_type = models.CharField(
+        max_length=20,
+        choices=PortType.choices,
+        blank=True,
+        help_text="Physical hardware fact, copied from the device's type — locked after creation.",
+    )
+    ordinal = models.PositiveIntegerField(editable=False, default=0)
+    # Materialization always passes is_dhcp=True explicitly regardless of
+    # this default (ADR 0010) — this stays False so directly-constructed
+    # ports (tests, or any future non-materialization path) keep defaulting
+    # to static, matching every other static-address model in this file.
     is_dhcp = models.BooleanField(default=False)
     address = models.GenericIPAddressField(protocol="IPv4", null=True, blank=True)
-    default_gateway = models.GenericIPAddressField(protocol="IPv4", null=True, blank=True)
     switch_port = models.OneToOneField(
         NetworkSwitchPort,
         on_delete=models.SET_NULL,
@@ -803,34 +1593,59 @@ class NetworkDevicePort(AuditedModel):
         blank=True,
         related_name="connected_device_port",
     )
+    source_type_port = models.ForeignKey(
+        NetworkDeviceTypePort,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        editable=False,
+        related_name="materialized_ports",
+        help_text="Provenance only — never used to re-derive this port's fields (seed-once).",
+    )
 
     class Meta:
         constraints = [
-            models.UniqueConstraint(fields=["device", "port_number"], name="unique_device_port_number"),
+            models.UniqueConstraint(fields=["device", "description"], name="unique_device_port_description"),
+            models.UniqueConstraint(fields=["device", "ordinal"], name="unique_device_port_ordinal"),
             models.UniqueConstraint(fields=["vlan", "address"], name="unique_device_port_vlan_address_value"),
             models.CheckConstraint(
+                condition=~models.Q(description=""), name="networkdeviceport_description_not_blank"
+            ),
+            models.CheckConstraint(
+                condition=models.Q(port_number__isnull=True) | models.Q(port_number__gte=1),
+                name="networkdeviceport_port_number_gte_1",
+            ),
+            models.CheckConstraint(
                 condition=(
-                    models.Q(is_dhcp=True, address__isnull=True, default_gateway__isnull=True)
+                    models.Q(is_dhcp=True, address__isnull=True)
                     | models.Q(is_dhcp=False, address__isnull=False)
                 ),
                 name="device_port_dhcp_xor_static_address",
             ),
         ]
-        ordering = ["device", "port_number"]
+        ordering = ["device", "ordinal"]
 
     def __str__(self) -> str:
-        return f"{self.device} port {self.port_number}"
+        return f"{self.device} — {self.description}"
 
-    @property
-    def switch(self) -> "NetworkSwitch | None":
-        switch_port = self.switch_port
-        return switch_port.switch if switch_port is not None else None
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        if self.pk is not None:
+            _check_locked_fields_unchanged(
+                NetworkDevicePort, self.pk, self._locked_fields(), update_fields=update_fields
+            )
+        super().save(
+            force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
+        )
 
     def clean(self) -> None:
         super().clean()
+        if self.pk is not None:
+            _check_locked_fields_unchanged(
+                NetworkDevicePort, self.pk, self._locked_fields(), update_fields=None
+            )
         if self.is_dhcp:
-            if self.address or self.default_gateway:
-                raise ValidationError("DHCP ports must not have a static address or gateway.")
+            if self.address:
+                raise ValidationError("DHCP ports must not have a static address.")
         else:
             device = _get_related(self, "device")
             vlan = _get_related(self, "vlan")
@@ -854,8 +1669,37 @@ class NetworkDevicePort(AuditedModel):
                     exclude_switch_address_pk=None,
                     exclude_device_port_pk=self.pk,
                 )
-        if self.device_id and self.port_number and self.port_number > self.device.device_type.port_count:
-            raise ValidationError(
-                f"port_number {self.port_number} exceeds {self.device.device_type}'s "
-                f"port_count ({self.device.device_type.port_count})."
-            )
+
+    def _locked_fields(self) -> dict[str, Any]:
+        # ``device``/``port_number``/``ordinal``/``source_type_port``
+        # identify which physical port this row represents (materialized
+        # once from the device's type, ADR 0010) — only
+        # ``is_dhcp``/``address``/``switch_port`` are meant to be editable,
+        # so a plain save() must not be able to silently move, renumber, or
+        # reorder a materialized port.
+        return {
+            "device": self.device_id,
+            "port_number": self.port_number,
+            "description": self.description,
+            "vlan": self.vlan_id,
+            "port_type": self.port_type,
+            "ordinal": self.ordinal,
+            "source_type_port": self.source_type_port_id,
+        }
+
+    @property
+    def switch(self) -> "NetworkSwitch | None":
+        switch_port = self.switch_port
+        return switch_port.switch if switch_port is not None else None
+
+    @property
+    def default_gateway(self) -> str | None:
+        """Live-derived from this port's VLAN (ADR 0010) — never stored, so
+        it can't go stale against a VLAN gateway that's edited later.
+        ``None`` while the port is DHCP-configured, or if the VLAN itself
+        has no gateway set.
+        """
+        if self.is_dhcp:
+            return None
+        vlan = _get_related(self, "vlan")
+        return vlan.default_gateway if vlan is not None else None
