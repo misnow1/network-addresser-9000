@@ -1632,6 +1632,85 @@ class PortProfileTemplateLockTests(TestCase):
         self.assertIn("port_count", admin.get_readonly_fields(RequestFactory().get("/"), device_type))
 
 
+class MaterializedPortLockTests(TestCase):
+    """ADR 0010: a materialized instance port's ownership/identity/
+    provenance fields are locked after creation — a plain ``save()`` must
+    not be able to move a port to another switch/device, renumber it, or
+    reorder it (PR #17 review).
+    """
+
+    def setUp(self) -> None:
+        self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.switch_type = _make_switch_type(port_count=1)
+        self.switch = NetworkSwitch.objects.create(switch_type=self.switch_type)
+        self.other_switch = NetworkSwitch.objects.create(
+            switch_type=_make_switch_type(port_count=1, name="Other")
+        )
+        self.device_type = _make_device_type(port_count=1, vlan=self.vlan)
+        self.device = NetworkDevice.objects.create(device_type=self.device_type)
+        self.other_device = NetworkDevice.objects.create(
+            device_type=_make_device_type(port_count=1, vlan=self.vlan, name="Other")
+        )
+
+    def test_switch_port_switch_locked(self) -> None:
+        port = self.switch.ports.get()
+        port.switch = self.other_switch
+        with self.assertRaises(ValidationError):
+            port.save()
+
+    def test_switch_port_number_locked(self) -> None:
+        port = self.switch.ports.get()
+        port.port_number = 99
+        with self.assertRaises(ValidationError):
+            port.save()
+
+    def test_switch_port_source_type_port_locked(self) -> None:
+        port = self.switch.ports.get()
+        port.source_type_port = self.other_switch.switch_type.type_ports.get()
+        with self.assertRaises(ValidationError):
+            port.save()
+
+    def test_switch_port_vlan_purpose_still_editable(self) -> None:
+        port = self.switch.ports.get()
+        port.description = "uplink"
+        port.save()  # must not raise
+
+    def test_device_port_device_locked(self) -> None:
+        port = self.device.ports.get()
+        port.device = self.other_device
+        with self.assertRaises(ValidationError):
+            port.save()
+
+    def test_device_port_number_locked(self) -> None:
+        port = self.device.ports.get()
+        port.port_number = 99
+        with self.assertRaises(ValidationError):
+            port.save()
+
+    def test_device_port_ordinal_locked(self) -> None:
+        port = self.device.ports.get()
+        port.ordinal = 99
+        with self.assertRaises(ValidationError):
+            port.save()
+
+    def test_device_port_source_type_port_locked(self) -> None:
+        port = self.device.ports.get()
+        port.source_type_port = self.other_device.device_type.type_ports.get()
+        with self.assertRaises(ValidationError):
+            port.save()
+
+    def test_device_port_dhcp_and_address_still_editable(self) -> None:
+        rack = Rack.objects.create(name="Rack 1", slot_count=4)
+        RackVlanRange.objects.create(rack=rack, vlan=self.vlan, address_range="10.200.1.0/27")
+        self.device.rack = rack
+        self.device.rack_slot = 1
+        self.device.save()
+        port = self.device.ports.get()
+        port.is_dhcp = False
+        port.address = "10.200.1.1"
+        port.save()  # must not raise
+
+
 class DerivedDefaultGatewayTests(TestCase):
     """ADR 0010: a device port's default_gateway is a read-only property
     live-derived from its VLAN — never stored, so it can't go stale.

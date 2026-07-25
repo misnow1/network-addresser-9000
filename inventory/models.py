@@ -1169,7 +1169,7 @@ class NetworkSwitchPort(AuditedModel):
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
         if self.pk is not None:
             _check_locked_fields_unchanged(
-                NetworkSwitchPort, self.pk, {"port_type": self.port_type}, update_fields=update_fields
+                NetworkSwitchPort, self.pk, self._locked_fields(), update_fields=update_fields
             )
         super().save(
             force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
@@ -1179,8 +1179,21 @@ class NetworkSwitchPort(AuditedModel):
         super().clean()
         if self.pk is not None:
             _check_locked_fields_unchanged(
-                NetworkSwitchPort, self.pk, {"port_type": self.port_type}, update_fields=None
+                NetworkSwitchPort, self.pk, self._locked_fields(), update_fields=None
             )
+
+    def _locked_fields(self) -> dict[str, Any]:
+        # ``switch``/``port_number``/``source_type_port`` identify which
+        # physical port this row represents (materialized once from the
+        # switch's type, ADR 0010) — only VLAN purpose/description/mode
+        # are meant to be editable per switch, so a plain save() must not
+        # be able to silently move or renumber a materialized port.
+        return {
+            "switch": self.switch_id,
+            "port_number": self.port_number,
+            "port_type": self.port_type,
+            "source_type_port": self.source_type_port_id,
+        }
 
 
 class NetworkSwitchPortAllowedVlan(AuditedModel):
@@ -1592,10 +1605,7 @@ class NetworkDevicePort(AuditedModel):
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
         if self.pk is not None:
             _check_locked_fields_unchanged(
-                NetworkDevicePort,
-                self.pk,
-                {"description": self.description, "vlan": self.vlan_id, "port_type": self.port_type},
-                update_fields=update_fields,
+                NetworkDevicePort, self.pk, self._locked_fields(), update_fields=update_fields
             )
         super().save(
             force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
@@ -1605,10 +1615,7 @@ class NetworkDevicePort(AuditedModel):
         super().clean()
         if self.pk is not None:
             _check_locked_fields_unchanged(
-                NetworkDevicePort,
-                self.pk,
-                {"description": self.description, "vlan": self.vlan_id, "port_type": self.port_type},
-                update_fields=None,
+                NetworkDevicePort, self.pk, self._locked_fields(), update_fields=None
             )
         if self.is_dhcp:
             if self.address:
@@ -1636,6 +1643,23 @@ class NetworkDevicePort(AuditedModel):
                     exclude_switch_address_pk=None,
                     exclude_device_port_pk=self.pk,
                 )
+
+    def _locked_fields(self) -> dict[str, Any]:
+        # ``device``/``port_number``/``ordinal``/``source_type_port``
+        # identify which physical port this row represents (materialized
+        # once from the device's type, ADR 0010) — only
+        # ``is_dhcp``/``address``/``switch_port`` are meant to be editable,
+        # so a plain save() must not be able to silently move, renumber, or
+        # reorder a materialized port.
+        return {
+            "device": self.device_id,
+            "port_number": self.port_number,
+            "description": self.description,
+            "vlan": self.vlan_id,
+            "port_type": self.port_type,
+            "ordinal": self.ordinal,
+            "source_type_port": self.source_type_port_id,
+        }
 
     @property
     def switch(self) -> "NetworkSwitch | None":
