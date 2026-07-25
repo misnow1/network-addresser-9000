@@ -169,7 +169,8 @@ STORAGES = {
 }
 
 
-# Mutation audit trail (ADR 0004), via django-auditlog — see ADR 0008.
+# Mutation audit trail (ADR 0004), via django-auditlog — see ADR 0008 and,
+# for the port-profile models added in phase 8, ADR 0010.
 #
 # Scoped to ADR 0004's three named categories rather than every field on
 # every object: address overrides and rack/slot reassignment get
@@ -180,26 +181,41 @@ STORAGES = {
 # tracking" example. Every model is still registered so removals (ADR 0007)
 # are always logged, regardless of whether its edits are scoped.
 #
+# ``NetworkSwitchTypePort``/``NetworkDeviceTypePort`` (ADR 0010's port
+# profile templates) get full tracking like the type models they belong
+# to — a profile's port layout is exactly the kind of thing later
+# instances depend on, not a trivial field. They're also only ever
+# editable before their parent type has any instance (locked afterward),
+# so there's no ongoing edit-noise to scope away here.
+#
 # ``created_at`` is added to every ``include_fields`` list below for a
 # subtler reason: auditlog computes deletion diffs by comparing the row's
 # real values against ``None`` defaults, so if every included field happens
 # to already be ``None``/blank at delete time — a spare-pool switch/device
 # (unracked: ``rack``/``rack_slot`` both null) or a DHCP device port
-# (``address``/``default_gateway`` both null) — the diff comes back empty
-# and *no* deletion is logged at all, silently violating "removals are
-# always logged." ``created_at`` is never null and never edited after
-# creation, so it always registers a change on create/delete without ever
-# contributing edit-noise on an ordinary update.
+# (``address`` null) — the diff comes back empty and *no* deletion is
+# logged at all, silently violating "removals are always logged."
+# ``created_at`` is never null and never edited after creation, so it
+# always registers a change on create/delete without ever contributing
+# edit-noise on an ordinary update.
 #
-# ``NetworkSwitchPort.allowed_vlans`` is a ManyToManyField, which auditlog
-# never diffs as an ordinary field (Django M2M changes don't even go through
-# the model's own ``save()``) — it has to be named explicitly via
+# ``NetworkDevicePort.default_gateway`` is a read-only property derived
+# live from its VLAN (ADR 0010), not a stored column — it can't be (and
+# isn't) named here; ``is_dhcp`` is tracked instead, since toggling a port
+# between DHCP and static is itself an address-override-adjacent event.
+#
+# ``allowed_vlans`` (on both ``NetworkSwitchTypePort`` and
+# ``NetworkSwitchPort``) is a ManyToManyField, which auditlog never diffs
+# as an ordinary field (Django M2M changes don't even go through the
+# model's own ``save()``) — it has to be named explicitly via
 # ``m2m_fields`` to get change tracking at all.
 AUDITLOG_INCLUDE_TRACKING_MODELS = (
     "inventory.VLAN",
     "inventory.Rack",
     "inventory.NetworkSwitchType",
     "inventory.NetworkDeviceType",
+    "inventory.NetworkDeviceTypePort",
+    {"model": "inventory.NetworkSwitchTypePort", "m2m_fields": ["allowed_vlans"]},
     {"model": "inventory.RackVlanRange", "include_fields": ["address_range", "created_at"]},
     {"model": "inventory.NetworkSwitch", "include_fields": ["rack", "rack_slot", "created_at"]},
     {"model": "inventory.NetworkSwitchAddress", "include_fields": ["address", "created_at"]},
@@ -211,6 +227,6 @@ AUDITLOG_INCLUDE_TRACKING_MODELS = (
     {"model": "inventory.NetworkDevice", "include_fields": ["rack", "rack_slot", "created_at"]},
     {
         "model": "inventory.NetworkDevicePort",
-        "include_fields": ["address", "default_gateway", "created_at"],
+        "include_fields": ["address", "is_dhcp", "created_at"],
     },
 )

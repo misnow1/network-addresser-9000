@@ -24,6 +24,14 @@ _Avoid_: treating "spare rack" as a distinct type from Rack
 Devices/switches not yet assigned to any Rack (`rack` is null). These arrive DHCP-configured from the factory and are tracked by little more than serial number and hostname until they're racked and statically addressed.
 _Avoid_: confusing with "spare rack" — a spare rack is a real Rack (see Rack); the spare pool is equipment with no rack at all
 
+**Type Profile**:
+A Network Switch/Device Type is a *purpose profile* built on a hardware model, not the bare hardware model itself — the same physical hardware can have several profiles when what its ports are used for differs (e.g. a Cisco SG350-10MP wired for a drive rack vs. the same switch wired for an amp rack). Identified by `(Manufacturer, Model, Name)`, where `Name` is a required, non-blank profile label ("Default" for a model with only one profile). See ADR 0010.
+_Avoid_: treating `(Manufacturer, Model)` as a Type's whole identity, or assuming one Type = one hardware model
+
+**Network Switch Type Port / Network Device Type Port**:
+A port definition template owned by a Type Profile — physical port type, and (for switches) VLAN mode/purpose. Copied exactly once ("materialized") into a real Network Switch Port/Network Device Port when an instance of that type is first created; never re-synced afterward. A profile's type ports lock once the profile has any instance — change a profile's port layout by creating a new named profile instead. See ADR 0010.
+_Avoid_: assuming an edit to a Type Port after instances exist affects those instances; assuming an instance's type can be changed instead of recreating it with a different Type
+
 ## Roles
 
 **Viewer**:
