@@ -13,7 +13,7 @@ An end-point piece of equipment (amp, processor, mixer, etc.) with ports that ea
 _Avoid_: treating as a kind of Network Switch
 
 **VLAN**:
-A top-level object combining an 802.1Q VLAN ID with its IPv4 addressing (subnet/CIDR, default gateway, DHCP range). A VLAN and its IPv4 network are the same row — the system has no notion of one without the other.
+A top-level object combining an 802.1Q VLAN ID with its IPv4 addressing (subnet/CIDR, default gateway, DHCP range as a start/end address pair). A VLAN and its IPv4 network are the same row — the system has no notion of one without the other.
 _Avoid_: "IPv4 Network" as an entity distinct from VLAN (it's a set of properties on VLAN, not a separate table)
 
 **Rack**:

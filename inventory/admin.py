@@ -306,7 +306,7 @@ class NetworkDevicePortInline(admin.TabularInline):
 
 @admin.register(VLAN)
 class VLANAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
-    list_display = ["name", "vlan_id", "subnet", "default_gateway", "dhcp_range"]
+    list_display = ["name", "vlan_id", "subnet", "default_gateway", "dhcp_range_start", "dhcp_range_end"]
     search_fields = ["name", "vlan_id", "subnet"]
     ordering = ["vlan_id"]
     show_auditlog_history_link = True

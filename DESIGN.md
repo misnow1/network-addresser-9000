@@ -29,7 +29,7 @@ At the top level are VLANs, each combining an 802.1Q VLAN ID with an IPv4 subnet
   * VLAN ID: 200
   * IPv4 Subnet: 10.200.0.0/21
   * Default Gateway: 10.200.0.1 (suggested; stored and overridable)
-  * DHCP Range: 10.200.0.0/24 (suggested as the bottom `/24` of the `/21`; stored and overridable — see [ADR 0002](./docs/adr/0002-network-sizing-dhcp-convention.md))
+  * DHCP Range: 10.200.0.2 - 10.200.0.199 (a manually-entered start/end address pair, not a CIDR block — must fall within the subnet and exclude the network, gateway, and broadcast addresses; see [ADR 0011](./docs/adr/0011-dhcp-range-as-address-range.md))
 * VLAN 201
   * Name: Dante Primary
   * VLAN ID: 201
@@ -83,7 +83,7 @@ The list of objects that the system will need to track includes, but is not limi
     * VLAN ID
     * Base Address / Prefix
     * Default Gateway
-    * DHCP Range
+    * DHCP Range (start/end address pair)
 * Rack: an abstract grouping of devices with an address range from which device addresses are computed. Has no "purpose" field — a rack of spare equipment is just an ordinary Rack (see `CONTEXT.md`).
     * Slot Count
     * IPv4 Address Range (per VLAN)
@@ -185,7 +185,7 @@ There are other device types, such as video devices, that have not been consider
 By convention:
 * We use RFC1918 addresses in the 10.0.0.0/8 range
 * The VLAN ID is the second octet of the address
-* VLANs default to a `/21`, giving eight `/24`-sized blocks; the bottom `/24` is suggested as the DHCP range and the rest is available for static rack allocation. This is a default suggestion, not an enforced rule — see [ADR 0002](./docs/adr/0002-network-sizing-dhcp-convention.md).
+* VLANs default to a `/21`, giving eight `/24`-sized blocks; there is no longer an automatic DHCP-range suggestion, but static rack allocation is conventionally kept out of the bottom `/24` when a DHCP range is manually entered there. See [ADR 0002](./docs/adr/0002-network-sizing-dhcp-convention.md) for the `/21` sizing convention and [ADR 0011](./docs/adr/0011-dhcp-range-as-address-range.md) for the DHCP range itself: a manually-entered start/end address pair (not a CIDR block), which must fall entirely within the subnet and exclude the network address, the default gateway, and the broadcast address.
 * The default gateway address is suggested as the lowest host address in the VLAN's subnet (`.1`), stored and overridable.
 * The broadcast address is the highest address in the subnet.
 * Rack address ranges are manually assigned per VLAN (system-suggests the next free block of the right size) rather than computed from the rack number — see [ADR 0001](./docs/adr/0001-manual-rack-address-ranges.md).
