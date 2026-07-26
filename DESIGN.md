@@ -81,7 +81,7 @@ The list of objects that the system will need to track includes, but is not limi
 
 * VLAN (see `CONTEXT.md`)
     * VLAN ID
-    * Base Address / Prefix
+    * Base Address / Prefix — optional; a VLAN with no subnet is **L2-only** and cannot have a Default Gateway, DHCP Range, rack address range, or static address (see [ADR 0012](./docs/adr/0012-switch-port-vlan-profiles.md))
     * Default Gateway
     * DHCP Range (start/end address pair)
 * Rack: an abstract grouping of devices with an address range from which device addresses are computed. Has no "purpose" field — a rack of spare equipment is just an ordinary Rack (see `CONTEXT.md`).
@@ -100,14 +100,12 @@ A Type's port list is fixed once any instance (switch/device) exists — editing
     * Port Number
     * Port Description
     * Port Type — a structured choice, not free text: 10/100M RJ45, 1GbE RJ45 (copper), 1GbE SFP, 1GbE Combo (RJ45/SFP), 2.5GbE RJ45, 10GbE RJ45, 10GbE SFP+, 25GbE SFP28, Other/Unknown
-    * Port Mode (Trunk, Access, etc.)
-    * Primary (untagged) VLAN
-    * Allowed VLANs
+    * Switch Port VLAN Profile (see "Switch Port VLAN Profiles" below) — required; defaults to the system "Default" profile if none is selected
 * Network Switch (an instance of a Network Switch Type)
     * ...
     * Serial Number
     * The switch's Type is fixed at creation and cannot be changed afterward. Re-typing a switch (e.g. moving it to a different profile) means removing and recreating it, not editing the Type field.
-* Network Switch Port: automatically populated from the switch's Type and its Type Ports, as a **one-time copy** made when the switch is first created — not kept in sync with later Type edits (which can't happen anyway, since the Type locks once the switch exists). **VLAN assignment is editable** in contrast to device port instances (see below), but the **physical Port Type is locked** — it's a hardware fact copied from the Type, not something that varies per switch. Conflict detection (such as incorrect VLAN assignment if a device is already connected) should be flagged, but this can be deferred to the custom UI.
+* Network Switch Port: automatically populated from the switch's Type and its Type Ports, as a **one-time copy** made when the switch is first created — not kept in sync with later Type edits (which can't happen anyway, since the Type locks once the switch exists). Unlike every other materialized field here, the **Switch Port VLAN Profile is copied as a live reference, not a snapshot** (see below and [ADR 0012](./docs/adr/0012-switch-port-vlan-profiles.md)) — editing a profile's allowed VLANs changes every port using it immediately, including already-materialized ones. **A different profile can be selected** for an instantiated port unless a device is already connected to it, but the **physical Port Type is locked** — it's a hardware fact copied from the Type, not something that varies per switch. Conflict detection (such as incorrect VLAN assignment if a device is already connected) should be flagged, but this can be deferred to the custom UI.
 * Network Device Type (amp, processor, mixer, etc.) — also a purpose profile; see above. e.g. "Martin Audio IK-42 — with Dante Card" vs "— without Dante Card", or "Shure ULXD4Q — Split Mode" vs "— Redundant Mode".
     * Manufacturer
     * Model
@@ -180,6 +178,81 @@ A computer may have an arbitrary number of ports on arbitrary VLANs. This is a c
 
 There are other device types, such as video devices, that have not been considered yet.
 
+## Switch Configuration
+
+This section expands on the switch type, switch, switch port type, and switch port configurations described above.
+
+### VLAN Profiles
+
+TODO: Document VLAN profiles for various purposes (Dante, AES67, NDI, etc). This is mostly outside the scope of the tool but is very useful for writing switch configurations.
+
+### Switch Port VLAN Profiles
+
+Many devices have multiple ports that have the same general purpose but different numbers and descriptions. Rather than configuring each port's VLAN mode by hand, a port points at a reusable **Switch Port VLAN Profile** — a named bundle of Port Mode / Native VLAN / Allowed VLANs / Allow All VLANs. Unlike a Type Port's other materialized fields (a one-time copy, per [ADR 0010](./docs/adr/0010-port-profiles-and-materialization.md)), a Switch Port VLAN Profile is referenced **live**: editing a profile's allowed VLANs changes every port that uses it immediately, including ports on switches that already exist. See [ADR 0012](./docs/adr/0012-switch-port-vlan-profiles.md) for why this is a deliberate departure from the rest of the port-profile/materialization pattern.
+
+For example, consider the following profiles:
+
+* Audio Control
+    * Port Mode: Trunk
+    * Native VLAN: 200
+    * Allowed VLANs: none (VLAN 200 is implied)
+* Dante Primary
+    * Port Mode: Trunk
+    * Native VLAN: 201
+    * Allowed VLANs: none (VLAN 201 is implied)
+* Dante Secondary
+    * Port Mode: Trunk
+    * Native VLAN: 202
+    * Allowed VLANs: none (VLAN 202 is implied)
+* Audio Trunk Port
+    * Port Mode: Trunk
+    * Native VLAN: 201
+    * Allowed VLANs: 200, 202 (VLAN 201 is implied)
+* System Trunk Port
+    * Port Mode: Trunk
+    * Native VLAN: 1 (the system "Default VLAN" — see below)
+    * Allow all VLANs: true
+
+A switch definition might then become:
+
+* Fancy Switch 1
+    * ...
+    * Ports: 2
+        * Port 1
+            * Number: 1
+            * Name: Fancy Name
+            * Profile: Dante Primary
+        * Port 2
+            * Number: 2
+            * Name: Fancy Second Name
+            * Profile: Audio Trunk Port
+
+Once a profile has any real Network Switch Port using it, its **Port Mode and Native VLAN lock** — the same "create a new named profile instead" rule Type Profiles use ([ADR 0010](./docs/adr/0010-port-profiles-and-materialization.md)). **Allowed VLANs and Allow All VLANs stay editable** even then: adding a tagged VLAN to a trunk that's already deployed is the profile's whole reason to exist. A profile referenced only by Type Ports (no real switch yet) is still fully editable. A profile's Name is never locked. The system "Default" profile (see below) locks all three permanently and can never be deleted.
+
+### Switch Port Profile VLAN Selection
+
+There must be a default port profile in the system, permanently defined as:
+* Name: Default
+* Native VLAN: 1
+* Allowed VLANs: (null)
+* All VLANs Allowed: true
+* Port Mode: Trunk
+
+VLAN 1 is represented by a real, system-seeded VLAN named "Default VLAN" with no IPv4 subnet — an **L2-only VLAN**: it can be used as a port's native or allowed VLAN, but it can never have a default gateway, a DHCP range, a rack address range, or a static address, since there is no subnet to validate any of those against. Any VLAN's subnet may be left blank for the same reason, not just VLAN 1's.
+
+A switch port profile is required for every switch type port. If none is selected, then the default (above) is used.
+
+When creating a profile, the default switch port mode should be Trunk.
+
+A switch/device Type Port stores a **profile assignment**, not a copy of the profile's VLAN configuration. When a switch is created, its ports are materialized with the *same profile reference* their Type Ports had at that moment (a one-time copy of the assignment, per ADR 0010's usual pattern) — but from then on, the port's VLAN config is whatever the assigned profile currently says, live, not a frozen snapshot.
+
+Editing a profile's Allowed VLANs or Allow All VLANs is always allowed, even once it's in use. Editing its Port Mode or Native VLAN is blocked once any real Network Switch Port uses it — create a new named profile instead.
+
+The user can select a different profile for an instantiated port unless a device is already connected — disconnect it first, swap profiles, then reconnect.
+
+There is no manual configuration for switch ports at creation or after — all changes to a port's Native VLAN, etc. must be done by selecting a different profile (or, for allowed VLANs, editing the assigned profile directly). This is to prevent potential footguns.
+
+
 ## Address Computation
 
 By convention:
@@ -190,6 +263,7 @@ By convention:
 * The broadcast address is the highest address in the subnet.
 * Rack address ranges are manually assigned per VLAN (system-suggests the next free block of the right size) rather than computed from the rack number — see [ADR 0001](./docs/adr/0001-manual-rack-address-ranges.md).
 * Within a rack's range, a device's static address defaults to the rack's base address plus the device's rack slot number. This default is stored per device, not recomputed on the fly, and overriding it is strongly discouraged but not disallowed — needed to eventually support a device-replacement workflow (swapping a spare into an already-addressed slot), which is not yet designed. See [ADR 0003](./docs/adr/0003-device-addresses-stored-not-immutable.md).
+* A VLAN's subnet may be left blank, making it L2-only: usable as a Switch Port VLAN Profile's Native or Allowed VLAN, or as a Network Device Type Port's VLAN (DHCP only), but never addressed. The system-seeded VLAN 1 ("Default VLAN") is one such VLAN; a site may leave any other VLAN subnet-less the same way. See [ADR 0012](./docs/adr/0012-switch-port-vlan-profiles.md).
 
 ## Constraints and Other Notes
 

@@ -204,26 +204,31 @@ STORAGES = {
 # isn't) named here; ``is_dhcp`` is tracked instead, since toggling a port
 # between DHCP and static is itself an address-override-adjacent event.
 #
-# ``allowed_vlans`` (on both ``NetworkSwitchTypePort`` and
-# ``NetworkSwitchPort``) is a ManyToManyField, which auditlog never diffs
-# as an ordinary field (Django M2M changes don't even go through the
-# model's own ``save()``) — it has to be named explicitly via
-# ``m2m_fields`` to get change tracking at all.
+# ``allowed_vlans`` is a ManyToManyField, which auditlog never diffs as an
+# ordinary field (Django M2M changes don't even go through the model's own
+# ``save()``) — it has to be named explicitly via ``m2m_fields`` to get
+# change tracking at all.
+#
+# ``SwitchPortVlanProfile`` (phase 9, ADR 0012) gets full scalar + M2M
+# tracking: unlike the seed-once ``*TypePort`` templates, a profile is
+# referenced *live* by every port that uses it, so editing one is a
+# fleet-wide config change squarely within ADR 0004's "mutations are
+# logged, not just creation." ``NetworkSwitchTypePort``/``NetworkSwitchPort``
+# no longer carry ``allowed_vlans`` themselves (that lives on the profile
+# now) — the profile FK they do carry is an ordinary scalar field, already
+# covered by their existing tracking below with no extra configuration.
 AUDITLOG_INCLUDE_TRACKING_MODELS = (
     "inventory.VLAN",
     "inventory.Rack",
     "inventory.NetworkSwitchType",
     "inventory.NetworkDeviceType",
     "inventory.NetworkDeviceTypePort",
-    {"model": "inventory.NetworkSwitchTypePort", "m2m_fields": ["allowed_vlans"]},
+    "inventory.NetworkSwitchTypePort",
+    {"model": "inventory.SwitchPortVlanProfile", "m2m_fields": ["allowed_vlans"]},
     {"model": "inventory.RackVlanRange", "include_fields": ["address_range", "created_at"]},
     {"model": "inventory.NetworkSwitch", "include_fields": ["rack", "rack_slot", "created_at"]},
     {"model": "inventory.NetworkSwitchAddress", "include_fields": ["address", "created_at"]},
-    {
-        "model": "inventory.NetworkSwitchPort",
-        "exclude_fields": ["description"],
-        "m2m_fields": ["allowed_vlans"],
-    },
+    {"model": "inventory.NetworkSwitchPort", "exclude_fields": ["description"]},
     {"model": "inventory.NetworkDevice", "include_fields": ["rack", "rack_slot", "created_at"]},
     {
         "model": "inventory.NetworkDevicePort",

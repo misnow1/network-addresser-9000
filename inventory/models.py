@@ -17,6 +17,13 @@ type is first created (``_materialize_ports``) — never re-synced
 afterward. A type is immutable once it has any instance, and a profile's
 type ports are locked once the profile has any instance, so "this profile"
 always means one fixed port layout.
+
+``SwitchPortVlanProfile`` (ADR 0012) is a *different* kind of profile, named
+the same way by DESIGN.md but referenced *live* rather than seed-once:
+``NetworkSwitchTypePort``/``NetworkSwitchPort`` store a profile id, not a
+copy of its VLAN config, so editing a profile's allowed VLANs reaches every
+port using it immediately — the one deliberate exception to this module's
+otherwise seed-once/never-re-synced rule.
 """
 
 import ipaddress
@@ -126,12 +133,14 @@ def _check_locked_fields_unchanged(
     below.
 
     Known gap (documented, not closed), same root cause:
-    ``NetworkSwitchTypePort.allowed_vlans`` isn't itself a locked field
-    checked here, but a locked type port's allowed VLANs can still be
-    changed via ``.add()``/``.remove()``/``.set()``/``.clear()`` on the
-    M2M manager — those write ``NetworkSwitchTypePortAllowedVlan`` (the
-    through table) directly and never call ``NetworkSwitchTypePort.save()``
-    or its ``_profile_locked()`` check. Unsupported for now; see ADR 0010.
+    ``SwitchPortVlanProfile.allowed_vlans`` isn't itself a field this helper
+    checks (M2M managers don't go through ``Model.save()`` at all — see ADR
+    0012), so its own locking/validation lives elsewhere: an ``m2m_changed``
+    receiver for ``.add()``/``.set()``/``.clear()``, and
+    ``SwitchPortVlanProfileAllowedVlan.save()``/``.clean()`` for direct
+    through-row writes. A raw ``bulk_create()`` against that through table
+    still bypasses both and is unsupported, consistent with the
+    ``QuerySet.update()``/``bulk_create()`` gap above.
     """
     if update_fields is not None:
         attname_to_name = {
@@ -241,10 +250,16 @@ def _address_containment_error(
     check for re-validating an *already-saved* address after its equipment
     moves, not just for a fresh/edited address row.
     """
+    if not vlan.subnet:
+        # L2-only VLAN (ADR 0012) — a legitimate, addressing-less state, not
+        # an error to defer to VLAN's own clean() the way a malformed
+        # subnet below is; this must reject outright or a static address
+        # would silently pass with nothing to validate it against.
+        return f"{vlan} has no subnet (L2-only) — it cannot be assigned a static address."
     try:
         validate_ipv4_cidr(vlan.subnet)
     except ValidationError:
-        return None  # VLAN's own subnet is invalid; its own clean() will report that
+        return None  # VLAN's own subnet is malformed; its own clean() will report that
     try:
         address_obj = ipaddress.IPv4Address(address)
     except ValueError:
@@ -366,8 +381,13 @@ class VLAN(AuditedModel):
     )
     subnet = models.CharField(
         max_length=18,
+        blank=True,
         validators=[validate_ipv4_cidr],
-        help_text="IPv4 subnet in CIDR notation, e.g. 10.200.0.0/21.",
+        help_text=(
+            "IPv4 subnet in CIDR notation, e.g. 10.200.0.0/21. Leave blank for an L2-only VLAN "
+            "with no tracked addressing (ADR 0012) — no gateway, DHCP range, rack range, or "
+            "static address may then be set on it."
+        ),
     )
     default_gateway = models.GenericIPAddressField(
         protocol="IPv4",
@@ -400,6 +420,20 @@ class VLAN(AuditedModel):
                 ),
                 name="vlan_dhcp_range_start_end_together",
             ),
+            # Backs the "subnet-less VLAN is L2-only" rule (ADR 0012) at the
+            # DB level, not just in clean() — a subnet-less VLAN has nothing
+            # for a gateway or DHCP range to be validated against.
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(subnet="")
+                    | (
+                        models.Q(default_gateway__isnull=True)
+                        & models.Q(dhcp_range_start__isnull=True)
+                        & models.Q(dhcp_range_end__isnull=True)
+                    )
+                ),
+                name="vlan_subnetless_has_no_addressing",
+            ),
         ]
         ordering = ["vlan_id"]
 
@@ -409,6 +443,23 @@ class VLAN(AuditedModel):
     def clean(self) -> None:
         super().clean()
         if not self.subnet:
+            # L2-only VLAN (ADR 0012) — no addressing is tracked at all, so
+            # nothing below is meaningful; back this with the DB constraint
+            # above, not just this check, since QuerySet.update()/
+            # bulk_create() bypass clean() entirely.
+            if self.default_gateway or self.dhcp_range_start or self.dhcp_range_end:
+                raise ValidationError(
+                    "A VLAN with no subnet is L2-only (ADR 0012) and cannot have a default "
+                    "gateway or DHCP range."
+                )
+            # *Blanking* a subnet is a subnet change like any other, so it has
+            # to re-validate existing dependents the same way the non-blank
+            # path below does — otherwise an already-addressed VLAN could be
+            # turned L2-only, stranding rack ranges and static addresses on a
+            # VLAN that every other check says may not have them (and that
+            # they could then never be re-saved against).
+            if self.pk is not None:
+                self._reject_blanking_subnet_with_dependents()
             return
         try:
             validate_ipv4_cidr(self.subnet)
@@ -578,6 +629,51 @@ class VLAN(AuditedModel):
                         "update or remove it first."
                     )
 
+    def _reject_blanking_subnet_with_dependents(self) -> None:
+        """Block clearing ``subnet`` on a VLAN that still has addressing.
+
+        An L2-only VLAN may not have a ``RackVlanRange``, a switch address,
+        or a static device port (ADR 0012), and every *creation* path already
+        rejects those. Without this, the one way into that forbidden state is
+        to address a VLAN normally and then blank its subnet afterward —
+        stranding rows that could never be re-saved, and that would hard-fail
+        the next time their equipment moved rack.
+        """
+        rack_range = self.rack_ranges.select_related("rack").first()
+        if rack_range is not None:
+            raise ValidationError(
+                {
+                    "subnet": (
+                        f"cannot be cleared: {rack_range.rack} still has an address range "
+                        f"({rack_range.address_range}) on this VLAN. Remove it first — a VLAN "
+                        "with no subnet is L2-only and cannot carry addressing (ADR 0012)."
+                    )
+                }
+            )
+        switch_address = self.switch_addresses.select_related("switch").first()
+        if switch_address is not None:
+            raise ValidationError(
+                {
+                    "subnet": (
+                        f"cannot be cleared: {switch_address.switch} still has a static address "
+                        f"({switch_address.address}) on this VLAN. Remove it first — a VLAN with "
+                        "no subnet is L2-only and cannot carry addressing (ADR 0012)."
+                    )
+                }
+            )
+        device_port = self.device_ports.filter(address__isnull=False).select_related("device").first()
+        if device_port is not None:
+            raise ValidationError(
+                {
+                    "subnet": (
+                        f"cannot be cleared: {device_port.device} still has a static address "
+                        f"({device_port.address}) on this VLAN. Remove it or set the port to DHCP "
+                        "first — a VLAN with no subnet is L2-only and cannot carry addressing "
+                        "(ADR 0012)."
+                    )
+                }
+            )
+
 
 class Rack(AuditedModel):
     """A physical container with a fixed slot count.
@@ -653,6 +749,15 @@ class RackVlanRange(AuditedModel):
         super().clean()
         rack = _get_related(self, "rack")
         vlan = _get_related(self, "vlan")
+        if vlan is not None and not vlan.subnet:
+            raise ValidationError(
+                {
+                    "vlan": (
+                        f"{vlan} has no subnet (L2-only, ADR 0012) — a rack range needs a VLAN "
+                        "with tracked addressing."
+                    )
+                }
+            )
         if self.pk is None and not self.address_range and rack is not None and vlan is not None:
             used_ranges = []
             for value in vlan.rack_ranges.exclude(pk=self.pk).values_list("address_range", flat=True):
@@ -828,6 +933,400 @@ class RackSlotAssignmentMixin:
         raise NotImplementedError
 
 
+def _lock_profile_rows(*pks: int | None) -> None:
+    """Acquire a row lock (``SELECT ... FOR UPDATE``) on the given
+    ``SwitchPortVlanProfile`` rows — must run inside ``transaction.atomic()``.
+
+    Mirrors ``_lock_type_rows()`` (same race, different table): without this,
+    a profile edit/deletion reading "is this profile in use?" and a
+    concurrent change to what references it (a new switch port, a profile
+    swap on an existing port, or a switch's first materialization) can each
+    independently observe a stale "not in use yet" state and both proceed.
+    Kept as a separate helper rather than overloading ``_lock_type_rows()``
+    since profiles aren't Types and the callers read more clearly named for
+    what they're actually locking.
+    """
+    ids = sorted({pk for pk in pks if pk is not None})
+    if ids:
+        list(SwitchPortVlanProfile._default_manager.select_for_update().filter(pk__in=ids))
+
+
+#: Locked once any real ``NetworkSwitchPort`` references the profile (not
+#: merely a ``NetworkSwitchTypePort`` — see ``SwitchPortVlanProfile``).
+_PROFILE_IN_USE_LOCKED_FIELDS: frozenset[str] = frozenset({"port_mode", "native_vlan"})
+
+#: Locked permanently on the system default profile — a superset of the
+#: in-use set because the default's ``all_vlans_allowed`` is also part of
+#: its documented, fixed fallback behavior (DESIGN.md's "Switch Port
+#: Profile VLAN Selection").
+_PROFILE_SYSTEM_LOCKED_FIELDS: frozenset[str] = frozenset({"port_mode", "native_vlan", "all_vlans_allowed"})
+
+
+class SwitchPortVlanProfileQuerySet(models.QuerySet):
+    """Blocks bulk ``QuerySet.delete()`` on a profile that's the system
+    default or still in use — mirrors ``NetworkSwitchTypePortQuerySet``
+    (a per-instance ``delete()`` override alone doesn't stop Django's bulk
+    SQL DELETE from bypassing it).
+    """
+
+    def delete(self):
+        with transaction.atomic():
+            ids = list(self.values_list("pk", flat=True))
+            _lock_profile_rows(*ids)
+            blocked = SwitchPortVlanProfile._default_manager.filter(pk__in=ids).filter(
+                models.Q(is_system=True) | models.Q(type_ports__isnull=False) | models.Q(ports__isnull=False)
+            )
+            if blocked.exists():
+                raise ValidationError(
+                    "One or more selected profiles is the system default profile, or still in "
+                    "use by a switch type port or switch port; remove those references first."
+                )
+            return super().delete()
+
+
+class SwitchPortVlanProfile(AuditedModel):
+    """A reusable, named bundle of switch port L2 config (DESIGN.md's
+    "Switch Port VLAN Profiles" / "Switch Port Profile VLAN Selection").
+
+    Referenced *live* by ``NetworkSwitchTypePort``/``NetworkSwitchPort`` —
+    unlike the seed-once materialization pattern the rest of ADR 0010 uses,
+    a port stores this profile's id, not a copy of its fields, so editing a
+    profile's VLANs reaches every port that uses it immediately. This is a
+    deliberate departure from ADR 0010's "materialize once, never re-sync"
+    rule, made because the entire point of a named profile ("Audio Trunk",
+    "Dante Primary") is to redefine what it means fleet-wide in one place —
+    see ADR 0012.
+
+    ``port_mode``/``native_vlan`` lock once any real ``NetworkSwitchPort``
+    references this profile — not merely a ``NetworkSwitchTypePort``, since a
+    profile still being wired into type definitions has no real port
+    depending on its exact VLAN yet, mirroring ADR 0010's "locks once it has
+    any instance". ``allowed_vlans``/``all_vlans_allowed`` stay editable even
+    then: adding a tagged VLAN to a trunk that's already in use is this
+    profile's whole reason to exist. ``name`` is never locked (cosmetic).
+
+    The system default profile (``is_system=True``, seeded by migration —
+    see ``default_switch_port_vlan_profile()``) locks all three scalar
+    fields permanently, including ``all_vlans_allowed``, since it's the
+    documented fallback every unselected type port lands on. ``is_system``
+    itself is immutable after creation — enforced the same way every other
+    locked field in this module is (``_check_locked_fields_unchanged``) — so
+    it can't be flipped off as a way to unlock or delete this row.
+
+    The three ``allowed_vlans`` invariants (native VLAN not also listed as
+    an allowed VLAN; no allowed VLANs while ``all_vlans_allowed`` is set; no
+    allowed VLANs in Access mode) can't be enforced from this model's own
+    ``clean()``: a new profile has no pk yet (so its M2M manager can't be
+    queried), and for an edited profile ``ModelForm.save_m2m()`` runs
+    *after* ``save()``, so ``clean()`` would only ever see the previous
+    links. They're enforced instead, each against the actual state that
+    path can see: the admin form's ``clean()`` (submitted complete state);
+    an ``m2m_changed`` receiver on ``allowed_vlans`` (``.add()``/``.set()``);
+    ``SwitchPortVlanProfileAllowedVlan``'s own ``clean()``/``save()`` (direct
+    through-row creation, which never fires ``m2m_changed``); and this
+    model's own ``save()``, which re-checks a scalar change against
+    already-*persisted* links (see ``_validate_scalars_against_persisted_links``).
+    """
+
+    name = models.CharField(max_length=100, unique=True)
+    port_mode = models.CharField(
+        max_length=10,
+        choices=PortMode.choices,
+        default=PortMode.TRUNK,
+        help_text="Defaults to Trunk (DESIGN.md).",
+    )
+    native_vlan = models.ForeignKey(
+        VLAN,
+        on_delete=models.PROTECT,
+        related_name="+",
+        help_text="Primary (untagged) VLAN — implicitly allowed, must not also appear in allowed_vlans.",
+    )
+    all_vlans_allowed = models.BooleanField(
+        default=False,
+        help_text="If set, every VLAN is allowed on this port and allowed_vlans must be empty.",
+    )
+    allowed_vlans: models.ManyToManyField = models.ManyToManyField(
+        VLAN,
+        through="SwitchPortVlanProfileAllowedVlan",
+        related_name="+",
+        blank=True,
+        help_text="Additional tagged VLANs, beyond the implied native VLAN. Must be empty if "
+        "all_vlans_allowed is set or port_mode is Access.",
+    )
+    is_system = models.BooleanField(
+        default=False,
+        editable=False,
+        help_text="System default profile (seeded by migration) — permanently locked, never deletable.",
+    )
+
+    objects = SwitchPortVlanProfileQuerySet.as_manager()
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(condition=~models.Q(name=""), name="switchportvlanprofile_name_not_blank"),
+        ]
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        # Never evaluates a queryset — this renders in admin selectors, list
+        # columns, and every ValidationError message that names a profile.
+        return self.name
+
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        with transaction.atomic():
+            if self.pk is not None:
+                _lock_profile_rows(self.pk)
+                # is_system is immutable after creation, full stop — checked
+                # before deciding which *other* fields are locked, since that
+                # decision itself depends on whether this is the system row.
+                _check_locked_fields_unchanged(
+                    SwitchPortVlanProfile,
+                    self.pk,
+                    {"is_system": self.is_system},
+                    update_fields=update_fields,
+                )
+                self._check_scalar_fields_locked(update_fields=update_fields)
+                self._validate_scalars_against_persisted_links()
+            super().save(
+                force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
+            )
+
+    def clean(self) -> None:
+        super().clean()
+        if self.pk is not None:
+            _check_locked_fields_unchanged(
+                SwitchPortVlanProfile, self.pk, {"is_system": self.is_system}, update_fields=None
+            )
+            self._check_scalar_fields_locked(update_fields=None)
+            self._validate_scalars_against_persisted_links()
+
+    def delete(self, using=None, keep_parents=False) -> tuple[int, dict[str, int]]:
+        with transaction.atomic():
+            _lock_profile_rows(self.pk)
+            if self._in_use_or_system():
+                raise ValidationError(
+                    f"{self} cannot be deleted: it is the system default profile, or is still in "
+                    "use by a switch type port or switch port."
+                )
+            return super().delete(using=using, keep_parents=keep_parents)
+
+    @property
+    def allows_all_vlans(self) -> bool:
+        return self.all_vlans_allowed
+
+    @property
+    def effective_allowed_vlans(self) -> "set[VLAN]":
+        """Native VLAN plus explicitly allowed VLANs. "All VLANs allowed"
+        logically includes the native VLAN too. Meaningful only when
+        ``allows_all_vlans`` is ``False`` — returns the same set either way
+        so a caller that ignores the flag still gets something sane rather
+        than an empty or misleading result.
+        """
+        vlans = set(self.allowed_vlans.all())
+        native_vlan = _get_related(self, "native_vlan")
+        if native_vlan is not None:
+            vlans.add(native_vlan)
+        return vlans
+
+    def _in_use(self) -> bool:
+        return self.pk is not None and self.ports.exists()
+
+    def _in_use_or_system(self) -> bool:
+        return self.is_system or self._in_use()
+
+    def _check_scalar_fields_locked(self, *, update_fields: "list[str] | frozenset[str] | None") -> None:
+        if self.is_system:
+            locked_fields = _PROFILE_SYSTEM_LOCKED_FIELDS
+        elif self._in_use():
+            locked_fields = _PROFILE_IN_USE_LOCKED_FIELDS
+        else:
+            return
+        _check_locked_fields_unchanged(
+            SwitchPortVlanProfile,
+            self.pk,
+            {
+                field: (self.native_vlan_id if field == "native_vlan" else getattr(self, field))
+                for field in locked_fields
+            },
+            update_fields=update_fields,
+        )
+
+    def _validate_scalars_against_persisted_links(self) -> None:
+        """Guards the one ``allowed_vlans`` invariant a plain scalar edit can
+        violate on its own: flipping ``all_vlans_allowed``/``port_mode`` to a
+        state that's incompatible with *already-persisted* allowed-VLAN
+        links, or repointing ``native_vlan`` onto a VLAN that's already an
+        explicit allowed link.
+
+        Pending (not-yet-saved) M2M changes from the same admin submission
+        aren't visible here — ``ModelForm.save_m2m()`` only runs after
+        ``save()`` — those are validated separately by the ``m2m_changed``
+        receiver and the through model's own ``clean()``/``save()``; see the
+        class docstring.
+        """
+        if (self.all_vlans_allowed or self.port_mode == PortMode.ACCESS) and self.allowed_vlans.exists():
+            raise ValidationError(
+                "This profile's existing allowed VLANs must be removed first before setting "
+                "all_vlans_allowed or switching port_mode to Access."
+            )
+        if self.allowed_vlans.filter(pk=self.native_vlan_id).exists():
+            raise ValidationError(
+                {
+                    "native_vlan": (
+                        f"{self.native_vlan} is already an explicit allowed VLAN on this profile — "
+                        "the native VLAN is implicitly allowed and must not also be listed."
+                    )
+                }
+            )
+
+
+class SwitchPortVlanProfileAllowedVlan(AuditedModel):
+    """Explicit through model for ``SwitchPortVlanProfile.allowed_vlans``.
+
+    A plain M2M's auto-generated join table has no ``on_delete`` to set, so
+    it can't protect a VLAN from removal (ADR 0007) — this explicit model
+    gives the ``vlan`` side a real ``PROTECT`` FK, which Django's deletion
+    collector honors for both ``Model.delete()`` and bulk
+    ``QuerySet.delete()``/admin bulk-delete alike (the same pattern ADR
+    0010 used for the switch/device type-port ``allowed_vlans`` this
+    profile's own field replaces).
+
+    Direct creation of a row here bypasses ``.add()``/``.set()`` entirely,
+    so it never fires ``m2m_changed`` — this re-validates the same three
+    invariants the signal receiver checks (see ``SwitchPortVlanProfile``),
+    against its own profile's *current* scalar state. ``bulk_create()``
+    remains a documented, unsupported bypass, consistent with this module's
+    existing locked-field policy.
+    """
+
+    profile = models.ForeignKey(
+        SwitchPortVlanProfile, on_delete=models.CASCADE, related_name="allowed_vlan_links"
+    )
+    vlan = models.ForeignKey(VLAN, on_delete=models.PROTECT, related_name="+")
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["profile", "vlan"], name="unique_profile_allowed_vlan"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.profile} allows {self.vlan}"
+
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        self._validate_against_profile()
+        super().save(
+            force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
+        )
+
+    def clean(self) -> None:
+        super().clean()
+        self._validate_against_profile()
+
+    def _validate_against_profile(self) -> None:
+        profile = _get_related(self, "profile")
+        if profile is None:
+            return
+        if profile.all_vlans_allowed or profile.port_mode == PortMode.ACCESS:
+            raise ValidationError(
+                f"{profile} does not accept explicit allowed VLANs while all_vlans_allowed is "
+                "set or its port_mode is Access."
+            )
+        if profile.native_vlan_id == self.vlan_id:
+            raise ValidationError(
+                {"vlan": f"{self.vlan} is already {profile}'s native VLAN — it's implicitly allowed."}
+            )
+
+
+def _validate_profile_allowed_vlans_change(
+    sender: type[models.Model],
+    instance: "SwitchPortVlanProfile",
+    action: str,
+    pk_set: "set[int] | None",
+    reverse: bool,
+    **kwargs: Any,
+) -> None:
+    """The one signal receiver in this module (see ``SwitchPortVlanProfile``
+    docstring for why): ``Model.clean()`` can't validate ``allowed_vlans`` —
+    no pk yet on create, and stale on edit since ``ModelForm.save_m2m()``
+    runs after ``save()`` — and the through model's own ``clean()``/``save()``
+    only catches *direct* row creation, since ``.add()``/``.set()`` write the
+    through table without ever calling its ``save()``. ``m2m_changed`` is the
+    only hook Django offers for those calls.
+
+    ``related_name="+"`` on ``allowed_vlans`` means there is no reverse
+    accessor, so ``reverse=True`` can never actually fire here — the guard is
+    defensive, not load-bearing.
+
+    Locks the profile row and then **re-reads its scalars from the database**
+    before validating (Django's ``.add()``/``.set()`` already run inside their
+    own ``transaction.atomic()``, so this signal fires from within one).
+    Validating ``instance``'s in-memory values instead would leave the very
+    race this lock exists to close wide open: the caller's copy can predate a
+    concurrent, already-committed change to ``native_vlan``/``port_mode``/
+    ``all_vlans_allowed``, so the lock would serialize the section while the
+    check still read stale data. Taking a lock and then trusting a cached
+    object is lock-shaped, not lock-safe.
+    """
+    if reverse or action != "pre_add":
+        return
+    with transaction.atomic():
+        _lock_profile_rows(instance.pk)
+        current = (
+            SwitchPortVlanProfile._default_manager.filter(pk=instance.pk)
+            .values("all_vlans_allowed", "port_mode", "native_vlan")
+            .first()
+        )
+        if current is None:
+            return  # row not visible (e.g. mid-delete elsewhere) — nothing to validate against
+        if current["all_vlans_allowed"] or current["port_mode"] == PortMode.ACCESS:
+            raise ValidationError(
+                f"{instance} does not accept explicit allowed VLANs while all_vlans_allowed is "
+                "set or its port_mode is Access."
+            )
+        if pk_set and current["native_vlan"] in pk_set:
+            raise ValidationError(
+                f"{instance}'s native VLAN can't also be added as an explicit allowed VLAN — "
+                "it's already implicitly allowed."
+            )
+
+
+models.signals.m2m_changed.connect(
+    _validate_profile_allowed_vlans_change, sender=SwitchPortVlanProfile.allowed_vlans.through
+)
+
+
+#: Identity of the seeded system default VLAN/profile rows — shared by
+#: migration ``0006_switch_port_vlan_profiles``' seed step and the
+#: ``seed_defaults`` management command (the latter re-seeds these if
+#: they're ever removed by ``manage.py flush``, which the migration can't
+#: repair after the fact). Plain literals, not model classes, so importing
+#: them into a migration doesn't create the "migrations must use historical
+#: models" coupling that a model-class import would.
+DEFAULT_VLAN_ID = 1
+DEFAULT_VLAN_NAME = "Default VLAN"
+DEFAULT_PROFILE_NAME = "Default"
+
+
+def default_switch_port_vlan_profile() -> int:
+    """Resolve the unique system default ``SwitchPortVlanProfile``'s pk *at
+    call time* — never cache a pk at import time, which would bind to
+    whatever happened to exist (or not) when models were first imported,
+    rather than what's actually in the database when a port is created.
+    """
+    try:
+        return SwitchPortVlanProfile.objects.get(is_system=True).pk
+    except SwitchPortVlanProfile.DoesNotExist as exc:
+        raise ValidationError(
+            "No system default Switch Port VLAN Profile exists — run `manage.py seed_defaults` "
+            "(or apply migrations) first."
+        ) from exc
+    except SwitchPortVlanProfile.MultipleObjectsReturned as exc:
+        raise ValidationError(
+            "Multiple system default Switch Port VLAN Profiles exist — exactly one row may have "
+            "is_system=True."
+        ) from exc
+
+
 class NetworkSwitchType(AuditedModel):
     """A switch make/model *profile* (ADR 0010).
 
@@ -930,26 +1429,23 @@ class NetworkSwitchTypePort(AuditedModel):
     0010 — change a profile's port layout by creating a new named profile
     instead.
 
-    Known gap (documented, not closed): ``allowed_vlans.add()``/
-    ``.remove()``/``.set()``/``.clear()`` bypass this lock — see the
-    "Known gap" note on ``_check_locked_fields_unchanged`` and ADR 0010.
+    ``profile`` (a ``SwitchPortVlanProfile``) is a *live* reference, not a
+    seed-once copy like everything else on this model — see
+    ``SwitchPortVlanProfile`` and ADR 0012. Which profile a type port points
+    at still locks the same way as any other field here once the type has
+    instances; it's the profile's own contents that can keep changing.
     """
 
     switch_type = models.ForeignKey(NetworkSwitchType, on_delete=models.CASCADE, related_name="type_ports")
     port_number = models.PositiveIntegerField(validators=[MinValueValidator(1)])
     description = models.CharField(max_length=255, blank=True)
     port_type = models.CharField(max_length=20, choices=PortType.choices)
-    port_mode = models.CharField(max_length=10, choices=PortMode.choices, default=PortMode.ACCESS)
-    native_vlan = models.ForeignKey(
-        VLAN,
+    profile = models.ForeignKey(
+        SwitchPortVlanProfile,
         on_delete=models.PROTECT,
-        null=True,
-        blank=True,
-        related_name="+",
-        help_text="Primary (untagged) VLAN for this port.",
-    )
-    allowed_vlans: models.ManyToManyField = models.ManyToManyField(
-        VLAN, through="NetworkSwitchTypePortAllowedVlan", related_name="+", blank=True
+        related_name="type_ports",
+        default=default_switch_port_vlan_profile,
+        help_text="Switch Port VLAN Profile — defaults to the system Default profile if none is selected.",
     )
 
     objects = NetworkSwitchTypePortQuerySet.as_manager()
@@ -1050,32 +1546,6 @@ class NetworkSwitchTypePort(AuditedModel):
         ).exists()
 
 
-class NetworkSwitchTypePortAllowedVlan(AuditedModel):
-    """Explicit through model for ``NetworkSwitchTypePort.allowed_vlans``.
-
-    A plain M2M's auto-generated join table has no ``on_delete`` to set, so
-    it can't protect a VLAN from removal (ADR 0007) — this explicit model
-    gives the ``vlan`` side a real ``PROTECT`` FK, which Django's deletion
-    collector honors for both ``Model.delete()`` and bulk
-    ``QuerySet.delete()``/admin bulk-delete alike.
-    """
-
-    type_port = models.ForeignKey(
-        NetworkSwitchTypePort, on_delete=models.CASCADE, related_name="allowed_vlan_links"
-    )
-    vlan = models.ForeignKey(VLAN, on_delete=models.PROTECT, related_name="+")
-
-    class Meta:
-        constraints = [
-            models.UniqueConstraint(
-                fields=["type_port", "vlan"], name="unique_switch_type_port_allowed_vlan"
-            ),
-        ]
-
-    def __str__(self) -> str:
-        return f"{self.type_port} allows {self.vlan}"
-
-
 class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
     """A physical switch instance. Unracked (rack is null) = spare pool.
 
@@ -1158,19 +1628,19 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
         """
         _validate_switch_type_port_profile(self.switch_type)
         for type_port in self.switch_type.type_ports.all():
-            port = NetworkSwitchPort.objects.create(
+            NetworkSwitchPort.objects.create(
                 switch=self,
                 port_number=type_port.port_number,
                 description=type_port.description,
                 port_type=type_port.port_type,
-                port_mode=type_port.port_mode,
-                native_vlan=type_port.native_vlan,
+                # ``profile_id``, not ``profile``: the profile object itself is
+                # never used here, and touching the descriptor would fetch the
+                # row once per type port (a 48-port switch paid 48 extra
+                # SELECTs for a value it already had as a raw id).
+                profile_id=type_port.profile_id,
                 source_type_port=type_port,
                 created_by=self.created_by,
             )
-            vlan_ids = list(type_port.allowed_vlans.values_list("pk", flat=True))
-            if vlan_ids:
-                port.allowed_vlans.set(vlan_ids)
 
     def _check_rack_slot_not_occupied(self) -> None:
         if NetworkDevice.objects.filter(rack=self.rack, rack_slot=self.rack_slot).exists():
@@ -1257,15 +1727,35 @@ class NetworkSwitchAddress(AuditedModel):
             )
 
 
+def _lock_switch_port_rows(*pks: int | None) -> None:
+    """Acquire a row lock on the given ``NetworkSwitchPort`` rows — must run
+    inside ``transaction.atomic()``.
+
+    Closes the race between changing this port's ``profile`` and
+    connecting/reassigning a ``NetworkDevicePort.switch_port`` to it: both
+    sides take this lock before checking whether the other condition
+    (device connected / profile being changed) holds, so they can't each
+    observe a stale, still-consistent state and both proceed.
+    """
+    ids = sorted({pk for pk in pks if pk is not None})
+    if ids:
+        list(NetworkSwitchPort._default_manager.select_for_update().filter(pk__in=ids))
+
+
 class NetworkSwitchPort(AuditedModel):
     """A single physical port on a switch — L2 config only, no address.
 
     Materialized exactly once from the switch's ``switch_type`` when the
     switch is first created (``NetworkSwitch._materialize_ports``).
     ``port_type`` is a locked hardware fact copied from the type port;
-    everything else here (VLAN purpose, description, mode) is editable per
-    switch — in contrast to ``NetworkDevicePort``, where purpose/VLAN are
-    locked too (ADR 0010).
+    ``description`` stays editable per switch, same as before.
+
+    ``profile`` (a ``SwitchPortVlanProfile``) replaces the old
+    ``port_mode``/``native_vlan``/``allowed_vlans`` fields — see
+    ``SwitchPortVlanProfile`` and ADR 0012. Unlike ``description``, it can't
+    be swapped freely: DESIGN.md allows selecting a different profile "unless
+    a device is already connected" (``connected_device_port``), enforced in
+    ``clean()``/``save()`` below.
     """
 
     switch = models.ForeignKey(NetworkSwitch, on_delete=models.CASCADE, related_name="ports")
@@ -1277,17 +1767,12 @@ class NetworkSwitchPort(AuditedModel):
         blank=True,
         help_text="Physical hardware fact, copied from the switch's type — locked after creation.",
     )
-    port_mode = models.CharField(max_length=10, choices=PortMode.choices, default=PortMode.ACCESS)
-    native_vlan = models.ForeignKey(
-        VLAN,
+    profile = models.ForeignKey(
+        SwitchPortVlanProfile,
         on_delete=models.PROTECT,
-        null=True,
-        blank=True,
-        related_name="+",
-        help_text="Primary (untagged) VLAN for this port.",
-    )
-    allowed_vlans: models.ManyToManyField = models.ManyToManyField(
-        VLAN, through="NetworkSwitchPortAllowedVlan", related_name="+", blank=True
+        related_name="ports",
+        default=default_switch_port_vlan_profile,
+        help_text="Switch Port VLAN Profile. Can be swapped for another unless a device is connected.",
     )
     source_type_port = models.ForeignKey(
         NetworkSwitchTypePort,
@@ -1313,13 +1798,32 @@ class NetworkSwitchPort(AuditedModel):
         return f"{self.switch} port {self.port_number}"
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
-        if self.pk is not None:
-            _check_locked_fields_unchanged(
-                NetworkSwitchPort, self.pk, self._locked_fields(), update_fields=update_fields
+        with transaction.atomic():
+            is_new = self.pk is None or self._state.adding
+            if is_new:
+                # Materialization (and any other insert) flips the target
+                # profile's in-use state — lock it before it's read anywhere
+                # else concurrently (see ``SwitchPortVlanProfile``).
+                _lock_profile_rows(self.profile_id)
+            else:
+                _lock_switch_port_rows(self.pk)
+                persisted_profile_id = self._persisted_profile_id()
+                _lock_profile_rows(self.profile_id, persisted_profile_id)
+                if persisted_profile_id != self.profile_id and self._has_connected_device_port():
+                    raise ValidationError(
+                        {
+                            "profile": (
+                                "profile cannot be changed while a device port is connected to "
+                                "this switch port; disconnect it first."
+                            )
+                        }
+                    )
+                _check_locked_fields_unchanged(
+                    NetworkSwitchPort, self.pk, self._locked_fields(), update_fields=update_fields
+                )
+            super().save(
+                force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
             )
-        super().save(
-            force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
-        )
 
     def clean(self) -> None:
         super().clean()
@@ -1327,13 +1831,23 @@ class NetworkSwitchPort(AuditedModel):
             _check_locked_fields_unchanged(
                 NetworkSwitchPort, self.pk, self._locked_fields(), update_fields=None
             )
+            persisted_profile_id = self._persisted_profile_id()
+            if persisted_profile_id != self.profile_id and self._has_connected_device_port():
+                raise ValidationError(
+                    {
+                        "profile": (
+                            "profile cannot be changed while a device port is connected to this "
+                            "switch port; disconnect it first."
+                        )
+                    }
+                )
 
     def _locked_fields(self) -> dict[str, Any]:
         # ``switch``/``port_number``/``source_type_port`` identify which
         # physical port this row represents (materialized once from the
-        # switch's type, ADR 0010) — only VLAN purpose/description/mode
-        # are meant to be editable per switch, so a plain save() must not
-        # be able to silently move or renumber a materialized port.
+        # switch's type, ADR 0010) — only ``description``/``profile`` are
+        # meant to be editable per switch, so a plain save() must not be
+        # able to silently move or renumber a materialized port.
         return {
             "switch": self.switch_id,
             "port_number": self.port_number,
@@ -1341,23 +1855,15 @@ class NetworkSwitchPort(AuditedModel):
             "source_type_port": self.source_type_port_id,
         }
 
+    def _persisted_profile_id(self) -> int | None:
+        if self.pk is None:
+            return None
+        return (
+            NetworkSwitchPort._default_manager.filter(pk=self.pk).values_list("profile_id", flat=True).first()
+        )
 
-class NetworkSwitchPortAllowedVlan(AuditedModel):
-    """Explicit through model for ``NetworkSwitchPort.allowed_vlans`` — see
-    ``NetworkSwitchTypePortAllowedVlan`` for why a plain M2M can't protect
-    a VLAN from removal.
-    """
-
-    port = models.ForeignKey(NetworkSwitchPort, on_delete=models.CASCADE, related_name="allowed_vlan_links")
-    vlan = models.ForeignKey(VLAN, on_delete=models.PROTECT, related_name="+")
-
-    class Meta:
-        constraints = [
-            models.UniqueConstraint(fields=["port", "vlan"], name="unique_switch_port_allowed_vlan"),
-        ]
-
-    def __str__(self) -> str:
-        return f"{self.port} allows {self.vlan}"
+    def _has_connected_device_port(self) -> bool:
+        return NetworkDevicePort.objects.filter(switch_port_id=self.pk).exists()
 
 
 class NetworkDeviceType(AuditedModel):
@@ -1762,13 +2268,20 @@ class NetworkDevicePort(AuditedModel):
         return f"{self.device} — {self.description}"
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
-        if self.pk is not None:
-            _check_locked_fields_unchanged(
-                NetworkDevicePort, self.pk, self._locked_fields(), update_fields=update_fields
+        with transaction.atomic():
+            if self.pk is not None:
+                _check_locked_fields_unchanged(
+                    NetworkDevicePort, self.pk, self._locked_fields(), update_fields=update_fields
+                )
+            # Lock both the old and new NetworkSwitchPort (connecting,
+            # disconnecting, or reassigning switch_port) — the other half of
+            # the race NetworkSwitchPort.save() guards against when its
+            # profile changes; see _lock_switch_port_rows().
+            persisted_switch_port_id = self._persisted_switch_port_id()
+            _lock_switch_port_rows(self.switch_port_id, persisted_switch_port_id)
+            super().save(
+                force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
             )
-        super().save(
-            force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
-        )
 
     def clean(self) -> None:
         super().clean()
@@ -1819,6 +2332,15 @@ class NetworkDevicePort(AuditedModel):
             "ordinal": self.ordinal,
             "source_type_port": self.source_type_port_id,
         }
+
+    def _persisted_switch_port_id(self) -> int | None:
+        if self.pk is None:
+            return None
+        return (
+            NetworkDevicePort._default_manager.filter(pk=self.pk)
+            .values_list("switch_port_id", flat=True)
+            .first()
+        )
 
     @property
     def switch(self) -> "NetworkSwitch | None":

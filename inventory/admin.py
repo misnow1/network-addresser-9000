@@ -12,6 +12,8 @@ from django.http import HttpRequest, HttpResponseRedirect
 from django.template.response import TemplateResponse
 
 from .models import (
+    _PROFILE_IN_USE_LOCKED_FIELDS,
+    _PROFILE_SYSTEM_LOCKED_FIELDS,
     VLAN,
     AuditedModel,
     NetworkDevice,
@@ -23,8 +25,10 @@ from .models import (
     NetworkSwitchPort,
     NetworkSwitchType,
     NetworkSwitchTypePort,
+    PortMode,
     Rack,
     RackVlanRange,
+    SwitchPortVlanProfile,
 )
 
 
@@ -140,47 +144,73 @@ class NetworkDeviceTypePortFormSet(_PortCountFormSet):
     pass
 
 
-class NetworkSwitchTypePortForm(forms.ModelForm):
-    """``allowed_vlans`` uses an explicit through model (ADR 0010, so a VLAN
-    still referenced by it can't be deleted out from under a profile) —
-    Django's admin can't auto-generate a widget for a ManyToManyField with a
-    non-auto-created through model, so it's declared here by hand instead.
-    The through model has no fields beyond the two FKs, so the model's own
-    ``.set()`` (invoked by ``ModelForm``'s normal ``save_m2m()``) still
-    works exactly like a plain M2M would.
+class SwitchPortVlanProfileForm(forms.ModelForm):
+    """Carries the three ``allowed_vlans`` invariants that can't live in
+    ``SwitchPortVlanProfile.clean()`` (see that model's docstring: no pk yet
+    on create, stale M2M on edit since ``save_m2m()`` runs after ``save()``)
+    — this is the one enforcement path that can turn them into field-level
+    form errors instead of a raised ``ValidationError`` after the fact. The
+    other paths (``m2m_changed`` receiver, through-model ``clean()``/
+    ``save()``, and the profile's own ``save()`` against persisted links)
+    are backstops for non-form writes, not duplicated here.
     """
 
     allowed_vlans = forms.ModelMultipleChoiceField(queryset=VLAN.objects.all(), required=False)
 
     class Meta:
-        model = NetworkSwitchTypePort
-        # switch_type (the parent link) is deliberately omitted — the
-        # inline formset sets it directly, not through the form.
-        fields = ["port_number", "description", "port_type", "port_mode", "native_vlan", "allowed_vlans"]
+        model = SwitchPortVlanProfile
+        fields = ["name", "port_mode", "native_vlan", "all_vlans_allowed", "allowed_vlans"]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         if self.instance.pk:
             self.fields["allowed_vlans"].initial = self.instance.allowed_vlans.all()
 
+    def clean(self) -> dict[str, Any]:
+        cleaned_data = super().clean() or {}
+        if any(self.errors):
+            return cleaned_data
+        all_vlans_allowed = cleaned_data.get("all_vlans_allowed")
+        port_mode = cleaned_data.get("port_mode")
+        native_vlan = cleaned_data.get("native_vlan")
+        allowed_vlans = cleaned_data.get("allowed_vlans")
+        if allowed_vlans and (all_vlans_allowed or port_mode == PortMode.ACCESS):
+            raise forms.ValidationError(
+                "allowed_vlans must be empty when all_vlans_allowed is set or port_mode is Access."
+            )
+        if native_vlan is not None and allowed_vlans and allowed_vlans.filter(pk=native_vlan.pk).exists():
+            raise forms.ValidationError(
+                "native_vlan is already listed in allowed_vlans — it's implicitly allowed and "
+                "must not also be listed explicitly."
+            )
+        return cleaned_data
+
 
 class NetworkSwitchPortForm(forms.ModelForm):
-    """See ``NetworkSwitchTypePortForm`` — same reason ``allowed_vlans`` is
-    declared by hand here.
-    """
+    """Disables ``profile`` on a row that already has a connected device
+    port (DESIGN.md: profile can be swapped for another "unless a device is
+    already connected"). ``InlineModelAdmin.get_readonly_fields()`` can't
+    express this — it receives the parent ``NetworkSwitch``, not each port,
+    and its result applies to the whole formset, so it can't lock just the
+    connected rows while leaving free ones editable in the same formset.
 
-    allowed_vlans = forms.ModelMultipleChoiceField(queryset=VLAN.objects.all(), required=False)
+    ``disabled=True`` (not merely leaving it out of ``readonly_fields``) so
+    a crafted POST can't smuggle a new value past it — Django ignores a
+    disabled field's submitted data and keeps the form's initial value
+    instead. The model-level guard (``NetworkSwitchPort.save()``) still
+    stands for direct ORM/API writes that never go through this form.
+    """
 
     class Meta:
         model = NetworkSwitchPort
         # switch (the parent link) is deliberately omitted — the inline
         # formset sets it directly, not through the form.
-        fields = ["port_number", "description", "port_type", "port_mode", "native_vlan", "allowed_vlans"]
+        fields = ["port_number", "description", "port_type", "profile"]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        if self.instance.pk:
-            self.fields["allowed_vlans"].initial = self.instance.allowed_vlans.all()
+        if self.instance.pk and hasattr(self.instance, "connected_device_port"):
+            self.fields["profile"].disabled = True
 
 
 def _profile_locked(type_obj: Any, instances_related_name: str) -> bool:
@@ -195,20 +225,13 @@ def _profile_locked(type_obj: Any, instances_related_name: str) -> bool:
 
 
 class NetworkSwitchTypePortInline(admin.TabularInline):
-    """``fields`` is deliberately left unset: Django's admin checks
-    (admin.E013) refuse to let a ManyToManyField with a manually-specified
-    through model appear in an explicit ``fields`` list, even though the
-    custom ``form`` above declares ``allowed_vlans`` by hand — so this
-    falls back to ``form.base_fields`` (which does include it) instead.
-    """
-
     model = NetworkSwitchTypePort
-    form = NetworkSwitchTypePortForm
     formset = NetworkSwitchTypePortFormSet
+    fields = ["port_number", "description", "port_type", "profile"]
     extra = 0
 
     def get_queryset(self, request: HttpRequest) -> QuerySet:
-        return super().get_queryset(request).prefetch_related("allowed_vlans")
+        return super().get_queryset(request).select_related("profile")
 
     def has_add_permission(self, request: HttpRequest, obj: Any = None) -> bool:
         if _profile_locked(obj, "switches"):
@@ -251,18 +274,40 @@ class NetworkDeviceTypePortInline(admin.TabularInline):
 class NetworkSwitchPortInline(admin.TabularInline):
     """Instance ports are materialized from the switch's type on creation
     (ADR 0010), never hand-added or removed — ``port_type`` (a hardware
-    fact copied from the type) is locked too; only VLAN purpose stays
-    editable.
+    fact copied from the type) is locked too; ``description``/``profile``
+    stay editable per switch, though ``NetworkSwitchPortForm`` disables
+    ``profile`` on a row that already has a connected device port.
     """
 
     model = NetworkSwitchPort
     form = NetworkSwitchPortForm
-    # No explicit ``fields`` here either — see NetworkSwitchTypePortInline.
-    readonly_fields = ["port_number", "port_type"]
+    fields = ["port_number", "port_type", "description", "profile", "profile_summary"]
+    readonly_fields = ["port_number", "port_type", "profile_summary"]
     extra = 0
 
     def get_queryset(self, request: HttpRequest) -> QuerySet:
-        return super().get_queryset(request).prefetch_related("allowed_vlans")
+        # ``profile_summary`` reads mode/native VLAN/allowed VLANs per row, and
+        # ``NetworkSwitchPortForm.__init__`` probes ``connected_device_port``
+        # per row to decide whether to disable ``profile`` — without all three
+        # of these, each is an N+1 across a switch's ports. The reverse
+        # one-to-one is ``select_related``-able, and ``hasattr()`` still
+        # short-circuits correctly against the cached null.
+        return (
+            super()
+            .get_queryset(request)
+            .select_related("profile__native_vlan", "connected_device_port")
+            .prefetch_related("profile__allowed_vlans")
+        )
+
+    @admin.display(description="Profile config")
+    def profile_summary(self, obj: NetworkSwitchPort) -> str:
+        profile = obj.profile
+        mode = profile.get_port_mode_display()
+        if profile.all_vlans_allowed:
+            return f"{mode}, all VLANs allowed"
+        allowed = ", ".join(str(vlan.vlan_id) for vlan in profile.allowed_vlans.all())
+        summary = f"{mode}, native {profile.native_vlan.vlan_id}"
+        return f"{summary}, allowed {allowed}" if allowed else summary
 
     def has_add_permission(self, request: HttpRequest, obj: Any = None) -> bool:
         return False
@@ -310,6 +355,34 @@ class VLANAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAd
     search_fields = ["name", "vlan_id", "subnet"]
     ordering = ["vlan_id"]
     show_auditlog_history_link = True
+
+
+@admin.register(SwitchPortVlanProfile)
+class SwitchPortVlanProfileAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
+    form = SwitchPortVlanProfileForm
+    list_display = ["name", "port_mode", "native_vlan", "all_vlans_allowed", "is_system"]
+    search_fields = ["name"]
+    show_auditlog_history_link = True
+
+    def get_readonly_fields(self, request: HttpRequest, obj: Any = None) -> list[str]:
+        # Both sets are the same ones SwitchPortVlanProfile.save() itself
+        # enforces — no second, hand-maintained list here (ADR 0012).
+        if obj is None:
+            return []
+        if obj.is_system:
+            return sorted(_PROFILE_SYSTEM_LOCKED_FIELDS)
+        if obj.ports.exists():
+            return sorted(_PROFILE_IN_USE_LOCKED_FIELDS)
+        return []
+
+    def has_delete_permission(self, request: HttpRequest, obj: Any = None) -> bool:
+        # A profile still in use is already blocked by Django's native
+        # protected-object detection (profile FKs are on_delete=PROTECT) —
+        # only is_system needs an explicit override, since nothing at the
+        # DB level otherwise stops it from being deleted.
+        if obj is not None and obj.is_system:
+            return False
+        return super().has_delete_permission(request, obj)
 
 
 @admin.register(Rack)
