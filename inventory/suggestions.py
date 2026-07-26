@@ -22,19 +22,6 @@ def suggest_default_gateway(subnet: str) -> str | None:
     return str(network.network_address + 1)
 
 
-def suggest_dhcp_range(subnet: str) -> str | None:
-    """Suggested DHCP range: the bottom /24 of ``subnet``.
-
-    ``None`` if ``subnet`` is smaller than a /24 — "bottom 256 addresses"
-    only equals "bottom /24" when the network is octet-aligned (ADR 0002).
-    """
-    network = ipaddress.IPv4Network(subnet, strict=True)
-    if network.prefixlen > 24:
-        return None
-    bottom_24 = next(network.subnets(new_prefix=24))
-    return str(bottom_24)
-
-
 def required_block_size(slot_count: int) -> int:
     """Minimum address count a rack-VLAN-range block needs for ``slot_count`` slots.
 
@@ -56,12 +43,18 @@ def prefix_length_for_capacity(slot_count: int) -> int:
     return 32 - host_bits
 
 
-def suggest_rack_vlan_range(subnet: str, slot_count: int, used_ranges: list[str]) -> str | None:
+def suggest_rack_vlan_range(
+    subnet: str, slot_count: int, used_ranges: list[str], dhcp_range: tuple[str, str] | None = None
+) -> str | None:
     """Next free block sized for ``slot_count``, within ``subnet``.
 
     ``None`` if ``slot_count`` needs more addresses than ``subnet`` has, or
     every same-sized block within ``subnet`` overlaps something in
-    ``used_ranges``.
+    ``used_ranges`` or ``dhcp_range``.
+
+    ``dhcp_range`` (a ``(start, end)`` address pair) is checked separately
+    from ``used_ranges`` (CIDR blocks) since it isn't itself CIDR-shaped —
+    see ``dhcp_range_overlaps_cidr``.
     """
     network = ipaddress.IPv4Network(subnet, strict=True)
     prefixlen = prefix_length_for_capacity(slot_count)
@@ -69,8 +62,11 @@ def suggest_rack_vlan_range(subnet: str, slot_count: int, used_ranges: list[str]
         return None
     used = [ipaddress.IPv4Network(r, strict=True) for r in used_ranges]
     for candidate in network.subnets(new_prefix=prefixlen):
-        if not any(candidate.overlaps(block) for block in used):
-            return str(candidate)
+        if any(candidate.overlaps(block) for block in used):
+            continue
+        if dhcp_range is not None and dhcp_range_overlaps_cidr(dhcp_range[0], dhcp_range[1], str(candidate)):
+            continue
+        return str(candidate)
     return None
 
 
@@ -83,3 +79,21 @@ def suggest_slot_address(range_cidr: str, slot: int) -> str:
 def ranges_overlap(a: str, b: str) -> bool:
     """Whether two IPv4 CIDR ranges overlap at all."""
     return ipaddress.IPv4Network(a, strict=True).overlaps(ipaddress.IPv4Network(b, strict=True))
+
+
+def dhcp_range_overlaps_cidr(start: str, end: str, cidr: str) -> bool:
+    """Whether IPv4 address range ``[start, end]`` overlaps CIDR block ``cidr``.
+
+    ``start``/``end`` are normalized if reversed — callers are expected to
+    have already enforced ``start < end`` (e.g. ``VLAN.clean()``), but that
+    isn't a DB-level guarantee (a string-based ordering CheckConstraint can't
+    express IPv4 ordering correctly), so a reversed pair reaching this
+    function is treated as the same range rather than silently producing a
+    wrong overlap answer.
+    """
+    start_addr = ipaddress.IPv4Address(start)
+    end_addr = ipaddress.IPv4Address(end)
+    if start_addr > end_addr:
+        start_addr, end_addr = end_addr, start_addr
+    network = ipaddress.IPv4Network(cidr, strict=True)
+    return start_addr <= network.broadcast_address and end_addr >= network.network_address

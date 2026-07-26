@@ -28,10 +28,10 @@ from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models, transaction
 
 from .suggestions import (
+    dhcp_range_overlaps_cidr,
     ranges_overlap,
     required_block_size,
     suggest_default_gateway,
-    suggest_dhcp_range,
     suggest_rack_vlan_range,
     suggest_slot_address,
 )
@@ -269,6 +269,28 @@ def _address_containment_error(
         range_network = ipaddress.IPv4Network(rack_range.address_range, strict=True)
         if address_obj not in range_network:
             return f"{address} is not within {rack}'s range on {vlan} ({rack_range.address_range})."
+
+    if vlan.dhcp_range_start and vlan.dhcp_range_end:
+        try:
+            dhcp_start = ipaddress.IPv4Address(vlan.dhcp_range_start)
+            dhcp_end = ipaddress.IPv4Address(vlan.dhcp_range_end)
+        except ValueError:
+            pass  # VLAN's own malformed range; its own clean() will report it
+        else:
+            # Normalized the same way dhcp_range_overlaps_cidr() is: ordering
+            # is only enforced by VLAN.clean(), not the DB, so a reversed
+            # pair reaching this *different, already-persisted* VLAN's fields
+            # via a clean()-bypassing write must not silently make this an
+            # unsatisfiable (always-False) comparison — that would silently
+            # disable the "reject a static address inside the DHCP range"
+            # rule for every address on that VLAN.
+            if dhcp_start > dhcp_end:
+                dhcp_start, dhcp_end = dhcp_end, dhcp_start
+            if dhcp_start <= address_obj <= dhcp_end:
+                return (
+                    f"{address} falls within {vlan}'s DHCP range "
+                    f"({vlan.dhcp_range_start}-{vlan.dhcp_range_end})."
+                )
     return None
 
 
@@ -353,14 +375,32 @@ class VLAN(AuditedModel):
         null=True,
         help_text="Suggested as the lowest host address in the subnet; stored and overridable.",
     )
-    dhcp_range = models.CharField(
-        max_length=18,
+    dhcp_range_start = models.GenericIPAddressField(
+        protocol="IPv4",
         blank=True,
-        validators=[validate_ipv4_cidr],
-        help_text="Suggested as the bottom /24 of the subnet; stored and overridable.",
+        null=True,
+        help_text=(
+            "Start of the DHCP address range (inclusive). Leave both start and end blank if "
+            "this VLAN has no DHCP range."
+        ),
+    )
+    dhcp_range_end = models.GenericIPAddressField(
+        protocol="IPv4",
+        blank=True,
+        null=True,
+        help_text="End of the DHCP address range (inclusive). Must be greater than the start address.",
     )
 
     class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(dhcp_range_start__isnull=True, dhcp_range_end__isnull=True)
+                    | models.Q(dhcp_range_start__isnull=False, dhcp_range_end__isnull=False)
+                ),
+                name="vlan_dhcp_range_start_end_together",
+            ),
+        ]
         ordering = ["vlan_id"]
 
     def __str__(self) -> str:
@@ -376,15 +416,10 @@ class VLAN(AuditedModel):
             return  # subnet itself is invalid; clean_fields() already reports it
         vlan_network = ipaddress.IPv4Network(self.subnet, strict=True)
 
-        if self.pk is None:
-            if not self.default_gateway:
-                suggestion = suggest_default_gateway(self.subnet)
-                if suggestion:
-                    self.default_gateway = suggestion
-            if not self.dhcp_range:
-                suggestion = suggest_dhcp_range(self.subnet)
-                if suggestion:
-                    self.dhcp_range = suggestion
+        if self.pk is None and not self.default_gateway:
+            suggestion = suggest_default_gateway(self.subnet)
+            if suggestion:
+                self.default_gateway = suggestion
 
         # From here on, validate the final values regardless of whether they
         # were just suggested, supplied by the admin, or (on an edit) already
@@ -401,17 +436,82 @@ class VLAN(AuditedModel):
                         {"default_gateway": f"{self.default_gateway} is not within subnet {self.subnet}."}
                     )
 
-        dhcp_network = None
-        if self.dhcp_range:
+        # bool(), not "is None": GenericIPAddressField.empty_strings_allowed is
+        # False, so a blank form submission reaches this point as "" (only
+        # converted to NULL by the DB layer at save() time, after clean() has
+        # already run) — an "is None" check would silently miss that case and
+        # let a mismatched pair fall through to a raw DB IntegrityError from
+        # ``vlan_dhcp_range_start_end_together`` instead of this message.
+        if bool(self.dhcp_range_start) != bool(self.dhcp_range_end):
+            raise ValidationError("dhcp_range_start and dhcp_range_end must both be set or both left blank.")
+
+        dhcp_start = dhcp_end = None
+        if self.dhcp_range_start and self.dhcp_range_end:
             try:
-                dhcp_network = ipaddress.IPv4Network(self.dhcp_range, strict=True)
+                # Parsed into locals first, only assigned to dhcp_start/dhcp_end
+                # together below — full_clean() still calls clean() even after
+                # clean_fields() has already flagged one endpoint as malformed,
+                # so a partial assignment here (e.g. dhcp_start set, dhcp_end
+                # left None after the parse below raises) would let the later
+                # ``dhcp_start <= ... <= dhcp_end`` comparisons crash with a
+                # raw TypeError instead of clean_fields()'s ValidationError.
+                parsed_start = ipaddress.IPv4Address(self.dhcp_range_start)
+                parsed_end = ipaddress.IPv4Address(self.dhcp_range_end)
             except ValueError:
                 pass  # malformed value; the field's own validator already reports it
             else:
-                if not dhcp_network.subnet_of(vlan_network):
+                dhcp_start, dhcp_end = parsed_start, parsed_end
+                if dhcp_start >= dhcp_end:
                     raise ValidationError(
-                        {"dhcp_range": f"{self.dhcp_range} is not within subnet {self.subnet}."}
+                        {
+                            "dhcp_range_end": (
+                                f"{self.dhcp_range_end} must be greater than the start address "
+                                f"({self.dhcp_range_start})."
+                            )
+                        }
                     )
+                if dhcp_start not in vlan_network or dhcp_end not in vlan_network:
+                    raise ValidationError(
+                        {
+                            "dhcp_range_start": (
+                                f"{self.dhcp_range_start}-{self.dhcp_range_end} is not fully within "
+                                f"subnet {self.subnet}."
+                            )
+                        }
+                    )
+                if dhcp_start <= vlan_network.network_address <= dhcp_end:
+                    raise ValidationError(
+                        {
+                            "dhcp_range_start": (
+                                f"range must not contain the network address "
+                                f"({vlan_network.network_address})."
+                            )
+                        }
+                    )
+                if dhcp_start <= vlan_network.broadcast_address <= dhcp_end:
+                    raise ValidationError(
+                        {
+                            "dhcp_range_end": (
+                                f"range must not contain the broadcast address "
+                                f"({vlan_network.broadcast_address})."
+                            )
+                        }
+                    )
+                if self.default_gateway:
+                    try:
+                        gateway_address = ipaddress.IPv4Address(self.default_gateway)
+                    except ValueError:
+                        pass
+                    else:
+                        if dhcp_start <= gateway_address <= dhcp_end:
+                            raise ValidationError(
+                                {
+                                    "dhcp_range_start": (
+                                        f"range must not contain the default gateway "
+                                        f"({self.default_gateway})."
+                                    )
+                                }
+                            )
 
         if self.pk is not None:
             for rack_range in self.rack_ranges.all():
@@ -425,12 +525,19 @@ class VLAN(AuditedModel):
                         f"subnet {self.subnet} no longer contains {rack_range.rack}'s existing range "
                         f"({rack_range.address_range}) on this VLAN; update or remove that range first."
                     )
-                if dhcp_network is not None and dhcp_network.overlaps(range_network):
+                if (
+                    dhcp_start is not None
+                    and self.dhcp_range_start is not None
+                    and self.dhcp_range_end is not None
+                    and dhcp_range_overlaps_cidr(
+                        self.dhcp_range_start, self.dhcp_range_end, rack_range.address_range
+                    )
+                ):
                     raise ValidationError(
                         {
-                            "dhcp_range": (
-                                f"{self.dhcp_range} overlaps {rack_range.rack}'s existing range "
-                                f"({rack_range.address_range})."
+                            "dhcp_range_start": (
+                                f"{self.dhcp_range_start}-{self.dhcp_range_end} overlaps "
+                                f"{rack_range.rack}'s existing range ({rack_range.address_range})."
                             )
                         }
                     )
@@ -448,6 +555,12 @@ class VLAN(AuditedModel):
                         f"subnet {self.subnet} no longer contains {switch_address.switch}'s existing "
                         f"address ({switch_address.address}) on this VLAN; update or remove it first."
                     )
+                if dhcp_start is not None and dhcp_end is not None and dhcp_start <= address_obj <= dhcp_end:
+                    raise ValidationError(
+                        f"DHCP range {self.dhcp_range_start}-{self.dhcp_range_end} would newly contain "
+                        f"{switch_address.switch}'s existing address ({switch_address.address}) on this "
+                        "VLAN; update or remove it first."
+                    )
             for device_port in self.device_ports.filter(address__isnull=False):
                 try:
                     address_obj = ipaddress.IPv4Address(device_port.address)
@@ -457,6 +570,12 @@ class VLAN(AuditedModel):
                     raise ValidationError(
                         f"subnet {self.subnet} no longer contains {device_port.device}'s existing "
                         f"address ({device_port.address}) on this VLAN; update or remove it first."
+                    )
+                if dhcp_start is not None and dhcp_end is not None and dhcp_start <= address_obj <= dhcp_end:
+                    raise ValidationError(
+                        f"DHCP range {self.dhcp_range_start}-{self.dhcp_range_end} would newly contain "
+                        f"{device_port.device}'s existing address ({device_port.address}) on this VLAN; "
+                        "update or remove it first."
                     )
 
 
@@ -542,19 +661,21 @@ class RackVlanRange(AuditedModel):
                 except ValidationError:
                     continue  # that sibling range's own malformed value; its own clean() reports it
                 used_ranges.append(value)
-            if vlan.dhcp_range:
+            dhcp_range = None
+            if vlan.dhcp_range_start and vlan.dhcp_range_end:
                 try:
-                    validate_ipv4_cidr(vlan.dhcp_range)
-                except ValidationError:
-                    pass  # VLAN's own malformed dhcp_range; its own clean() reports it
+                    ipaddress.IPv4Address(vlan.dhcp_range_start)
+                    ipaddress.IPv4Address(vlan.dhcp_range_end)
+                except ValueError:
+                    pass  # VLAN's own malformed dhcp range; its own clean() reports it
                 else:
-                    used_ranges.append(vlan.dhcp_range)
+                    dhcp_range = (vlan.dhcp_range_start, vlan.dhcp_range_end)
             try:
                 validate_ipv4_cidr(vlan.subnet)
             except ValidationError:
                 pass  # VLAN's own subnet is invalid; nothing sensible to suggest
             else:
-                suggestion = suggest_rack_vlan_range(vlan.subnet, rack.slot_count, used_ranges)
+                suggestion = suggest_rack_vlan_range(vlan.subnet, rack.slot_count, used_ranges, dhcp_range)
                 if suggestion:
                     self.address_range = suggestion
         if not self.address_range:
@@ -609,10 +730,22 @@ class RackVlanRange(AuditedModel):
                         )
                     }
                 )
-        if vlan.dhcp_range and ranges_overlap(self.address_range, vlan.dhcp_range):
-            raise ValidationError(
-                {"address_range": f"{self.address_range} overlaps {vlan}'s DHCP range ({vlan.dhcp_range})."}
-            )
+        if vlan.dhcp_range_start and vlan.dhcp_range_end:
+            try:
+                ipaddress.IPv4Address(vlan.dhcp_range_start)
+                ipaddress.IPv4Address(vlan.dhcp_range_end)
+            except ValueError:
+                pass  # VLAN's own malformed dhcp range; its own clean() reports it
+            else:
+                if dhcp_range_overlaps_cidr(vlan.dhcp_range_start, vlan.dhcp_range_end, self.address_range):
+                    raise ValidationError(
+                        {
+                            "address_range": (
+                                f"{self.address_range} overlaps {vlan}'s DHCP range "
+                                f"({vlan.dhcp_range_start}-{vlan.dhcp_range_end})."
+                            )
+                        }
+                    )
         # A range edit can leave already-assigned static addresses (switch or
         # device) for this rack, on this VLAN, outside the new block — block
         # the edit rather than silently orphaning them. Only meaningful once

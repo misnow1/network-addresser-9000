@@ -20,8 +20,8 @@ High-level phases only — day-to-day task tracking belongs in GitHub Issues onc
 
 ## 3. Core domain logic — done
 
-- [x] Address-range suggestion (rack ranges, VLAN gateway/DHCP range) — see ADR 0001, ADR 0002
-- [x] Overlap validation (rack ranges vs. each other and the DHCP block)
+- [x] Address-range suggestion (rack ranges, VLAN gateway) — see ADR 0001, ADR 0002. VLAN DHCP-range suggestion was later removed — see ADR 0011.
+- [x] Overlap validation (rack ranges vs. each other and the DHCP start/end range)
 - [x] Device address default-and-override behavior — see ADR 0003
 - [x] Removal semantics: block non-empty containers, unassign on leaf removal — see ADR 0007
 

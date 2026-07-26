@@ -1,3 +1,5 @@
 # Default network size is /21, with the bottom /24 reserved for DHCP
 
+> **Partially superseded by [ADR 0011](./0011-dhcp-range-as-address-range.md).** The `/21`-default network *sizing* convention below still holds. The DHCP-range part does not: `dhcp_range` is no longer a CIDR block and is no longer auto-suggested — see ADR 0011.
+
 By convention, IPv4 Networks (VLANs) are provisioned as `/21`s — eight `/24`-sized blocks. The bottom `/24` is suggested as the DHCP range; the remaining seven `/24`s are available for static rack allocation (previously tracked by spreadsheet, now by this tool). This is a suggested default, not an enforced constraint — per ADR 0001's manual-with-suggestion pattern, an admin can still create a differently-sized network or override the DHCP range — but the suggestion should snap to `/24` boundaries rather than an arbitrary address count, since "bottom 256 addresses" only equals "bottom `/24`" when the network happens to be octet-aligned.
