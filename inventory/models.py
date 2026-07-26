@@ -1013,15 +1013,22 @@ class SwitchPortVlanProfile(AuditedModel):
     locked field in this module is (``_check_locked_fields_unchanged``) — so
     it can't be flipped off as a way to unlock or delete this row.
 
-    The three ``allowed_vlans`` invariants (native VLAN not also listed as
-    an allowed VLAN; no allowed VLANs while ``all_vlans_allowed`` is set; no
-    allowed VLANs in Access mode) can't be enforced from this model's own
-    ``clean()``: a new profile has no pk yet (so its M2M manager can't be
-    queried), and for an edited profile ``ModelForm.save_m2m()`` runs
-    *after* ``save()``, so ``clean()`` would only ever see the previous
-    links. They're enforced instead, each against the actual state that
-    path can see: the admin form's ``clean()`` (submitted complete state);
-    an ``m2m_changed`` receiver on ``allowed_vlans`` (``.add()``/``.set()``);
+    A fourth invariant — Access mode excludes ``all_vlans_allowed`` — is a
+    pure scalar-vs-scalar rule with no M2M involved at all, so it's backed
+    by a real DB ``CheckConstraint`` and checked plainly in ``clean()``/
+    ``save()`` (``_validate_port_mode_excludes_all_vlans_allowed``).
+
+    The other three ``allowed_vlans`` invariants (native VLAN not also
+    listed as an allowed VLAN; no allowed VLANs while ``all_vlans_allowed``
+    is set; no allowed VLANs in Access mode) can't be enforced that simply:
+    a new profile has no pk yet (so its M2M manager can't be queried), and
+    for an edited profile ``ModelForm.save_m2m()`` runs *after* ``save()``,
+    so ``clean()`` would only ever see the previous links. They're enforced
+    instead, each against the actual state that path can see: the admin
+    form's ``clean()`` (submitted complete state — the only path that can
+    also grant ``_trust_pending_m2m_from_form`` once it has proven that
+    state sound, letting a combined scalar-and-M2M edit through); an
+    ``m2m_changed`` receiver on ``allowed_vlans`` (``.add()``/``.set()``);
     ``SwitchPortVlanProfileAllowedVlan``'s own ``clean()``/``save()`` (direct
     through-row creation, which never fires ``m2m_changed``); and this
     model's own ``save()``, which re-checks a scalar change against
@@ -1059,11 +1066,28 @@ class SwitchPortVlanProfile(AuditedModel):
         help_text="System default profile (seeded by migration) — permanently locked, never deletable.",
     )
 
+    #: Not a Django field — a one-request-lived escape hatch set by
+    #: ``SwitchPortVlanProfileForm.clean()`` once it has already validated
+    #: the *complete* submitted state (new scalars together with the new
+    #: ``allowed_vlans`` selection). See ``_validate_scalars_against_persisted_links``
+    #: for why ``Model.clean()``/``save()`` need this exemption at all.
+    _trust_pending_m2m_from_form: bool = False
+
     objects = SwitchPortVlanProfileQuerySet.as_manager()
 
     class Meta:
         constraints = [
             models.CheckConstraint(condition=~models.Q(name=""), name="switchportvlanprofile_name_not_blank"),
+            models.CheckConstraint(
+                # Access is inherently single-VLAN/untagged, so it can never
+                # coexist with "every VLAN is allowed" — independent of
+                # whether any explicit allowed_vlans links exist, unlike the
+                # invariants in _validate_scalars_against_persisted_links().
+                # A pure scalar-vs-scalar rule with no M2M timing subtlety,
+                # so (unlike those) it can be a real DB constraint.
+                condition=~(models.Q(port_mode=PortMode.ACCESS) & models.Q(all_vlans_allowed=True)),
+                name="switchportvlanprofile_access_excludes_all_vlans_allowed",
+            ),
         ]
         ordering = ["name"]
 
@@ -1074,6 +1098,7 @@ class SwitchPortVlanProfile(AuditedModel):
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
         with transaction.atomic():
+            self._validate_port_mode_excludes_all_vlans_allowed(update_fields=update_fields)
             if self.pk is not None:
                 _lock_profile_rows(self.pk)
                 # is_system is immutable after creation, full stop — checked
@@ -1085,25 +1110,39 @@ class SwitchPortVlanProfile(AuditedModel):
                     {"is_system": self.is_system},
                     update_fields=update_fields,
                 )
-                self._check_scalar_fields_locked(update_fields=update_fields)
-                self._validate_scalars_against_persisted_links()
+                # for_update=True: this runs inside the transaction that
+                # already holds the profile's row lock, so the "is a real
+                # port using this profile" read should participate in that
+                # same "always latest committed data" guarantee rather than
+                # riding whatever REPEATABLE READ snapshot this transaction
+                # established earlier (e.g. from loading the instance for an
+                # admin edit) — a locking SELECT and a plain SELECT in the
+                # same MySQL/InnoDB transaction are not guaranteed to see the
+                # same committed state otherwise.
+                self._check_scalar_fields_locked(update_fields=update_fields, for_update=True)
+                self._validate_scalars_against_persisted_links(update_fields=update_fields)
             super().save(
                 force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
             )
 
     def clean(self) -> None:
         super().clean()
+        self._validate_port_mode_excludes_all_vlans_allowed()
         if self.pk is not None:
             _check_locked_fields_unchanged(
                 SwitchPortVlanProfile, self.pk, {"is_system": self.is_system}, update_fields=None
             )
+            # Not for_update: a bare full_clean() has no enclosing
+            # transaction to lock within (same interim, best-effort
+            # reasoning RackSlotAssignmentMixin.clean() documents for its
+            # own cross-table check) — save() below is the actual guarantee.
             self._check_scalar_fields_locked(update_fields=None)
             self._validate_scalars_against_persisted_links()
 
     def delete(self, using=None, keep_parents=False) -> tuple[int, dict[str, int]]:
         with transaction.atomic():
             _lock_profile_rows(self.pk)
-            if self._in_use_or_system():
+            if self.is_system or self._referenced_by_any_port(for_update=True):
                 raise ValidationError(
                     f"{self} cannot be deleted: it is the system default profile, or is still in "
                     "use by a switch type port or switch port."
@@ -1128,16 +1167,40 @@ class SwitchPortVlanProfile(AuditedModel):
             vlans.add(native_vlan)
         return vlans
 
-    def _in_use(self) -> bool:
-        return self.pk is not None and self.ports.exists()
+    def _in_use(self, *, for_update: bool = False) -> bool:
+        """Whether a real ``NetworkSwitchPort`` references this profile —
+        the trigger for locking ``port_mode``/``native_vlan`` (a profile
+        referenced only by a ``NetworkSwitchTypePort`` is still fully
+        editable). Deliberately narrower than deletion eligibility — see
+        ``_referenced_by_any_port()``.
+        """
+        if self.pk is None:
+            return False
+        ports = self.ports.select_for_update() if for_update else self.ports
+        return ports.exists()
 
-    def _in_use_or_system(self) -> bool:
-        return self.is_system or self._in_use()
+    def _referenced_by_any_port(self, *, for_update: bool = False) -> bool:
+        """Whether *any* port — type port or real port — references this
+        profile. Used for deletion eligibility, a different question from
+        ``_in_use()``'s scalar-locking trigger: a profile referenced only
+        by a type port stays editable, but it still isn't deletable, since
+        ``NetworkSwitchTypePort.profile`` is ``on_delete=PROTECT`` and would
+        block the delete regardless. Checking it explicitly here gives a
+        friendly ``ValidationError`` instead of a raw ``ProtectedError`` for
+        that case, and matches ``SwitchPortVlanProfileQuerySet.delete()``'s
+        bulk-path predicate.
+        """
+        if self.pk is None:
+            return False
+        type_ports = self.type_ports.select_for_update() if for_update else self.type_ports
+        return type_ports.exists() or self._in_use(for_update=for_update)
 
-    def _check_scalar_fields_locked(self, *, update_fields: "list[str] | frozenset[str] | None") -> None:
+    def _check_scalar_fields_locked(
+        self, *, update_fields: "list[str] | frozenset[str] | None", for_update: bool = False
+    ) -> None:
         if self.is_system:
             locked_fields = _PROFILE_SYSTEM_LOCKED_FIELDS
-        elif self._in_use():
+        elif self._in_use(for_update=for_update):
             locked_fields = _PROFILE_IN_USE_LOCKED_FIELDS
         else:
             return
@@ -1151,7 +1214,29 @@ class SwitchPortVlanProfile(AuditedModel):
             update_fields=update_fields,
         )
 
-    def _validate_scalars_against_persisted_links(self) -> None:
+    def _validate_port_mode_excludes_all_vlans_allowed(
+        self, *, update_fields: "list[str] | frozenset[str] | None" = None
+    ) -> None:
+        """Access mode is inherently single-VLAN/untagged, so it can never
+        coexist with ``all_vlans_allowed`` — independent of whether any
+        explicit ``allowed_vlans`` links exist, unlike the invariants in
+        ``_validate_scalars_against_persisted_links()`` below. A pure
+        scalar-vs-scalar rule with no M2M timing subtlety, so — unlike
+        those — it's backed by a real DB ``CheckConstraint`` too; this
+        Python-level check exists only to turn that constraint's raw
+        ``IntegrityError`` into a friendly message before it ever reaches
+        the database.
+        """
+        if update_fields is not None and not ({"port_mode", "all_vlans_allowed"} & set(update_fields)):
+            return
+        if self.port_mode == PortMode.ACCESS and self.all_vlans_allowed:
+            raise ValidationError(
+                {"all_vlans_allowed": "all_vlans_allowed cannot be set while port_mode is Access."}
+            )
+
+    def _validate_scalars_against_persisted_links(
+        self, *, update_fields: "list[str] | frozenset[str] | None" = None
+    ) -> None:
         """Guards the one ``allowed_vlans`` invariant a plain scalar edit can
         violate on its own: flipping ``all_vlans_allowed``/``port_mode`` to a
         state that's incompatible with *already-persisted* allowed-VLAN
@@ -1162,8 +1247,41 @@ class SwitchPortVlanProfile(AuditedModel):
         aren't visible here — ``ModelForm.save_m2m()`` only runs after
         ``save()`` — those are validated separately by the ``m2m_changed``
         receiver and the through model's own ``clean()``/``save()``; see the
-        class docstring.
+        class docstring. ``SwitchPortVlanProfileForm.clean()`` is the one
+        place that ever sees the *submitted* scalars and the *submitted*
+        M2M selection together — when it has already validated that
+        complete state, it sets ``self._trust_pending_m2m_from_form`` on
+        this instance, and this check trusts that proof rather than
+        re-deriving a wrong answer from stale, still-persisted links. That
+        flag is the only way to satisfy this check with a combined edit
+        that both flips a scalar *and* clears the links that would
+        otherwise conflict with it (e.g. enabling ``all_vlans_allowed``
+        while clearing ``allowed_vlans`` in the same submission) — clearing
+        links goes through ``.set([])``/``.clear()``, which the
+        ``m2m_changed`` receiver correctly treats as always-safe and never
+        validates, so nothing else in this module ever proves that
+        particular combination sound.
+
+        Honors ``update_fields`` the same way ``_check_locked_fields_unchanged``
+        does: a ``save(update_fields=[...])`` that doesn't touch any of the
+        three fields this check cares about can't have introduced a conflict,
+        regardless of what those fields currently hold in memory. Without
+        this, e.g. ``profile.all_vlans_allowed = True;
+        profile.save(update_fields=["name"])`` would raise even though
+        ``all_vlans_allowed`` is never written.
         """
+        if self._trust_pending_m2m_from_form:
+            return
+        relevant_fields = {"all_vlans_allowed", "port_mode", "native_vlan"}
+        if update_fields is not None:
+            attname_to_name = {
+                field.attname: field.name
+                for field in SwitchPortVlanProfile._meta.concrete_fields
+                if field.attname != field.name
+            }
+            normalized_update_fields = {attname_to_name.get(name, name) for name in update_fields}
+            if not (relevant_fields & normalized_update_fields):
+                return
         if (self.all_vlans_allowed or self.port_mode == PortMode.ACCESS) and self.allowed_vlans.exists():
             raise ValidationError(
                 "This profile's existing allowed VLANs must be removed first before setting "
@@ -1194,9 +1312,13 @@ class SwitchPortVlanProfileAllowedVlan(AuditedModel):
     Direct creation of a row here bypasses ``.add()``/``.set()`` entirely,
     so it never fires ``m2m_changed`` — this re-validates the same three
     invariants the signal receiver checks (see ``SwitchPortVlanProfile``),
-    against its own profile's *current* scalar state. ``bulk_create()``
-    remains a documented, unsupported bypass, consistent with this module's
-    existing locked-field policy.
+    against its own profile's *current* scalar state. ``save()`` locks and
+    re-reads that state fresh from the database rather than trusting a
+    cached related object, for the same reason the ``m2m_changed`` receiver
+    does — a stale ``self.profile`` could predate a concurrent, already-
+    committed scalar change. ``bulk_create()`` remains a documented,
+    unsupported bypass, consistent with this module's existing locked-field
+    policy.
     """
 
     profile = models.ForeignKey(
@@ -1213,19 +1335,31 @@ class SwitchPortVlanProfileAllowedVlan(AuditedModel):
         return f"{self.profile} allows {self.vlan}"
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
-        self._validate_against_profile()
-        super().save(
-            force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
-        )
+        with transaction.atomic():
+            self._validate_against_profile(for_update=True)
+            super().save(
+                force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
+            )
 
     def clean(self) -> None:
         super().clean()
+        # Not for_update — see SwitchPortVlanProfile.clean() for why a bare
+        # full_clean() doesn't take a lock; save() above is the guarantee.
         self._validate_against_profile()
 
-    def _validate_against_profile(self) -> None:
-        profile = _get_related(self, "profile")
-        if profile is None:
+    def _validate_against_profile(self, *, for_update: bool = False) -> None:
+        if self.profile_id is None:
             return
+        if for_update:
+            profile = (
+                SwitchPortVlanProfile._default_manager.select_for_update().filter(pk=self.profile_id).first()
+            )
+            if profile is None:
+                return  # profile not visible (e.g. mid-delete elsewhere) — nothing to validate against
+        else:
+            profile = _get_related(self, "profile")
+            if profile is None:
+                return
         if profile.all_vlans_allowed or profile.port_mode == PortMode.ACCESS:
             raise ValidationError(
                 f"{profile} does not accept explicit allowed VLANs while all_vlans_allowed is "
@@ -1809,7 +1943,17 @@ class NetworkSwitchPort(AuditedModel):
                 _lock_switch_port_rows(self.pk)
                 persisted_profile_id = self._persisted_profile_id()
                 _lock_profile_rows(self.profile_id, persisted_profile_id)
-                if persisted_profile_id != self.profile_id and self._has_connected_device_port():
+                # ``self._profile_field_included(update_fields)``: without
+                # this, save(update_fields=["description"]) on an instance
+                # whose in-memory profile_id happens to differ from what's
+                # persisted (e.g. reused for an unrelated computation) would
+                # wrongly reject the save — profile was never going to be
+                # written at all.
+                if (
+                    persisted_profile_id != self.profile_id
+                    and self._profile_field_included(update_fields)
+                    and self._has_connected_device_port()
+                ):
                     raise ValidationError(
                         {
                             "profile": (
@@ -1861,6 +2005,15 @@ class NetworkSwitchPort(AuditedModel):
         return (
             NetworkSwitchPort._default_manager.filter(pk=self.pk).values_list("profile_id", flat=True).first()
         )
+
+    @staticmethod
+    def _profile_field_included(update_fields: "list[str] | frozenset[str] | None") -> bool:
+        """Whether a ``save(update_fields=...)`` call would actually write
+        ``profile`` — ``None`` means "every field", so this is ``True`` for
+        a plain ``save()``. Accepts both ``"profile"`` and the attname
+        ``"profile_id"``, matching Django's own ``update_fields`` handling.
+        """
+        return update_fields is None or "profile" in update_fields or "profile_id" in update_fields
 
     def _has_connected_device_port(self) -> bool:
         return NetworkDevicePort.objects.filter(switch_port_id=self.pk).exists()

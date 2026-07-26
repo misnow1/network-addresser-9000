@@ -2524,11 +2524,37 @@ class SwitchPortVlanProfileDeletionTests(TestCase):
             switch_type=switch_type, port_number=1, port_type=PortType.GBE_RJ45, profile=profile
         )
         NetworkSwitch.objects.create(switch_type=switch_type)
-        # Blocked either by this model's own guard or by the native
-        # on_delete=PROTECT from NetworkSwitchPort.profile — either way,
-        # deletion must not succeed.
-        with self.assertRaises((ValidationError, ProtectedError)):
+        with self.assertRaises(ValidationError):
             profile.delete()
+
+    def test_profile_referenced_only_by_type_port_cannot_be_deleted(self) -> None:
+        """A profile referenced only by a Type Port (no real switch yet) is
+        still fully *editable* (``_in_use()`` is scoped to real ports), but
+        it is not *deletable* — ``_referenced_by_any_port()`` checks type
+        ports too, so this raises the same friendly ``ValidationError`` the
+        real-port case does, rather than falling through to a raw
+        ``ProtectedError`` from ``NetworkSwitchTypePort.profile``.
+        """
+        profile = _make_profile(self.vlan_a, name="Trunk")
+        switch_type = NetworkSwitchType.objects.create(
+            manufacturer="Cisco", model="SG300", name="Del-Test-TypeOnly", port_count=0
+        )
+        NetworkSwitchTypePort.objects.create(
+            switch_type=switch_type, port_number=1, port_type=PortType.GBE_RJ45, profile=profile
+        )
+        with self.assertRaises(ValidationError):
+            profile.delete()
+
+    def test_bulk_queryset_delete_blocked_by_type_port_only(self) -> None:
+        profile = _make_profile(self.vlan_a, name="Trunk")
+        switch_type = NetworkSwitchType.objects.create(
+            manufacturer="Cisco", model="SG300", name="Del-Test-Bulk", port_count=0
+        )
+        NetworkSwitchTypePort.objects.create(
+            switch_type=switch_type, port_number=1, port_type=PortType.GBE_RJ45, profile=profile
+        )
+        with self.assertRaises(ValidationError):
+            SwitchPortVlanProfile.objects.filter(pk=profile.pk).delete()
 
 
 class SwitchPortProfileConnectedLockTests(TestCase):
@@ -2705,7 +2731,12 @@ class SeedDefaultsTests(TestCase):
         with self.assertRaises(RuntimeError):
             seed_module.seed_defaults(real_apps, None)
 
-    def test_migration_reverse_is_a_documented_noop(self) -> None:
+    def test_migration_data_steps_reverse_as_documented_noops(self) -> None:
+        """Both RunPython steps — seeding the system rows, and backfilling
+        the profile FK onto historical rows — are documented no-ops on
+        reverse (see their docstrings for why: neither can distinguish a
+        row/value it created from one it merely found or left alone).
+        """
         import importlib
 
         from django.db import migrations as django_migrations
@@ -2714,8 +2745,9 @@ class SeedDefaultsTests(TestCase):
         run_python_ops = [
             op for op in seed_module.Migration.operations if isinstance(op, django_migrations.RunPython)
         ]
-        self.assertEqual(len(run_python_ops), 1)
-        self.assertIs(run_python_ops[0].reverse_code, django_migrations.RunPython.noop)
+        self.assertEqual(len(run_python_ops), 2)
+        for op in run_python_ops:
+            self.assertIs(op.reverse_code, django_migrations.RunPython.noop)
 
     def test_seed_defaults_command_is_idempotent(self) -> None:
         call_command("seed_defaults")
@@ -2773,6 +2805,30 @@ class ReviewCouncilRegressionTests(TestCase):
         SwitchPortVlanProfile.objects.create(name=DEFAULT_PROFILE_NAME, native_vlan=self.vlan)
         with self.assertRaises(CommandError):
             call_command("seed_defaults")
+
+    def test_seed_defaults_refuses_to_wire_new_profile_to_mismatched_vlan(self) -> None:
+        """A previous version of this command warned about a mismatched
+        VLAN id=1 but still used it as the new profile's native_vlan —
+        silently wiring the system profile to whatever that row actually
+        was. Once no system profile exists yet, a mismatch must block
+        creation instead, matching the migration's own posture.
+        """
+        SwitchPortVlanProfile.objects.filter(is_system=True).update(is_system=False)
+        SwitchPortVlanProfile.objects.filter(name=DEFAULT_PROFILE_NAME).delete()
+        VLAN.objects.filter(vlan_id=DEFAULT_VLAN_ID).update(name="Repurposed", subnet="10.250.0.0/21")
+        with self.assertRaises(CommandError):
+            call_command("seed_defaults")
+        self.assertFalse(SwitchPortVlanProfile.objects.filter(is_system=True).exists())
+
+    def test_seed_defaults_tolerates_vlan_drift_once_profile_exists(self) -> None:
+        """Unlike the profile's `is_system` fields, VLAN 1's name/subnet
+        aren't documented as permanently locked — renaming it later is a
+        legitimate administrative action, not a conflict, once the system
+        profile is already wired to it.
+        """
+        VLAN.objects.filter(vlan_id=DEFAULT_VLAN_ID).update(name="Renamed VLAN 1")
+        call_command("seed_defaults")  # must not raise
+        self.assertTrue(SwitchPortVlanProfile.objects.filter(is_system=True).exists())
 
     # --- P1: clearing a VLAN's subnet orphaned its addressing -------------
     def test_clearing_subnet_blocked_by_existing_rack_range(self) -> None:
@@ -2871,3 +2927,246 @@ class ReviewCouncilRegressionTests(TestCase):
             [],
             "connected_device_port must come from select_related, not one query per inline row",
         )
+
+    # --- P2: through-model save() trusted a stale cached profile object ---
+    def test_through_row_save_rejects_against_committed_all_vlans_allowed(self) -> None:
+        """``SwitchPortVlanProfileAllowedVlan.save()`` used to validate a
+        cached ``self.profile`` FK object rather than the current database
+        row. No true concurrency/threading is needed to demonstrate this —
+        the bug was that a Python-level object reference held from an
+        earlier, unrelated read doesn't reflect a plain, ordinary ``.save()``
+        made by someone else in between, not a bypass or a race requiring
+        overlapping transactions.
+        """
+        profile = _make_profile(self.vlan, name="Trunk")
+        stale_profile = SwitchPortVlanProfile.objects.get(pk=profile.pk)  # loaded before the change
+
+        SwitchPortVlanProfile.objects.filter(pk=profile.pk).update(all_vlans_allowed=True)
+
+        link = SwitchPortVlanProfileAllowedVlan(profile=stale_profile, vlan=self.vlan)
+        with self.assertRaises(ValidationError):
+            link.save()
+
+    def test_through_row_save_rejects_against_committed_native_vlan_change(self) -> None:
+        other_vlan = VLAN.objects.create(name="Media", vlan_id=201, subnet="10.201.0.0/21")
+        profile = _make_profile(self.vlan, name="Trunk")
+        stale_profile = SwitchPortVlanProfile.objects.get(pk=profile.pk)
+
+        SwitchPortVlanProfile.objects.filter(pk=profile.pk).update(native_vlan=other_vlan)
+
+        link = SwitchPortVlanProfileAllowedVlan(profile=stale_profile, vlan=other_vlan)
+        with self.assertRaises(ValidationError):
+            link.save()
+
+    # --- P3: persisted-links / connected-port checks ignored update_fields
+    def test_persisted_links_check_ignores_unrelated_update_fields(self) -> None:
+        """``profile.all_vlans_allowed = True`` in memory must not block a
+        ``save(update_fields=[...])`` that never actually writes that field.
+        """
+        profile = _make_profile(self.vlan, name="Trunk")
+        other_vlan = VLAN.objects.create(name="Media", vlan_id=201, subnet="10.201.0.0/21")
+        profile.allowed_vlans.add(other_vlan)
+
+        profile.all_vlans_allowed = True  # in memory only
+        profile.name = "Renamed Trunk"
+        profile.save(update_fields=["name"])  # must not raise — all_vlans_allowed isn't written
+
+        profile.refresh_from_db()
+        self.assertEqual(profile.name, "Renamed Trunk")
+        self.assertFalse(profile.all_vlans_allowed)
+
+    def test_persisted_links_check_still_fires_when_field_is_included(self) -> None:
+        profile = _make_profile(self.vlan, name="Trunk")
+        other_vlan = VLAN.objects.create(name="Media", vlan_id=201, subnet="10.201.0.0/21")
+        profile.allowed_vlans.add(other_vlan)
+
+        profile.all_vlans_allowed = True
+        with self.assertRaises(ValidationError):
+            profile.save(update_fields=["all_vlans_allowed"])
+
+    def test_switch_port_profile_guard_ignores_unrelated_update_fields(self) -> None:
+        """An in-memory ``profile_id`` that differs from what's persisted
+        must not block a ``save(update_fields=[...])`` that never writes
+        ``profile`` — even on a port with a connected device.
+        """
+        rack = Rack.objects.create(name="Rack 1", slot_count=4)
+        RackVlanRange.objects.create(rack=rack, vlan=self.vlan, address_range="10.200.1.0/27")
+        switch_type = _make_switch_type(port_count=1)
+        switch = NetworkSwitch.objects.create(switch_type=switch_type)
+        port = switch.ports.get()
+        device_type = _make_device_type(port_count=1, vlan=self.vlan)
+        device = NetworkDevice.objects.create(device_type=device_type, rack=rack, rack_slot=1)
+        device_port = device.ports.get()
+        device_port.switch_port = port
+        device_port.save()
+
+        other_profile = _make_profile(self.vlan, name="Other")
+        port.profile_id = other_profile.pk  # in memory only
+        port.description = "renamed"
+        port.save(update_fields=["description"])  # must not raise — profile isn't written
+
+        port.refresh_from_db()
+        self.assertEqual(port.description, "renamed")
+        self.assertNotEqual(port.profile_id, other_profile.pk)
+
+    # --- P2: admin form clean() was inert on locked profiles ---------------
+    def _make_in_use_profile(self, name: str, **kwargs) -> SwitchPortVlanProfile:
+        profile = _make_profile(self.vlan, name=name, **kwargs)
+        switch_type = NetworkSwitchType.objects.create(
+            manufacturer="Cisco", model="SG300", name=f"{name}-type", port_count=1
+        )
+        NetworkSwitchTypePort.objects.create(
+            switch_type=switch_type, port_number=1, port_type=PortType.GBE_RJ45, profile=profile
+        )
+        NetworkSwitch.objects.create(switch_type=switch_type)
+        return profile
+
+    def _admin_form_for(self, profile: SwitchPortVlanProfile, data: dict):
+        """Builds the form the *admin* would actually build for ``profile``
+        — critically, going through ``SwitchPortVlanProfileAdmin.get_form()``
+        rather than instantiating ``SwitchPortVlanProfileForm`` directly.
+        Only ``ModelAdmin.get_form()`` applies ``exclude=readonly_fields``,
+        which is what actually drops ``port_mode``/``native_vlan`` from the
+        form for a locked profile — instantiating the form class directly
+        would require submitting them anyway (they're declared required on
+        the class itself) and so would never exercise the fallback this
+        test is checking.
+        """
+        request = RequestFactory().post(f"/admin/inventory/switchportvlanprofile/{profile.pk}/change/")
+        request.user = User.objects.create_superuser(
+            username=f"formtest-{profile.pk}", password="x", email="a@b.c"
+        )
+        admin = SwitchPortVlanProfileAdmin(SwitchPortVlanProfile, AdminSite())
+        form_class = admin.get_form(request, profile)
+        return form_class(data=data, instance=profile)
+
+    def test_form_rejects_all_vlans_allowed_on_locked_access_profile(self) -> None:
+        """``port_mode`` is excluded from the form entirely once a profile
+        is in use (it's in ``get_readonly_fields()``), so it used to read
+        as ``None`` in ``cleaned_data`` — silently passing an Access-mode,
+        in-use profile through with ``all_vlans_allowed=True`` submitted.
+        The form must fall back to the instance's persisted ``port_mode``.
+        """
+        profile = self._make_in_use_profile("LockedAccess", port_mode=PortMode.ACCESS)
+        form = self._admin_form_for(
+            profile, data={"name": profile.name, "all_vlans_allowed": "on", "allowed_vlans": []}
+        )
+        self.assertFalse(form.is_valid())
+        self.assertIn("all_vlans_allowed cannot be set while port_mode is Access", str(form.errors))
+
+    def test_form_still_valid_for_locked_trunk_profile_with_ordinary_edit(self) -> None:
+        other_vlan = VLAN.objects.create(name="Media", vlan_id=201, subnet="10.201.0.0/21")
+        profile = self._make_in_use_profile("LockedTrunk")
+        form = self._admin_form_for(
+            profile, data={"name": "Renamed", "all_vlans_allowed": "", "allowed_vlans": [other_vlan.pk]}
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+
+    # --- P2: single-submission scalar+M2M edit was rejected -----------------
+    def test_form_allows_enabling_all_vlans_allowed_while_clearing_allowed_vlans(self) -> None:
+        """Reproduces the ergonomics bug: a valid combined edit (flip
+        all_vlans_allowed on, clear the now-incompatible allowed_vlans) used
+        to be rejected because the model's persisted-links check runs
+        during _post_clean(), before save_m2m() has applied the cleared
+        selection — forcing two separate saves for what should be one.
+        """
+        other_vlan = VLAN.objects.create(name="Media", vlan_id=201, subnet="10.201.0.0/21")
+        profile = _make_profile(self.vlan, name="Trunk")
+        profile.allowed_vlans.add(other_vlan)
+
+        form = SwitchPortVlanProfileForm(
+            data={
+                "name": profile.name,
+                "port_mode": PortMode.TRUNK,
+                "native_vlan": self.vlan.pk,
+                "all_vlans_allowed": "on",
+                "allowed_vlans": [],
+            },
+            instance=profile,
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        saved = form.save(commit=True)  # commit=True already applies save_m2m() internally
+
+        saved.refresh_from_db()
+        self.assertTrue(saved.all_vlans_allowed)
+        self.assertEqual(list(saved.allowed_vlans.all()), [])
+
+    def test_trust_flag_does_not_bypass_a_genuinely_inconsistent_direct_save(self) -> None:
+        """The form-granted exemption is instance-scoped, not a general
+        bypass — a plain, non-form save that flips a scalar without ever
+        clearing the conflicting persisted links must still be rejected.
+        """
+        other_vlan = VLAN.objects.create(name="Media", vlan_id=201, subnet="10.201.0.0/21")
+        profile = _make_profile(self.vlan, name="Trunk")
+        profile.allowed_vlans.add(other_vlan)
+        profile.all_vlans_allowed = True
+        with self.assertRaises(ValidationError):
+            profile.save()
+
+    # --- P2: Access + all_vlans_allowed with an empty VLAN list -------------
+    def test_form_rejects_access_mode_with_all_vlans_allowed_on_create(self) -> None:
+        form = SwitchPortVlanProfileForm(
+            data={
+                "name": "Bad Access",
+                "port_mode": PortMode.ACCESS,
+                "native_vlan": self.vlan.pk,
+                "all_vlans_allowed": "on",
+                "allowed_vlans": [],
+            }
+        )
+        self.assertFalse(form.is_valid())
+
+    def test_model_rejects_access_mode_with_all_vlans_allowed_via_clean(self) -> None:
+        profile = SwitchPortVlanProfile(
+            name="Bad Access", native_vlan=self.vlan, port_mode=PortMode.ACCESS, all_vlans_allowed=True
+        )
+        with self.assertRaises(ValidationError):
+            profile.full_clean()
+
+    def test_db_rejects_access_mode_with_all_vlans_allowed_bypassing_clean(self) -> None:
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            SwitchPortVlanProfile.objects.bulk_create(
+                [
+                    SwitchPortVlanProfile(
+                        name="Bad Access Bulk",
+                        native_vlan=self.vlan,
+                        port_mode=PortMode.ACCESS,
+                        all_vlans_allowed=True,
+                    )
+                ]
+            )
+
+    def test_trunk_mode_with_all_vlans_allowed_remains_valid(self) -> None:
+        profile = SwitchPortVlanProfile(
+            name="Good Trunk All", native_vlan=self.vlan, port_mode=PortMode.TRUNK, all_vlans_allowed=True
+        )
+        profile.full_clean()  # must not raise
+        profile.save()
+
+    # --- P2: direct through-row writes left no audit entry ------------------
+    def test_direct_through_row_creation_is_logged(self) -> None:
+        """``m2m_fields`` on the profile's auditlog registration only
+        tracks ``.add()``/``.set()``/``.remove()`` (which fire
+        ``m2m_changed``) — direct ``SwitchPortVlanProfileAllowedVlan``
+        creation is a separately supported write path (it has its own
+        ``clean()``/``save()`` validation) that never fires that signal,
+        so it needs its own registration to be logged at all.
+        """
+        other_vlan = VLAN.objects.create(name="Media", vlan_id=201, subnet="10.201.0.0/21")
+        profile = _make_profile(self.vlan, name="Trunk")
+
+        link = SwitchPortVlanProfileAllowedVlan.objects.create(profile=profile, vlan=other_vlan)
+
+        self.assertTrue(
+            LogEntry.objects.filter(object_pk=str(link.pk), action=LogEntry.Action.CREATE).exists()
+        )
+
+    def test_direct_through_row_deletion_is_logged(self) -> None:
+        other_vlan = VLAN.objects.create(name="Media", vlan_id=201, subnet="10.201.0.0/21")
+        profile = _make_profile(self.vlan, name="Trunk")
+        link = SwitchPortVlanProfileAllowedVlan.objects.create(profile=profile, vlan=other_vlan)
+        pk = link.pk
+
+        link.delete()
+
+        self.assertTrue(LogEntry.objects.filter(object_pk=str(pk), action=LogEntry.Action.DELETE).exists())

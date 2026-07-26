@@ -217,6 +217,14 @@ STORAGES = {
 # no longer carry ``allowed_vlans`` themselves (that lives on the profile
 # now) — the profile FK they do carry is an ordinary scalar field, already
 # covered by their existing tracking below with no extra configuration.
+#
+# ``m2m_fields`` only tracks changes made *through the M2M manager*
+# (``.add()``/``.set()``/``.remove()``, which fire ``m2m_changed``) —
+# ``SwitchPortVlanProfileAllowedVlan`` supports direct row creation/deletion
+# too (see its own ``clean()``/``save()``), which never fires that signal
+# and so would otherwise leave a supported, config-changing write path
+# completely unaudited. Registering the through model itself closes that
+# gap with its own CREATE/DELETE log entries.
 AUDITLOG_INCLUDE_TRACKING_MODELS = (
     "inventory.VLAN",
     "inventory.Rack",
@@ -225,6 +233,10 @@ AUDITLOG_INCLUDE_TRACKING_MODELS = (
     "inventory.NetworkDeviceTypePort",
     "inventory.NetworkSwitchTypePort",
     {"model": "inventory.SwitchPortVlanProfile", "m2m_fields": ["allowed_vlans"]},
+    {
+        "model": "inventory.SwitchPortVlanProfileAllowedVlan",
+        "include_fields": ["profile", "vlan", "created_at"],
+    },
     {"model": "inventory.RackVlanRange", "include_fields": ["address_range", "created_at"]},
     {"model": "inventory.NetworkSwitch", "include_fields": ["rack", "rack_slot", "created_at"]},
     {"model": "inventory.NetworkSwitchAddress", "include_fields": ["address", "created_at"]},

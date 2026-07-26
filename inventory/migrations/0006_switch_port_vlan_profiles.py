@@ -84,6 +84,36 @@ def seed_defaults(apps, schema_editor):
         )
 
 
+def backfill_profile_fk(apps, schema_editor):
+    """Point every existing ``NetworkSwitchTypePort``/``NetworkSwitchPort``
+    row at the just-seeded Default profile, via this migration's own
+    *historical* model snapshot — never via the live
+    ``inventory.models.default_switch_port_vlan_profile()`` callable, which
+    the field's own definition uses as an ordinary Python-level default for
+    *future* row creation through the ORM. A schema migration must not rely
+    on that callable to backfill existing rows: it queries the model as
+    code defines it *today*, not as this migration's historical state
+    defines it, so a later migration that ever alters
+    ``SwitchPortVlanProfile``'s schema would otherwise break replaying this
+    migration from scratch (the callable would run against a schema this
+    point in history doesn't have yet). That's exactly why ``profile`` is
+    added nullable, with no default, then backfilled here explicitly, then
+    tightened to ``NOT NULL`` by the ``AlterField``s that follow.
+
+    In practice there is nothing to backfill — this project's databases are
+    rebuilt, not migrated over, so both tables are always empty here (see
+    the module docstring's "no semantic backfill" note) — but the correct
+    architecture for this migration doesn't depend on that being true.
+    """
+    SwitchPortVlanProfile = apps.get_model("inventory", "SwitchPortVlanProfile")
+    NetworkSwitchTypePort = apps.get_model("inventory", "NetworkSwitchTypePort")
+    NetworkSwitchPort = apps.get_model("inventory", "NetworkSwitchPort")
+
+    default_profile_id = SwitchPortVlanProfile.objects.get(is_system=True).pk
+    NetworkSwitchTypePort.objects.filter(profile__isnull=True).update(profile_id=default_profile_id)
+    NetworkSwitchPort.objects.filter(profile__isnull=True).update(profile_id=default_profile_id)
+
+
 class Migration(migrations.Migration):
     dependencies = [
         ("inventory", "0005_remove_vlan_dhcp_range_vlan_dhcp_range_end_and_more"),
@@ -262,7 +292,34 @@ class Migration(migrations.Migration):
         # to backfill existing rows even on an empty table, so the row must
         # already exist by then.
         migrations.RunPython(seed_defaults, reverse_code=migrations.RunPython.noop),
+        # Added nullable, no default, then backfilled and tightened below —
+        # see backfill_profile_fk()'s docstring for why the field's real
+        # (live-model-querying) default must never be invoked by a schema
+        # operation itself.
         migrations.AddField(
+            model_name="networkswitchtypeport",
+            name="profile",
+            field=models.ForeignKey(
+                null=True,
+                help_text="Switch Port VLAN Profile — defaults to the system Default profile if none is selected.",
+                on_delete=django.db.models.deletion.PROTECT,
+                related_name="type_ports",
+                to="inventory.switchportvlanprofile",
+            ),
+        ),
+        migrations.AddField(
+            model_name="networkswitchport",
+            name="profile",
+            field=models.ForeignKey(
+                null=True,
+                help_text="Switch Port VLAN Profile. Can be swapped for another unless a device is connected.",
+                on_delete=django.db.models.deletion.PROTECT,
+                related_name="ports",
+                to="inventory.switchportvlanprofile",
+            ),
+        ),
+        migrations.RunPython(backfill_profile_fk, reverse_code=migrations.RunPython.noop),
+        migrations.AlterField(
             model_name="networkswitchtypeport",
             name="profile",
             field=models.ForeignKey(
@@ -273,7 +330,7 @@ class Migration(migrations.Migration):
                 to="inventory.switchportvlanprofile",
             ),
         ),
-        migrations.AddField(
+        migrations.AlterField(
             model_name="networkswitchport",
             name="profile",
             field=models.ForeignKey(

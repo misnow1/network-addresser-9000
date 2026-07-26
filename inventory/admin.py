@@ -145,7 +145,7 @@ class NetworkDeviceTypePortFormSet(_PortCountFormSet):
 
 
 class SwitchPortVlanProfileForm(forms.ModelForm):
-    """Carries the three ``allowed_vlans`` invariants that can't live in
+    """Carries the ``allowed_vlans`` invariants that can't live in
     ``SwitchPortVlanProfile.clean()`` (see that model's docstring: no pk yet
     on create, stale M2M on edit since ``save_m2m()`` runs after ``save()``)
     — this is the one enforcement path that can turn them into field-level
@@ -166,14 +166,32 @@ class SwitchPortVlanProfileForm(forms.ModelForm):
         if self.instance.pk:
             self.fields["allowed_vlans"].initial = self.instance.allowed_vlans.all()
 
+    def _effective(self, cleaned_data: dict[str, Any], field: str, default: Any) -> Any:
+        """``cleaned_data[field]``, or the instance's current persisted
+        value if ``field`` was excluded from this form entirely —
+        ``SwitchPortVlanProfileAdmin.get_readonly_fields()`` drops
+        ``port_mode``/``native_vlan`` (and, on the system profile,
+        ``all_vlans_allowed``) once locked, so they're simply *absent* from
+        ``cleaned_data`` rather than present-but-unchanged. Falling back to
+        the instance's value is correct precisely because "locked" means
+        this submission cannot be changing it anyway. Falls back to
+        ``default`` only for a brand-new, not-yet-saved profile, where
+        nothing is ever excluded in the first place.
+        """
+        if field in cleaned_data:
+            return cleaned_data[field]
+        return getattr(self.instance, field) if self.instance.pk else default
+
     def clean(self) -> dict[str, Any]:
         cleaned_data = super().clean() or {}
         if any(self.errors):
             return cleaned_data
-        all_vlans_allowed = cleaned_data.get("all_vlans_allowed")
-        port_mode = cleaned_data.get("port_mode")
-        native_vlan = cleaned_data.get("native_vlan")
-        allowed_vlans = cleaned_data.get("allowed_vlans")
+        all_vlans_allowed = self._effective(cleaned_data, "all_vlans_allowed", False)
+        port_mode = self._effective(cleaned_data, "port_mode", PortMode.TRUNK)
+        native_vlan = self._effective(cleaned_data, "native_vlan", None)
+        allowed_vlans = cleaned_data.get("allowed_vlans")  # never excluded — always editable
+        if port_mode == PortMode.ACCESS and all_vlans_allowed:
+            raise forms.ValidationError("all_vlans_allowed cannot be set while port_mode is Access.")
         if allowed_vlans and (all_vlans_allowed or port_mode == PortMode.ACCESS):
             raise forms.ValidationError(
                 "allowed_vlans must be empty when all_vlans_allowed is set or port_mode is Access."
@@ -183,6 +201,15 @@ class SwitchPortVlanProfileForm(forms.ModelForm):
                 "native_vlan is already listed in allowed_vlans — it's implicitly allowed and "
                 "must not also be listed explicitly."
             )
+        # This form has now validated the *complete* submitted state
+        # (scalars together with the new allowed_vlans selection) — grant
+        # the one-instance exemption so the model's own persisted-links
+        # check (which only ever sees the *old* M2M state; save_m2m() runs
+        # after both _post_clean() and save()) doesn't reject a valid
+        # combined edit, e.g. enabling all_vlans_allowed while clearing
+        # allowed_vlans in the same submission. See
+        # SwitchPortVlanProfile._validate_scalars_against_persisted_links.
+        self.instance._trust_pending_m2m_from_form = True
         return cleaned_data
 
 
