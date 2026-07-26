@@ -387,9 +387,25 @@ class VLANAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAd
 @admin.register(SwitchPortVlanProfile)
 class SwitchPortVlanProfileAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
     form = SwitchPortVlanProfileForm
-    list_display = ["name", "port_mode", "native_vlan", "all_vlans_allowed", "is_system"]
+    list_display = [
+        "name",
+        "port_mode",
+        "native_vlan",
+        "all_vlans_allowed",
+        "allowed_vlans_display",
+        "is_system",
+    ]
     search_fields = ["name"]
     show_auditlog_history_link = True
+
+    def get_queryset(self, request: HttpRequest) -> QuerySet:
+        # allowed_vlans_display() reads every row's allowed_vlans — without
+        # this, an N+1 across the changelist.
+        return super().get_queryset(request).prefetch_related("allowed_vlans")
+
+    @admin.display(description="Allowed VLANs")
+    def allowed_vlans_display(self, obj: SwitchPortVlanProfile) -> str:
+        return ", ".join(str(vlan_id) for vlan_id in sorted(vlan.vlan_id for vlan in obj.allowed_vlans.all()))
 
     def get_readonly_fields(self, request: HttpRequest, obj: Any = None) -> list[str]:
         # Both sets are the same ones SwitchPortVlanProfile.save() itself

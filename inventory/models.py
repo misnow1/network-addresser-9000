@@ -933,6 +933,24 @@ class RackSlotAssignmentMixin:
         raise NotImplementedError
 
 
+def _persisted_is_system(pk: int) -> bool:
+    """The actually-persisted ``is_system`` value for profile ``pk``.
+
+    Deliberately not ``self.is_system`` — that in-memory attribute can be
+    set on an instance without ever being saved (``is_system`` is
+    ``editable=False`` but still a plain Python attribute), which would
+    otherwise let a caller unlock or delete the system profile just by
+    assigning ``profile.is_system = False`` before calling ``save()``/
+    ``delete()``. Callers that already hold this row's lock (``save()``/
+    ``delete()``, both via ``_lock_profile_rows()``) get the guaranteed
+    latest-committed value; ``clean()`` reads it unlocked, same tradeoff
+    ``_check_scalar_fields_locked()`` itself documents for that path.
+    """
+    return bool(
+        SwitchPortVlanProfile._default_manager.filter(pk=pk).values_list("is_system", flat=True).first()
+    )
+
+
 def _lock_profile_rows(*pks: int | None) -> None:
     """Acquire a row lock (``SELECT ... FOR UPDATE``) on the given
     ``SwitchPortVlanProfile`` rows — must run inside ``transaction.atomic()``.
@@ -1066,11 +1084,14 @@ class SwitchPortVlanProfile(AuditedModel):
         help_text="System default profile (seeded by migration) — permanently locked, never deletable.",
     )
 
-    #: Not a Django field — a one-request-lived escape hatch set by
+    #: Not a Django field — a one-save-lived escape hatch set by
     #: ``SwitchPortVlanProfileForm.clean()`` once it has already validated
     #: the *complete* submitted state (new scalars together with the new
-    #: ``allowed_vlans`` selection). See ``_validate_scalars_against_persisted_links``
-    #: for why ``Model.clean()``/``save()`` need this exemption at all.
+    #: ``allowed_vlans`` selection). ``SwitchPortVlanProfile.save()`` clears
+    #: it again immediately after using it, so it never outlives the one
+    #: save() call it was granted for. See
+    #: ``_validate_scalars_against_persisted_links`` for why
+    #: ``Model.clean()``/``save()`` need this exemption at all.
     _trust_pending_m2m_from_form: bool = False
 
     objects = SwitchPortVlanProfileQuerySet.as_manager()
@@ -1124,6 +1145,13 @@ class SwitchPortVlanProfile(AuditedModel):
             super().save(
                 force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
             )
+            # One-save exemption, consumed: SwitchPortVlanProfileForm.clean()
+            # grants this for the one save() that follows it (before its
+            # save_m2m() applies the newly-validated links) — left set, it
+            # would silently exempt every later save() on this same instance
+            # from _validate_scalars_against_persisted_links(), including
+            # ones a form never validated at all.
+            self._trust_pending_m2m_from_form = False
 
     def clean(self) -> None:
         super().clean()
@@ -1142,7 +1170,10 @@ class SwitchPortVlanProfile(AuditedModel):
     def delete(self, using=None, keep_parents=False) -> tuple[int, dict[str, int]]:
         with transaction.atomic():
             _lock_profile_rows(self.pk)
-            if self.is_system or self._referenced_by_any_port(for_update=True):
+            # _persisted_is_system(), not self.is_system — see
+            # _check_scalar_fields_locked for why the in-memory attribute
+            # can't be trusted here either.
+            if _persisted_is_system(self.pk) or self._referenced_by_any_port(for_update=True):
                 raise ValidationError(
                     f"{self} cannot be deleted: it is the system default profile, or is still in "
                     "use by a switch type port or switch port."
@@ -1198,7 +1229,10 @@ class SwitchPortVlanProfile(AuditedModel):
     def _check_scalar_fields_locked(
         self, *, update_fields: "list[str] | frozenset[str] | None", for_update: bool = False
     ) -> None:
-        if self.is_system:
+        # _persisted_is_system(), not self.is_system: the in-memory attribute
+        # can be mutated without saving, and this decides which fields are
+        # locked, so it must not trust an unsaved, possibly-forged value.
+        if _persisted_is_system(self.pk):
             locked_fields = _PROFILE_SYSTEM_LOCKED_FIELDS
         elif self._in_use(for_update=for_update):
             locked_fields = _PROFILE_IN_USE_LOCKED_FIELDS
@@ -1260,7 +1294,10 @@ class SwitchPortVlanProfile(AuditedModel):
         links goes through ``.set([])``/``.clear()``, which the
         ``m2m_changed`` receiver correctly treats as always-safe and never
         validates, so nothing else in this module ever proves that
-        particular combination sound.
+        particular combination sound. ``SwitchPortVlanProfile.save()``
+        clears the flag again right after using it, so it exempts exactly
+        the one save() call the form's clean() granted it for — never a
+        later, unrelated save() on the same in-memory instance.
 
         Honors ``update_fields`` the same way ``_check_locked_fields_unchanged``
         does: a ``save(update_fields=[...])`` that doesn't touch any of the
