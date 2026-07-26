@@ -51,9 +51,9 @@ from .models import (
     RackVlanRange,
 )
 from .suggestions import (
+    dhcp_range_overlaps_cidr,
     prefix_length_for_capacity,
     suggest_default_gateway,
-    suggest_dhcp_range,
     suggest_rack_vlan_range,
     suggest_slot_address,
 )
@@ -501,11 +501,24 @@ class SuggestionFunctionTests(TestCase):
     def test_suggest_default_gateway_is_lowest_host_address(self) -> None:
         self.assertEqual(suggest_default_gateway("10.200.0.0/21"), "10.200.0.1")
 
-    def test_suggest_dhcp_range_is_bottom_24_of_larger_subnet(self) -> None:
-        self.assertEqual(suggest_dhcp_range("10.200.0.0/21"), "10.200.0.0/24")
+    def test_dhcp_range_overlaps_cidr_when_range_starts_inside_block(self) -> None:
+        self.assertTrue(dhcp_range_overlaps_cidr("10.200.0.100", "10.200.1.50", "10.200.0.0/24"))
 
-    def test_suggest_dhcp_range_none_when_subnet_smaller_than_24(self) -> None:
-        self.assertIsNone(suggest_dhcp_range("10.200.1.0/27"))
+    def test_dhcp_range_overlaps_cidr_when_block_is_inside_range(self) -> None:
+        self.assertTrue(dhcp_range_overlaps_cidr("10.200.0.0", "10.200.7.255", "10.200.3.0/24"))
+
+    def test_dhcp_range_overlaps_cidr_touching_at_block_boundary(self) -> None:
+        self.assertTrue(dhcp_range_overlaps_cidr("10.200.0.255", "10.200.1.5", "10.200.1.0/24"))
+
+    def test_dhcp_range_overlaps_cidr_false_when_disjoint(self) -> None:
+        self.assertFalse(dhcp_range_overlaps_cidr("10.200.0.1", "10.200.0.254", "10.200.1.0/24"))
+
+    def test_dhcp_range_overlaps_cidr_normalizes_reversed_start_end(self) -> None:
+        # start/end ordering is only enforced by VLAN.clean(), not at the DB
+        # layer (a string-based CheckConstraint can't express IPv4 ordering
+        # correctly) — a reversed pair reaching this function must not
+        # silently compute a wrong (false-negative) overlap answer.
+        self.assertTrue(dhcp_range_overlaps_cidr("10.200.5.5", "10.200.1.5", "10.200.3.0/24"))
 
     def test_prefix_length_for_capacity_matches_worked_example(self) -> None:
         # DESIGN.md's worked example: a rack sized for slots 1-30 gets a /27.
@@ -533,7 +546,7 @@ class SuggestionFunctionTests(TestCase):
         self.assertEqual(result, "10.200.0.64/27")
 
     def test_suggest_rack_vlan_range_skips_dhcp_range(self) -> None:
-        result = suggest_rack_vlan_range("10.200.0.0/21", 30, ["10.200.0.0/24"])
+        result = suggest_rack_vlan_range("10.200.0.0/21", 30, [], dhcp_range=("10.200.0.1", "10.200.0.254"))
         self.assertEqual(result, "10.200.1.0/27")
 
     def test_suggest_rack_vlan_range_none_when_rack_too_big_for_subnet(self) -> None:
@@ -549,11 +562,12 @@ class SuggestionFunctionTests(TestCase):
 
 
 class VLANSuggestionTests(TestCase):
-    def test_blank_gateway_and_dhcp_range_filled_on_create(self) -> None:
+    def test_blank_gateway_filled_on_create_dhcp_range_stays_blank(self) -> None:
         vlan = VLAN(name="Control", vlan_id=200, subnet="10.200.0.0/21")
         vlan.full_clean()
         self.assertEqual(vlan.default_gateway, "10.200.0.1")
-        self.assertEqual(vlan.dhcp_range, "10.200.0.0/24")
+        self.assertIsNone(vlan.dhcp_range_start)
+        self.assertIsNone(vlan.dhcp_range_end)
 
     def test_explicit_values_are_preserved(self) -> None:
         vlan = VLAN(
@@ -561,16 +575,19 @@ class VLANSuggestionTests(TestCase):
             vlan_id=200,
             subnet="10.200.0.0/21",
             default_gateway="10.200.0.254",
-            dhcp_range="10.200.7.0/24",
+            dhcp_range_start="10.200.7.1",
+            dhcp_range_end="10.200.7.254",
         )
         vlan.full_clean()
         self.assertEqual(vlan.default_gateway, "10.200.0.254")
-        self.assertEqual(vlan.dhcp_range, "10.200.7.0/24")
+        self.assertEqual(vlan.dhcp_range_start, "10.200.7.1")
+        self.assertEqual(vlan.dhcp_range_end, "10.200.7.254")
 
-    def test_dhcp_range_left_blank_for_subnet_smaller_than_24(self) -> None:
+    def test_dhcp_range_start_and_end_stay_blank_when_not_provided(self) -> None:
         vlan = VLAN(name="Tiny", vlan_id=201, subnet="10.201.1.0/27")
         vlan.full_clean()
-        self.assertEqual(vlan.dhcp_range, "")
+        self.assertIsNone(vlan.dhcp_range_start)
+        self.assertIsNone(vlan.dhcp_range_end)
 
     def test_clearing_on_update_is_not_silently_refilled(self) -> None:
         vlan = VLAN.objects.create(
@@ -591,7 +608,79 @@ class VLANSuggestionTests(TestCase):
             vlan.full_clean()
 
     def test_dhcp_range_outside_subnet_raises(self) -> None:
-        vlan = VLAN(name="Control", vlan_id=200, subnet="10.200.0.0/21", dhcp_range="10.201.0.0/24")
+        vlan = VLAN(
+            name="Control",
+            vlan_id=200,
+            subnet="10.200.0.0/21",
+            dhcp_range_start="10.201.0.1",
+            dhcp_range_end="10.201.0.254",
+        )
+        with self.assertRaises(ValidationError):
+            vlan.full_clean()
+
+    def test_dhcp_range_start_only_raises(self) -> None:
+        vlan = VLAN(name="Control", vlan_id=200, subnet="10.200.0.0/21", dhcp_range_start="10.200.0.10")
+        with self.assertRaises(ValidationError):
+            vlan.full_clean()
+
+    def test_dhcp_range_end_only_raises(self) -> None:
+        vlan = VLAN(name="Control", vlan_id=200, subnet="10.200.0.0/21", dhcp_range_end="10.200.0.200")
+        with self.assertRaises(ValidationError):
+            vlan.full_clean()
+
+    def test_dhcp_range_start_after_end_raises(self) -> None:
+        vlan = VLAN(
+            name="Control",
+            vlan_id=200,
+            subnet="10.200.0.0/21",
+            dhcp_range_start="10.200.0.200",
+            dhcp_range_end="10.200.0.10",
+        )
+        with self.assertRaises(ValidationError):
+            vlan.full_clean()
+
+    def test_dhcp_range_start_equal_to_end_raises(self) -> None:
+        vlan = VLAN(
+            name="Control",
+            vlan_id=200,
+            subnet="10.200.0.0/21",
+            dhcp_range_start="10.200.0.10",
+            dhcp_range_end="10.200.0.10",
+        )
+        with self.assertRaises(ValidationError):
+            vlan.full_clean()
+
+    def test_dhcp_range_containing_network_address_raises(self) -> None:
+        vlan = VLAN(
+            name="Control",
+            vlan_id=200,
+            subnet="10.200.0.0/21",
+            dhcp_range_start="10.200.0.0",
+            dhcp_range_end="10.200.0.50",
+        )
+        with self.assertRaises(ValidationError):
+            vlan.full_clean()
+
+    def test_dhcp_range_containing_broadcast_address_raises(self) -> None:
+        vlan = VLAN(
+            name="Control",
+            vlan_id=200,
+            subnet="10.200.0.0/21",
+            dhcp_range_start="10.200.7.200",
+            dhcp_range_end="10.200.7.255",
+        )
+        with self.assertRaises(ValidationError):
+            vlan.full_clean()
+
+    def test_dhcp_range_containing_default_gateway_raises(self) -> None:
+        vlan = VLAN(
+            name="Control",
+            vlan_id=200,
+            subnet="10.200.0.0/21",
+            default_gateway="10.200.0.1",
+            dhcp_range_start="10.200.0.1",
+            dhcp_range_end="10.200.0.50",
+        )
         with self.assertRaises(ValidationError):
             vlan.full_clean()
 
@@ -607,7 +696,90 @@ class VLANSuggestionTests(TestCase):
         vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
         rack = Rack.objects.create(name="Rack 1", slot_count=30)
         RackVlanRange.objects.create(rack=rack, vlan=vlan, address_range="10.200.1.0/27")
-        vlan.dhcp_range = "10.200.1.0/24"
+        vlan.dhcp_range_start = "10.200.1.10"
+        vlan.dhcp_range_end = "10.200.1.20"
+        with self.assertRaises(ValidationError):
+            vlan.full_clean()
+
+    def test_editing_dhcp_range_to_newly_include_existing_switch_address_raises(self) -> None:
+        vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        rack = Rack.objects.create(name="Rack 1", slot_count=4)
+        switch_type = _make_switch_type()
+        switch = NetworkSwitch.objects.create(switch_type=switch_type, rack=rack, rack_slot=1)
+        # Direct-ORM create bypasses NetworkSwitchAddress.clean()'s own
+        # DHCP-range check (see this module's docstring) — needed here since
+        # the DHCP range that will swallow this address isn't set yet.
+        NetworkSwitchAddress.objects.create(switch=switch, vlan=vlan, address="10.200.5.1")
+        vlan.dhcp_range_start = "10.200.5.0"
+        vlan.dhcp_range_end = "10.200.5.10"
+        with self.assertRaises(ValidationError):
+            vlan.full_clean()
+
+    def test_editing_dhcp_range_to_newly_include_existing_device_port_address_raises(self) -> None:
+        vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        device_type = _make_device_type()
+        device = NetworkDevice.objects.create(device_type=device_type)
+        NetworkDevicePort.objects.create(device=device, description="Port A", vlan=vlan, address="10.200.5.2")
+        vlan.dhcp_range_start = "10.200.5.0"
+        vlan.dhcp_range_end = "10.200.5.10"
+        with self.assertRaises(ValidationError):
+            vlan.full_clean()
+
+    def test_new_switch_address_inside_dhcp_range_raises(self) -> None:
+        vlan = VLAN.objects.create(
+            name="Control",
+            vlan_id=200,
+            subnet="10.200.0.0/21",
+            dhcp_range_start="10.200.5.0",
+            dhcp_range_end="10.200.5.10",
+        )
+        rack = Rack.objects.create(name="Rack 1", slot_count=4)
+        switch_type = _make_switch_type()
+        switch = NetworkSwitch.objects.create(switch_type=switch_type, rack=rack, rack_slot=1)
+        RackVlanRange.objects.create(rack=rack, vlan=vlan, address_range="10.200.5.0/27")
+        address = NetworkSwitchAddress(switch=switch, vlan=vlan, address="10.200.5.5")
+        with self.assertRaises(ValidationError):
+            address.full_clean()
+
+    def test_new_device_port_address_inside_dhcp_range_raises(self) -> None:
+        vlan = VLAN.objects.create(
+            name="Control",
+            vlan_id=200,
+            subnet="10.200.0.0/21",
+            dhcp_range_start="10.200.5.0",
+            dhcp_range_end="10.200.5.10",
+        )
+        rack = Rack.objects.create(name="Rack 1", slot_count=4)
+        device_type = _make_device_type()
+        device = NetworkDevice.objects.create(device_type=device_type, rack=rack, rack_slot=1)
+        RackVlanRange.objects.create(rack=rack, vlan=vlan, address_range="10.200.5.0/27")
+        port = NetworkDevicePort(device=device, description="Port A", vlan=vlan, address="10.200.5.5")
+        with self.assertRaises(ValidationError):
+            port.full_clean()
+
+    def test_db_rejects_dhcp_range_start_only_bypassing_clean(self) -> None:
+        vlan = VLAN(name="Control", vlan_id=200, subnet="10.200.0.0/21", dhcp_range_start="10.200.0.10")
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            VLAN.objects.bulk_create([vlan])
+
+    def test_db_rejects_dhcp_range_end_only_bypassing_clean(self) -> None:
+        vlan = VLAN(name="Control", vlan_id=200, subnet="10.200.0.0/21", dhcp_range_end="10.200.0.200")
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            VLAN.objects.bulk_create([vlan])
+
+    def test_malformed_dhcp_range_end_with_existing_dependents_raises_validation_not_crash(self) -> None:
+        # full_clean() still calls clean() even after clean_fields() has
+        # already flagged dhcp_range_end as malformed — clean() must not
+        # leave dhcp_start set while dhcp_end stays None, which would crash
+        # the switch_addresses re-check below with a raw TypeError instead
+        # of the ValidationError clean_fields() already produced.
+        vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        rack = Rack.objects.create(name="Rack 1", slot_count=4)
+        switch_type = _make_switch_type()
+        switch = NetworkSwitch.objects.create(switch_type=switch_type, rack=rack, rack_slot=1)
+        NetworkSwitchAddress.objects.create(switch=switch, vlan=vlan, address="10.200.5.1")
+        vlan.dhcp_range_start = "10.200.0.10"
+        vlan.dhcp_range_end = "not-an-ip"
         with self.assertRaises(ValidationError):
             vlan.full_clean()
 
@@ -652,7 +824,8 @@ class RackVlanRangeSuggestionTests(TestCase):
         self.assertEqual(range_.address_range, "10.200.0.32/27")
 
     def test_suggestion_skips_vlans_dhcp_range(self) -> None:
-        self.vlan.dhcp_range = "10.200.0.0/24"
+        self.vlan.dhcp_range_start = "10.200.0.1"
+        self.vlan.dhcp_range_end = "10.200.0.254"
         self.vlan.save()
         range_ = RackVlanRange(rack=self.rack, vlan=self.vlan)
         range_.full_clean()
@@ -666,7 +839,8 @@ class RackVlanRangeSuggestionTests(TestCase):
             range_.full_clean()
 
     def test_explicit_overlap_with_dhcp_range_raises(self) -> None:
-        self.vlan.dhcp_range = "10.200.0.0/24"
+        self.vlan.dhcp_range_start = "10.200.0.1"
+        self.vlan.dhcp_range_end = "10.200.0.254"
         self.vlan.save()
         range_ = RackVlanRange(rack=self.rack, vlan=self.vlan, address_range="10.200.0.0/27")
         with self.assertRaises(ValidationError):
@@ -722,6 +896,33 @@ class RackVlanRangeSuggestionTests(TestCase):
         range_ = RackVlanRange(rack=self.rack, vlan=self.vlan, address_range="not-a-cidr")
         with self.assertRaises(ValidationError):
             range_.full_clean()
+
+    def test_suggestion_skips_malformed_vlan_dhcp_range_without_crashing(self) -> None:
+        # A malformed persisted dhcp_range_start/end (only reachable via a
+        # clean()-bypassing write, e.g. bulk_create/QuerySet.update()) must
+        # be skipped like any other malformed sibling value, not handed
+        # straight to ipaddress.IPv4Address() unguarded — that would raise a
+        # raw ValueError instead of gracefully falling back to "no DHCP
+        # range" for suggestion purposes.
+        VLAN.objects.filter(pk=self.vlan.pk).update(
+            dhcp_range_start="not-an-ip", dhcp_range_end="10.200.0.50"
+        )
+        self.vlan.refresh_from_db()
+        range_ = RackVlanRange(rack=self.rack, vlan=self.vlan)
+        range_.full_clean()  # must not raise
+        self.assertEqual(range_.address_range, "10.200.0.0/27")
+
+    def test_explicit_range_with_malformed_vlan_dhcp_range_does_not_crash(self) -> None:
+        # Same guard, but for _validate_range()'s own overlap check (an
+        # explicit, non-blank address_range skips the suggestion path
+        # entirely, so this exercises a different code path than the test
+        # above).
+        VLAN.objects.filter(pk=self.vlan.pk).update(
+            dhcp_range_start="not-an-ip", dhcp_range_end="10.200.0.50"
+        )
+        self.vlan.refresh_from_db()
+        range_ = RackVlanRange(rack=self.rack, vlan=self.vlan, address_range="10.200.0.0/27")
+        range_.full_clean()  # must not raise
 
 
 class RackSlotCountEditTests(TestCase):
@@ -857,7 +1058,11 @@ class RackSlotAddressSuggestionTests(TestCase):
         # for a manually-typed address within the VLAN's subnet — otherwise
         # it could land inside the DHCP range or on the gateway.
         other_vlan = VLAN.objects.create(
-            name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21", dhcp_range="10.201.0.0/24"
+            name="Dante Primary",
+            vlan_id=201,
+            subnet="10.201.0.0/21",
+            dhcp_range_start="10.201.0.1",
+            dhcp_range_end="10.201.0.254",
         )
         switch = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=1)
         address = NetworkSwitchAddress(switch=switch, vlan=other_vlan, address="10.201.0.5")
@@ -866,7 +1071,11 @@ class RackSlotAddressSuggestionTests(TestCase):
 
     def test_device_port_address_manually_entered_without_rack_range_still_raises(self) -> None:
         other_vlan = VLAN.objects.create(
-            name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21", dhcp_range="10.201.0.0/24"
+            name="Dante Primary",
+            vlan_id=201,
+            subnet="10.201.0.0/21",
+            dhcp_range_start="10.201.0.1",
+            dhcp_range_end="10.201.0.254",
         )
         device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=2)
         port = NetworkDevicePort(device=device, description="Port A", vlan=other_vlan, address="10.201.0.5")
