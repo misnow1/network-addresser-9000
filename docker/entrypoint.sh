@@ -1,8 +1,10 @@
 #!/bin/sh
 # Container entrypoint: wait for the database, apply migrations, ensure the
-# RBAC groups exist (sync_roles — see README's "Setting up accounts"), then
-# hand off to the real process (gunicorn) via exec so it becomes PID 1 and
-# receives signals directly.
+# RBAC groups exist (sync_roles — see README's "Setting up accounts") and the
+# system Default VLAN/profile exist (seed_defaults — see ADR 0012; migrations
+# already seed these once but can't repair them if removed some other way),
+# then hand off to the real process (gunicorn) via exec so it becomes PID 1
+# and receives signals directly.
 set -e
 
 db_host="${DB_HOST:-127.0.0.1}"
@@ -29,5 +31,6 @@ echo "Database is reachable."
 
 python manage.py migrate --noinput
 python manage.py sync_roles
+python manage.py seed_defaults
 
 exec "$@"

@@ -4,7 +4,7 @@ A backend service and web frontend for tracking IP addresses assigned to network
 
 ## Status
 
-Django scaffolding, core domain logic (address suggestion, overlap validation, removal semantics), access/accountability (RBAC, mutation audit trail, removal confirmation), and deployment (Docker / docker-compose) are in place; phase 6 (process hardening) is next. See [`ROADMAP.md`](./ROADMAP.md) for what that covers. The domain model and key architectural decisions are settled; see the documentation below.
+Django scaffolding, core domain logic (address suggestion, overlap validation, removal semantics), access/accountability (RBAC, mutation audit trail, removal confirmation), deployment (Docker / docker-compose), and port profiles (including reusable, live-referenced Switch Port VLAN Profiles — see ADR 0012) are in place; phase 6 (process hardening) is still open. See [`ROADMAP.md`](./ROADMAP.md) for what that covers. The domain model and key architectural decisions are settled; see the documentation below.
 
 ## Documentation
 
@@ -20,7 +20,7 @@ cp .env.compose.example .env   # then fill in SECRET_KEY, DJANGO_ALLOWED_HOSTS, 
 docker compose up
 ```
 
-This brings up MariaDB and the app together; the app container waits for the database, applies migrations, and runs `sync_roles` automatically on every start (see "Setting up accounts" below) before serving on `http://127.0.0.1:8000/` (loopback-only by default — see `HOST_BIND` in `.env.compose.example`). Create your first user with `docker compose exec app python manage.py createsuperuser`.
+This brings up MariaDB and the app together; the app container waits for the database, applies migrations, and runs `sync_roles` and `seed_defaults` automatically on every start (see "Setting up accounts" below, and ADR 0012 for what `seed_defaults` seeds) before serving on `http://127.0.0.1:8000/` (loopback-only by default — see `HOST_BIND` in `.env.compose.example`). Create your first user with `docker compose exec app python manage.py createsuperuser`.
 
 A few things worth knowing before relying on this in practice:
 
@@ -32,7 +32,7 @@ A few things worth knowing before relying on this in practice:
 
 ## Setting up accounts
 
-Create a user via `/admin/auth/user/add/` with **Staff status** checked (required for any Django-admin access, including the read-only Viewer role), then assign them to one of the three groups — Viewer, Editor, or Admin (see CONTEXT.md's "Roles") — from the user's own admin page. Under Docker, those groups are created automatically on every container start (see "Running with Docker"). Outside Docker, run `python manage.py sync_roles` once after `migrate` (safe to re-run any time, e.g. after adding a model).
+Create a user via `/admin/auth/user/add/` with **Staff status** checked (required for any Django-admin access, including the read-only Viewer role), then assign them to one of the three groups — Viewer, Editor, or Admin (see CONTEXT.md's "Roles") — from the user's own admin page. Under Docker, those groups are created automatically on every container start (see "Running with Docker"). Outside Docker, run `python manage.py sync_roles` once after `migrate` (safe to re-run any time, e.g. after adding a model). Also run `python manage.py seed_defaults` after `migrate` — it re-seeds the system Default VLAN/Switch Port VLAN Profile (ADR 0012) if they're ever missing; `migrate` seeds them once already, but can't repair them if removed some other way (e.g. `manage.py flush`).
 
 ## Planned stack
 

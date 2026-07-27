@@ -2,7 +2,7 @@
 
 High-level phases only — day-to-day task tracking belongs in GitHub Issues once there's code to file issues against. This file exists so it's obvious what phase the project is in and what's next, even after a fresh start.
 
-**Current phase: 6 — in progress.**
+**Current phase: 9 — in progress.**
 
 ## 1. Foundation — done
 
@@ -53,6 +53,14 @@ High-level phases only — day-to-day task tracking belongs in GitHub Issues onc
 - [x] Type immutable after creation; a profile's type ports lock once it has any instance
 - [x] `allowed_vlans` moved to an explicit `PROTECT`-FK through model (closes a VLAN-removal gap)
 - [x] Device port `default_gateway` is a derived read-only property, not a stored field
+
+## 9. Switch port VLAN profiles
+
+- [x] `SwitchPortVlanProfile`: reusable, *live-referenced* Port Mode/Native VLAN/Allowed VLANs/Allow All VLANs bundle — see ADR 0012
+- [x] `NetworkSwitchTypePort`/`NetworkSwitchPort` point at a profile instead of carrying their own VLAN config
+- [x] Port Mode/Native VLAN lock once a profile has any real switch port; Allowed VLANs/Allow All VLANs stay editable
+- [x] System-seeded "Default" profile and subnet-less "Default VLAN" (VLAN 1); `VLAN.subnet` is now optional (L2-only VLANs)
+- [x] `seed_defaults` management command re-seeds the system rows if removed outside a migration
 
 ## Later / not yet designed
 
