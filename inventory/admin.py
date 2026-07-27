@@ -25,6 +25,7 @@ from .models import (
     NetworkSwitchPort,
     NetworkSwitchType,
     NetworkSwitchTypePort,
+    PortAddressing,
     PortMode,
     Rack,
     RackVlanRange,
@@ -238,6 +239,39 @@ class NetworkSwitchPortForm(forms.ModelForm):
         super().__init__(*args, **kwargs)
         if self.instance.pk and hasattr(self.instance, "connected_device_port"):
             self.fields["profile"].disabled = True
+
+
+class NetworkDeviceAddForm(forms.ModelForm):
+    """Carries the creation-time-only ``port_addressing`` choice (ADR 0013)
+    — not a model field, so it can't be expressed via ``Meta.fields``
+    alone. Used only for the add view (``NetworkDeviceAdmin.get_form()``);
+    the choice has no effect after creation, so the change form omits it
+    entirely rather than showing a field that does nothing.
+    """
+
+    port_addressing = forms.ChoiceField(
+        choices=PortAddressing.choices,
+        initial=PortAddressing.STATIC,
+        required=False,
+        help_text=(
+            "Only applies at creation. Ignored (always DHCP) for an unracked device, or for "
+            "a port on an L2-only VLAN (no subnet) — neither can carry a static address."
+        ),
+    )
+
+    class Meta:
+        model = NetworkDevice
+        exclude: list[str] = []
+
+    def _post_clean(self) -> None:
+        # `or`, not `.get(..., default)` alone — required=False means an
+        # omitted/blank submission cleans to "" (present in cleaned_data, not
+        # absent), and a bare `.get()` default only covers a missing key.
+        # `or` covers both that and the ChoiceField-rejected-value case (which
+        # does leave the key genuinely absent). Must run before
+        # super()._post_clean(), which is what calls self.instance.full_clean().
+        self.instance.port_addressing = self.cleaned_data.get("port_addressing") or PortAddressing.STATIC
+        super()._post_clean()  # type: ignore[misc]
 
 
 def _profile_locked(type_obj: Any, instances_related_name: str) -> bool:
@@ -545,3 +579,10 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
         if obj is not None:
             return ["device_type"]
         return []
+
+    def get_form(self, request: HttpRequest, obj: Any = None, change: bool = False, **kwargs: Any) -> Any:
+        # port_addressing (ADR 0013) only makes sense at creation — the
+        # change form uses the default ModelForm, which has no such field.
+        if obj is None:
+            kwargs["form"] = NetworkDeviceAddForm
+        return super().get_form(request, obj, change=change, **kwargs)
