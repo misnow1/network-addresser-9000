@@ -2,7 +2,7 @@
 
 High-level phases only — day-to-day task tracking belongs in GitHub Issues once there's code to file issues against. This file exists so it's obvious what phase the project is in and what's next, even after a fresh start.
 
-**Current phase: 9 — in progress.**
+**Current phase: 10 — done.**
 
 ## 1. Foundation — done
 
@@ -54,7 +54,7 @@ High-level phases only — day-to-day task tracking belongs in GitHub Issues onc
 - [x] `allowed_vlans` moved to an explicit `PROTECT`-FK through model (closes a VLAN-removal gap)
 - [x] Device port `default_gateway` is a derived read-only property, not a stored field
 
-## 9. Switch port VLAN profiles
+## 9. Switch port VLAN profiles — done
 
 - [x] `SwitchPortVlanProfile`: reusable, *live-referenced* Port Mode/Native VLAN/Allowed VLANs/Allow All VLANs bundle — see ADR 0012
 - [x] `NetworkSwitchTypePort`/`NetworkSwitchPort` point at a profile instead of carrying their own VLAN config
@@ -62,11 +62,19 @@ High-level phases only — day-to-day task tracking belongs in GitHub Issues onc
 - [x] System-seeded "Default" profile and subnet-less "Default VLAN" (VLAN 1); `VLAN.subnet` is now optional (L2-only VLANs)
 - [x] `seed_defaults` management command re-seeds the system rows if removed outside a migration
 
+## 10. Static-by-default device port addressing — done
+
+- [x] Device creation offers a DHCP-or-static choice, defaulting to static, computed rack-range-base + rack-slot per port VLAN — see ADR 0013 (closes #24)
+- [x] Transient, never-stored `NetworkDevice.port_addressing` — a writable property, not a field or plain class attribute
+- [x] Unracked devices and L2-only-VLAN ports always materialize DHCP regardless of the choice
+- [x] Static materialization refuses Switched-Mode-shaped devices (duplicate VLAN across ports) atomically, with a clear error
+- [x] Admin add form exposes the choice (creation-only); change form omits it
+
 ## Later / not yet designed
 
 - Purpose-built frontend beyond Django admin (rack visualizations, address-utilization views)
 - Device-replacement workflow (swapping a spare into an already-addressed slot) — flagged in ADR 0003, design deferred
-- Bridged multi-port logical interfaces (e.g. Shure ULXD4Q/D "Switched" mode) — flagged in ADR 0010, design deferred
+- Addressing modeled per `(device, VLAN)` instead of per port — the actual fix for Switched Mode's bridged-jack limitation (ADR 0010, ADR 0013) — see #27
+- Slot moves don't re-suggest an already-static device port's address (armed by default now that static materializes by default, ADR 0013; follows from ADR 0003's "stored, not immutable") — see #28
 - Multicast configuration: port-level filtering plus switch-level IGMP snooping — see #22
 - Rack templates: a named set of VLANs applied once at rack creation (seed-once, per ADR 0010) — see #23
-- Device creation offering static addressing by default instead of always materializing ports as DHCP (revises ADR 0010) — see #24

@@ -29,7 +29,7 @@ A Network Switch/Device Type is a *purpose profile* built on a hardware model, n
 _Avoid_: treating `(Manufacturer, Model)` as a Type's whole identity, or assuming one Type = one hardware model
 
 **Network Switch Type Port / Network Device Type Port**:
-A port definition template owned by a Type Profile — physical port type, and (for switches) VLAN mode/purpose. Copied exactly once ("materialized") into a real Network Switch Port/Network Device Port when an instance of that type is first created; never re-synced afterward. A profile's type ports lock once the profile has any instance — change a profile's port layout by creating a new named profile instead. See ADR 0010.
+A port definition template owned by a Type Profile — physical port type, and (for switches) VLAN mode/purpose. Copied exactly once ("materialized") into a real Network Switch Port/Network Device Port when an instance of that type is first created; never re-synced afterward. Device creation chooses DHCP or static for the whole device at that moment (defaulting to static; always DHCP if unracked or on an L2-only VLAN) — see ADR 0013. A profile's type ports lock once the profile has any instance — change a profile's port layout by creating a new named profile instead. See ADR 0010.
 _Avoid_: assuming an edit to a Type Port after instances exist affects those instances; assuming an instance's type can be changed instead of recreating it with a different Type
 
 **Switch Port VLAN Profile**:

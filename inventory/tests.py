@@ -54,6 +54,7 @@ from .models import (
     NetworkSwitchPort,
     NetworkSwitchType,
     NetworkSwitchTypePort,
+    PortAddressing,
     PortMode,
     PortType,
     Rack,
@@ -1601,7 +1602,9 @@ class PortProfileMaterializationTests(TestCase):
         self.assertEqual(ports[0].port_type, PortType.GBE_RJ45)
         self.assertEqual(ports[0].source_type_port, switch_type.type_ports.get(port_number=1))
 
-    def test_device_materializes_ports_as_dhcp(self) -> None:
+    def test_unracked_device_materializes_ports_as_dhcp(self) -> None:
+        # Unracked (decision 3, ADR 0013) — not "DHCP is the default" anymore;
+        # see StaticPortAddressingTests for the racked-static-by-default case.
         device_type = _make_device_type(port_count=2, vlan=self.vlan_a)
         device = NetworkDevice.objects.create(device_type=device_type)
         ports = list(device.ports.order_by("ordinal"))
@@ -1706,6 +1709,306 @@ class PortProfileMaterializationTests(TestCase):
         port = switch.ports.get()
         self.assertTrue(port.profile.is_system)
         self.assertEqual(port.profile.name, DEFAULT_PROFILE_NAME)
+
+
+class StaticPortAddressingTests(TestCase):
+    """ADR 0013: device creation defaults to static port materialization
+    (rack-range-base + rack-slot, one address per VLAN), revising ADR
+    0010's always-DHCP rule.
+    """
+
+    def setUp(self) -> None:
+        self.vlan_a = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.vlan_b = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+        self.l2_vlan = VLAN.objects.create(name="L2 Only", vlan_id=999, subnet="")
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=4)
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan_a, address_range="10.200.1.0/27")
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan_b, address_range="10.201.1.0/27")
+
+    def _make_two_vlan_device_type(self, **kwargs) -> NetworkDeviceType:
+        """A two-port device type with each port on a different VLAN — the
+        shape every device except Switched Mode satisfies.
+        """
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="Martin Audio", model="IK-42", port_count=2, **kwargs
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type, description="Control", port_type=PortType.GBE_RJ45, vlan=self.vlan_a
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type, description="Dante", port_type=PortType.GBE_RJ45, vlan=self.vlan_b
+        )
+        return device_type
+
+    def test_racked_static_gets_base_plus_slot_per_own_vlan(self) -> None:
+        device_type = self._make_two_vlan_device_type(name="Two VLAN")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=2)
+        ports = {p.description: p for p in device.ports.all()}
+        self.assertFalse(ports["Control"].is_dhcp)
+        self.assertEqual(ports["Control"].address, "10.200.1.2")
+        self.assertFalse(ports["Dante"].is_dhcp)
+        self.assertEqual(ports["Dante"].address, "10.201.1.2")
+
+    def test_explicit_dhcp_on_racked_device_stays_dhcp(self) -> None:
+        device_type = self._make_two_vlan_device_type(name="Two VLAN DHCP")
+        device = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=device_type, rack=self.rack, rack_slot=2, port_addressing=PortAddressing.DHCP
+        )
+        for port in device.ports.all():
+            self.assertTrue(port.is_dhcp)
+            self.assertIsNone(port.address)
+
+    def test_unracked_device_materializes_dhcp_even_with_static_selected(self) -> None:
+        device_type = self._make_two_vlan_device_type(name="Unracked")
+        device = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=device_type, port_addressing=PortAddressing.STATIC
+        )
+        for port in device.ports.all():
+            self.assertTrue(port.is_dhcp)
+            self.assertIsNone(port.address)
+
+    def test_default_port_addressing_is_static(self) -> None:
+        device = NetworkDevice(device_type=self._make_two_vlan_device_type(name="Default Check"))
+        self.assertEqual(device.port_addressing, PortAddressing.STATIC)
+
+    def test_port_addressing_accepted_as_create_kwarg(self) -> None:
+        device_type = self._make_two_vlan_device_type(name="Kwarg Check")
+        device = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=device_type, port_addressing=PortAddressing.DHCP
+        )
+        self.assertEqual(device.port_addressing, PortAddressing.DHCP)
+
+    def test_invalid_port_addressing_rejected_not_silently_dhcp(self) -> None:
+        device_type = self._make_two_vlan_device_type(name="Invalid Check")
+        with self.assertRaises(ValidationError):
+            NetworkDevice.objects.create(device_type=device_type, port_addressing="bogus")  # type: ignore[misc]
+
+    def test_l2_only_port_stays_dhcp_other_port_goes_static(self) -> None:
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="Martin Audio", model="IK-42", name="Mixed VLAN", port_count=2
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type, description="Control", port_type=PortType.GBE_RJ45, vlan=self.vlan_a
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type, description="L2 Link", port_type=PortType.GBE_RJ45, vlan=self.l2_vlan
+        )
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=2)
+        ports = {p.description: p for p in device.ports.all()}
+        self.assertFalse(ports["Control"].is_dhcp)
+        self.assertEqual(ports["Control"].address, "10.200.1.2")
+        self.assertTrue(ports["L2 Link"].is_dhcp)
+        self.assertIsNone(ports["L2 Link"].address)
+
+    def test_duplicate_vlan_type_refused_atomically(self) -> None:
+        """Switched Mode's shape — two ports on the same VLAN — has no way
+        to give one address to both (decision 5). Exercised via
+        ``objects.create()`` directly, the path that never calls
+        ``clean()``, so this proves the save-time preflight (not just the
+        admin's clean()-time one) catches it.
+        """
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="Shure", model="ULXD4Q", name="Switched", port_count=2
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type, description="Dante A", port_type=PortType.GBE_RJ45, vlan=self.vlan_b
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type, description="Dante B", port_type=PortType.GBE_RJ45, vlan=self.vlan_b
+        )
+        with self.assertRaises(ValidationError) as ctx:
+            NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=2)
+        self.assertIn("Dante A", str(ctx.exception))
+        self.assertIn("Dante B", str(ctx.exception))
+        self.assertFalse(NetworkDevice.objects.filter(device_type=device_type).exists())
+        self.assertFalse(NetworkDevicePort.objects.filter(device__device_type=device_type).exists())
+
+    def test_missing_rack_vlan_range_refused_atomically(self) -> None:
+        no_range_vlan = VLAN.objects.create(name="No Range", vlan_id=202, subnet="10.202.0.0/21")
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="Martin Audio", model="IK-42", name="No Range Type", port_count=1
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type, description="Port A", port_type=PortType.GBE_RJ45, vlan=no_range_vlan
+        )
+        with self.assertRaises(ValidationError):
+            NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=2)
+        self.assertFalse(NetworkDevice.objects.filter(device_type=device_type).exists())
+
+    def test_collision_with_existing_address_refused_atomically(self) -> None:
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="Martin Audio", model="IK-42", name="Collision Type", port_count=1
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type, description="Port A", port_type=PortType.GBE_RJ45, vlan=self.vlan_a
+        )
+        # Slot 2 on vlan_a suggests 10.200.1.2 — occupy it first via a switch
+        # address so the second device's suggestion collides.
+        switch_type = _make_switch_type()
+        switch = NetworkSwitch.objects.create(switch_type=switch_type, rack=self.rack, rack_slot=3)
+        NetworkSwitchAddress.objects.create(switch=switch, vlan=self.vlan_a, address="10.200.1.2")
+        with self.assertRaises(ValidationError):
+            NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=2)
+        self.assertFalse(NetworkDevice.objects.filter(device_type=device_type).exists())
+
+    def test_admin_add_post_with_static_materializes_static(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        admin_user = User.objects.create_user("adminrole", password="testpass123", is_staff=True)
+        admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="adminrole", password="testpass123")
+        device_type = self._make_two_vlan_device_type(name="Admin Static")
+
+        response = self.client.post(
+            "/admin/inventory/networkdevice/add/",
+            {
+                "device_type": device_type.pk,
+                "hostname": "dev1",
+                "serial_number": "",
+                "rack": self.rack.pk,
+                "rack_slot": "2",
+                "port_addressing": PortAddressing.STATIC,
+                "ports-TOTAL_FORMS": "0",
+                "ports-INITIAL_FORMS": "0",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+            },
+        )
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        device = NetworkDevice.objects.get(hostname="dev1")
+        ports = {p.description: p for p in device.ports.all()}
+        self.assertFalse(ports["Control"].is_dhcp)
+        self.assertEqual(ports["Control"].address, "10.200.1.2")
+
+    def test_admin_add_post_omitting_port_addressing_still_defaults_to_static(self) -> None:
+        """Review-council finding: the field must be ``required=False`` — a
+        POST that omits it entirely (any tooling written before this field
+        existed, or a client that only sends changed/touched fields) must
+        still succeed and default to static, not fail with "this field is
+        required" the way a genuinely required model field would.
+        """
+        call_command("sync_roles", stdout=io.StringIO())
+        admin_user = User.objects.create_user("adminrole4", password="testpass123", is_staff=True)
+        admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="adminrole4", password="testpass123")
+        device_type = self._make_two_vlan_device_type(name="Admin Omitted Field")
+
+        response = self.client.post(
+            "/admin/inventory/networkdevice/add/",
+            {
+                "device_type": device_type.pk,
+                "hostname": "dev4",
+                "serial_number": "",
+                "rack": self.rack.pk,
+                "rack_slot": "2",
+                # port_addressing deliberately omitted
+                "ports-TOTAL_FORMS": "0",
+                "ports-INITIAL_FORMS": "0",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+            },
+        )
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        device = NetworkDevice.objects.get(hostname="dev4")
+        ports = {p.description: p for p in device.ports.all()}
+        self.assertFalse(ports["Control"].is_dhcp)
+        self.assertEqual(ports["Control"].address, "10.200.1.2")
+
+    def test_admin_add_post_duplicate_vlan_renders_form_error_not_500(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        admin_user = User.objects.create_user("adminrole2", password="testpass123", is_staff=True)
+        admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="adminrole2", password="testpass123")
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="Shure", model="ULXD4Q", name="Admin Switched", port_count=2
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type, description="Dante A", port_type=PortType.GBE_RJ45, vlan=self.vlan_b
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type, description="Dante B", port_type=PortType.GBE_RJ45, vlan=self.vlan_b
+        )
+
+        response = self.client.post(
+            "/admin/inventory/networkdevice/add/",
+            {
+                "device_type": device_type.pk,
+                "hostname": "dev2",
+                "serial_number": "",
+                "rack": self.rack.pk,
+                "rack_slot": "2",
+                "port_addressing": PortAddressing.STATIC,
+                "ports-TOTAL_FORMS": "0",
+                "ports-INITIAL_FORMS": "0",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+            },
+        )
+        self.assertEqual(response.status_code, 200)  # re-renders with a form error, not a 500
+        self.assertContains(response, "Dante A")
+        self.assertContains(response, "Dante B")
+        self.assertFalse(NetworkDevice.objects.filter(hostname="dev2").exists())
+
+    def test_admin_add_post_address_collision_renders_form_error_not_500(self) -> None:
+        """Review-council finding: `_validate_static_address()` raises a
+        `ValidationError` keyed on "address" — the right shape for
+        `NetworkDevicePort.clean()`, which has that field, but wrong for
+        `NetworkDevice.clean()` (and `NetworkDeviceAddForm`, which has no
+        `address` field at all). Left unconverted, Django's `add_error()`
+        raises a raw `ValueError` for a nonexistent form field instead of
+        rendering a validation message — an ordinary Editor submission
+        hitting an address collision would 500, not see a form error.
+        """
+        call_command("sync_roles", stdout=io.StringIO())
+        admin_user = User.objects.create_user("adminrole3", password="testpass123", is_staff=True)
+        admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="adminrole3", password="testpass123")
+        # Slot 2 on vlan_a suggests 10.200.1.2 — occupy it first via a switch
+        # address so the device's suggested address collides.
+        switch_type = _make_switch_type()
+        switch = NetworkSwitch.objects.create(switch_type=switch_type, rack=self.rack, rack_slot=3)
+        NetworkSwitchAddress.objects.create(switch=switch, vlan=self.vlan_a, address="10.200.1.2")
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="Martin Audio", model="IK-42", name="Collision Admin Type", port_count=1
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type, description="Port A", port_type=PortType.GBE_RJ45, vlan=self.vlan_a
+        )
+
+        response = self.client.post(
+            "/admin/inventory/networkdevice/add/",
+            {
+                "device_type": device_type.pk,
+                "hostname": "dev3",
+                "serial_number": "",
+                "rack": self.rack.pk,
+                "rack_slot": "2",
+                "port_addressing": PortAddressing.STATIC,
+                "ports-TOTAL_FORMS": "0",
+                "ports-INITIAL_FORMS": "0",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+            },
+        )
+        self.assertEqual(response.status_code, 200)  # re-renders with a form error, not a 500
+        self.assertContains(response, "10.200.1.2")
+        self.assertFalse(NetworkDevice.objects.filter(hostname="dev3").exists())
+
+    def test_admin_add_form_shows_field_preselected_static(self) -> None:
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        request = RequestFactory().get("/admin/inventory/networkdevice/add/")
+        form_class = admin.get_form(request, None)
+        self.assertIn("port_addressing", form_class.base_fields)
+        self.assertEqual(form_class.base_fields["port_addressing"].initial, PortAddressing.STATIC)
+
+    def test_admin_change_form_omits_field(self) -> None:
+        device_type = self._make_two_vlan_device_type(name="Change View")
+        device = NetworkDevice.objects.create(device_type=device_type)
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        request = RequestFactory().get(f"/admin/inventory/networkdevice/{device.pk}/change/")
+        form_class = admin.get_form(request, device)
+        self.assertNotIn("port_addressing", form_class.base_fields)
 
 
 class PortProfileAtomicityTests(TestCase):
@@ -1813,7 +2116,15 @@ class PortProfileLockedFieldTests(TestCase):
         self.switch = NetworkSwitch.objects.create(switch_type=self.switch_type)
         self.switch_port = self.switch.ports.get()
         self.device_type = _make_device_type(port_count=1, vlan=self.vlan_a)
-        self.device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=1)
+        # Explicit DHCP: this class is about locked fields, not addressing
+        # defaults — test_device_port_can_be_made_static below needs a DHCP
+        # starting point to actually exercise the DHCP -> static transition.
+        self.device = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            port_addressing=PortAddressing.DHCP,
+        )
         self.device_port = self.device.ports.get()
 
     def test_switch_port_type_cannot_change_via_plain_save(self) -> None:
@@ -2178,7 +2489,12 @@ class DerivedDefaultGatewayTests(TestCase):
         self.assertIsNone(port.default_gateway)
 
     def test_gateway_derived_from_vlan_once_static(self) -> None:
-        device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=1)
+        # Explicit DHCP so this test actually exercises the DHCP -> static
+        # transition it's named for, rather than starting out static already
+        # (ADR 0013's new default) and never actually flipping.
+        device = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=self.device_type, rack=self.rack, rack_slot=1, port_addressing=PortAddressing.DHCP
+        )
         port = device.ports.get()
         port.is_dhcp = False
         port.address = "10.200.1.1"
@@ -2186,7 +2502,9 @@ class DerivedDefaultGatewayTests(TestCase):
         self.assertEqual(port.default_gateway, "10.200.0.1")
 
     def test_gateway_follows_later_vlan_gateway_change(self) -> None:
-        device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=1)
+        device = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=self.device_type, rack=self.rack, rack_slot=1, port_addressing=PortAddressing.DHCP
+        )
         port = device.ports.get()
         port.is_dhcp = False
         port.address = "10.200.1.1"
@@ -2574,7 +2892,14 @@ class SwitchPortProfileConnectedLockTests(TestCase):
         self.switch = NetworkSwitch.objects.create(switch_type=self.switch_type)
         self.connected_port, self.free_port = self.switch.ports.order_by("port_number")
         self.device_type = _make_device_type(port_count=1, vlan=self.vlan_a)
-        self.device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=1)
+        # Explicit DHCP: this class is about switch-port profile locking,
+        # not device addressing — the choice here is incidental.
+        self.device = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            port_addressing=PortAddressing.DHCP,
+        )
         device_port = self.device.ports.get()
         device_port.switch_port = self.connected_port
         device_port.save()
@@ -2995,7 +3320,11 @@ class ReviewCouncilRegressionTests(TestCase):
         switch = NetworkSwitch.objects.create(switch_type=switch_type)
         port = switch.ports.get()
         device_type = _make_device_type(port_count=1, vlan=self.vlan)
-        device = NetworkDevice.objects.create(device_type=device_type, rack=rack, rack_slot=1)
+        # Explicit DHCP: this test is about the profile guard's
+        # update_fields handling, not device addressing.
+        device = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=device_type, rack=rack, rack_slot=1, port_addressing=PortAddressing.DHCP
+        )
         device_port = device.ports.get()
         device_port.switch_port = port
         device_port.save()

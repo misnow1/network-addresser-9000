@@ -66,6 +66,18 @@ class PortType(models.TextChoices):
     OTHER = "other", "Other / Unknown"
 
 
+class PortAddressing(models.TextChoices):
+    """Creation-time choice of how a device's ports materialize (ADR 0013).
+
+    Transient — never stored (see ``NetworkDevice.port_addressing``); the
+    materialized ``NetworkDevicePort`` rows themselves are the record of
+    what was chosen.
+    """
+
+    STATIC = "static", "Static"
+    DHCP = "dhcp", "DHCP"
+
+
 class PortMode(models.TextChoices):
     """Switch port L2 mode — shared by switch Type Ports and instance ports."""
 
@@ -233,7 +245,13 @@ def _suggest_rack_slot_address(rack: "Rack | None", rack_slot: int | None, vlan_
         validate_ipv4_cidr(rack_range.address_range)
     except ValidationError:
         return None  # that range's own malformed value; its own clean() would report it
-    return suggest_slot_address(rack_range.address_range, rack_slot)
+    try:
+        return suggest_slot_address(rack_range.address_range, rack_slot)
+    except ValueError:
+        # rack_slot bypassed clean()'s rack_slot <= rack.slot_count guard
+        # (save() alone never enforces it) and overflows this range's block —
+        # its own clean() would report that.
+        return None
 
 
 def _address_containment_error(
@@ -2281,6 +2299,12 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
     rack = models.ForeignKey(Rack, on_delete=models.PROTECT, null=True, blank=True, related_name="devices")
     rack_slot = models.PositiveIntegerField(null=True, blank=True, validators=[MinValueValidator(1)])
 
+    #: Class-level default for the ``port_addressing`` property below —
+    #: never a plain class attribute, since Django's ``Model.__init__``
+    #: only accepts unknown kwargs (``objects.create(port_addressing=...)``)
+    #: when the name is a field or a property (ADR 0013).
+    _port_addressing: str = PortAddressing.STATIC
+
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=["rack", "rack_slot"], name="unique_device_rack_slot"),
@@ -2325,31 +2349,136 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
             device_type = _get_related(self, "device_type")
             if device_type is not None and device_type.pk is not None:
                 _validate_device_type_port_profile(device_type)
+                if self._materializes_static():
+                    self._check_static_materialization_possible()
         else:
             _check_locked_fields_unchanged(
                 NetworkDevice, self.pk, {"device_type": self.device_type_id}, update_fields=None
             )
 
+    @property
+    def port_addressing(self) -> str:
+        """Creation-time-only choice of DHCP vs. static port materialization
+        (ADR 0013). Never stored — the materialized ``NetworkDevicePort``
+        rows are the record of what was chosen; setting this after creation
+        has no effect since ``_materialize_ports()`` only runs once.
+        """
+        return self._port_addressing
+
+    @port_addressing.setter
+    def port_addressing(self, value: str) -> None:
+        if value not in PortAddressing.values:
+            raise ValidationError(
+                f"{value!r} is not a valid port_addressing — must be one of {PortAddressing.values}."
+            )
+        self._port_addressing = value
+
+    def _materializes_static(self) -> bool:
+        """Whether this (not-yet-materialized) device will get static
+        addresses — only when racked (decision 3: unracked is always DHCP,
+        spare pool by definition) and the static choice is in effect
+        (ADR 0013).
+        """
+        return self.rack is not None and self.port_addressing == PortAddressing.STATIC
+
+    def _check_static_materialization_possible(self) -> None:
+        """Pre-flight over ``self.device_type``'s Network Device Type Ports
+        for whether static materialization can succeed — pure, needs no
+        device pk, so it can run from both ``clean()`` (admin form errors)
+        and ``_materialize_ports()`` (the ``objects.create()`` path, which
+        never calls ``clean()``).
+
+        Skips L2-only-VLAN ports entirely (decision 4: those always
+        materialize DHCP and that's not a failure). For the rest: any VLAN
+        shared by more than one port can't be addressed by
+        ``suggest_slot_address()``'s one-address-per-(slot, VLAN) model
+        (decision 5, Switched Mode devices), and each remaining port's
+        suggested address must actually be usable
+        (``_validate_static_address``).
+        """
+        addressable = [tp for tp in self.device_type.type_ports.select_related("vlan") if tp.vlan.subnet]
+        by_vlan: dict[int, list[NetworkDeviceTypePort]] = {}
+        for type_port in addressable:
+            by_vlan.setdefault(type_port.vlan_id, []).append(type_port)
+        for type_port_group in by_vlan.values():
+            if len(type_port_group) > 1:
+                names = ", ".join(tp.description for tp in type_port_group)
+                raise ValidationError(
+                    f"{self.device_type} has more than one port on {type_port_group[0].vlan} "
+                    f"({names}) — static materialization needs one address per VLAN, and this "
+                    "device has no way to give one address to all of them. Use DHCP for this device."
+                )
+        for type_port in addressable:
+            address = _suggest_rack_slot_address(self.rack, self.rack_slot, type_port.vlan_id)
+            if address is None:
+                raise ValidationError(
+                    f"No usable address range for {type_port.vlan} in {self.rack} — assign a "
+                    f"Rack VLAN Range for this VLAN before creating a static {self.device_type} "
+                    "device here, or use DHCP."
+                )
+            try:
+                _validate_static_address(
+                    address,
+                    type_port.vlan,
+                    self.rack,
+                    self.rack_slot,
+                    exclude_switch_address_pk=None,
+                    exclude_device_port_pk=None,
+                )
+            except ValidationError as exc:
+                # _validate_static_address() raises keyed on "address" — the
+                # right shape for NetworkDevicePort.clean() (which has that
+                # field), but this call site is NetworkDevice.clean(), which
+                # doesn't. A dict-keyed ValidationError for a nonexistent
+                # form field crashes Django's admin add_error() with a raw
+                # ValueError instead of rendering a form error, so re-raise
+                # as a plain, non-field error here.
+                raise ValidationError(exc.messages) from exc
+
     def _materialize_ports(self) -> None:
         """One-time copy of ``device_type``'s Network Device Type Ports into
-        real ``NetworkDevicePort`` rows, materialized as DHCP (ADR 0010) —
-        an operator gives a port a static address afterward. Runs inside
-        the same transaction as this device's insert (see ``save()``).
+        real ``NetworkDevicePort`` rows — static by default when racked, or
+        DHCP when unracked or explicitly chosen (ADR 0013, revising ADR
+        0010's always-DHCP rule). Runs inside the same transaction as this
+        device's insert (see ``save()``), so any failure here rolls back
+        the device and every port materialized before it.
         """
         _validate_device_type_port_profile(self.device_type)
-        for type_port in self.device_type.type_ports.order_by("ordinal"):
-            NetworkDevicePort.objects.create(
-                device=self,
-                port_number=type_port.port_number,
-                description=type_port.description,
-                vlan=type_port.vlan,
-                port_type=type_port.port_type,
-                ordinal=type_port.ordinal,
-                source_type_port=type_port,
-                is_dhcp=True,
-                address=None,
-                created_by=self.created_by,
-            )
+        static = self._materializes_static()
+        if static:
+            self._check_static_materialization_possible()
+        for type_port in self.device_type.type_ports.select_related("vlan").order_by("ordinal"):
+            if static and type_port.vlan.subnet:
+                port = NetworkDevicePort(
+                    device=self,
+                    port_number=type_port.port_number,
+                    description=type_port.description,
+                    vlan=type_port.vlan,
+                    port_type=type_port.port_type,
+                    ordinal=type_port.ordinal,
+                    source_type_port=type_port,
+                    is_dhcp=False,
+                    address=None,
+                    created_by=self.created_by,
+                )
+                port.full_clean()
+                port.save()
+            else:
+                # DHCP path — either the overall choice, or an L2-only VLAN
+                # under a static choice (decision 4), which always
+                # materializes DHCP and isn't a failure.
+                NetworkDevicePort.objects.create(
+                    device=self,
+                    port_number=type_port.port_number,
+                    description=type_port.description,
+                    vlan=type_port.vlan,
+                    port_type=type_port.port_type,
+                    ordinal=type_port.ordinal,
+                    source_type_port=type_port,
+                    is_dhcp=True,
+                    address=None,
+                    created_by=self.created_by,
+                )
 
     def _check_rack_slot_not_occupied(self) -> None:
         if NetworkSwitch.objects.filter(rack=self.rack, rack_slot=self.rack_slot).exists():
@@ -2375,9 +2504,12 @@ class NetworkDevicePort(AuditedModel):
     """A device port: one purpose (VLAN), one static address or DHCP.
 
     Materialized exactly once from the device's ``device_type`` when the
-    device is first created (``NetworkDevice._materialize_ports``),
-    starting out DHCP-configured (``is_dhcp=True``, ``address=None``) — an
-    operator gives it a static address afterward. ``description`` (this
+    device is first created (``NetworkDevice._materialize_ports``) —
+    static by default when racked, computed rack-range-base + rack-slot
+    like every other static address here, or DHCP-configured
+    (``is_dhcp=True``, ``address=None``) when unracked or explicitly chosen
+    (ADR 0013, revising ADR 0010's always-DHCP rule); an operator can flip
+    a port's addressing afterward either way. ``description`` (this
     port's purpose), ``vlan``, and ``port_type`` are locked hardware/
     purpose facts copied from the type port (ADR 0010); only
     ``is_dhcp``/``address``/``switch_port`` are editable. Identity is
@@ -2410,10 +2542,11 @@ class NetworkDevicePort(AuditedModel):
         help_text="Physical hardware fact, copied from the device's type — locked after creation.",
     )
     ordinal = models.PositiveIntegerField(editable=False, default=0)
-    # Materialization always passes is_dhcp=True explicitly regardless of
-    # this default (ADR 0010) — this stays False so directly-constructed
-    # ports (tests, or any future non-materialization path) keep defaulting
-    # to static, matching every other static-address model in this file.
+    # Materialization always passes is_dhcp explicitly, one way or the
+    # other, regardless of this default (ADR 0013) — this stays False so
+    # directly-constructed ports (tests, or any future non-materialization
+    # path) keep defaulting to static, matching every other static-address
+    # model in this file.
     is_dhcp = models.BooleanField(default=False)
     address = models.GenericIPAddressField(protocol="IPv4", null=True, blank=True)
     switch_port = models.OneToOneField(
