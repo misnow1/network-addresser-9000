@@ -694,10 +694,16 @@ class VLAN(AuditedModel):
 
 
 class Rack(AuditedModel):
-    """A physical container with a fixed slot count.
+    """An abstract grouping of equipment with a fixed slot count.
+
+    A slot is an addressing ordinal (base address + slot number), not a
+    physical rack-unit position — physical RU height/placement is
+    deliberately not modeled (CONTEXT.md).
 
     Has no "purpose" field by design — a spare rack is an ordinary Rack
-    whose slots happen to hold spare equipment (CONTEXT.md).
+    whose slots happen to hold spare equipment, and a rack created from a
+    Rack Template (ADR 0014) is likewise just an ordinary Rack the moment
+    it exists (CONTEXT.md).
     """
 
     name = models.CharField(max_length=100)

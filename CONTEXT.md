@@ -17,8 +17,12 @@ A top-level object combining an 802.1Q VLAN ID with its IPv4 addressing (subnet/
 _Avoid_: "IPv4 Network" as an entity distinct from VLAN (it's a set of properties on VLAN, not a separate table); assuming every VLAN has a subnet
 
 **Rack**:
-A physical container with a fixed slot count and a reserved IPv4 address range per VLAN, used to compute static addresses for the equipment installed in it. A Rack has no "purpose" field in the data model — a "spare rack" (e.g. a rack of spare amps) is just an ordinary Rack whose slots happen to hold spare equipment.
-_Avoid_: treating "spare rack" as a distinct type from Rack
+An abstract grouping of equipment with a fixed slot count and a reserved IPv4 address range per VLAN, used to compute static addresses for the equipment installed in it. A slot is an *addressing ordinal* (base address + slot number) — not a physical rack-unit position; physical RU height/placement is deliberately not modeled. A Rack has no "purpose" field in the data model — a "spare rack" (e.g. a rack of spare amps) is just an ordinary Rack whose slots happen to hold spare equipment, and a rack created from a Rack Template is likewise just an ordinary Rack the moment it exists (see Rack Template).
+_Avoid_: treating "spare rack" as a distinct type from Rack; treating a slot number as a physical rack-unit position
+
+**Rack Template**:
+A named, reusable set of VLANs (plus an optional default slot count) that seeds a new Rack's `RackVlanRange` rows in one step at creation time, reusing the same next-free-block suggestion manual range entry already uses. Seed-once, like Type Port materialization (ADR 0010) — **not** live-referenced like a Switch Port VLAN Profile (ADR 0012): editing a template after a rack exists has no effect on that rack, and the rack keeps no reference back to the template. See ADR 0014.
+_Avoid_: calling this a "rack type" or "rack profile" — "Type" already means a purpose profile of a *hardware model* (see Type Profile) and "profile" already means the *live-referenced* Switch Port VLAN Profile; neither matches this seed-once concept. Also avoid assuming a rack remembers which template created it — it doesn't (see Rack).
 
 **Spare Pool**:
 Devices/switches not yet assigned to any Rack (`rack` is null). These arrive DHCP-configured from the factory and are tracked by little more than serial number and hostname until they're racked and statically addressed.
