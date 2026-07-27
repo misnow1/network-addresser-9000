@@ -10,3 +10,8 @@ db.sqlite3
 htmlcov/
 staticfiles/
 .DS_Store
+# Local testing scratchpad — drained into issues/ROADMAP, never committed
+TESTING-NOTES.md
+
+# claude scratch space
+.claude
