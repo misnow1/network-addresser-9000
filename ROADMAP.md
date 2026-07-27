@@ -64,7 +64,7 @@ High-level phases only — day-to-day task tracking belongs in GitHub Issues onc
 
 ## Later / not yet designed
 
-- Purpose-built frontend beyond Django admin (rack visualizations, address-utilization views) — see #25
+- Purpose-built frontend beyond Django admin (rack visualizations, address-utilization views)
 - Device-replacement workflow (swapping a spare into an already-addressed slot) — flagged in ADR 0003, design deferred
 - Bridged multi-port logical interfaces (e.g. Shure ULXD4Q/D "Switched" mode) — flagged in ADR 0010, design deferred
 - Multicast configuration: port-level filtering plus switch-level IGMP snooping — see #22
