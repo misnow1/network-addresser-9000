@@ -385,8 +385,8 @@ class VLAN(AuditedModel):
         validators=[validate_ipv4_cidr],
         help_text=(
             "IPv4 subnet in CIDR notation, e.g. 10.200.0.0/21. Leave blank for an L2-only VLAN "
-            "with no tracked addressing (ADR 0012) — no gateway, DHCP range, rack range, or "
-            "static address may then be set on it."
+            "with no tracked addressing — no gateway, DHCP range, rack range, or static address "
+            "may then be set on it."
         ),
     )
     default_gateway = models.GenericIPAddressField(
@@ -733,7 +733,7 @@ class RackVlanRange(AuditedModel):
         max_length=18,
         blank=True,
         validators=[validate_ipv4_cidr],
-        help_text="Leave blank to suggest the next free block sized for the rack's slot_count.",
+        help_text="Leave blank to suggest the next free block sized for the rack's slot count.",
     )
 
     class Meta:
@@ -1058,25 +1058,26 @@ class SwitchPortVlanProfile(AuditedModel):
         max_length=10,
         choices=PortMode.choices,
         default=PortMode.TRUNK,
-        help_text="Defaults to Trunk (DESIGN.md).",
+        help_text="Defaults to Trunk.",
     )
     native_vlan = models.ForeignKey(
         VLAN,
         on_delete=models.PROTECT,
         related_name="+",
-        help_text="Primary (untagged) VLAN — implicitly allowed, must not also appear in allowed_vlans.",
+        help_text="Primary (untagged) VLAN — implicitly allowed, so it must not also be listed "
+        "under Allowed VLANs.",
     )
     all_vlans_allowed = models.BooleanField(
         default=False,
-        help_text="If set, every VLAN is allowed on this port and allowed_vlans must be empty.",
+        help_text="If set, every VLAN is allowed on this port and Allowed VLANs must be empty.",
     )
     allowed_vlans: models.ManyToManyField = models.ManyToManyField(
         VLAN,
         through="SwitchPortVlanProfileAllowedVlan",
         related_name="+",
         blank=True,
-        help_text="Additional tagged VLANs, beyond the implied native VLAN. Must be empty if "
-        "all_vlans_allowed is set or port_mode is Access.",
+        help_text="Additional tagged VLANs, beyond the implied Native VLAN. Must be empty if "
+        "Allow All VLANs is set or Port Mode is Access.",
     )
     is_system = models.BooleanField(
         default=False,
