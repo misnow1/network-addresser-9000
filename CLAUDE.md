@@ -18,6 +18,9 @@ review-council pass — check which model you are (your system prompt states it)
   a weaker model.
 - **Already Opus-class?** Say nothing. Just plan.
 
+The planning phase should use the /grill-me skill to thoroughly question the plan
+and make sure all ambiguous items are resolved.
+
 **When planning ends and implementation begins** — right after plan approval /
 `ExitPlanMode`, or when Mike says to go build it:
 

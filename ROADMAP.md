@@ -2,7 +2,7 @@
 
 High-level phases only — day-to-day task tracking belongs in GitHub Issues once there's code to file issues against. This file exists so it's obvious what phase the project is in and what's next, even after a fresh start.
 
-**Current phase: 10 — done.**
+**Current phase: 11 — designed, not yet built.**
 
 ## 1. Foundation — done
 
@@ -70,6 +70,14 @@ High-level phases only — day-to-day task tracking belongs in GitHub Issues onc
 - [x] Static materialization refuses Switched-Mode-shaped devices (duplicate VLAN across ports) atomically, with a clear error
 - [x] Admin add form exposes the choice (creation-only); change form omits it
 
+## 11. Rack Templates — designed, not yet built
+
+- [x] Design decided: named, reusable VLAN sets seeding `RackVlanRange` rows at rack creation, seed-once (not live-referenced) — see ADR 0014, closes the VLAN-only scope of #23
+- [ ] `RackTemplate` model + `PROTECT`-FK through model for VLAN membership + migration
+- [ ] Admin: template CRUD, and a creation-only template picker on the Rack add view
+- [ ] Domain-level apply operation (construct-blank → `full_clean()` → `save()` per VLAN, all-or-nothing, reachable from programmatic creation — not admin-only)
+- [ ] Tests: successful suggestion via the template path; rollback when one of several VLANs can't be allocated
+
 ## Later / not yet designed
 
 - Purpose-built frontend beyond Django admin (rack visualizations, address-utilization views)
@@ -77,4 +85,5 @@ High-level phases only — day-to-day task tracking belongs in GitHub Issues onc
 - Addressing modeled per `(device, VLAN)` instead of per port — the actual fix for Switched Mode's bridged-jack limitation (ADR 0010, ADR 0013) — see #27
 - Slot moves don't re-suggest an already-static device port's address (armed by default now that static materializes by default, ADR 0013; follows from ADR 0003's "stored, not immutable") — see #28
 - Multicast configuration: port-level filtering plus switch-level IGMP snooping — see #22
-- Rack templates: a named set of VLANs applied once at rack creation (seed-once, per ADR 0010) — see #23
+- Populated rack templates: slot layouts that materialize equipment (needs Type `PROTECT`, unlike the VLAN-only feature) — see #30
+- Hostname templating for materialized equipment — see #31

@@ -246,4 +246,9 @@ AUDITLOG_INCLUDE_TRACKING_MODELS = (
         "model": "inventory.NetworkDevicePort",
         "include_fields": ["address", "is_dhcp", "created_at"],
     },
+    {"model": "inventory.RackTemplate", "m2m_fields": ["vlans"]},
+    {
+        "model": "inventory.RackTemplateVlan",
+        "include_fields": ["template", "vlan", "created_at"],
+    },
 )
