@@ -125,15 +125,21 @@ of untraceable mutation the audit trail exists to prevent.
    **not** cover.
 
 9. **`Rack.slot_count` stays a required field on `Rack` itself.** A template's `slot_count`, if
-   set, supplies only an **overridable initial value** on the rack-creation form; a template
-   with no `slot_count` leaves the field exactly as unfilled as it is today. Neither
-   `Rack.slot_count` nor a template's `slot_count` is bounded below or above today —
-   `Rack.slot_count` is a plain `PositiveIntegerField` (`inventory/models.py:710`) with no
-   `MinValueValidator`, so `0` is already legal on `Rack` itself, independent of this feature.
-   This is a pre-existing gap, not one this ADR introduces, but since a template's `slot_count`
-   feeds directly into `suggest_rack_vlan_range()`'s block-size computation, a future
-   implementation plan should decide whether to finally bound it (e.g. `>= 1`) rather than
-   silently inheriting the ambiguity.
+   set, is a **server-side fallback on submission, not a live prefill**: if the rack-creation
+   form's `slot_count` is left blank, it adopts the chosen template's value; an explicitly
+   entered `slot_count` is never overwritten. This project has no JavaScript anywhere in it — the
+   admin is customized entirely through templates and forms — so a true prefill the operator sees
+   *before* submitting (updating as they change the template selector) isn't buildable without
+   introducing a first JS dependency for one field. A template with no `slot_count` leaves the
+   field exactly as unfilled as it is today. The programmatic path
+   (`Rack.objects.create(template=t, ...)`) gets none of this: it still requires `slot_count`
+   explicitly, since the fallback lives in the admin form, not in `Rack` itself (decision 3's
+   VLAN-list-only domain scope).
+
+   `Rack.slot_count` is now bounded `>= 1` (`MinValueValidator` plus a DB `CheckConstraint`) —
+   this ADR originally deferred that decision to the implementation plan; the plan settled it,
+   since a `slot_count=0` rack was legal before this change and produced a degenerate block via
+   `prefix_length_for_capacity(0)`. `RackTemplate.slot_count` carries the same bound.
 
 10. **Template application is a domain operation, not an admin-only convenience.** It must be
     reachable from programmatic rack creation, not only through the admin add view — the same

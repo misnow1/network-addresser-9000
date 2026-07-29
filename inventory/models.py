@@ -691,6 +691,173 @@ class VLAN(AuditedModel):
                     )
                 }
             )
+        template_link = self.rack_template_links.select_related("template").first()
+        if template_link is not None:
+            raise ValidationError(
+                {
+                    "subnet": (
+                        f"cannot be cleared: {template_link.template} still includes this VLAN. "
+                        "Remove it from the template first — a VLAN with no subnet is L2-only and "
+                        "cannot carry addressing (ADR 0012)."
+                    )
+                }
+            )
+
+
+class RackTemplate(AuditedModel):
+    """A named, reusable set of VLANs (ADR 0014) that seeds a new Rack's
+    ``RackVlanRange`` rows in one step at creation.
+
+    Seed-once, not live-referenced (ADR 0010's pattern, not ADR 0012's):
+    applying a template copies its current VLAN list into real rows at that
+    moment. Editing a template afterward — or deleting it entirely — has no
+    effect on any rack already created from it, because a Rack keeps no
+    reference back to its template (decision 5). That also means, unlike
+    ``SwitchPortVlanProfile``, nothing here ever locks: there is no "in use"
+    state for a template to fall into, so it stays freely deletable and
+    freely editable for its entire life (decision 4).
+    """
+
+    name = models.CharField(max_length=100, unique=True)
+    slot_count = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(1)],
+        help_text="Optional. Supplies the rack-creation form's slot count when left blank there "
+        "— type a different value on that form to override it.",
+    )
+    vlans: models.ManyToManyField = models.ManyToManyField(
+        VLAN,
+        through="RackTemplateVlan",
+        related_name="+",
+        blank=True,
+        help_text="VLANs to allocate a rack address range for when a rack is created from this "
+        "template. A VLAN with no subnet (L2-only, ADR 0012) cannot be included.",
+    )
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(condition=~models.Q(name=""), name="racktemplate_name_not_blank"),
+            models.CheckConstraint(
+                condition=models.Q(slot_count__isnull=True) | models.Q(slot_count__gte=1),
+                name="racktemplate_slot_count_gte_1",
+            ),
+        ]
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        # Never evaluates a queryset — this renders in selectors, list
+        # columns, and every ValidationError message that names a template.
+        return self.name
+
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        # Stripped here too, not just clean() — Model.save() never calls
+        # clean(), so a direct RackTemplate.objects.create(name="Foo ")
+        # would otherwise bypass the strip and persist trailing whitespace
+        # the DB's case-insensitive collation doesn't also fold away.
+        if self.name:
+            self.name = self.name.strip()
+        super().save(
+            force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
+        )
+
+    def clean(self) -> None:
+        super().clean()
+        if self.name:
+            self.name = self.name.strip()
+
+
+class RackTemplateVlan(AuditedModel):
+    """Explicit through model for ``RackTemplate.vlans`` (decision 2).
+
+    A plain M2M's auto-generated join table has no ``on_delete`` to set, so
+    it can't protect a VLAN from removal (ADR 0007) — this explicit model
+    gives the ``vlan`` side a real ``PROTECT`` FK, the same reason
+    ``SwitchPortVlanProfileAllowedVlan`` exists. Unlike that through model,
+    ``template`` itself is ``CASCADE``: a Rack Template is freely deletable
+    (decision 4 — nothing ever references it once a rack exists), so its
+    membership rows should simply disappear with it rather than blocking
+    the delete.
+
+    Direct creation of a row here bypasses ``.add()``/``.set()`` entirely,
+    so it never fires ``m2m_changed`` — ``clean()``/``save()`` re-validate
+    the L2-only rule for that path. ``.add()``/``.set()`` write the through
+    table without ever calling this model's ``save()`` (Django's documented
+    behavior for custom-through M2M managers), so they're covered instead
+    by the ``m2m_changed`` receiver below — the same split
+    ``SwitchPortVlanProfileAllowedVlan`` has for the same reason.
+    """
+
+    template = models.ForeignKey(RackTemplate, on_delete=models.CASCADE, related_name="vlan_links")
+    vlan = models.ForeignKey(VLAN, on_delete=models.PROTECT, related_name="rack_template_links")
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["template", "vlan"], name="unique_rack_template_vlan"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.template} includes {self.vlan}"
+
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        self._validate_vlan_has_subnet()
+        super().save(
+            force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
+        )
+
+    def clean(self) -> None:
+        super().clean()
+        self._validate_vlan_has_subnet()
+
+    def _validate_vlan_has_subnet(self) -> None:
+        vlan = _get_related(self, "vlan")
+        if vlan is not None and not vlan.subnet:
+            raise ValidationError(
+                {
+                    "vlan": (
+                        f"{vlan} has no subnet (L2-only, ADR 0012) — a Rack Template needs a VLAN "
+                        "with tracked addressing."
+                    )
+                }
+            )
+
+
+def _validate_rack_template_vlan_change(
+    sender: type[models.Model],
+    instance: "RackTemplate",
+    action: str,
+    pk_set: "set[int] | None",
+    reverse: bool,
+    **kwargs: Any,
+) -> None:
+    """Closes the gap ``RackTemplateVlan.clean()``/``save()`` can't:
+    ``template.vlans.add()``/``.set()`` write the through table directly,
+    without ever calling ``RackTemplateVlan.save()`` — the same reason
+    ``SwitchPortVlanProfile`` needs ``_validate_profile_allowed_vlans_change``
+    (see that function's docstring). ``m2m_changed`` is the only hook Django
+    offers for those calls.
+
+    Queries the VLANs being added fresh by ``pk_set`` rather than trusting
+    any cached objects on ``instance`` — inherently non-stale, unlike the
+    profile receiver's scalar re-read, since there's no ``instance``-level
+    state to go stale here in the first place.
+
+    ``related_name="+"`` on ``vlans`` means there is no reverse accessor, so
+    ``reverse=True`` can never actually fire here — the guard is defensive,
+    not load-bearing (same note as the profile's receiver).
+    """
+    if reverse or action != "pre_add" or not pk_set:
+        return
+    l2_only = VLAN.objects.filter(pk__in=pk_set, subnet="").values_list("name", "vlan_id")
+    if l2_only.exists():
+        names = ", ".join(f"{name} (VLAN {vlan_id})" for name, vlan_id in l2_only)
+        raise ValidationError(
+            f"{instance} cannot include {names} — a VLAN with no subnet is L2-only (ADR 0012) "
+            "and a Rack Template needs VLANs with tracked addressing."
+        )
+
+
+models.signals.m2m_changed.connect(_validate_rack_template_vlan_change, sender=RackTemplate.vlans.through)
 
 
 class Rack(AuditedModel):
@@ -707,18 +874,52 @@ class Rack(AuditedModel):
     """
 
     name = models.CharField(max_length=100)
-    slot_count = models.PositiveIntegerField()
+    slot_count = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+
+    #: Class-level default for the ``template`` property below — never a
+    #: plain class attribute, since Django's ``Model.__init__`` only
+    #: accepts unknown kwargs (``objects.create(template=...)``) when the
+    #: name is a field or a property (mirrors ADR 0013's
+    #: ``NetworkDevice._port_addressing``/``port_addressing``).
+    _template: "RackTemplate | None" = None
 
     class Meta:
         ordering = ["name"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(slot_count__gte=1), name="rack_slot_count_gte_1"),
+        ]
 
     def __str__(self) -> str:
         return self.name
 
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        # ``self.pk is None or self._state.adding`` — see NetworkSwitch.save()
+        # for why neither check alone is sufficient.
+        is_new = self.pk is None or self._state.adding
+        with transaction.atomic():
+            super().save(
+                force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
+            )
+            if is_new and self._template is not None:
+                self._apply_template()
+
     def clean(self) -> None:
         super().clean()
         if self.pk is None:
-            return  # nothing assigned yet on a not-yet-created rack
+            # Advisory only — _apply_template() re-checks against the same
+            # snapshot inside save()'s transaction, which is the real
+            # guarantee. A second, independent read here could in
+            # principle observe different template membership than the
+            # apply actually uses: this project runs READ COMMITTED, not
+            # REPEATABLE READ (verified against the app's own connection —
+            # Django's MySQL backend sets isolation per connection,
+            # defaulting to read committed, regardless of the MariaDB
+            # server's global setting). That's fine for an advisory check,
+            # but not for the guarantee itself — see _apply_template().
+            if self._template is not None and self.slot_count is not None:
+                links = list(self._template.vlan_links.select_related("vlan").order_by("vlan__vlan_id"))
+                self._check_template_application_possible(links)
+            return  # nothing else assigned yet on a not-yet-created rack
         if self.switches.filter(rack_slot__gt=self.slot_count).exists():
             raise ValidationError(
                 {"slot_count": f"{self.slot_count} is smaller than the rack_slot of a switch assigned here."}
@@ -742,6 +943,115 @@ class Rack(AuditedModel):
                         )
                     }
                 )
+
+    @property
+    def template(self) -> "RackTemplate | None":
+        """Creation-time-only Rack Template to seed this rack's
+        ``RackVlanRange`` rows from (ADR 0014). Never stored — the
+        materialized ranges are the only record of what was applied;
+        setting this after creation has no effect, since
+        ``_apply_template()`` only runs once. A rack keeps no reference to
+        its template by design (decision 5), so this is deliberately never
+        a field.
+        """
+        return self._template
+
+    @template.setter
+    def template(self, value: "RackTemplate | None") -> None:
+        if value is not None and not isinstance(value, RackTemplate):
+            raise ValidationError(f"{value!r} is not a RackTemplate.")
+        self._template = value
+
+    def _apply_template(self) -> None:
+        """One-time copy of ``self.template``'s VLAN list into real
+        ``RackVlanRange`` rows (ADR 0014 decision 7). Each range is built
+        unsaved with a blank ``address_range`` and put through
+        ``full_clean()`` before ``save()`` — ``RackVlanRange`` has no
+        ``save()`` override, so a bare ``objects.create()`` would otherwise
+        persist an empty string on a NOT NULL column instead of triggering
+        ``RackVlanRange.clean()``'s existing suggestion logic. Runs inside
+        the same transaction as this rack's insert (see ``save()``), so any
+        failure rolls back the rack and every range materialized before it
+        (decision 8's all-or-nothing).
+
+        Reads the template's VLAN links exactly once into ``links`` and
+        reuses that same snapshot for both the pre-flight and this loop,
+        rather than querying twice — this project runs READ COMMITTED (see
+        ``clean()``), so two independent reads inside this one transaction
+        could observe different membership if a concurrent template edit
+        landed in between. No row lock on the template: that would only
+        narrow this specific torn-read window, not ADR 0014's already-
+        accepted range-allocation race (see that ADR's Known-gap section),
+        so a snapshot is the right amount of correctness for what it costs.
+        """
+        template = self._template
+        assert template is not None  # only ever called from save() after that same check
+        links = list(template.vlan_links.select_related("vlan").order_by("vlan__vlan_id"))
+        self._check_template_application_possible(links)
+        for link in links:
+            rng = RackVlanRange(rack=self, vlan=link.vlan, address_range="", created_by=self.created_by)
+            rng.full_clean()
+            rng.save()
+
+    def _check_template_application_possible(self, links: "list[RackTemplateVlan]") -> None:
+        """Pure pre-flight over a snapshot of a template's VLAN links:
+        whether each listed VLAN can allocate a ``slot_count``-sized block
+        right now. Pure and independent of ``self.pk``, so it can run from
+        both ``clean()`` (admin form errors, its own freshly-read snapshot)
+        and the top of ``_apply_template()`` (the same snapshot that
+        materialization then uses).
+
+        Collects every VLAN that can't be allocated rather than stopping at
+        the first, so the operator sees the whole picture in one pass —
+        mirrors ADR 0013's ``_check_static_materialization_possible()``,
+        which names both conflicting ports rather than just one.
+        """
+        failures = []
+        for link in links:
+            vlan = link.vlan
+            try:
+                validate_ipv4_cidr(vlan.subnet)
+            except ValidationError:
+                failures.append(f"{vlan} (invalid subnet)")
+                continue
+            used_ranges = []
+            for value in vlan.rack_ranges.values_list("address_range", flat=True):
+                try:
+                    validate_ipv4_cidr(value)
+                except ValidationError:
+                    continue  # sibling range's own malformed value; not this check's job
+                used_ranges.append(value)
+            dhcp_range = None
+            if vlan.dhcp_range_start and vlan.dhcp_range_end:
+                try:
+                    ipaddress.IPv4Address(vlan.dhcp_range_start)
+                    ipaddress.IPv4Address(vlan.dhcp_range_end)
+                except ValueError:
+                    pass  # VLAN's own malformed dhcp range; its own clean() reports it
+                else:
+                    dhcp_range = (vlan.dhcp_range_start, vlan.dhcp_range_end)
+            suggestion = suggest_rack_vlan_range(vlan.subnet, self.slot_count, used_ranges, dhcp_range)
+            if suggestion is None:
+                failures.append(str(vlan))
+        if failures:
+            # Keyed "template" — not a real model field, but safe here
+            # unlike NetworkDevice._check_static_materialization_possible()'s
+            # analogous re-raise-as-plain-error workaround: this method only
+            # ever runs when self._template is set, which itself only
+            # happens via RackAddForm (which always declares a "template"
+            # form field) or a programmatic caller with no ModelForm
+            # involved at all — so there's no call site where "template"
+            # could fail to match a form field and crash Django's
+            # add_error().
+            raise ValidationError(
+                {
+                    "template": (
+                        f"No free address block sized for slot_count={self.slot_count} on: "
+                        f"{', '.join(failures)}. Resize the rack, free up space on those VLANs, or "
+                        "remove them from the template before applying it."
+                    )
+                }
+            )
 
 
 class RackVlanRange(AuditedModel):

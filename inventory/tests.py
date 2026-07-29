@@ -35,7 +35,10 @@ from .admin import (
     NetworkSwitchPortForm,
     NetworkSwitchPortInline,
     NetworkSwitchTypeAdmin,
+    RackAddForm,
     RackAdmin,
+    RackTemplateForm,
+    RackVlanRangeInlineFormSet,
     SwitchPortVlanProfileAdmin,
     SwitchPortVlanProfileForm,
     VLANAdmin,
@@ -58,6 +61,8 @@ from .models import (
     PortMode,
     PortType,
     Rack,
+    RackTemplate,
+    RackTemplateVlan,
     RackVlanRange,
     SwitchPortVlanProfile,
     SwitchPortVlanProfileAllowedVlan,
@@ -3499,3 +3504,379 @@ class ReviewCouncilRegressionTests(TestCase):
         link.delete()
 
         self.assertTrue(LogEntry.objects.filter(object_pk=str(pk), action=LogEntry.Action.DELETE).exists())
+
+
+class RackTemplateModelTests(TestCase):
+    """ADR 0014 decisions 1-3: name strip/uniqueness, both slot_count
+    bounds (Rack's and RackTemplate's — separate fields, separate tests, so
+    one can't accidentally stand in for the other), and L2-only VLAN
+    rejection tested against all three write paths that can add a
+    (template, VLAN) link, since none of them can live in
+    ``RackTemplateVlan.clean()`` alone.
+    """
+
+    def setUp(self) -> None:
+        self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.l2_vlan = VLAN.objects.create(name="L2 Only", vlan_id=999, subnet="")
+
+    def test_name_is_stripped_on_save(self) -> None:
+        template = RackTemplate.objects.create(name="  Audio Rack  ")
+        self.assertEqual(template.name, "Audio Rack")
+
+    def test_name_is_stripped_before_uniqueness_check(self) -> None:
+        RackTemplate.objects.create(name="Audio Rack")
+        duplicate = RackTemplate(name="Audio Rack  ")
+        with self.assertRaises(ValidationError):
+            duplicate.full_clean()
+
+    def test_blank_name_rejected_by_db_constraint(self) -> None:
+        with self.assertRaises(IntegrityError):
+            RackTemplate.objects.create(name="")
+
+    def test_duplicate_template_vlan_pair_rejected(self) -> None:
+        template = RackTemplate.objects.create(name="Audio Rack")
+        RackTemplateVlan.objects.create(template=template, vlan=self.vlan)
+        with self.assertRaises(IntegrityError):
+            RackTemplateVlan.objects.create(template=template, vlan=self.vlan)
+
+    # Rack.slot_count's own >= 1 bound (ADR 0014 decision 9's settled
+    # question) — distinct from RackTemplate.slot_count's below.
+    def test_rack_slot_count_zero_rejected_by_db_constraint(self) -> None:
+        with self.assertRaises(IntegrityError):
+            Rack.objects.create(name="Rack 1", slot_count=0)
+
+    # RackTemplate.slot_count's own >= 1 bound — a different field on a
+    # different model; must not be satisfied by the test above alone.
+    def test_rack_template_slot_count_zero_rejected_by_validator(self) -> None:
+        template = RackTemplate(name="Bad", slot_count=0)
+        with self.assertRaises(ValidationError):
+            template.full_clean()
+
+    def test_rack_template_slot_count_zero_rejected_by_db_constraint(self) -> None:
+        with self.assertRaises(IntegrityError):
+            RackTemplate.objects.create(name="Bad DB", slot_count=0)
+
+    # Path 1: direct through-row clean().
+    def test_direct_through_row_rejects_l2_only_vlan_via_clean(self) -> None:
+        template = RackTemplate.objects.create(name="Audio Rack")
+        link = RackTemplateVlan(template=template, vlan=self.l2_vlan)
+        with self.assertRaises(ValidationError):
+            link.full_clean()
+
+    # Path 1, bypassing clean(): the through row's own save().
+    def test_direct_through_row_save_rejects_l2_only_vlan_bypassing_clean(self) -> None:
+        template = RackTemplate.objects.create(name="Audio Rack")
+        with self.assertRaises(ValidationError):
+            RackTemplateVlan.objects.create(template=template, vlan=self.l2_vlan)
+
+    # Path 2: the m2m_changed receiver — .add()/.set() never call
+    # RackTemplateVlan.save() at all.
+    def test_add_rejects_l2_only_vlan(self) -> None:
+        template = RackTemplate.objects.create(name="Audio Rack")
+        with self.assertRaises(ValidationError):
+            template.vlans.add(self.l2_vlan)
+
+    def test_set_rejects_l2_only_vlan(self) -> None:
+        template = RackTemplate.objects.create(name="Audio Rack")
+        with self.assertRaises(ValidationError):
+            template.vlans.set([self.vlan, self.l2_vlan])
+
+    def test_add_allows_ordinary_vlan(self) -> None:
+        template = RackTemplate.objects.create(name="Audio Rack")
+        template.vlans.add(self.vlan)  # must not raise
+        self.assertIn(self.vlan, template.vlans.all())
+
+    # Path 3: the admin form's clean_vlans().
+    def test_admin_form_rejects_l2_only_vlan(self) -> None:
+        form = RackTemplateForm(data={"name": "Audio Rack", "vlans": [self.l2_vlan.pk]})
+        self.assertFalse(form.is_valid())
+
+    def test_admin_form_accepts_ordinary_vlan(self) -> None:
+        form = RackTemplateForm(data={"name": "Audio Rack", "vlans": [self.vlan.pk]})
+        self.assertTrue(form.is_valid(), form.errors)
+
+
+class RackTemplateApplicationTests(TestCase):
+    """ADR 0014's two mandated cases — a successful multi-VLAN apply
+    through the construct-blank -> full_clean() -> save() path, and a
+    rollback leaving no rack and no ranges when one of several VLANs can't
+    be allocated — plus the surrounding behavior the implementation plan
+    calls out: zero-VLAN no-op, the programmatic path (with and without
+    slot_count), seed-once (editing/deleting a template after apply has no
+    effect), and the pre-flight naming every failing VLAN, not just the
+    first.
+    """
+
+    def setUp(self) -> None:
+        self.vlan_a = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.vlan_b = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+        # A /27 (32 addresses) can never fit a slot_count large enough to
+        # also need more than vlan_a/vlan_b's /21s — used below to force an
+        # allocation failure on exactly one VLAN of several.
+        self.tiny_vlan = VLAN.objects.create(name="Tiny", vlan_id=202, subnet="10.202.1.0/27")
+
+    def test_apply_creates_ranges_via_suggestion_path(self) -> None:
+        template = RackTemplate.objects.create(name="Audio Rack")
+        RackTemplateVlan.objects.create(template=template, vlan=self.vlan_a)
+        RackTemplateVlan.objects.create(template=template, vlan=self.vlan_b)
+        # slot_count=30 -> required_block_size=32 -> a /27 block, matching
+        # RackVlanRangeSuggestionTests' fixture so the expected suggestion
+        # here is verified against the same known-good arithmetic.
+        rack = Rack(name="Rack 1", slot_count=30)
+        rack.template = template
+        rack.save()
+        self.assertEqual(
+            RackVlanRange.objects.get(rack=rack, vlan=self.vlan_a).address_range, "10.200.0.0/27"
+        )
+        self.assertEqual(
+            RackVlanRange.objects.get(rack=rack, vlan=self.vlan_b).address_range, "10.201.0.0/27"
+        )
+
+    def test_apply_rolls_back_rack_and_ranges_when_one_vlan_unallocatable(self) -> None:
+        template = RackTemplate.objects.create(name="Mixed")
+        RackTemplateVlan.objects.create(template=template, vlan=self.vlan_a)
+        RackTemplateVlan.objects.create(template=template, vlan=self.tiny_vlan)
+        # slot_count=1000 needs a /22-sized block: fits inside vlan_a's
+        # /21, but is bigger than tiny_vlan's whole /27 subnet.
+        rack = Rack(name="Rack 2", slot_count=1000)
+        rack.template = template
+        with self.assertRaises(ValidationError):
+            rack.save()
+        self.assertFalse(Rack.objects.filter(name="Rack 2").exists())
+        self.assertFalse(RackVlanRange.objects.filter(vlan=self.vlan_a).exists())
+        self.assertFalse(RackVlanRange.objects.filter(vlan=self.tiny_vlan).exists())
+
+    def test_preflight_error_names_all_unallocatable_vlans(self) -> None:
+        tiny_vlan_2 = VLAN.objects.create(name="Tiny2", vlan_id=203, subnet="10.203.1.0/27")
+        template = RackTemplate.objects.create(name="Multi-fail")
+        RackTemplateVlan.objects.create(template=template, vlan=self.tiny_vlan)
+        RackTemplateVlan.objects.create(template=template, vlan=tiny_vlan_2)
+        rack = Rack(name="Rack 3", slot_count=1000)
+        rack.template = template
+        with self.assertRaises(ValidationError) as ctx:
+            rack.save()
+        message = str(ctx.exception)
+        self.assertIn(str(self.tiny_vlan), message)
+        self.assertIn(str(tiny_vlan_2), message)
+
+    def test_apply_is_noop_for_zero_vlan_template(self) -> None:
+        empty_template = RackTemplate.objects.create(name="Empty")
+        rack = Rack(name="Rack 4", slot_count=4)
+        rack.template = empty_template
+        rack.save()  # must not raise
+        self.assertFalse(RackVlanRange.objects.filter(rack=rack).exists())
+
+    def test_objects_create_with_template_kwarg_applies_template(self) -> None:
+        template = RackTemplate.objects.create(name="Programmatic")
+        RackTemplateVlan.objects.create(template=template, vlan=self.vlan_a)
+        # template is a property, not a real field — django-stubs doesn't
+        # recognize it as a valid objects.create() kwarg.
+        rack = Rack.objects.create(name="Rack 5", slot_count=4, template=template)  # type: ignore[misc]
+        self.assertTrue(RackVlanRange.objects.filter(rack=rack, vlan=self.vlan_a).exists())
+
+    def test_objects_create_with_template_but_no_slot_count_still_raises(self) -> None:
+        # The template HAS a slot_count — proves it's not consulted outside
+        # the admin form's fallback (grilling decision 2's domain-scope
+        # boundary: only the VLAN list is a domain-level concern).
+        template = RackTemplate.objects.create(name="No Slot Count", slot_count=8)
+        with self.assertRaises(IntegrityError):
+            Rack.objects.create(name="Rack 6", template=template)  # type: ignore[misc]
+
+    def test_editing_template_after_apply_does_not_affect_existing_rack(self) -> None:
+        template = RackTemplate.objects.create(name="Solo")
+        RackTemplateVlan.objects.create(template=template, vlan=self.vlan_a)
+        rack = Rack(name="Rack 7", slot_count=4)
+        rack.template = template
+        rack.save()
+        original_range = RackVlanRange.objects.get(rack=rack, vlan=self.vlan_a).address_range
+
+        RackTemplateVlan.objects.create(template=template, vlan=self.vlan_b)  # edit after the fact
+
+        rack.refresh_from_db()
+        self.assertEqual(RackVlanRange.objects.filter(rack=rack).count(), 1)
+        self.assertEqual(RackVlanRange.objects.get(rack=rack, vlan=self.vlan_a).address_range, original_range)
+        self.assertFalse(RackVlanRange.objects.filter(rack=rack, vlan=self.vlan_b).exists())
+
+    def test_deleting_template_after_apply_does_not_affect_existing_rack(self) -> None:
+        template = RackTemplate.objects.create(name="Ephemeral")
+        RackTemplateVlan.objects.create(template=template, vlan=self.vlan_a)
+        rack = Rack(name="Rack 8", slot_count=4)
+        rack.template = template
+        rack.save()
+
+        template.delete()
+
+        self.assertTrue(Rack.objects.filter(pk=rack.pk).exists())
+        self.assertTrue(RackVlanRange.objects.filter(rack=rack, vlan=self.vlan_a).exists())
+
+
+class RackTemplateAdminTests(TestCase):
+    """The admin add-form/change-form split (template only makes sense at
+    creation, ADR 0014 decision 5), the slot_count blank-submit fallback
+    (decision 9, as amended), and decision 11's template/manual-inline
+    collision check — including the grilling-decision-6 guard: the
+    duplicate-VLAN test asserts a *form error* specifically, not just "an
+    exception of some kind", so a future Django admin internals change that
+    breaks the ordering RackVlanRangeInlineFormSet depends on fails loudly
+    here instead of silently degrading to a raw IntegrityError.
+    """
+
+    def setUp(self) -> None:
+        self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+
+    def test_template_field_present_on_add_form(self) -> None:
+        form_class = RackAdmin(Rack, AdminSite()).get_form(RequestFactory().get("/"), obj=None)
+        self.assertIn("template", form_class.base_fields)
+
+    def test_template_field_absent_on_change_form(self) -> None:
+        rack = Rack.objects.create(name="Rack 1", slot_count=4)
+        form_class = RackAdmin(Rack, AdminSite()).get_form(RequestFactory().get("/"), obj=rack)
+        self.assertNotIn("template", form_class.base_fields)
+
+    def test_blank_slot_count_adopts_template_value(self) -> None:
+        template = RackTemplate.objects.create(name="Audio Rack", slot_count=8)
+        form = RackAddForm(data={"name": "Rack 2", "slot_count": "", "template": str(template.pk)})
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.slot_count, 8)
+
+    def test_explicit_slot_count_is_not_overwritten_by_template(self) -> None:
+        template = RackTemplate.objects.create(name="Audio Rack", slot_count=8)
+        form = RackAddForm(data={"name": "Rack 3", "slot_count": "4", "template": str(template.pk)})
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.slot_count, 4)
+
+    def test_switching_template_on_resubmit_adopts_new_templates_value(self) -> None:
+        RackTemplate.objects.create(name="Audio Rack", slot_count=8)
+        template_b = RackTemplate.objects.create(name="Video Rack", slot_count=12)
+        form = RackAddForm(data={"name": "Rack 4", "slot_count": "", "template": str(template_b.pk)})
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.slot_count, 12)
+
+    def test_no_template_and_blank_slot_count_is_required_error(self) -> None:
+        form = RackAddForm(data={"name": "Rack 5", "slot_count": ""})
+        self.assertFalse(form.is_valid())
+        self.assertIn("slot_count", form.errors)
+
+    def test_duplicate_vlan_across_template_and_manual_inline_is_form_error(self) -> None:
+        template = RackTemplate.objects.create(name="Audio Rack")
+        RackTemplateVlan.objects.create(template=template, vlan=self.vlan)
+        form = RackAddForm(data={"name": "Rack 6", "slot_count": "4", "template": str(template.pk)})
+        FormSet = inlineformset_factory(  # type: ignore[var-annotated]
+            Rack,
+            RackVlanRange,
+            formset=RackVlanRangeInlineFormSet,
+            fields=["vlan", "address_range"],
+            extra=1,
+            can_delete=True,
+        )
+        data = {
+            "vlan_ranges-TOTAL_FORMS": "1",
+            "vlan_ranges-INITIAL_FORMS": "0",
+            "vlan_ranges-MIN_NUM_FORMS": "0",
+            "vlan_ranges-MAX_NUM_FORMS": "1000",
+            "vlan_ranges-0-vlan": str(self.vlan.pk),
+            "vlan_ranges-0-address_range": "",
+        }
+        # Mirrors Django's real admin ordering (see
+        # RackVlanRangeInlineFormSet's docstring): the formset is
+        # constructed against form.instance *before* form.is_valid() runs —
+        # capture that reference here, then validate the form, then the
+        # formset, in that exact order.
+        formset = FormSet(data, instance=form.instance, prefix="vlan_ranges")
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertFalse(formset.is_valid())
+        self.assertIn(str(self.vlan), str(formset.non_form_errors()))
+
+    def test_non_conflicting_manual_inline_alongside_template_is_valid(self) -> None:
+        other_vlan = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+        template = RackTemplate.objects.create(name="Audio Rack")
+        RackTemplateVlan.objects.create(template=template, vlan=self.vlan)
+        form = RackAddForm(data={"name": "Rack 7", "slot_count": "4", "template": str(template.pk)})
+        FormSet = inlineformset_factory(  # type: ignore[var-annotated]
+            Rack,
+            RackVlanRange,
+            formset=RackVlanRangeInlineFormSet,
+            fields=["vlan", "address_range"],
+            extra=1,
+            can_delete=True,
+        )
+        data = {
+            "vlan_ranges-TOTAL_FORMS": "1",
+            "vlan_ranges-INITIAL_FORMS": "0",
+            "vlan_ranges-MIN_NUM_FORMS": "0",
+            "vlan_ranges-MAX_NUM_FORMS": "1000",
+            "vlan_ranges-0-vlan": str(other_vlan.pk),
+            "vlan_ranges-0-address_range": "",
+        }
+        formset = FormSet(data, instance=form.instance, prefix="vlan_ranges")
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertTrue(formset.is_valid(), formset.errors)
+
+
+class RackTemplateDeletionTests(TestCase):
+    """ADR 0014 decisions 2/4: a Rack Template is freely deletable and its
+    membership cascades (the inverse direction — a listed VLAN is
+    PROTECTed against deletion, and against having its subnet blanked).
+    """
+
+    def setUp(self) -> None:
+        self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+
+    def test_template_freely_deletable(self) -> None:
+        template = RackTemplate.objects.create(name="Audio Rack")
+        RackTemplateVlan.objects.create(template=template, vlan=self.vlan)
+        template.delete()  # must not raise
+        self.assertFalse(RackTemplate.objects.filter(pk=template.pk).exists())
+
+    def test_deleting_template_cascades_membership_rows(self) -> None:
+        template = RackTemplate.objects.create(name="Audio Rack")
+        link = RackTemplateVlan.objects.create(template=template, vlan=self.vlan)
+        template.delete()
+        self.assertFalse(RackTemplateVlan.objects.filter(pk=link.pk).exists())
+
+    def test_vlan_removal_blocked_while_listed_in_template(self) -> None:
+        template = RackTemplate.objects.create(name="Audio Rack")
+        RackTemplateVlan.objects.create(template=template, vlan=self.vlan)
+        with self.assertRaises(ProtectedError):
+            self.vlan.delete()
+
+    def test_blanking_listed_vlans_subnet_is_blocked(self) -> None:
+        template = RackTemplate.objects.create(name="Audio Rack")
+        RackTemplateVlan.objects.create(template=template, vlan=self.vlan)
+        self.vlan.subnet = ""
+        with self.assertRaises(ValidationError):
+            self.vlan.full_clean()
+
+
+class RackTemplateAuditTests(TestCase):
+    """ADR 0014 decision 12: RackTemplate/RackTemplateVlan mutations are in
+    ADR 0004's audit scope, not just creation — the profile's own
+    m2m_fields registration covers .add()/.set() (which fire m2m_changed),
+    and RackTemplateVlan's own registration covers direct through-row
+    writes (which never fire that signal), mirroring
+    SwitchPortVlanProfile's exact registration split
+    (ReviewCouncilRegressionTests above, for the same reason).
+    """
+
+    def setUp(self) -> None:
+        self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+
+    def test_template_creation_is_logged(self) -> None:
+        template = RackTemplate.objects.create(name="Audio Rack")
+        self.assertTrue(
+            LogEntry.objects.filter(object_pk=str(template.pk), action=LogEntry.Action.CREATE).exists()
+        )
+
+    def test_vlans_add_is_logged(self) -> None:
+        template = RackTemplate.objects.create(name="Audio Rack")
+        template.vlans.add(self.vlan)
+        self.assertTrue(
+            LogEntry.objects.filter(object_pk=str(template.pk), action=LogEntry.Action.UPDATE).exists()
+        )
+
+    def test_direct_through_row_creation_is_logged(self) -> None:
+        template = RackTemplate.objects.create(name="Audio Rack")
+        link = RackTemplateVlan.objects.create(template=template, vlan=self.vlan)
+        self.assertTrue(
+            LogEntry.objects.filter(object_pk=str(link.pk), action=LogEntry.Action.CREATE).exists()
+        )

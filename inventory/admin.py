@@ -28,6 +28,7 @@ from .models import (
     PortAddressing,
     PortMode,
     Rack,
+    RackTemplate,
     RackVlanRange,
     SwitchPortVlanProfile,
 )
@@ -89,8 +90,53 @@ class AuditedModelAdminMixin:
         formset.save_m2m()
 
 
+class RackVlanRangeInlineFormSet(BaseInlineFormSet):
+    """Implements ADR 0014 decision 11: a manually-entered range here that
+    names a VLAN the chosen template already covers is a validation error
+    naming that VLAN — not silent precedence in either direction, and not a
+    raw ``unique_rack_vlan_range`` IntegrityError surfacing after template
+    rows have already been written.
+
+    Reads ``self.instance.template`` — populated by ``RackAddForm.
+    _post_clean()`` before this formset's own ``clean()`` runs. This works
+    because ``formset.instance`` *is* ``form.instance`` (the same object,
+    not a copy) and Django's admin ``_changeform_view`` only calls
+    ``all_valid(formsets)`` (which is what triggers formset validation)
+    *after* ``form.is_valid()`` has already run ``_post_clean()`` — even
+    though the formsets themselves are *constructed* earlier, before
+    ``form.is_valid()`` runs. If a future Django release reorders that,
+    this degrades to the raw IntegrityError decision 11 forbids rather than
+    silently doing nothing — ``RackTemplateAdminTests`` asserts the *form
+    error* specifically so that regression fails loudly. On the rack change
+    form (no ``template`` field at all), ``self.instance.template`` is
+    simply the property's default ``None`` and this check is a no-op,
+    exactly as intended.
+    """
+
+    def clean(self) -> None:
+        super().clean()
+        if any(self.errors):
+            return
+        template = getattr(self.instance, "template", None)
+        if template is None:
+            return
+        template_vlan_ids = set(template.vlan_links.values_list("vlan_id", flat=True))
+        if not template_vlan_ids:
+            return
+        for form in self.forms:
+            if not form.cleaned_data or form.cleaned_data.get("DELETE", False):
+                continue
+            vlan = form.cleaned_data.get("vlan")
+            if vlan is not None and vlan.pk in template_vlan_ids:
+                raise forms.ValidationError(
+                    f"{vlan} is already included by the selected Rack Template — remove this row "
+                    "or choose a different VLAN; it will be allocated by the template automatically."
+                )
+
+
 class RackVlanRangeInline(admin.TabularInline):
     model = RackVlanRange
+    formset = RackVlanRangeInlineFormSet
     extra = 0
 
 
@@ -214,6 +260,41 @@ class SwitchPortVlanProfileForm(forms.ModelForm):
         return cleaned_data
 
 
+class RackTemplateForm(forms.ModelForm):
+    """Carries ``vlans`` as a hand-declared ``ModelMultipleChoiceField`` —
+    Django admin.E013 blocks a through-model M2M from ``ModelAdmin.fields``
+    directly, the same reason ``SwitchPortVlanProfileForm.allowed_vlans``
+    exists.
+
+    ``clean_vlans()`` rejects an L2-only VLAN here so the rule surfaces as a
+    field error rather than a save-time exception — the model-level guards
+    (``RackTemplateVlan.clean()``/``save()``, the ``m2m_changed`` receiver)
+    are backstops for non-form writes, not duplicated here.
+    """
+
+    vlans = forms.ModelMultipleChoiceField(queryset=VLAN.objects.all(), required=False)
+
+    class Meta:
+        model = RackTemplate
+        fields = ["name", "slot_count", "vlans"]
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        if self.instance.pk:
+            self.fields["vlans"].initial = self.instance.vlans.all()
+
+    def clean_vlans(self) -> QuerySet:
+        vlans = self.cleaned_data["vlans"]
+        l2_only = vlans.filter(subnet="")
+        if l2_only.exists():
+            names = ", ".join(str(vlan) for vlan in l2_only)
+            raise forms.ValidationError(
+                f"{names} — a VLAN with no subnet is L2-only (ADR 0012) and cannot be included in "
+                "a Rack Template."
+            )
+        return vlans
+
+
 class NetworkSwitchPortForm(forms.ModelForm):
     """Disables ``profile`` on a row that already has a connected device
     port (DESIGN.md: profile can be swapped for another "unless a device is
@@ -271,6 +352,69 @@ class NetworkDeviceAddForm(forms.ModelForm):
         # does leave the key genuinely absent). Must run before
         # super()._post_clean(), which is what calls self.instance.full_clean().
         self.instance.port_addressing = self.cleaned_data.get("port_addressing") or PortAddressing.STATIC
+        super()._post_clean()  # type: ignore[misc]
+
+
+class RackAddForm(forms.ModelForm):
+    """Carries the creation-time-only ``template`` picker (ADR 0014) — not a
+    model field (a rack keeps no reference to its template, decision 5), so
+    it can't be expressed via ``Meta.fields`` alone. Used only for the add
+    view (``RackAdmin.get_form()``); a template has no effect after
+    creation, so the change form omits this field entirely.
+
+    Leaving ``slot_count`` blank on this form adopts the chosen template's
+    ``slot_count``, if it has one (decision 9) — a server-side fallback on
+    submission, not a live-updating prefill: this project has no
+    JavaScript, so nothing can populate a value on this page before it's
+    submitted.
+    """
+
+    template = forms.ModelChoiceField(
+        queryset=RackTemplate.objects.all(),
+        required=False,
+        help_text="Optional. Seeds this rack's VLAN address ranges at creation (ADR 0014). Leave "
+        "slot_count blank below to use the template's slot_count, if it has one.",
+    )
+
+    class Meta:
+        model = Rack
+        fields = ["name", "slot_count"]
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.fields["slot_count"].required = False
+
+    def clean(self) -> dict[str, Any]:
+        cleaned_data = super().clean() or {}
+        template = cleaned_data.get("template")
+        if cleaned_data.get("slot_count") is None:
+            if template is not None and template.slot_count:
+                cleaned_data["slot_count"] = template.slot_count
+            else:
+                # slot_count is form-required=False only to let the
+                # fallback above satisfy it silently — when nothing can
+                # (no template, or a template with no slot_count of its
+                # own), it must still surface as an ordinary field error
+                # here. Without this, Django's ModelForm excludes an
+                # empty, form-non-required field from the model's own
+                # full_clean() (see BaseModelForm._get_validation_
+                # exclusions's "backwards-compatibility" exclusion for
+                # exactly this shape), so the blank value would sail
+                # through form.is_valid() and only fail later as a raw
+                # IntegrityError from the NOT NULL column at save() time.
+                self.add_error(
+                    "slot_count",
+                    "This field is required, unless a template with a slot_count is selected.",
+                )
+        return cleaned_data
+
+    def _post_clean(self) -> None:
+        # template isn't a model field, so construct_instance() (called
+        # inside super()._post_clean(), before instance.full_clean()) never
+        # touches it — set once here, before super()._post_clean(), so
+        # Rack.clean()'s advisory pre-flight (also inside
+        # super()._post_clean(), via instance.full_clean()) sees it.
+        self.instance.template = self.cleaned_data.get("template")
         super()._post_clean()  # type: ignore[misc]
 
 
@@ -462,12 +606,39 @@ class SwitchPortVlanProfileAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMix
         return super().has_delete_permission(request, obj)
 
 
+@admin.register(RackTemplate)
+class RackTemplateAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
+    form = RackTemplateForm
+    list_display = ["name", "slot_count", "vlans_display"]
+    search_fields = ["name"]
+    show_auditlog_history_link = True
+
+    def get_queryset(self, request: HttpRequest) -> QuerySet:
+        # vlans_display() reads every row's vlans — without this, an N+1
+        # across the changelist.
+        return super().get_queryset(request).prefetch_related("vlans")
+
+    @admin.display(description="VLANs")
+    def vlans_display(self, obj: RackTemplate) -> str:
+        return ", ".join(str(vlan_id) for vlan_id in sorted(vlan.vlan_id for vlan in obj.vlans.all()))
+
+
 @admin.register(Rack)
 class RackAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
     list_display = ["name", "slot_count"]
     search_fields = ["name"]
     inlines = [RackVlanRangeInline]
     show_auditlog_history_link = True
+
+    def get_form(self, request: HttpRequest, obj: Any = None, change: bool = False, **kwargs: Any) -> Any:
+        # template (ADR 0014) only makes sense at creation — a rack keeps
+        # no reference to its template (decision 5), so the change form
+        # uses the default ModelForm, which has no such field. There is
+        # deliberately no way to filter/search racks by template for the
+        # same reason: no rack stores one.
+        if obj is None:
+            kwargs["form"] = RackAddForm
+        return super().get_form(request, obj, change=change, **kwargs)
 
 
 @admin.register(NetworkSwitchType)
