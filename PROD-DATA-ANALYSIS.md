@@ -440,8 +440,42 @@ block-size variation that made first-fit results diverge most easily. Neither cl
 gap, and neither should be presented as if it did.
 
 A real fix means allocating a rack's offset once across all its VLANs — a materially
-different allocation model from ADR 0001's per-VLAN one, and worth its own ADR if the
-alignment turns out to be something operators actually rely on.
+different allocation model from ADR 0001's per-VLAN one. It is parked in `ROADMAP.md`'s
+"Later" section with the recommended approach; the two points below are what that section
+depends on.
+
+#### What is actually aligned: the offset, not the third octet
+
+It is tempting to describe the invariant as "every device in a rack shares a third octet",
+because that is what the production data looks like. It isn't the rule. **16 of the 21 racks
+don't start on a `/24` boundary** — six of them share third octet `1` — and an offset like
+`WPC1SRU`'s 288 spans two octets (`1`×256 + `32`). The invariant is *the rack block's offset
+from its VLAN's network address*, which happens to look octet-shaped only because `/21`
+subnets and 32-address blocks keep each rack inside a single `/24`. An offset-based rule
+survives a VLAN that isn't a `/21`; a third-octet rule does not.
+
+#### The guarantee covers static addresses only
+
+Alignment is a property of **rack VLAN ranges**, and therefore of the static addresses
+computed from them. DHCP-assigned interfaces are outside it entirely: the only promises for
+those are the VLAN's subnet and the DHCP pool the server is configured with.
+
+Structurally this needs no special handling — a DHCP port has no address to align, since the
+`device_port_dhcp_xor_static_address` constraint forces `address = NULL` when `is_dhcp` is
+set. But it does mean a device can legitimately be *partly* aligned, and two ordinary paths
+produce that: `is_dhcp` is editable per port after creation (one of the three fields that
+stays mutable), and ADR 0013 decision 4 always materializes an L2-only-VLAN port as DHCP even
+under a static choice. So "this rack is `.2.16x` on everything" is a statement about its
+static ports, and any misalignment report must consider only those or it will flag every
+mixed device as broken.
+
+Worth recording alongside it: the DHCP range on a VLAN is **declarative**. It records what an
+external server is configured to hand out (ADR 0011 made it a manual start/end pair for
+exactly that reason); nothing in this tool configures or reads the real server. The tool
+therefore guarantees one direction only — it will not allocate a static address inside the
+declared pool — while a server whose real pool is wider than the recorded one can hand out an
+address inside a rack block, and nothing here would detect it. That asymmetry is inherent to
+tracking rather than controlling DHCP, not a gap this project introduced.
 
 ## 7. Outcome
 
@@ -452,7 +486,7 @@ alignment turns out to be something operators actually rely on.
 | Switch addresses entirely hand-entered | [ADR 0016](docs/adr/0016-switch-address-materialization.md) |
 | DiGiCo console control + engine addressing | [ADR 0017](docs/adr/0017-derived-same-vlan-addresses.md) |
 | `.255` avoidance only holds up to `/24` blocks | §2.4 — newly documented in ADR 0015, unreachable in practice, not fixed |
-| Cross-VLAN host alignment unenforced | §6.1 — documented, no fix proposed |
+| Cross-VLAN alignment is coincidental | §6.1 — approach chosen: allocate the rack's offset once, across all its VLANs. Suggest it, don't enforce it. Parked in `ROADMAP.md` "Later" |
 | `default-vlan tagged`, unused-port state | §4 — noted, minor |
 | **34 addresses (15%) assigned to interfaces that don't exist** | §5.1–5.4 — all resolved; omitted on import, and the device type's port list makes the whole class unrepresentable |
 | Device-type addressing modes (would have prevented all 34) | §5.4 — parked in `ROADMAP.md` "Later"; needs a VLAN role concept, and two modes are blocked by #27 |
