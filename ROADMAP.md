@@ -2,7 +2,7 @@
 
 High-level phases only — day-to-day task tracking belongs in GitHub Issues once there's code to file issues against. This file exists so it's obvious what phase the project is in and what's next, even after a fresh start.
 
-**Current phase: 11 — designed, not yet built.**
+**Current phase: 12 — designed, not yet built.**
 
 ## 1. Foundation — done
 
@@ -70,13 +70,29 @@ High-level phases only — day-to-day task tracking belongs in GitHub Issues onc
 - [x] Static materialization refuses Switched-Mode-shaped devices (duplicate VLAN across ports) atomically, with a clear error
 - [x] Admin add form exposes the choice (creation-only); change form omits it
 
-## 11. Rack Templates — designed, not yet built
+## 11. Rack Templates — done
 
 - [x] Design decided: named, reusable VLAN sets seeding `RackVlanRange` rows at rack creation, seed-once (not live-referenced) — see ADR 0014, closes the VLAN-only scope of #23
-- [ ] `RackTemplate` model + `PROTECT`-FK through model for VLAN membership + migration
-- [ ] Admin: template CRUD, and a creation-only template picker on the Rack add view
-- [ ] Domain-level apply operation (construct-blank → `full_clean()` → `save()` per VLAN, all-or-nothing, reachable from programmatic creation — not admin-only)
-- [ ] Tests: successful suggestion via the template path; rollback when one of several VLANs can't be allocated
+- [x] `RackTemplate` model + `PROTECT`-FK through model for VLAN membership + migration
+- [x] Admin: template CRUD, and a creation-only template picker on the Rack add view
+- [x] Domain-level apply operation (construct-blank → `full_clean()` → `save()` per VLAN, all-or-nothing, reachable from programmatic creation — not admin-only)
+- [x] Tests: successful suggestion via the template path; rollback when one of several VLANs can't be allocated
+
+## 12. Production data validation — designed, not yet built
+
+Three CSVs exported from the production spreadsheet were validated against the code's own
+arithmetic. The formula matches exactly (259/259 address assignments), which turned the
+exercise into a search for missing *rules* rather than missing features — see
+`PROD-DATA-ANALYSIS.md`.
+
+- [x] Validation: 259/259 assignments match `base + slot`; all 21 rack bases match `VLAN base + offset` — see `PROD-DATA-ANALYSIS.md`
+- [x] Rack address blocks are never smaller than a `/27` — see ADR 0015 (reproduces 19 of 21 production rack bases automatically, vs. 1 today)
+- [x] Switches materialize VLAN addresses at creation from the rack's ranges — see ADR 0016
+- [x] Derived same-VLAN addresses via per-port slot offsets, for DiGiCo control+engine consoles — see ADR 0017 (partially supersedes ADR 0003)
+- [ ] Implement ADR 0015 — one-line change to `required_block_size`, five existing tests to update
+- [ ] Implement ADR 0016
+- [ ] Implement ADR 0017 — its own plan; touches the type-port schema, materialization, locked fields, rack-slot validation, and the same-VLAN pre-flight
+- [ ] Production import — see `PLAN-prod-import.md`; blocked on switch profile names, the rack↔switch-type mapping, and the AVIO/console hostname→model mapping
 
 ## Later / not yet designed
 
@@ -87,3 +103,6 @@ High-level phases only — day-to-day task tracking belongs in GitHub Issues onc
 - Multicast configuration: port-level filtering plus switch-level IGMP snooping — see #22
 - Populated rack templates: slot layouts that materialize equipment (needs Type `PROTECT`, unlike the VLAN-only feature) — see #30
 - Hostname templating for materialized equipment — see #31
+- Rack *slot* occupancy has no DB-level overlap guarantee once a device spans several ordinals (ADR 0017's known gap). `RackSlotAssignmentMixin`'s docstring defers this to phase 3's "Overlap validation", but that item shipped covering rack-range-vs-range and DHCP overlap only — the deferral has no live home and the pointer is stale
+- Cross-VLAN host-octet alignment is coincidental, not enforced — the production spreadsheet guarantees it via one offset per rack; we allocate per `(rack, VLAN)` — see `PROD-DATA-ANALYSIS.md` §6.1
+- `.255` avoidance is structural only for blocks of `/24` or smaller; a rack of 255+ slots gets a block with assignable interior `.255` addresses, and `slot_count` has no upper bound — see ADR 0015
