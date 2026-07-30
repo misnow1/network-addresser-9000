@@ -171,8 +171,8 @@ than it first appears:
 | Rack family | Composition | Table that fits, and why |
 |---|---|---|
 | WPC1SRU / 2SRL / 3SLU / 4SLL | Primary + Redundant switch, 3× IK42 | SG300-10MP #1 — **three** amp port-pairs |
-| WPM1SR / 2SL / 3 | Primary + Redundant switch, IK81 + PLM20K | SG350-10 — **two** amp port-pairs, and its port-2 note reads "Not used by Lab amp" = Lab.gruppen = PLM20K |
-| W8LM1SR / 2SL / 3 | Primary switch, 2× LM26 | Netgear — ports literally labelled "LM26 1 Dante" / "LM26 2 Dante" |
+| WPM1SR / 2SL / 3 | Primary + Redundant switch, IK81 + PLM20K | SG350-10 — **two** amp port-pairs, and its port-2 note "Not used by Lab amp" is confirmed: the PLM20K has no Control interface (`PROD-DATA-ANALYSIS.md` §5.1) |
+| W8LM1SR / 2SL / 3 | Primary switch, 2× LM26 | Netgear — ports literally labelled "LM26 1 Dante" / "LM26 2 Dante", and its **total absence of Control ports** is correct, not an omission (§5.1) |
 | FOH Drive #1 / #2 | Primary switch, LM44 | SG300-10MP #2 — has an explicit LM44 port |
 | XE300-1 / 2 | 2× IK42, **slots 1–2 empty** | Unmanaged — an unmanaged switch has no IP, so it has no row in the addressing sheet |
 
@@ -186,10 +186,19 @@ Treat this table as a proposal to confirm, not a derived fact — but the residu
 
 38 distinct descriptions across 66 device instances, in three tiers of recoverability.
 
-**Tier 1 — unambiguous. 32 instances, 5 types.** The model is in the description, and all
-five carry the same Control + Dante Primary + Dante Secondary signature:
+**Tier 1 — unambiguous. 32 instances, 5 types.** The model is in the description. They split
+by manufacturer, not by the addressing sheet's columns:
 
-`IK42` ×17, `LM26` ×6, `IK81` ×4, `PLM20K` ×3, `LM44` ×2.
+| Type | Instances | Ports |
+|---|---|---|
+| Martin Audio IK-42 (with Dante card) | 17 | Control 200, Dante Pri 201, Dante Sec 202 |
+| Martin Audio IK-81 | 4 | Control 200, Dante Pri 201, Dante Sec 202 |
+| Lake LM26 | 6 | Dante Pri 201, Dante Sec 202 |
+| Lake LM44 | 2 | Dante Pri 201, Dante Sec 202 |
+| Lab.gruppen PLM20000Q | 3 | Dante Pri 201, Dante Sec 202 |
+
+The Martin Audio amps have a real Control interface (`DESIGN.md:131-134`); the three
+Lab.gruppen types do not, and their 11 production Control addresses are dropped — see below.
 
 **Tier 2 — mostly inferable. 15 console rows.** The models read out of the hostnames:
 `DM7C-1` → Yamaha DM7C, `SD12-96-1/2` → DiGiCo SD12, `SD9`/`SD11` → DiGiCo, `SQ5-1` → Allen
@@ -225,9 +234,9 @@ Types recoverable from the export:
 |---|---|
 | Martin Audio IK-42 — with Dante Card | Control 200, Dante Pri 201, Dante Sec 202 |
 | Martin Audio IK-81 | Control 200, Dante Pri 201, Dante Sec 202 |
-| Lab.gruppen PLM20K | Control 200, Dante Pri 201, Dante Sec 202 |
-| Lake LM44 | Control 200, Dante Pri 201, Dante Sec 202 |
-| Lake LM26 | Control 200, Dante Pri 201, Dante Sec 202 |
+| Lab.gruppen PLM20000Q | Dante Pri 201, Dante Sec 202 — **no Control port** |
+| Lake LM44 | Dante Pri 201, Dante Sec 202 — **no Control port** |
+| Lake LM26 | Dante Pri 201, Dante Sec 202 — **no Control port** |
 | DiGiCo SD12 | Control 200 **offset 0**, Engine 200 **offset 1** |
 | DiGiCo DMI-DANTE (card) | Dante Pri 201, Dante Sec 202 |
 | Yamaha DM7 | Control 200 |
@@ -236,9 +245,16 @@ Types recoverable from the export:
 All ports at offset 0 except the SD12's engine. DM7 and DM7-EX stay two independent types —
 their addresses are independent and need not be consecutive (ADR 0017's scope boundary).
 
-Note that LM44/LM26 carry Control addresses in production but `DESIGN.md:142-144` gives them
-Dante only. The table above follows production; `DESIGN.md` needs updating or the discrepancy
-needs resolving.
+**Lab.gruppen devices take no Control port, and their 11 production Control addresses are not
+imported** — control traffic rides both Dante ports on every Lab.gruppen product, so there is
+no control interface to address. `DESIGN.md:142-144` already had this right. See
+`PROD-DATA-ANALYSIS.md` §5.1 for the eleven addresses and why the ports file was the reliable
+source. All eleven run Redundant mode (one port per VLAN), so they need no ADR 0017 offsets.
+
+Two identity strings to confirm before these types are created, since
+`(manufacturer, model, name)` locks once an instance exists: whether the LM44/LM26
+manufacturer should read **Lake** (as `DESIGN.md` has it) or **Lab.gruppen** (one group, two
+brands), and whether the amp's model is **PLM20000Q** or the sheet's shorthand **PLM20K**.
 
 **Blocked:** tier 3's hostname → `(manufacturer, model)` lookup, above.
 
@@ -287,6 +303,7 @@ Ordered by effort-to-clear, not by section:
 | 3 | Four switch profiles absent from the export: redundant-switch layout, TP-Link SG108E, SG300-26, and whatever `CONSOLES` slots 2–3 are | needs running configs | §6, §8 — 4+ of 23 switches |
 | 4 | Confirm the five rack↔switch-type mappings proposed in §6a | review, not discovery | §8 |
 | 5 | Are the two `-device-control` rows separate devices or second interfaces? | decision | §7 tier 2, §9 |
+| 5a | Lake vs. Lab.gruppen as manufacturer; PLM20000Q vs. PLM20K as model | seconds | §7 tier 1 — locks with the type |
 | 6 | SD9 / SD11 engine status | check the gear | §5 slot counts, §7, §9 — and reworks `CONSOLES` if yes |
 | 7 | SD7 engine count | check the gear | §7, that one type only |
 | 8 | Real DHCP pool bounds | check the DHCP server | §2 |
@@ -307,9 +324,24 @@ them later, since a rack with an unaddressed switch is legal.
 The export is its own test oracle, which is the best property this import has:
 
 - **Address-for-address diff.** After the import, dump every `NetworkDevicePort.address` and
-  `NetworkSwitchAddress.address` and compare against the CSV. All 259 assignments should
-  match, and the diff should be empty except for rows deliberately changed (the DMI-DANTE
-  cards, per §9, and anything resolved from §5's defects).
+  `NetworkSwitchAddress.address` and compare against the CSV. Mind which figure you compare
+  against — the sheet's raw assignment count double-counts the duplicated rows:
+
+  | Figure | Count |
+  |---|---|
+  | Raw assignments as written in the sheet | 259 |
+  | …minus the duplicate-row surplus (§2.2 of the analysis, 10 rows) | 30 |
+  | **Distinct assignments across the 89 occupied slots** | **229** |
+  | …minus Lab.gruppen Control addresses, which no interface consumes | 11 |
+  | **What the import should place** | **218** |
+
+  Of those 218, the 2–4 DMI-DANTE card addresses will differ from the sheet by design (§9 —
+  the card becomes its own device at its own ordinal). Row 103's two addresses appear in
+  neither count, having no rack or slot to be counted against.
+
+  So the pass condition is: **218 addresses placed, 214–216 of them byte-identical to the
+  sheet, and every difference on the DMI-DANTE list.** Anything else is a bug — the point of
+  enumerating it this precisely is that "close enough" is not a check.
 - **Rack bases.** All 21 `RackVlanRange` blocks on VLAN 200 should equal the offsets in
   `PROD-DATA-ANALYSIS.md` §1. This is the check that catches a creation-order mistake, and
   it should run before any equipment is created — a wrong base is much cheaper to find at

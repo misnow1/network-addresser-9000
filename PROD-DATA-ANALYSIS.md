@@ -81,6 +81,11 @@ matching base + slot        : 259
 mismatches                  : 0
 ```
 
+That 259 is every assignment **as written**, including the duplicated rows of §2.2. Collapsing
+those to one device per slot gives **229 distinct** assignments across the 89 occupied slots —
+the figure that matters when checking an import, since 30 of the 259 are the same address
+written more than once. `PLAN-prod-import.md`'s verification section works from 229.
+
 This is `suggest_slot_address()` (`inventory/suggestions.py:73`) — `base + slot` — with the
 rack base being `suggest_rack_vlan_range()`'s block. The lookups table is independently
 consistent too: `VLAN base + Address Offset == stated rack base` holds for all 21 racks on
@@ -257,9 +262,7 @@ Independent of any tooling decision, these need resolving in the source data:
   while every other rack puts its primary switch there.
 - **`Rack Increment` carries a stray `0`** on the `CDD` row where every other populated cell
   reads `32`, and `CDD`→`AVIO` is a normal +32. Spreadsheet residue.
-- **`LM44` and `LM26` carry Control addresses in production**, but `DESIGN.md:142-144`
-  specifies Dante Primary + Secondary only. Either the device type needs a third port or
-  `DESIGN.md` is out of date — worth deciding rather than silently picking one.
+- **Eleven Control addresses are allocated to interfaces that don't exist** — see §5.1.
 - **Three racks hold no equipment** (`CONTROL`, `CDD`, `SHURE`). Legal — a rack with ranges
   and no occupants is fine — but worth confirming they're reservations rather than
   leftovers. `SHURE` in particular sits behind a deliberate 14-increment gap.
@@ -268,19 +271,59 @@ Independent of any tooling decision, these need resolving in the source data:
   already holds — that would mean reworking the `CONSOLES` allocation rather than importing
   it.
 
-### Two contradictions between the addressing sheet and the ports sheet
+### 5.1 Lab.gruppen devices have no Control interface — 11 spurious addresses
 
-The two files disagree about which VLANs some equipment is on. Both are small, both change
-what gets built, and neither is resolvable from the exports alone:
+Two apparent contradictions between the addressing sheet and the ports sheet turned out to be
+the same fact, and the ports sheet is the one telling the truth:
 
-- **The Netgear table has no Control-VLAN ports at all** — its ten ports are 2× Dante
-  Primary access, 4 unused, 4 trunk — yet all six `LM26`s in the `W8LM*` racks have Control
-  addresses. Either LM26 control traffic rides the Dante Primary VLAN (which the Shure
-  entries in `DESIGN.md:146-150` show is an established pattern here) or that port table is
-  incomplete.
-- **The SG350 table marks port 2 "Not used by Lab amp"**, yet all three `PLM20K`s
-  (Lab.gruppen) have Control addresses. If the Lab amp genuinely doesn't use a control port,
-  those three addresses are allocated to an interface that isn't connected.
+- The Netgear table has **no Control-VLAN ports at all** — 2× Dante Primary access, 4 unused,
+  4 trunk — yet all six `LM26`s in the `W8LM*` racks carry Control addresses.
+- The SG350 table marks port 2 **"Not used by Lab amp"**, yet all three `PLM20K`s carry
+  Control addresses.
+
+**Every Lab.gruppen product behaves the same way**: control traffic rides on *both* Dante
+ports and addresses, whether the device is in Switched/Bridged or Redundant mode. There is no
+dedicated control interface and no control network involvement at all — only the Dante
+address(es) are used. The Control addresses in the sheet were allocated for convenience, not
+because anything consumes them.
+
+So the port tables are complete and correct, and **`DESIGN.md:142-144` was right all along** —
+it gives `LM44`/`LM26` Dante Primary + Secondary and no Control port. An earlier draft of this
+document flagged that as a possible `DESIGN.md` staleness; it isn't. The production sheet is
+what's carrying extra data.
+
+Eleven device instances are affected, and all eleven of their Control addresses should be
+omitted on import:
+
+| Device | Rack | Slot | Control (spurious) | Dante Primary | Dante Secondary |
+|---|---|---|---|---|---|
+| LM44 | FOH Drive #1 | 2 | `10.200.2.162` | `10.201.2.162` | `10.202.2.162` |
+| LM44 | FOH Drive #2 | 2 | `10.200.2.194` | `10.201.2.194` | `10.202.2.194` |
+| LM26 | W8LM1SR | 2 | `10.200.2.66` | `10.201.2.66` | `10.202.2.66` |
+| LM26 | W8LM1SR | 3 | `10.200.2.67` | `10.201.2.67` | `10.202.2.67` |
+| LM26 | W8LM2SL | 2 | `10.200.2.98` | `10.201.2.98` | `10.202.2.98` |
+| LM26 | W8LM2SL | 3 | `10.200.2.99` | `10.201.2.99` | `10.202.2.99` |
+| LM26 | W8LM3 | 2 | `10.200.2.130` | `10.201.2.130` | `10.202.2.130` |
+| LM26 | W8LM3 | 3 | `10.200.2.131` | `10.201.2.131` | `10.202.2.131` |
+| PLM20K | WPM1SR | 4 | `10.200.1.164` | `10.201.1.164` | `10.202.1.164` |
+| PLM20K | WPM2SL | 4 | `10.200.1.196` | `10.201.1.196` | `10.202.1.196` |
+| PLM20K | WPM3 | 4 | `10.200.1.228` | `10.201.1.228` | `10.202.1.228` |
+
+All eleven have both Dante addresses populated — one port per VLAN, i.e. **Redundant mode**.
+That matters: Switched/Bridged mode would put both ports on Dante Primary sharing one address,
+which is the #27 bridged-interface shape ADR 0013 refuses. Production runs these Redundant, so
+they import cleanly. Nothing here needs ADR 0017's offsets either — two ports, two VLANs, one
+address each.
+
+Note that the racks still need their Control ranges: the `W8LM*` and `WPM*` racks all hold
+switches, which *do* carry Control addresses. Only the 11 device-level allocations go away.
+
+**This is the tool earning its keep, not just recording data.** A spreadsheet computes an
+address per row per column and has no way to express "this model has no control interface," so
+the shortcut was invisible and free. In the app that fact lives in exactly one place — the
+device type's port list — and materialization then *cannot* allocate a Control address to a
+device whose type has no Control port. The 11 addresses aren't merely cleaned up on import;
+the class of error becomes unrepresentable.
 
 ### Switches with no port configuration recorded
 
@@ -322,6 +365,6 @@ alignment turns out to be something operators actually rely on.
 | `.255` avoidance only holds up to `/24` blocks | §2.4 — newly documented in ADR 0015, unreachable in practice, not fixed |
 | Cross-VLAN host alignment unenforced | §6.1 — documented, no fix proposed |
 | `default-vlan tagged`, unused-port state | §4 — noted, minor |
-| Addressing sheet vs. ports sheet contradictions (LM26 / PLM20K control ports) | §5 — needs a decision, not derivable |
+| Lab.gruppen devices have no Control interface; 11 spurious addresses | §5.1 — resolved; omit on import, and the device type makes it unrepeatable |
 | Four deployed switch profiles absent from the ports file | §5 — needs running configs; `PLAN-prod-import.md` §6 |
 | Data defects, missing type identities | §5, §4 — source-data and import work; see `PLAN-prod-import.md` |
