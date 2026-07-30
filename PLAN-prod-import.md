@@ -111,17 +111,31 @@ binds nowhere in the current data, but the importer should assert it rather than
 (`10.200.5.0/27`, `10.201.5.0/27`, `10.202.5.0/27`) and `CONSOLES` (`…6.0/27` on each)
 are created with those three ranges entered explicitly.
 
-### 6. Switch types — **blocked**
+### 6. Switch types — **blocked on seven strings**
 
-Five profiles from `Switch Ports.csv`, all needing information the export lacks:
+`NetworkSwitchType`'s identity is `(manufacturer, model, name)`, all three required and
+non-blank, unique together (`unique_switch_type`). `Switch Ports.csv` gives five port tables
+and satisfies that for none of them:
 
-- Profile **names** for all five (`(Manufacturer, Model, Name)` is the identity; the two
-  Cisco SG300-10MP tables need distinct names — the analysis suggests they're a drive-rack
-  and an amp-rack wiring).
-- **Model** for the "Netgear Managed Switch" table.
-- **Manufacturer and model** for the "Unmanaged Switch" table.
-- Per-port `port_type` values. `Convertable to Fiber` → `1gbe_combo`; the rest need
-  confirming as `1gbe_rj45` or otherwise.
+| Table | Layout | Missing |
+|---|---|---|
+| Cisco SG300-10MP | 3× amp Control, 3× amp Dante, 4× patch-panel trunk (2 fibre-convertible) | profile **name** |
+| Cisco SG350-10 | 2× amp Control, 2× amp Dante, 4× PP trunk, 1 unused, 1 fibre trunk | profile **name** |
+| Netgear Managed Switch | 2× LM26 Dante, 4 unused, 4× PP trunk | **model**, name |
+| Unmanaged Switch | 2× amp Control, 2× amp Dante, 6× trunk | **manufacturer**, **model**, name |
+| Cisco SG300-10MP | 1× WAP, 1× LM44, 2× PP Dante access, 1× PP Control access, 5× trunk | profile **name**, distinct from the first |
+
+The two SG300-10MP tables are the hard stop: identical manufacturer and model, so without
+distinct names they collide on the unique constraint.
+
+**Seven strings unblock this** — five profile names, the Netgear model, and the unmanaged
+switch's manufacturer and model. The layouts suggest the names strongly (`For Amp Rack
+(3 Amps)`, `For Amp Rack (2 Amps)`, `For LM26 Rack`, `For Drive Rack`), but a profile name is
+an operator-facing label inside a `PROTECT`ed identity that locks the moment a switch exists
+— worth 60 seconds of confirmation rather than a guess.
+
+Also needed, lower stakes: per-port `port_type` values. `Convertable to Fiber` →
+`1gbe_combo`; the rest need confirming as `1gbe_rj45` or otherwise.
 
 Drop the trailing `Patch Panel 4 / Analogue Backup` row — it has no port number and is not
 an ethernet port. `NetworkSwitchTypePort.port_number` is required and must form a contiguous
@@ -129,9 +143,83 @@ an ethernet port. `NetworkSwitchTypePort.port_number` is required and must form 
 
 `Unused` ports take the seeded system `Default` profile (see analysis §4).
 
+#### Four switch profiles the export doesn't contain at all
+
+Separate from the naming problem, and more interesting: there are deployed switches with no
+port table anywhere in the file.
+
+1. **No redundant-switch layout exists.** Seven redundant switches are deployed (4 WPC +
+   3 WPM). A redundant switch's amp ports carry Dante **Secondary**, but every table in the
+   file shows Dante **Primary**. There is no sixth table. Either both switches in a rack are
+   genuinely wired identically, or a table was never exported — worth checking a running
+   config before assuming the former.
+2. **The TP-Link SG108E has no table.** Three are addressed in `FLOATSWITCH`
+   (`mps-tlsg108e-01/02/03`).
+3. **`Spare SG300-26` has no table.** 26 ports, so neither 10-port SG300 profile fits.
+4. **`CONSOLES` slots 2 and 3 are blank-description rows carrying all three VLANs** — which
+   is exactly the Primary/Redundant Switch signature. They look like switches whose
+   descriptions were lost, with slot 1 empty above them.
+
+23 addressed switches need types. Roughly 19 are confidently placeable via §6a below; these
+four cases are not.
+
+### 6a. Rack↔switch-type mapping — mostly inferable
+
+The amp and processor counts line up 1:1 with the port tables, so this is far less blocked
+than it first appears:
+
+| Rack family | Composition | Table that fits, and why |
+|---|---|---|
+| WPC1SRU / 2SRL / 3SLU / 4SLL | Primary + Redundant switch, 3× IK42 | SG300-10MP #1 — **three** amp port-pairs |
+| WPM1SR / 2SL / 3 | Primary + Redundant switch, IK81 + PLM20K | SG350-10 — **two** amp port-pairs, and its port-2 note reads "Not used by Lab amp" = Lab.gruppen = PLM20K |
+| W8LM1SR / 2SL / 3 | Primary switch, 2× LM26 | Netgear — ports literally labelled "LM26 1 Dante" / "LM26 2 Dante" |
+| FOH Drive #1 / #2 | Primary switch, LM44 | SG300-10MP #2 — has an explicit LM44 port |
+| XE300-1 / 2 | 2× IK42, **slots 1–2 empty** | Unmanaged — an unmanaged switch has no IP, so it has no row in the addressing sheet |
+
+The XE300 case is the useful one: those two empty slots aren't missing data, they're switches
+that cannot be addressed by definition.
+
+Treat this table as a proposal to confirm, not a derived fact — but the residual work is
+"confirm five mappings", not "supply a mapping that doesn't exist".
+
 ### 7. Device types
 
-Recoverable from the export:
+38 distinct descriptions across 66 device instances, in three tiers of recoverability.
+
+**Tier 1 — unambiguous. 32 instances, 5 types.** The model is in the description, and all
+five carry the same Control + Dante Primary + Dante Secondary signature:
+
+`IK42` ×17, `LM26` ×6, `IK81` ×4, `PLM20K` ×3, `LM44` ×2.
+
+**Tier 2 — mostly inferable. 15 console rows.** The models read out of the hostnames:
+`DM7C-1` → Yamaha DM7C, `SD12-96-1/2` → DiGiCo SD12, `SD9`/`SD11` → DiGiCo, `SQ5-1` → Allen
+& Heath SQ-5, `bej-tio1608-d2-1` → Yamaha Tio1608-D2, `bej-dm3-1` → Yamaha DM3. Under ADR
+0017 the four SD12 rows collapse to two devices. What is *not* inferable: whether the two
+`-device-control` rows (`dm7c-1-device-control`, `bej-dm3-1-device-control`, both Dante
+Primary only) are separate devices or second interfaces of their consoles, and what the two
+blank-description rows at `CONSOLES` slots 2–3 are (see §6's fourth case — they look like
+switches).
+
+**Tier 3 — genuinely opaque. 19 AVIO instances, ~7 types.** These hostnames name a
+*function*, not a product, so `(manufacturer, model)` cannot be recovered from them:
+
+| Hostname family | Count | Needs |
+|---|---|---|
+| `mps-avio-amph-output-1..4` | 4 | manufacturer + model |
+| `mps-avio-avio-output-1/2` | 2 | manufacturer + model |
+| `mps-avio-avio-input-1/2` | 2 | manufacturer + model |
+| `mps-avio-avio-aes-io-1/2` | 2 | manufacturer + model |
+| `mps-avio-avio-usb-io-1/2` | 2 | manufacturer + model |
+| `mps-avio-na2-dline-1..3` | 3 | manufacturer + model |
+| `mps-avio-radial-tx`, `-rx-1..3` | 4 | manufacturer + model (one type or two?) |
+
+All 19 share Control + Dante Primary, with no Dante Secondary. The naming hints at Audinate
+AVIO adapters and Neutrik NA2-IO-DLINE, but guessing hardware models into a `PROTECT`ed
+identity that locks once instanced is the wrong place to be clever. **This is a seven-row
+lookup table someone can write in a few minutes with the rack in front of them** — the
+cheapest of the three blockers to clear, and it unblocks 19 of the 66 devices.
+
+Types recoverable from the export:
 
 | Type | Ports |
 |---|---|
@@ -152,11 +240,7 @@ Note that LM44/LM26 carry Control addresses in production but `DESIGN.md:142-144
 Dante only. The table above follows production; `DESIGN.md` needs updating or the discrepancy
 needs resolving.
 
-**Blocked:** the AVIO rows (19 of them) and most console rows carry *hostnames*
-(`mps-avio-na2-dline-1`, `mps-avio-radial-rx-2`), not manufacturers and models. At least
-seven distinct product families are visible in the naming — Amphenol outputs, AVIO
-input/output/AES/USB adapters, NA2-DLINE, Radial TX/RX — but the mapping from hostname to
-`(manufacturer, model)` has to come from Mike.
+**Blocked:** tier 3's hostname → `(manufacturer, model)` lookup, above.
 
 **Also blocked:** SD7 engine count, and whether SD9/SD11 follow the SD-series control+engine
 pattern. The SD9/SD11 answer changes the `CONSOLES` allocation rather than just adding a
@@ -164,13 +248,20 @@ type — if they need engines, SD9's would want `.6.12`, which SD11 currently ho
 
 ### 8. Switches
 
-One per "Primary Switch" / "Redundant Switch" / `mps-tlsg108e-*` / "Spare SG300-26" row, at
-its rack and slot. Addresses materialize from the rack's ranges (ADR 0016) and should land
-exactly on the sheet's values.
+23 addressed switches: 12 "Primary Switch", 7 "Redundant Switch", 3 `mps-tlsg108e-*`, and
+1 "Spare SG300-26" — each at its rack and slot. Addresses materialize from the rack's ranges
+(ADR 0016) and should land exactly on the sheet's values.
 
-**Blocked on the same gap as §6:** nothing in any of the three files says which switch type
-each rack uses. The addressing sheet says only "Primary Switch"; the ports file has no rack
-column.
+Plus, not in the addressing sheet at all: the unmanaged switches in `XE300-1`/`XE300-2` slots
+1–2, which have no addresses to record (§6a). Whether to create them as `NetworkSwitch` rows
+with no `NetworkSwitchAddress` — legal, and more truthful about what's in the rack — or leave
+those slots empty is a judgement call worth making deliberately.
+
+**Type assignment:** the five rack families in §6a cover 19 of the 23. The remaining four are
+the switches whose port layout the export never contained (§6's second half) — the redundant
+switches' Dante-Secondary variant, the TP-Link SG108Es, and the SG300-26. A rack with an
+unaddressed or untyped switch is legal, so the import can proceed without them and add them
+once configs are available; it does not have to block on all 23.
 
 ### 9. Devices
 
@@ -187,19 +278,29 @@ not during. `CONSOLES` has room either way — 16 of 30 usable ordinals in use.
 
 ## Blockers, collected
 
-| # | Blocker | Blocks |
-|---|---|---|
-| 1 | Switch profile names, plus Netgear model and unmanaged-switch manufacturer/model | §6, §8 |
-| 2 | Rack↔switch-type mapping | §8 |
-| 3 | AVIO and console hostname → `(manufacturer, model)` mapping | §7, §9 |
-| 4 | SD9 / SD11 engine status | §5 slot counts, §7, §9 for `CONSOLES` |
-| 5 | SD7 engine count | §7 for that one type |
-| 6 | Real DHCP pool bounds | §2 |
-| 7 | Whether racks carry 3 VLANs or 8 | §4, and every switch's address count |
-| 8 | DMI-DANTE re-address vs. override | §9 |
+Ordered by effort-to-clear, not by section:
 
-1–3 block a complete import. 4–8 have safe defaults but change the result, so they should be
-decided rather than defaulted silently.
+| # | Blocker | Effort | Blocks |
+|---|---|---|---|
+| 1 | Seven strings: five switch profile names, the Netgear model, the unmanaged switch's manufacturer + model | minutes | §6, §8 — the largest unblock per keystroke |
+| 2 | AVIO hostname → `(manufacturer, model)`: a seven-row lookup | minutes, rack access | §7 tier 3, §9 — 19 of 66 devices |
+| 3 | Four switch profiles absent from the export: redundant-switch layout, TP-Link SG108E, SG300-26, and whatever `CONSOLES` slots 2–3 are | needs running configs | §6, §8 — 4+ of 23 switches |
+| 4 | Confirm the five rack↔switch-type mappings proposed in §6a | review, not discovery | §8 |
+| 5 | Are the two `-device-control` rows separate devices or second interfaces? | decision | §7 tier 2, §9 |
+| 6 | SD9 / SD11 engine status | check the gear | §5 slot counts, §7, §9 — and reworks `CONSOLES` if yes |
+| 7 | SD7 engine count | check the gear | §7, that one type only |
+| 8 | Real DHCP pool bounds | check the DHCP server | §2 |
+| 9 | Whether racks carry 3 VLANs or 8 | decision | §4, and every switch's address count |
+| 10 | DMI-DANTE re-address vs. override | decision | §9 |
+
+**1–3 are what actually block a complete import.** 4 is confirmation of work already done
+here. 5–10 have safe defaults but change the result, so they want deciding rather than
+defaulting silently.
+
+A useful property: 1 and 2 together are perhaps ten minutes of someone's time and clear the
+majority of the import surface. 3 is the only blocker needing real investigation, and it
+concerns 4 switches out of 23 — the import could reasonably proceed without them and add
+them later, since a rack with an unaddressed switch is legal.
 
 ## Verification
 

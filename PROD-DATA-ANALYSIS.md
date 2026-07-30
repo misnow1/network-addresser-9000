@@ -139,9 +139,22 @@ ADR's floor and no such rack exists here.
 ### 2.5 Slot occupancy
 
 Eighteen of 21 racks hold equipment; `CONTROL`, `CDD`, and `SHURE` are empty. Occupancy
-ranges from 2 to 19 slots. Two gaps worth noting: `XE300-1` and `XE300-2` start at slot 3
-(slots 1–2 unoccupied, where every other rack puts its switches), and `CONSOLES` starts at
-slot 2 with slot 1 empty.
+ranges from 2 to 19 slots. Collapsing the duplicate rows (§2.2), the 89 distinct slots hold
+**23 addressed switches and 66 devices**.
+
+Two gaps worth noting, with different explanations:
+
+- **`XE300-1` and `XE300-2` start at slot 3**, slots 1–2 unoccupied where every other rack
+  puts its switches. This is almost certainly not missing data: those racks hold 2× IK42
+  each, matching the ports file's "Unmanaged Switch" table exactly, and an unmanaged switch
+  has no IP — so it can't appear in an addressing sheet. See `PLAN-prod-import.md` §6a.
+- **`CONSOLES` starts at slot 2 with slot 1 empty**, and slots 2–3 carry addresses with blank
+  descriptions whose three-VLAN signature matches Primary/Redundant Switch. That one does
+  look like lost data.
+
+Rack-by-rack composition, and how it maps onto the five switch port tables, is tabulated in
+`PLAN-prod-import.md` §6a — that mapping turns out to be largely derivable from amp and
+processor counts rather than needing to be supplied.
 
 ## 3. Would the current system address a site this way?
 
@@ -214,9 +227,13 @@ Two minor representation gaps this file exposes:
   blank-mode `Unused` ports still need *some* profile. The seeded system `Default` is the
   least-wrong choice; a dedicated `Unused` profile would be cosmetic.
 
-There is also **no rack↔switch-type mapping in any of the three files** — the addressing
-sheet says only "Primary Switch"/"Redundant Switch", and the ports file has no rack column.
-Which of the five profiles each rack's switches use is not recoverable from this export.
+**On the rack↔switch-type mapping:** no file states it — the addressing sheet says only
+"Primary Switch"/"Redundant Switch", and the ports file has no rack column — but it is
+largely *derivable*. Each table's amp or processor port count matches exactly one rack
+family's composition (3-amp tables to the `WPC*` racks with 3× IK42, the "LM26 1/2 Dante"
+table to the `W8LM*` racks, and so on). `PLAN-prod-import.md` §6a tabulates all five with the
+evidence for each. What genuinely can't be derived is the four switch profiles missing from
+the file altogether — see §5.
 
 ## 5. Production data defects
 
@@ -251,6 +268,29 @@ Independent of any tooling decision, these need resolving in the source data:
   already holds — that would mean reworking the `CONSOLES` allocation rather than importing
   it.
 
+### Two contradictions between the addressing sheet and the ports sheet
+
+The two files disagree about which VLANs some equipment is on. Both are small, both change
+what gets built, and neither is resolvable from the exports alone:
+
+- **The Netgear table has no Control-VLAN ports at all** — its ten ports are 2× Dante
+  Primary access, 4 unused, 4 trunk — yet all six `LM26`s in the `W8LM*` racks have Control
+  addresses. Either LM26 control traffic rides the Dante Primary VLAN (which the Shure
+  entries in `DESIGN.md:146-150` show is an established pattern here) or that port table is
+  incomplete.
+- **The SG350 table marks port 2 "Not used by Lab amp"**, yet all three `PLM20K`s
+  (Lab.gruppen) have Control addresses. If the Lab amp genuinely doesn't use a control port,
+  those three addresses are allocated to an interface that isn't connected.
+
+### Switches with no port configuration recorded
+
+Four switch profiles are deployed but absent from the ports file entirely — detailed in
+`PLAN-prod-import.md` §6. Briefly: no redundant-switch layout exists anywhere (7 are
+deployed, and their amp ports should carry Dante Secondary where every table shows Dante
+Primary); the three `FLOATSWITCH` TP-Link SG108Es have no table; `Spare SG300-26` has no
+table; and `CONSOLES` slots 2–3 are blank-description rows whose three-VLAN signature matches
+Primary/Redundant Switch exactly, above an empty slot 1.
+
 ## 6. Remaining gap, not addressed by any ADR
 
 ### 6.1 Cross-VLAN host alignment is coincidental, not enforced
@@ -282,4 +322,6 @@ alignment turns out to be something operators actually rely on.
 | `.255` avoidance only holds up to `/24` blocks | §2.4 — newly documented in ADR 0015, unreachable in practice, not fixed |
 | Cross-VLAN host alignment unenforced | §6.1 — documented, no fix proposed |
 | `default-vlan tagged`, unused-port state | §4 — noted, minor |
-| Data defects, unrecoverable type/profile mappings | §5, §4 — source-data and import work; see `PLAN-prod-import.md` |
+| Addressing sheet vs. ports sheet contradictions (LM26 / PLM20K control ports) | §5 — needs a decision, not derivable |
+| Four deployed switch profiles absent from the ports file | §5 — needs running configs; `PLAN-prod-import.md` §6 |
+| Data defects, missing type identities | §5, §4 — source-data and import work; see `PLAN-prod-import.md` |
