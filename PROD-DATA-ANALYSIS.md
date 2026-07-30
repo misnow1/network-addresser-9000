@@ -14,6 +14,12 @@ equipment rows satisfy `rack_base + slot` exactly, on all three audio VLANs, wit
 deviations. Two rules production depends on are missing from the code, and one class of
 production hardware can't be modeled at all. All three are now recorded as ADRs 0015–0017.
 
+**The finding that outlived the validation, though, is one the arithmetic could never have
+caught:** 34 of the sheet's 229 distinct addresses — 15% — are assigned to interfaces that
+don't physically exist. Every one of them computes correctly. They are wrong about the
+hardware, not the maths, and they are wrong in three unrelated-looking ways that turn out to
+share one cause (§5.4).
+
 ## 1. What each file represents
 
 ### `IP Calc Lookups.csv` — the addressing scheme
@@ -360,12 +366,53 @@ have cards and keep all three.
 this needs no new modeling, just the right type per instance. It does mean `XE300-1` and
 `XE300-2` hold **different device types** despite being indistinguishable in the sheet.
 
-Combined with §5.1, **15 of the sheet's 229 distinct assignments are allocated to interfaces
-that don't physically exist** — 11 Control addresses on Lab.Gruppen units, and these 4 Dante
-addresses. Both were cheap conveniences in a spreadsheet that computes a value per row per
-column. Both become unrepresentable once the device type declares which ports a model actually
-has, which is the same argument as §5.1's closing note: the tool doesn't just record these
-allocations more accurately, it removes the mechanism that produced them.
+### 5.3 The 19 AVIO devices are single-port — 19 more spurious addresses
+
+The largest instance of the same error. Every device in the `AVIO` rack is a single-RJ45 Dante
+adapter — one interface, on Dante Primary. The sheet gives all 19 a Control address as well.
+
+| Family | Count | Slots |
+|---|---|---|
+| `mps-avio-amph-output-1..4` | 4 | 1, 2, 3, 15 |
+| `mps-avio-avio-output-1/2` | 2 | 4, 5 |
+| `mps-avio-avio-input-1/2` | 2 | 6, 7 |
+| `mps-avio-avio-aes-io-1/2` | 2 | 8, 9 |
+| `mps-avio-avio-usb-io-1/2` | 2 | 10, 11 |
+| `mps-avio-na2-dline-1..3` | 3 | 12, 13, 14 |
+| `mps-avio-radial-tx`, `-rx-1..3` | 4 | 16, 17, 18, 19 |
+
+All 19 Control addresses (`10.200.3.1`–`10.200.3.19`) are dropped on import; the Dante Primary
+addresses (`10.201.3.1`–`10.201.3.19`) are correct and kept. Their device types are the
+simplest in the whole dataset — one port each, Dante Primary, 1×1GbE copper — which narrows the
+tier-3 blocker in `PLAN-prod-import.md` §7 to identity strings only, since the port shape is now
+known.
+
+### 5.4 The three together: 34 addresses, one root cause
+
+| Finding | Addresses | Cause |
+|---|---|---|
+| §5.1 Lab.Gruppen Control | 11 | control rides both Dante ports; no control interface exists |
+| §5.2 `XE300-1` IK-42 Dante | 4 | no Dante card fitted |
+| §5.3 AVIO Control | 19 | single-port adapters |
+| **Total** | **34** | |
+
+**34 of the sheet's 229 distinct assignments — 15% — are allocated to interfaces that do not
+physically exist.** Not one of them is an arithmetic error: every single one satisfies
+`base + slot` perfectly, which is exactly why §2.1's clean validation result could never have
+caught them. They are all the same mistake in three costumes — a port list built by hand,
+column by column, with no way for the sheet to know which ports a model actually has.
+
+This is the sharpest available argument for what the tool is for. A spreadsheet computes a value
+per row per column; asserting "this model has no control interface" isn't something it can
+express, so allocating the address anyway is free and invisible. In the app that fact lives in
+exactly one place — the device type's port list — and materialization then *cannot* produce an
+address for a port the type doesn't declare. The 34 addresses aren't merely cleaned up during
+import; the mechanism that generated them stops existing.
+
+It is also what motivates the addressing-mode refactor now parked in `ROADMAP.md`'s "Later"
+section: a device type whose ports are chosen from a short list of real hardware shapes
+(Control yes/no, plus Dante none/redundant/switched/single) is harder to get wrong than one
+assembled a port at a time, and all 34 of these would have been unrepresentable under it.
 
 ### Switches with no port configuration recorded
 
@@ -407,7 +454,7 @@ alignment turns out to be something operators actually rely on.
 | `.255` avoidance only holds up to `/24` blocks | §2.4 — newly documented in ADR 0015, unreachable in practice, not fixed |
 | Cross-VLAN host alignment unenforced | §6.1 — documented, no fix proposed |
 | `default-vlan tagged`, unused-port state | §4 — noted, minor |
-| Lab.Gruppen devices have no Control interface; 11 spurious addresses | §5.1 — resolved; omit on import, and the device type makes it unrepeatable |
-| Two IK-42s have no Dante card; 4 spurious addresses | §5.2 — resolved; `XE300-1` slots 3–4 take the `without Dante Card` type |
+| **34 addresses (15%) assigned to interfaces that don't exist** | §5.1–5.4 — all resolved; omitted on import, and the device type's port list makes the whole class unrepresentable |
+| Device-type addressing modes (would have prevented all 34) | §5.4 — parked in `ROADMAP.md` "Later"; needs a VLAN role concept, and two modes are blocked by #27 |
 | Four deployed switch profiles absent from the ports file | §5 — needs running configs; `PLAN-prod-import.md` §6 |
 | Data defects, missing type identities | §5, §4 — source-data and import work; see `PLAN-prod-import.md` |

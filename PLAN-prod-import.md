@@ -238,8 +238,9 @@ Primary only) are separate devices or second interfaces of their consoles, and w
 blank-description rows at `CONSOLES` slots 2–3 are (see §6's fourth case — they look like
 switches).
 
-**Tier 3 — genuinely opaque. 19 AVIO instances, ~7 types.** These hostnames name a
-*function*, not a product, so `(manufacturer, model)` cannot be recovered from them:
+**Tier 3 — identity strings only. 19 AVIO instances, ~7 types.** These hostnames name a
+*function*, not a product, so `(manufacturer, model)` cannot be recovered from them. Every one
+takes the same single port — `Dante Primary` (VLAN 201), 1×1GbE copper:
 
 | Hostname family | Count | Needs |
 |---|---|---|
@@ -251,11 +252,16 @@ switches).
 | `mps-avio-na2-dline-1..3` | 3 | manufacturer + model |
 | `mps-avio-radial-tx`, `-rx-1..3` | 4 | manufacturer + model (one type or two?) |
 
-All 19 share Control + Dante Primary, with no Dante Secondary. The naming hints at Audinate
-AVIO adapters and Neutrik NA2-IO-DLINE, but guessing hardware models into a `PROTECT`ed
-identity that locks once instanced is the wrong place to be clever. **This is a seven-row
-lookup table someone can write in a few minutes with the rack in front of them** — the
-cheapest of the three blockers to clear, and it unblocks 19 of the 66 devices.
+**The port shape is settled, so only the identity strings are missing.** All 19 are
+single-RJ45 Dante adapters — one port each, Dante Primary, 1×1GbE copper — which makes them the
+simplest types in the dataset. Their Control addresses in the sheet are spurious and dropped
+(`PROD-DATA-ANALYSIS.md` §5.3). What remains is the `(manufacturer, model)` pair per family:
+the naming hints at Audinate AVIO adapters and a Neutrik NA2-IO-DLINE, but guessing hardware
+models into a `PROTECT`ed identity that locks once instanced is the wrong place to be clever.
+
+**This is a seven-row lookup someone can write in a few minutes with the rack in front of
+them** — the cheapest of the three blockers to clear, and it unblocks 19 of the 66 devices.
+The one open sub-question is whether `radial-tx` and `radial-rx` are one model or two.
 
 Beyond tier 1's five, the console and card types the export supports:
 
@@ -373,20 +379,22 @@ The export is its own test oracle, which is the best property this import has:
   | **Distinct assignments across the 89 occupied slots** | **229** |
   | …minus Lab.Gruppen Control addresses — no control interface exists (analysis §5.1) | 11 |
   | …minus `XE300-1`'s two IK-42 Dante addresses — no Dante card fitted (analysis §5.2) | 4 |
-  | **What the import should place** | **214** |
+  | …minus AVIO Control addresses — single-port adapters (analysis §5.3) | 19 |
+  | **What the import should place** | **195** |
 
-  Of those 214, the 2–4 DMI-DANTE card addresses will differ from the sheet by design (§9 —
+  Of those 195, the 2–4 DMI-DANTE card addresses will differ from the sheet by design (§9 —
   the card becomes its own device at its own ordinal). Row 103's two addresses appear in
   neither count, having no rack or slot to be counted against.
 
-  So the pass condition is: **214 addresses placed, 210–212 of them byte-identical to the
+  So the pass condition is: **195 addresses placed, 191–193 of them byte-identical to the
   sheet, and every difference on the DMI-DANTE list.** Anything else is a bug — the point of
   enumerating it this precisely is that "close enough" is not a check.
 
-  Worth stating plainly, since it is the headline number people will remember: **15 of the
-  sheet's 229 distinct assignments are dropped, not reproduced** — 11 Lab.Gruppen Control and
-  4 `XE300-1` Dante. A faithful import is *supposed* to place fewer addresses than the
-  spreadsheet holds, and an import that reproduces all 229 has faithfully copied 15 mistakes.
+  Worth stating plainly, since it is the headline number people will remember: **34 of the
+  sheet's 229 distinct assignments are dropped, not reproduced** — 15% of them, across the
+  three findings in `PROD-DATA-ANALYSIS.md` §5.1–5.3. A faithful import is *supposed* to place
+  materially fewer addresses than the spreadsheet holds, and an import that reproduces all 229
+  has faithfully copied 34 mistakes.
 - **Rack bases.** All 21 `RackVlanRange` blocks on VLAN 200 should equal the offsets in
   `PROD-DATA-ANALYSIS.md` §1. This is the check that catches a creation-order mistake, and
   it should run before any equipment is created — a wrong base is much cheaper to find at
