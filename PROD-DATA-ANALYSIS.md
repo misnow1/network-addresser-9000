@@ -151,7 +151,9 @@ Two gaps worth noting, with different explanations:
 
 - **`XE300-1` and `XE300-2` start at slot 3**, slots 1–2 unoccupied where every other rack
   puts its switches. This is almost certainly not missing data: those racks hold 2× IK42
-  each, matching the ports file's "Unmanaged Switch" table exactly, and an unmanaged switch
+  each, fitting the ports file's "Unmanaged Switch" table (§5.2 notes that `XE300-1`'s two
+  amps have no Dante card, so that rack leaves the table's two Dante ports unused), and an
+  unmanaged switch
   has no IP — so it can't appear in an addressing sheet. See `PLAN-prod-import.md` §6a.
 - **`CONSOLES` starts at slot 2 with slot 1 empty**, and slots 2–3 carry addresses with blank
   descriptions whose three-VLAN signature matches Primary/Redundant Switch. That one does
@@ -338,6 +340,33 @@ device type's port list — and materialization then *cannot* allocate a Control
 device whose type has no Control port. The 11 addresses aren't merely cleaned up on import;
 the class of error becomes unrepresentable.
 
+### 5.2 Two IK-42s have no Dante card — 4 more spurious addresses
+
+The mirror image of §5.1, found from the opposite direction. The Dante card is an order-time
+option on every current-generation Martin Audio amp, and **two of the IK-42s don't have one:
+`XE300-1` slots 3 and 4.** Addresses were allocated across all three VLANs anyway, for
+consistency with every other amp row.
+
+| Device | Rack | Slot | Control | Dante Primary (spurious) | Dante Secondary (spurious) |
+|---|---|---|---|---|---|
+| IK42 | XE300-1 | 3 | `10.200.2.3` | `10.201.2.3` | `10.202.2.3` |
+| IK42 | XE300-1 | 4 | `10.200.2.4` | `10.201.2.4` | `10.202.2.4` |
+
+Four addresses to omit on import. `XE300-2`'s two IK-42s (slots 3 and 4, `…2.35` / `…2.36`) do
+have cards and keep all three.
+
+`DESIGN.md:131-136` already models both variants — "Martin Audio IK-42 with Dante Card"
+(Control + Dante Primary + Dante Secondary) against "without Dante Card" (Control only) — so
+this needs no new modeling, just the right type per instance. It does mean `XE300-1` and
+`XE300-2` hold **different device types** despite being indistinguishable in the sheet.
+
+Combined with §5.1, **15 of the sheet's 229 distinct assignments are allocated to interfaces
+that don't physically exist** — 11 Control addresses on Lab.Gruppen units, and these 4 Dante
+addresses. Both were cheap conveniences in a spreadsheet that computes a value per row per
+column. Both become unrepresentable once the device type declares which ports a model actually
+has, which is the same argument as §5.1's closing note: the tool doesn't just record these
+allocations more accurately, it removes the mechanism that produced them.
+
 ### Switches with no port configuration recorded
 
 Four switch profiles are deployed but absent from the ports file entirely — detailed in
@@ -379,5 +408,6 @@ alignment turns out to be something operators actually rely on.
 | Cross-VLAN host alignment unenforced | §6.1 — documented, no fix proposed |
 | `default-vlan tagged`, unused-port state | §4 — noted, minor |
 | Lab.Gruppen devices have no Control interface; 11 spurious addresses | §5.1 — resolved; omit on import, and the device type makes it unrepeatable |
+| Two IK-42s have no Dante card; 4 spurious addresses | §5.2 — resolved; `XE300-1` slots 3–4 take the `without Dante Card` type |
 | Four deployed switch profiles absent from the ports file | §5 — needs running configs; `PLAN-prod-import.md` §6 |
 | Data defects, missing type identities | §5, §4 — source-data and import work; see `PLAN-prod-import.md` |

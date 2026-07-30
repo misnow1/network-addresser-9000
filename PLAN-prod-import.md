@@ -186,30 +186,41 @@ Treat this table as a proposal to confirm, not a derived fact — but the residu
 
 38 distinct descriptions across 66 device instances, in three tiers of recoverability.
 
-**Tier 1 — unambiguous. 32 instances, 5 types.** Full `(manufacturer, model, name)` triples,
-following the `Model — Name` convention `DESIGN.md:109` sets out:
+**Tier 1 — unambiguous. 32 instances, 6 types.** Full `(manufacturer, model, name)` triples,
+following the `Model — Name` convention `DESIGN.md:109` sets out. No guesses remain here:
 
 | Manufacturer | Model | Name | Instances | Ports |
 |---|---|---|---|---|
-| Martin Audio | IK-42 | with Dante Card | 17 | Control 200, Dante Pri 201, Dante Sec 202 |
-| Martin Audio | IK-81 | with Dante Card † | 4 | Control 200, Dante Pri 201, Dante Sec 202 |
+| Martin Audio | IK-42 | with Dante Card | 15 | Control 200, Dante Pri 201, Dante Sec 202 |
+| Martin Audio | IK-42 | without Dante Card | 2 | Control 200 **only** |
+| Martin Audio | IK-81 | with Dante Card | 4 | Control 200, Dante Pri 201, Dante Sec 202 |
 | Lab.Gruppen | LM26 | Redundant Mode | 6 | Dante Pri 201, Dante Sec 202 |
 | Lab.Gruppen | LM44 | Redundant Mode | 2 | Dante Pri 201, Dante Sec 202 |
 | Lab.Gruppen | PLM20000Q | Redundant Mode | 3 | Dante Pri 201, Dante Sec 202 |
 
-The Martin Audio amps have a real Control interface (`DESIGN.md:131-134`); the three
-Lab.Gruppen types do not, and their 11 production Control addresses are dropped — see below.
+The Dante card is a genuine order-time option on every current-generation Martin Audio amp, so
+`with Dante Card` / `without Dante Card` is a real profile distinction rather than a label —
+which is exactly the `(manufacturer, model, name)` identity doing its job, and it is already
+`DESIGN.md:131-136`'s worked example. It applies to the IK-81 too; all four of ours have cards.
+
+**The two `without Dante Card` instances are `XE300-1` slots 3 and 4**, and their Dante
+addresses in the sheet are spurious — four addresses allocated for consistency to interfaces
+that don't exist. See `PROD-DATA-ANALYSIS.md` §5.2. This is the same class of finding as §5.1's
+Lab.Gruppen Control addresses, arrived at from the opposite direction.
+
+Note that `XE300-1` and `XE300-2` therefore hold *different* device types despite looking
+identical in the sheet — `XE300-2`'s two IK-42s do have cards. The rack↔switch-type inference
+in §6a is unaffected: both racks still fit the Unmanaged Switch table, with `XE300-1` simply
+leaving its two Dante ports unused.
+
+The Martin Audio amps have a real Control interface; the three Lab.Gruppen types do not, and
+their 11 production Control addresses are dropped — see below.
 
 The `PLM20K` shorthand is resolved: all three are **Lab.Gruppen PLM20000Q** power amps with
 redundant Dante interfaces, so this is one type, not two. `Redundant Mode` as the profile
 label follows `DESIGN.md`'s existing vocabulary for exactly this distinction (its Shure and
 generic 2-port entries use `Redundant Mode` against `Switched Mode`), and it matches what the
 data shows: both Dante addresses populated, one port per VLAN.
-
-† `IK-81`'s profile label is the one guess left in this table. Its port shape is identical to
-the IK-42's with a Dante card, so `with Dante Card` is the consistent choice — but whether the
-card is even optional on an IK-81 is unconfirmed, and a single-profile model conventionally
-takes `Default` instead (`CONTEXT.md`). Low stakes, but it locks with the type.
 
 Note the manufacturer: **Lab.Gruppen** (that stylization, capital G) for all three, including
 the LM-series processors. Lab.Gruppen bought the Lake processing technology from Dolby years
@@ -266,18 +277,24 @@ no control interface to address. `DESIGN.md:142-144` already had this right. See
 `PROD-DATA-ANALYSIS.md` §5.1 for the eleven addresses and why the ports file was the reliable
 source. All eleven run Redundant Mode (one port per VLAN), so they need no ADR 0017 offsets.
 
-**A note on modes, because the Type carries them and the hardware doesn't have to.** Every
-Lab.Gruppen unit in production runs Redundant Mode — two Dante jacks, one on each Dante VLAN,
-one address each. That shape imports cleanly and needs no ADR 0017 offsets.
+**Dante port configuration is an immutable property of the materialized device — decided, not
+deferred.** Switched/Bridged versus Redundant lives in the `NetworkDeviceType`'s profile name
+and port list, so it is fixed when the device is created and changing it means dropping the
+device and adding a new one. That is a deliberate acceptance: this isn't something to change in
+the field, and reconfiguring a rack is rare enough that drop-and-recreate is the cheaper answer
+than making mode mutable.
 
-Switched/Bridged mode is the same hardware configured differently, and it is *not* importable:
-both jacks bridge into one logical interface on Dante Primary sharing a single address, which
-is the #27 shape ADR 0013 refuses outright. In this model that mode is a different
-`NetworkDeviceType` (`LM26 — Switched Mode`), not a per-instance setting — so if any
-Lab.Gruppen device is ever reconfigured to Bridged, it can't be tracked as a static device
-until #27 lands. DHCP remains available for it. Nothing in production is in that state today;
-recorded because the mode is a field-changeable setting, so the state is one config change
-away rather than hypothetical.
+It also needs no new machinery — it is precisely ADR 0010's existing rule that a device's Type
+is immutable after creation and re-typing means remove-and-recreate, which `DESIGN.md:138`
+already applies to adding or removing an amp's Dante card. Mode is one more instance of the
+same pattern, not an exception to it.
+
+Every Lab.Gruppen unit in production runs Redundant Mode — two Dante jacks, one per Dante VLAN,
+one address each — which imports cleanly and needs no ADR 0017 offsets. Worth knowing what a
+future Switched/Bridged type would run into: both jacks bridge into one logical interface on
+Dante Primary sharing a single address, which is the #27 shape ADR 0013 refuses outright. So a
+`LM26 — Switched Mode` type could not be tracked as a static device until #27 lands, though
+DHCP would remain available. Nothing in production is in that state.
 
 **Blocked:** tier 3's hostname → `(manufacturer, model)` lookup, above.
 
@@ -326,7 +343,6 @@ Ordered by effort-to-clear, not by section:
 | 3 | Four switch profiles absent from the export: redundant-switch layout, TP-Link SG108E, SG300-26, and whatever `CONSOLES` slots 2–3 are | needs running configs | §6, §8 — 4+ of 23 switches |
 | 4 | Confirm the five rack↔switch-type mappings proposed in §6a | review, not discovery | §8 |
 | 5 | Are the two `-device-control` rows separate devices or second interfaces? | decision | §7 tier 2, §9 |
-| 5a | `IK-81`'s profile label — `with Dante Card` or `Default`? | seconds | §7 tier 1 — the last guess in that table |
 | 6 | SD9 / SD11 engine status | check the gear | §5 slot counts, §7, §9 — and reworks `CONSOLES` if yes |
 | 7 | SD7 engine count | check the gear | §7, that one type only |
 | 8 | Real DHCP pool bounds | check the DHCP server | §2 |
@@ -355,16 +371,22 @@ The export is its own test oracle, which is the best property this import has:
   | Raw assignments as written in the sheet | 259 |
   | …minus the duplicate-row surplus (§2.2 of the analysis, 10 rows) | 30 |
   | **Distinct assignments across the 89 occupied slots** | **229** |
-  | …minus Lab.Gruppen Control addresses, which no interface consumes | 11 |
-  | **What the import should place** | **218** |
+  | …minus Lab.Gruppen Control addresses — no control interface exists (analysis §5.1) | 11 |
+  | …minus `XE300-1`'s two IK-42 Dante addresses — no Dante card fitted (analysis §5.2) | 4 |
+  | **What the import should place** | **214** |
 
-  Of those 218, the 2–4 DMI-DANTE card addresses will differ from the sheet by design (§9 —
+  Of those 214, the 2–4 DMI-DANTE card addresses will differ from the sheet by design (§9 —
   the card becomes its own device at its own ordinal). Row 103's two addresses appear in
   neither count, having no rack or slot to be counted against.
 
-  So the pass condition is: **218 addresses placed, 214–216 of them byte-identical to the
+  So the pass condition is: **214 addresses placed, 210–212 of them byte-identical to the
   sheet, and every difference on the DMI-DANTE list.** Anything else is a bug — the point of
   enumerating it this precisely is that "close enough" is not a check.
+
+  Worth stating plainly, since it is the headline number people will remember: **15 of the
+  sheet's 229 distinct assignments are dropped, not reproduced** — 11 Lab.Gruppen Control and
+  4 `XE300-1` Dante. A faithful import is *supposed* to place fewer addresses than the
+  spreadsheet holds, and an import that reproduces all 229 has faithfully copied 15 mistakes.
 - **Rack bases.** All 21 `RackVlanRange` blocks on VLAN 200 should equal the offsets in
   `PROD-DATA-ANALYSIS.md` §1. This is the check that catches a creation-order mistake, and
   it should run before any equipment is created — a wrong base is much cheaper to find at
