@@ -193,12 +193,19 @@ by manufacturer, not by the addressing sheet's columns:
 |---|---|---|
 | Martin Audio IK-42 (with Dante card) | 17 | Control 200, Dante Pri 201, Dante Sec 202 |
 | Martin Audio IK-81 | 4 | Control 200, Dante Pri 201, Dante Sec 202 |
-| Lake LM26 | 6 | Dante Pri 201, Dante Sec 202 |
-| Lake LM44 | 2 | Dante Pri 201, Dante Sec 202 |
-| Lab.gruppen PLM20000Q | 3 | Dante Pri 201, Dante Sec 202 |
+| Lab.Gruppen LM26 | 6 | Dante Pri 201, Dante Sec 202 |
+| Lab.Gruppen LM44 | 2 | Dante Pri 201, Dante Sec 202 |
+| Lab.Gruppen PLM20000Q *or* PLM20K44 | 3 | Dante Pri 201, Dante Sec 202 |
 
 The Martin Audio amps have a real Control interface (`DESIGN.md:131-134`); the three
-Lab.gruppen types do not, and their 11 production Control addresses are dropped — see below.
+Lab.Gruppen types do not, and their 11 production Control addresses are dropped — see below.
+
+Note the manufacturer: **Lab.Gruppen** (that stylization, capital G) for all three, including
+the LM-series processors. Lab.Gruppen bought the Lake processing technology from Dolby years
+ago, so "Lake" names the DSP inside the box, not the company that makes it — calling an LM44
+"a Lake" is shop shorthand. `DESIGN.md:142` used to read "Lake LM44 or Lake LM26", which named
+a manufacturer that isn't one; corrected in this change, along with a note recording the
+no-control-interface rule for the whole product line.
 
 **Tier 2 — mostly inferable. 15 console rows.** The models read out of the hostnames:
 `DM7C-1` → Yamaha DM7C, `SD12-96-1/2` → DiGiCo SD12, `SD9`/`SD11` → DiGiCo, `SQ5-1` → Allen
@@ -234,9 +241,9 @@ Types recoverable from the export:
 |---|---|
 | Martin Audio IK-42 — with Dante Card | Control 200, Dante Pri 201, Dante Sec 202 |
 | Martin Audio IK-81 | Control 200, Dante Pri 201, Dante Sec 202 |
-| Lab.gruppen PLM20000Q | Dante Pri 201, Dante Sec 202 — **no Control port** |
-| Lake LM44 | Dante Pri 201, Dante Sec 202 — **no Control port** |
-| Lake LM26 | Dante Pri 201, Dante Sec 202 — **no Control port** |
+| Lab.Gruppen PLM20000Q *or* PLM20K44 — see below | Dante Pri 201, Dante Sec 202 — **no Control port** |
+| Lab.Gruppen LM44 | Dante Pri 201, Dante Sec 202 — **no Control port** |
+| Lab.Gruppen LM26 | Dante Pri 201, Dante Sec 202 — **no Control port** |
 | DiGiCo SD12 | Control 200 **offset 0**, Engine 200 **offset 1** |
 | DiGiCo DMI-DANTE (card) | Dante Pri 201, Dante Sec 202 |
 | Yamaha DM7 | Control 200 |
@@ -245,16 +252,22 @@ Types recoverable from the export:
 All ports at offset 0 except the SD12's engine. DM7 and DM7-EX stay two independent types —
 their addresses are independent and need not be consecutive (ADR 0017's scope boundary).
 
-**Lab.gruppen devices take no Control port, and their 11 production Control addresses are not
-imported** — control traffic rides both Dante ports on every Lab.gruppen product, so there is
+**Lab.Gruppen devices take no Control port, and their 11 production Control addresses are not
+imported** — control traffic rides both Dante ports on every Lab.Gruppen product, so there is
 no control interface to address. `DESIGN.md:142-144` already had this right. See
 `PROD-DATA-ANALYSIS.md` §5.1 for the eleven addresses and why the ports file was the reliable
 source. All eleven run Redundant mode (one port per VLAN), so they need no ADR 0017 offsets.
 
-Two identity strings to confirm before these types are created, since
-`(manufacturer, model, name)` locks once an instance exists: whether the LM44/LM26
-manufacturer should read **Lake** (as `DESIGN.md` has it) or **Lab.gruppen** (one group, two
-brands), and whether the amp's model is **PLM20000Q** or the sheet's shorthand **PLM20K**.
+**One identity string still open, and it may mean two types rather than one.** The sheet's
+`PLM20K` is shorthand that doesn't disambiguate between the **PLM20000Q** and the newer
+**PLM20K44** — two different products, either of which the shorthand could mean. There are
+three instances (`WPM1SR`, `WPM2SL`, `WPM3`, all slot 4). If they're all the same generation
+that's one `NetworkDeviceType`; if the racks were built out at different times it's two, and
+the import needs to know which slot holds which. `(manufacturer, model, name)` locks the
+moment an instance exists, so this is worth reading off the rear panels rather than guessing.
+
+The port list is the same either way — both are four-channel Dante amps with no control
+interface — so nothing downstream of the identity changes.
 
 **Blocked:** tier 3's hostname → `(manufacturer, model)` lookup, above.
 
@@ -303,7 +316,7 @@ Ordered by effort-to-clear, not by section:
 | 3 | Four switch profiles absent from the export: redundant-switch layout, TP-Link SG108E, SG300-26, and whatever `CONSOLES` slots 2–3 are | needs running configs | §6, §8 — 4+ of 23 switches |
 | 4 | Confirm the five rack↔switch-type mappings proposed in §6a | review, not discovery | §8 |
 | 5 | Are the two `-device-control` rows separate devices or second interfaces? | decision | §7 tier 2, §9 |
-| 5a | Lake vs. Lab.gruppen as manufacturer; PLM20000Q vs. PLM20K as model | seconds | §7 tier 1 — locks with the type |
+| 5a | Are the three `PLM20K`s PLM20000Q, PLM20K44, or a mix? A mix means two types | read the rear panels | §7 tier 1 — locks with the type |
 | 6 | SD9 / SD11 engine status | check the gear | §5 slot counts, §7, §9 — and reworks `CONSOLES` if yes |
 | 7 | SD7 engine count | check the gear | §7, that one type only |
 | 8 | Real DHCP pool bounds | check the DHCP server | §2 |
@@ -332,7 +345,7 @@ The export is its own test oracle, which is the best property this import has:
   | Raw assignments as written in the sheet | 259 |
   | …minus the duplicate-row surplus (§2.2 of the analysis, 10 rows) | 30 |
   | **Distinct assignments across the 89 occupied slots** | **229** |
-  | …minus Lab.gruppen Control addresses, which no interface consumes | 11 |
+  | …minus Lab.Gruppen Control addresses, which no interface consumes | 11 |
   | **What the import should place** | **218** |
 
   Of those 218, the 2–4 DMI-DANTE card addresses will differ from the sheet by design (§9 —

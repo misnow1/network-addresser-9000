@@ -139,9 +139,11 @@ A caveat: the Dante card can be added and removed from an amp but that is *very*
 
 **Processors**
 
-* Lake LM44 or Lake LM26
+* Lab.Gruppen LM44 or LM26
     * Primary: Dante Primary
     * Secondary: Dante Secondary
+
+Deliberately no Control port, and this holds for **every** Lab.Gruppen product (the LM-series processors above, and amps such as the PLM20000Q / PLM20K44): control traffic rides on *both* Dante ports and addresses, in Switched/Bridged and Redundant mode alike. There is no dedicated control interface to address. Note the manufacturer — Lab.Gruppen acquired the Lake processing technology from Dolby years ago, so "Lake" names the DSP inside the unit, not the company; referring to an LM44 as "a Lake" is shop shorthand.
 
 **Shure Wireless Mic Receivers**
 

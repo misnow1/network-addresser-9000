@@ -271,7 +271,7 @@ Independent of any tooling decision, these need resolving in the source data:
   already holds — that would mean reworking the `CONSOLES` allocation rather than importing
   it.
 
-### 5.1 Lab.gruppen devices have no Control interface — 11 spurious addresses
+### 5.1 Lab.Gruppen devices have no Control interface — 11 spurious addresses
 
 Two apparent contradictions between the addressing sheet and the ports sheet turned out to be
 the same fact, and the ports sheet is the one telling the truth:
@@ -281,11 +281,20 @@ the same fact, and the ports sheet is the one telling the truth:
 - The SG350 table marks port 2 **"Not used by Lab amp"**, yet all three `PLM20K`s carry
   Control addresses.
 
-**Every Lab.gruppen product behaves the same way**: control traffic rides on *both* Dante
+**Every Lab.Gruppen product behaves the same way**: control traffic rides on *both* Dante
 ports and addresses, whether the device is in Switched/Bridged or Redundant mode. There is no
 dedicated control interface and no control network involvement at all — only the Dante
 address(es) are used. The Control addresses in the sheet were allocated for convenience, not
 because anything consumes them.
+
+That covers the LM-series processors as well as the amps: **Lab.Gruppen** (that stylization)
+is the manufacturer of all of them. Lab.Gruppen acquired the Lake processing technology from
+Dolby years ago, so "Lake" is the DSP inside the unit rather than the company — referring to
+an LM44 as "a Lake" is shop shorthand. `DESIGN.md:142` named "Lake" as the manufacturer and is
+corrected in this change, which also records the no-control-interface rule for the whole
+product line where the device examples live. A related shorthand remains unresolved in the
+data: the sheet's `PLM20K` doesn't distinguish the **PLM20000Q** from the newer **PLM20K44**,
+which are different products (`PLAN-prod-import.md` §7, blocker 5a).
 
 So the port tables are complete and correct, and **`DESIGN.md:142-144` was right all along** —
 it gives `LM44`/`LM26` Dante Primary + Secondary and no Control port. An earlier draft of this
@@ -365,6 +374,6 @@ alignment turns out to be something operators actually rely on.
 | `.255` avoidance only holds up to `/24` blocks | §2.4 — newly documented in ADR 0015, unreachable in practice, not fixed |
 | Cross-VLAN host alignment unenforced | §6.1 — documented, no fix proposed |
 | `default-vlan tagged`, unused-port state | §4 — noted, minor |
-| Lab.gruppen devices have no Control interface; 11 spurious addresses | §5.1 — resolved; omit on import, and the device type makes it unrepeatable |
+| Lab.Gruppen devices have no Control interface; 11 spurious addresses | §5.1 — resolved; omit on import, and the device type makes it unrepeatable |
 | Four deployed switch profiles absent from the ports file | §5 — needs running configs; `PLAN-prod-import.md` §6 |
 | Data defects, missing type identities | §5, §4 — source-data and import work; see `PLAN-prod-import.md` |
