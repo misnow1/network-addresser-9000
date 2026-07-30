@@ -292,9 +292,13 @@ is the manufacturer of all of them. Lab.Gruppen acquired the Lake processing tec
 Dolby years ago, so "Lake" is the DSP inside the unit rather than the company — referring to
 an LM44 as "a Lake" is shop shorthand. `DESIGN.md:142` named "Lake" as the manufacturer and is
 corrected in this change, which also records the no-control-interface rule for the whole
-product line where the device examples live. A related shorthand remains unresolved in the
-data: the sheet's `PLM20K` doesn't distinguish the **PLM20000Q** from the newer **PLM20K44**,
-which are different products (`PLAN-prod-import.md` §7, blocker 5a).
+product line where the device examples live.
+
+The sheet's other shorthand is resolved too: `PLM20K` means the **Lab.Gruppen PLM20000Q** power
+amp with redundant Dante interfaces — not the newer PLM20K44, which the shorthand would equally
+have fitted. All three instances are the same model, so it's one device type. "Redundant" here
+is the port shape the data already showed (both Dante addresses populated, one per VLAN) and
+becomes the type's profile label, following `DESIGN.md:109`'s `Model — Name` convention.
 
 So the port tables are complete and correct, and **`DESIGN.md:142-144` was right all along** —
 it gives `LM44`/`LM26` Dante Primary + Secondary and no Control port. An earlier draft of this

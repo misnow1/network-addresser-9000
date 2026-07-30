@@ -186,19 +186,30 @@ Treat this table as a proposal to confirm, not a derived fact — but the residu
 
 38 distinct descriptions across 66 device instances, in three tiers of recoverability.
 
-**Tier 1 — unambiguous. 32 instances, 5 types.** The model is in the description. They split
-by manufacturer, not by the addressing sheet's columns:
+**Tier 1 — unambiguous. 32 instances, 5 types.** Full `(manufacturer, model, name)` triples,
+following the `Model — Name` convention `DESIGN.md:109` sets out:
 
-| Type | Instances | Ports |
-|---|---|---|
-| Martin Audio IK-42 (with Dante card) | 17 | Control 200, Dante Pri 201, Dante Sec 202 |
-| Martin Audio IK-81 | 4 | Control 200, Dante Pri 201, Dante Sec 202 |
-| Lab.Gruppen LM26 | 6 | Dante Pri 201, Dante Sec 202 |
-| Lab.Gruppen LM44 | 2 | Dante Pri 201, Dante Sec 202 |
-| Lab.Gruppen PLM20000Q *or* PLM20K44 | 3 | Dante Pri 201, Dante Sec 202 |
+| Manufacturer | Model | Name | Instances | Ports |
+|---|---|---|---|---|
+| Martin Audio | IK-42 | with Dante Card | 17 | Control 200, Dante Pri 201, Dante Sec 202 |
+| Martin Audio | IK-81 | with Dante Card † | 4 | Control 200, Dante Pri 201, Dante Sec 202 |
+| Lab.Gruppen | LM26 | Redundant Mode | 6 | Dante Pri 201, Dante Sec 202 |
+| Lab.Gruppen | LM44 | Redundant Mode | 2 | Dante Pri 201, Dante Sec 202 |
+| Lab.Gruppen | PLM20000Q | Redundant Mode | 3 | Dante Pri 201, Dante Sec 202 |
 
 The Martin Audio amps have a real Control interface (`DESIGN.md:131-134`); the three
 Lab.Gruppen types do not, and their 11 production Control addresses are dropped — see below.
+
+The `PLM20K` shorthand is resolved: all three are **Lab.Gruppen PLM20000Q** power amps with
+redundant Dante interfaces, so this is one type, not two. `Redundant Mode` as the profile
+label follows `DESIGN.md`'s existing vocabulary for exactly this distinction (its Shure and
+generic 2-port entries use `Redundant Mode` against `Switched Mode`), and it matches what the
+data shows: both Dante addresses populated, one port per VLAN.
+
+† `IK-81`'s profile label is the one guess left in this table. Its port shape is identical to
+the IK-42's with a Dante card, so `with Dante Card` is the consistent choice — but whether the
+card is even optional on an IK-81 is unconfirmed, and a single-profile model conventionally
+takes `Default` instead (`CONTEXT.md`). Low stakes, but it locks with the type.
 
 Note the manufacturer: **Lab.Gruppen** (that stylization, capital G) for all three, including
 the LM-series processors. Lab.Gruppen bought the Lake processing technology from Dolby years
@@ -235,39 +246,38 @@ identity that locks once instanced is the wrong place to be clever. **This is a 
 lookup table someone can write in a few minutes with the rack in front of them** — the
 cheapest of the three blockers to clear, and it unblocks 19 of the 66 devices.
 
-Types recoverable from the export:
+Beyond tier 1's five, the console and card types the export supports:
 
-| Type | Ports |
-|---|---|
-| Martin Audio IK-42 — with Dante Card | Control 200, Dante Pri 201, Dante Sec 202 |
-| Martin Audio IK-81 | Control 200, Dante Pri 201, Dante Sec 202 |
-| Lab.Gruppen PLM20000Q *or* PLM20K44 — see below | Dante Pri 201, Dante Sec 202 — **no Control port** |
-| Lab.Gruppen LM44 | Dante Pri 201, Dante Sec 202 — **no Control port** |
-| Lab.Gruppen LM26 | Dante Pri 201, Dante Sec 202 — **no Control port** |
-| DiGiCo SD12 | Control 200 **offset 0**, Engine 200 **offset 1** |
-| DiGiCo DMI-DANTE (card) | Dante Pri 201, Dante Sec 202 |
-| Yamaha DM7 | Control 200 |
-| Yamaha DM7-EX | Control 200 |
+| Manufacturer | Model | Name | Ports |
+|---|---|---|---|
+| DiGiCo | SD12 | Default | Control 200 **offset 0**, Engine 200 **offset 1** |
+| DiGiCo | DMI-DANTE | Default | Dante Pri 201, Dante Sec 202 |
+| Yamaha | DM7C | Default | Control 200, Dante Pri 201, Dante Sec 202 |
+| Yamaha | DM7-EX | Default | Control 200 |
 
-All ports at offset 0 except the SD12's engine. DM7 and DM7-EX stay two independent types —
-their addresses are independent and need not be consecutive (ADR 0017's scope boundary).
+All ports at offset 0 except the SD12's engine. DM7C and DM7-EX stay two independent types —
+their addresses are independent and need not be consecutive (ADR 0017's scope boundary). The
+remaining tier-2 consoles (SD9, SD11, SQ-5, Tio1608-D2, DM3) need their profile labels and
+their engine question settled before their types can be written down; see blockers 5 and 6.
 
 **Lab.Gruppen devices take no Control port, and their 11 production Control addresses are not
 imported** — control traffic rides both Dante ports on every Lab.Gruppen product, so there is
 no control interface to address. `DESIGN.md:142-144` already had this right. See
 `PROD-DATA-ANALYSIS.md` §5.1 for the eleven addresses and why the ports file was the reliable
-source. All eleven run Redundant mode (one port per VLAN), so they need no ADR 0017 offsets.
+source. All eleven run Redundant Mode (one port per VLAN), so they need no ADR 0017 offsets.
 
-**One identity string still open, and it may mean two types rather than one.** The sheet's
-`PLM20K` is shorthand that doesn't disambiguate between the **PLM20000Q** and the newer
-**PLM20K44** — two different products, either of which the shorthand could mean. There are
-three instances (`WPM1SR`, `WPM2SL`, `WPM3`, all slot 4). If they're all the same generation
-that's one `NetworkDeviceType`; if the racks were built out at different times it's two, and
-the import needs to know which slot holds which. `(manufacturer, model, name)` locks the
-moment an instance exists, so this is worth reading off the rear panels rather than guessing.
+**A note on modes, because the Type carries them and the hardware doesn't have to.** Every
+Lab.Gruppen unit in production runs Redundant Mode — two Dante jacks, one on each Dante VLAN,
+one address each. That shape imports cleanly and needs no ADR 0017 offsets.
 
-The port list is the same either way — both are four-channel Dante amps with no control
-interface — so nothing downstream of the identity changes.
+Switched/Bridged mode is the same hardware configured differently, and it is *not* importable:
+both jacks bridge into one logical interface on Dante Primary sharing a single address, which
+is the #27 shape ADR 0013 refuses outright. In this model that mode is a different
+`NetworkDeviceType` (`LM26 — Switched Mode`), not a per-instance setting — so if any
+Lab.Gruppen device is ever reconfigured to Bridged, it can't be tracked as a static device
+until #27 lands. DHCP remains available for it. Nothing in production is in that state today;
+recorded because the mode is a field-changeable setting, so the state is one config change
+away rather than hypothetical.
 
 **Blocked:** tier 3's hostname → `(manufacturer, model)` lookup, above.
 
@@ -316,7 +326,7 @@ Ordered by effort-to-clear, not by section:
 | 3 | Four switch profiles absent from the export: redundant-switch layout, TP-Link SG108E, SG300-26, and whatever `CONSOLES` slots 2–3 are | needs running configs | §6, §8 — 4+ of 23 switches |
 | 4 | Confirm the five rack↔switch-type mappings proposed in §6a | review, not discovery | §8 |
 | 5 | Are the two `-device-control` rows separate devices or second interfaces? | decision | §7 tier 2, §9 |
-| 5a | Are the three `PLM20K`s PLM20000Q, PLM20K44, or a mix? A mix means two types | read the rear panels | §7 tier 1 — locks with the type |
+| 5a | `IK-81`'s profile label — `with Dante Card` or `Default`? | seconds | §7 tier 1 — the last guess in that table |
 | 6 | SD9 / SD11 engine status | check the gear | §5 slot counts, §7, §9 — and reworks `CONSOLES` if yes |
 | 7 | SD7 engine count | check the gear | §7, that one type only |
 | 8 | Real DHCP pool bounds | check the DHCP server | §2 |
