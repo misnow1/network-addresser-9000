@@ -120,6 +120,42 @@ spans `NetworkSwitchAddress` and `NetworkDevicePort`, so concurrent allocations 
 both validate and collide. As ADR 0013 says of the same gap: this work exercises it more
 often without introducing it or worsening it in kind.
 
+## Amendment: the implementation departs from this ADR in two places
+
+Both surfaced during the independently reviewed implementation plan, not during writing this
+ADR, and both are load-bearing — the implementation keeps them rather than "correcting" it
+back to what's written above.
+
+**1. There is a `clean()`-time pre-flight after all.** The "Zero ranges" paragraph above
+argues no equivalent of ADR 0013's `_check_static_materialization_possible()` is needed,
+because the only remaining failure is a collision and `_validate_static_address()` already
+reports those clearly. That's an argument about *message quality*, and it misses a mechanical
+fact: Django's admin calls `save_model()` — and therefore `NetworkSwitch.save()`, and
+therefore materialization — **after** form validation has already passed. A `ValidationError`
+raised from inside `save()` has no form left to attach to; Django's `add_error()` raises a raw
+`ValueError` for a nonexistent field instead of rendering a message, which is a 500, not a
+form error. This is exactly the failure mode
+`test_admin_add_post_address_collision_renders_form_error_not_500` exists to prevent on the
+device side (a review-council finding there). Without a pre-flight in
+`NetworkSwitch.clean()`, an ordinary Editor who hits an address collision creating a switch
+would get that same 500 on the switch side. `_check_address_materialization_possible()` adds
+this pre-flight — pure, no pk needed, called from both `clean()` and the top of
+`_materialize_addresses()`, the same dual-call-site shape as the device side. It does not
+change decision 5: a missing range is still not a failure, since the pre-flight only checks
+the ranges that already exist.
+
+**2. `NetworkSwitchAddressInline.has_add_permission()` returns `False` when `obj is None`.**
+Nothing above anticipated the inline itself as a second way to hit a collision. Django saves
+the parent (`save_model()`, which runs materialization) before it saves inline formsets
+(`save_related()`). An operator who creates a switch and, on that same Add page, types an
+address for a VLAN the rack already has a range for would get both a materialized row and
+their hand-entered row for it — an `IntegrityError` on `unique_switch_vlan_address`.
+Materialization can't avoid this by inspection, because the inline's rows don't exist yet
+when it runs. Blocking adds on the switch's Add page (matching how
+`NetworkDevicePortInline` already behaves) makes this unreachable; the change page keeps
+full add/edit/delete, so `MANUAL` becomes "create the switch, then add its addresses on the
+change page" rather than losing any capability.
+
 ## Follow-up
 
 Implementation is a separate, independently reviewed plan, per this project's convention.
