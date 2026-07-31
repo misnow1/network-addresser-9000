@@ -477,7 +477,94 @@ declared pool — while a server whose real pool is wider than the recorded one 
 address inside a rack block, and nothing here would detect it. That asymmetry is inherent to
 tracking rather than controlling DHCP, not a gap this project introduced.
 
-## 7. Outcome
+## 7. Deployment context
+
+Answers to the questions this review raised, recorded because several of them change how the
+data should be read and none of them are recoverable from the files.
+
+### 7.1 Audio is the pilot, not the scope
+
+All eight VLANs are in scope. **Audio went first as the guinea pig**; video is beginning to
+adopt the same model and lighting will follow. So the five VLANs with no equipment are
+*future*, not out-of-scope, and the sharp edges audio is finding now are being found on
+everyone's behalf.
+
+Two consequences worth holding onto. First, this dataset is a fraction of the eventual
+inventory, so anything that works only because there are 21 racks and three VLANs should be
+treated with suspicion. Second, it strengthens the case for Rack Templates carrying purpose
+(ADR 0014) — "Audio Rack" and "Video Rack" seeding different VLAN sets is exactly the shape a
+phased rollout produces, and `DESIGN.md` already sketches both.
+
+**AES67** is the exception among the five: it is an audio VLAN, but no AES67 gear exists yet.
+It is nominally Dante-compatible (in AES67 mode) with its own distinct sharp edges, so treat
+its absence as "not yet exercised" rather than "not used".
+
+### 7.2 The offset gaps are mnemonic, not technical
+
+The two interior gaps — offsets 864–1279 before `SHURE`, and 1312–1535 before `CONSOLES` —
+have **no technical purpose**. They exist so an address can be identified by eye in the field:
+"that's an amp rack address", "that's a Shure receiver address". It is the same instinct as
+putting the VLAN ID in the second octet, applied to the host part, and it doubles as
+error-detection — something in the wrong region is visibly in the wrong region.
+
+Two things follow, and they pull in opposite directions:
+
+- **The suggester will consume these gaps.** First-fit takes the lowest free offset, and the
+  aligned allocation chosen in `ROADMAP.md` doesn't change that. The next rack created lands at
+  offset 864, inside the region reserved by eye for wireless. There is no "reserved but
+  unallocated" concept. Today this is prevented only by offsets being chosen by hand.
+- **Choosing offsets by hand is itself the problem.** It is error-prone, and overlapping rack
+  ranges are easy to create by accident — which is precisely what this tool exists to stop.
+
+So the mnemonic property and the automation are in direct tension, and resolving it needs
+somewhere to declare the regions. That is recorded as a design item in `ROADMAP.md`'s "Later"
+section (**address regions**), because the obvious fix — several declared ranges per VLAN — is
+more tractable than it first appears and would deliver the mnemonic grouping *and* remove the
+hand-calculation that causes the overlaps.
+
+### 7.3 The second-octet convention is mnemonic too, and has a known ceiling
+
+VLAN IDs validate 1–4094; an octet holds 0–255, so the convention cannot survive a VLAN above
+255. The sketched extension is to use a different `/21` inside the same second octet — VLAN
+1200 as `10.200.8.0/21`, adjacent to VLAN 200's `10.200.0.0/21`. Nothing in the tool enforces
+the convention either way, so this works today; it is recorded so the ceiling isn't discovered
+by surprise. Aligned allocation is unaffected, since offsets are measured from each VLAN's own
+network address.
+
+### 7.4 The connection graph is derivable, not lost
+
+No device-to-switch-port link is recorded anywhere in the export (§4), but **the wiring is
+identical across instances of each device type** — every IK-42 in a WPC rack is patched the
+same way — so the graph can be reconstructed from a per-type rule plus slot position, rather
+than entered 66 devices at a time. The ports file already hints at it: ports labelled "Amp 1
+Control" / "Amp 1 Dante" against racks holding three IK-42s at slots 3/4/5.
+
+This is a lookup table someone can dictate, and it is the difference between the import
+delivering addresses only and delivering the topology as well.
+
+### 7.5 The spare pool should be used, and currently isn't
+
+Nothing in production is unracked; `SPARE` is an ordinary rack holding statically addressed
+equipment. The spare pool as `CONTEXT.md` defines it — unracked, DHCP-configured, tracked by
+serial and hostname — is a real intent that current practice doesn't yet follow. Recorded as
+an intended-use gap rather than a data defect: the model already supports it, so this is a
+process change more than a code one.
+
+### 7.6 Hostnames should be generated
+
+25 of 89 slots carry a real hostname; the rest hold model names like `IK42`. The production
+convention is visible in the ones that exist (`mps-tlsg108e-01`, `mps-avio-na2-dline-1`, and
+`DESIGN.md`'s `mps-sg300-wpc-sr-upper`). The intent is for the tool to compute these rather
+than have them typed — that is issue #31, wanted but not urgent, and the existing hostnames are
+the best available input for its pattern.
+
+### 7.7 The drive-rack switches are the DHCP servers
+
+By convention the switches in the drive racks (`FOH Drive #1`, `FOH Drive #2`) serve DHCP for
+their networks. Nothing in the export records it, but `NetworkSwitch.dhcp_server_enabled`
+exists for exactly this, so the import can set it on those two switches.
+
+## 8. Outcome
 
 | Finding | Disposition |
 |---|---|

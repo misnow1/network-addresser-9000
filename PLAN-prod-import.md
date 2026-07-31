@@ -89,12 +89,16 @@ The trunk profile references all eight VLANs, so all eight must exist first.
 
 One `RackTemplate` — "Audio Rack", VLANs 200/201/202.
 
-**Decision needed:** whether racks get ranges on only the three audio VLANs or on all
-eight. This is not cosmetic under ADR 0016, which gives a switch one address per rack
-range: a rack carrying all eight VLANs produces switches with eight addresses, where
-production has three. The export only ever exercises 200/201/202, so the template lists
-those three, and any rack genuinely needing Lighting/AES67/Video/NDI ranges gets them added
-explicitly.
+**Three VLANs, not eight — settled.** Audio is the pilot, not the scope: all eight VLANs are
+in scope on a phased rollout, with video adopting now and lighting later
+(`PROD-DATA-ANALYSIS.md` §7.1). But today's 21 racks are *audio* racks, and this matters under
+ADR 0016, which gives a switch one address per rack range — a rack carrying all eight VLANs
+would produce switches with eight addresses where production has three.
+
+So the "Audio Rack" template lists 200/201/202. Video racks arrive later behind a "Video Rack"
+template, which is exactly the shape ADR 0014 anticipated and `DESIGN.md` already sketches. Any
+rack that genuinely needs a Lighting/AES67/Video/NDI range gets it added explicitly. AES67 has
+no gear yet, so it stays unexercised rather than unused.
 
 ### 5. Racks — 21 rows, in ascending offset order
 
@@ -352,12 +356,28 @@ Ordered by effort-to-clear, not by section:
 | 6 | SD9 / SD11 engine status | check the gear | §5 slot counts, §7, §9 — and reworks `CONSOLES` if yes |
 | 7 | SD7 engine count | check the gear | §7, that one type only |
 | 8 | Real DHCP pool bounds | check the DHCP server | §2 |
-| 9 | Whether racks carry 3 VLANs or 8 | decision | §4, and every switch's address count |
-| 10 | DMI-DANTE re-address vs. override | decision | §9 |
+| 9 | DMI-DANTE re-address vs. override | decision | §9 |
+| 10 | Per-device-type wiring rule (which switch port each device port patches to) | a dictated lookup | §9 — optional, but see below |
 
 **1–3 are what actually block a complete import.** 4 is confirmation of work already done
-here. 5–10 have safe defaults but change the result, so they want deciding rather than
+here. 5–9 have safe defaults but change the result, so they want deciding rather than
 defaulting silently.
+
+**Resolved since this list was first written** (`PROD-DATA-ANALYSIS.md` §7):
+
+- *Whether racks carry 3 VLANs or 8* — audio is the pilot, not the scope. All eight VLANs are
+  in scope on a phased rollout (video adopting now, lighting later), but today's racks are
+  audio racks and should carry 200/201/202 only. Video racks arrive later with a "Video Rack"
+  template. AES67 has no gear yet.
+- *Which switch is the DHCP server* — by convention the drive-rack switches. Set
+  `dhcp_server_enabled` on `FOH Drive #1` and `FOH Drive #2`'s primary switches (§7.7).
+
+**Blocker 10 is new and optional, but it is the difference between importing addresses and
+importing the topology.** No device-to-switch-port link exists in the export, but the wiring is
+identical across instances of each device type, so a per-type rule plus slot position
+reconstructs the whole graph (`PROD-DATA-ANALYSIS.md` §7.4). Skipping it leaves every
+`NetworkDevicePort.switch_port` null — legal, and fillable later, but it is ~66 devices × up to
+3 ports of hand-entry to do afterwards versus one dictated table now.
 
 A useful property: 1 and 2 together are perhaps ten minutes of someone's time and clear the
 majority of the import surface. 3 is the only blocker needing real investigation, and it
