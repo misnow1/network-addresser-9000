@@ -107,24 +107,58 @@ being true, sub-`/27` ranges need widening before this change is applied.
 ## Follow-up
 
 Implementation is a separate, independently reviewed plan, per this project's convention.
-The one-line change has wide test fallout, listed here so it is planned for rather than
-discovered:
+An earlier version of this section predicted five failing tests from reading the change;
+that prediction was wrong. Applying the one-line change and running the suite shows only
+three of the five actually fail. The list below is the measured result, corrected after
+implementation, not the original prediction — it's kept here rather than silently fixed so
+the gap between "reading a diff" and "running the suite" stays visible.
+
+Genuinely failing:
 
 - `inventory/tests.py:555` — `prefix_length_for_capacity(1) == 30` becomes `27`.
 - `:564` — `prefix_length_for_capacity(3) == 29` becomes `27`. This test exists to prove
-  the top address is reserved (a naive `slot_count + 1` rule would give a `/30`); it needs
-  a rewrite that still proves that, at a slot count above the floor.
+  the top address is reserved (a naive `slot_count + 1` rule would give a `/30`); it needed
+  a rewrite, not a new expected number, since at slot count 3 the floor now decides the
+  answer regardless of the reservation. Re-expressed above the floor: `slot_count=31` must
+  give a `/26`, not the `/27` a naive `slot_count + 1` rule (with no top-address reservation)
+  would give it.
 - `:470` — an admin formset asserting a suggested `10.200.0.0/29` becomes `/27`.
-- `:968` — creates a `/29` for a 4-slot rack as a fixture and is now invalid at
-  construction; needs restructuring around a `/27`-and-larger pair.
-- `:890` — still correctly rejects a `/30`, but for the floor's reason rather than the
-  slot-count reason, so its error-message assertion changes.
+
+Originally listed as failures, but they don't fail — they pass for the wrong reason, which
+is worse than failing, because nothing draws attention to it:
+
+- `:890` (`test_explicit_range_too_small_for_rack_slot_count_raises`) still raises
+  `ValidationError` for a `/30` against a 4-slot rack, but now because the range is below
+  the `/27` floor, not because it's too small for that rack's `slot_count` — the
+  slot-count arm of `_validate_range()` is left with no coverage at all. Split into two
+  tests: the original `/30` case (now asserting the floor's message), and a new case above
+  the floor (a `/27` against a 40-slot rack, which needs 42 addresses) exercising the
+  slot-count branch the original test was named for.
+- `:968` (`test_increasing_slot_count_beyond_existing_range_capacity_raises`) builds a
+  `/29` for a 4-slot rack via `RackVlanRange.objects.create()`, which skips
+  `clean()`/`full_clean()` and therefore the floor — the fixture is now constructed in a
+  state `full_clean()` would reject. The test's own assertion still passes, coincidentally,
+  because growing the rack's `slot_count` further is refused either way. Restructured
+  around a `/27`: a 4-slot rack with a `/27`, grown to 40 slots, is refused for the
+  capacity reason the test is named for.
 
 `:550` (`slot_count=30` → `/27`) and `:558` (`slot_count=62` → `/26`) are unaffected, both
 being at or above the floor already.
 
-New coverage the implementation must add: the floor applied at every slot count below 30;
-the floor enforced against a hand-entered sub-`/27` range; and an end-to-end case
-replaying the production racks — 21 racks at honest slot counts, DHCP occupying the bottom
-`/24`, asserting the 19 automatically-reproduced bases — since that replay is the entire
-evidentiary basis for this decision and should fail loudly if the arithmetic ever drifts.
+One more bug, pre-existing and unrelated to this change but made permanent by it: `:859`
+(`test_explicit_overlap_with_sibling_range_raises`) builds a `/28` for a **30-slot** rack.
+`required_block_size(30)` was already `32` before this ADR (`30 + 2`), so the range was
+already rejected for being too small, before ever reaching the overlap check the test is
+named for — the bare `assertRaises(ValidationError)` hid this. The floor doesn't cause the
+bug, but does make the fix mandatory: nudging the `/28` to a `/27` at the same base doesn't
+work (`10.200.0.16/27` has host bits set, and `IPv4Network(..., strict=True)` rejects it
+before any overlap check runs), so the range needs to both clear the size check and
+genuinely overlap its sibling — e.g. a `/26` at the same base, which contains it.
+
+New coverage added: the floor applied at every slot count below 30 (and pinned at 31,
+where it stops applying); the floor enforced against a hand-entered sub-`/27` range; and
+an end-to-end case replaying the production racks — 19 racks at honest slot counts, DHCP
+occupying the bottom `/24`, asserting the 19 automatically-reproduced bases plus the
+counter-assertion that a 20th rack keeps packing sequentially rather than jumping to either
+of the two manually-reserved gaps — since that replay is the entire evidentiary basis for
+this decision and should fail loudly if the arithmetic ever drifts.

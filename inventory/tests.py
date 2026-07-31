@@ -71,6 +71,7 @@ from .models import (
 from .suggestions import (
     dhcp_range_overlaps_cidr,
     prefix_length_for_capacity,
+    required_block_size,
     suggest_default_gateway,
     suggest_rack_vlan_range,
     suggest_slot_address,
@@ -467,7 +468,7 @@ class InlineFormsetSaveTests(TestCase):
         }
         formset = FormSet(data, instance=unsaved_rack, prefix="vlan_ranges")
         self.assertTrue(formset.is_valid(), formset.errors)
-        self.assertEqual(formset.forms[0].instance.address_range, "10.200.0.0/29")
+        self.assertEqual(formset.forms[0].instance.address_range, "10.200.0.0/27")
 
 
 class UnsavedParentInlineSuggestionTests(TestCase):
@@ -550,18 +551,40 @@ class SuggestionFunctionTests(TestCase):
         self.assertEqual(prefix_length_for_capacity(30), 27)
 
     def test_prefix_length_for_capacity_single_slot(self) -> None:
-        # 1 slot needs the base address, slot 1, and a reserved top address: 3
-        # addresses, rounded up to the next power of two (/30, 4 addresses).
-        self.assertEqual(prefix_length_for_capacity(1), 30)
+        # 1 slot needs the base address, slot 1, and a reserved top address:
+        # 3 addresses, which would round up to the next power of two (/30, 4
+        # addresses) on the raw arithmetic alone — but ADR 0015's /27 floor
+        # (32 addresses) applies to every slot count this small.
+        self.assertEqual(prefix_length_for_capacity(1), 27)
 
     def test_prefix_length_for_capacity_larger_rack(self) -> None:
         self.assertEqual(prefix_length_for_capacity(62), 26)
 
     def test_prefix_length_for_capacity_reserves_top_address(self) -> None:
-        # A naive "slot_count + 1" rule would give slot_count=3 a /30 (4
-        # addresses), putting slot 3 on that block's own top/broadcast-like
-        # address. Reserving the top address too pushes it out to a /29.
-        self.assertEqual(prefix_length_for_capacity(3), 29)
+        # A naive "slot_count + 1" rule (no reserved top address) would give
+        # slot_count=31 a /27: 31 slots + 1 base = 32 addresses, exactly a
+        # /27's worth, putting slot 31 on that block's own top/broadcast-like
+        # address. Reserving the top address too means 31 slots need 33
+        # addresses, one more than a /27 has, pushing the answer out to a
+        # /26. This has to be checked above the /27 floor (ADR 0015) — at or
+        # below it (e.g. the old slot_count=3), the floor decides the answer
+        # regardless of whether the top address is reserved, so the test
+        # would no longer prove anything about the reservation itself.
+        self.assertEqual(prefix_length_for_capacity(31), 26)
+
+    def test_required_block_size_and_prefix_floored_below_slot_count_30(self) -> None:
+        # ADR 0015: production allocates a uniform /27 per rack regardless of
+        # occupancy, and replaying production's honest slot counts (1-19)
+        # through the suggester only reproduces that if every slot count up
+        # to 30 floors to the same 32-address block. Pin the floor across
+        # its whole range, and pin the boundary where it stops applying —
+        # slot_count=31 needs 33 addresses, one more than a /27 has, so it's
+        # the first count the floor doesn't decide.
+        for slot_count in range(1, 31):
+            self.assertEqual(required_block_size(slot_count), 32)
+            self.assertEqual(prefix_length_for_capacity(slot_count), 27)
+        self.assertEqual(required_block_size(31), 33)
+        self.assertEqual(prefix_length_for_capacity(31), 26)
 
     def test_suggest_rack_vlan_range_first_block_when_nothing_used(self) -> None:
         self.assertEqual(suggest_rack_vlan_range("10.200.0.0/21", 30, []), "10.200.0.0/27")
@@ -857,11 +880,25 @@ class RackVlanRangeSuggestionTests(TestCase):
         self.assertEqual(range_.address_range, "10.200.1.0/27")
 
     def test_explicit_overlap_with_sibling_range_raises(self) -> None:
+        # Pre-existing bug, found while implementing ADR 0015: this used to
+        # build a /28 (16 addresses) against a 30-slot rack, but
+        # required_block_size(30) was already 32 before the floor existed
+        # (30 + 2) — so _validate_range() rejected the range for being too
+        # small before ever reaching the overlap loop, and the bare
+        # assertRaises(ValidationError) below was passing for the wrong
+        # reason. The /27 floor (ADR 0015) makes that permanent. Nudging the
+        # /28 up to a /27 at the same base doesn't fix it either —
+        # 10.200.0.16/27 has host bits set, and IPv4Network(...,
+        # strict=True) rejects it before any overlap check runs. Use a /26
+        # instead: comfortably above the floor, and it contains the sibling
+        # /27, so it genuinely overlaps.
         RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.200.0.0/27")
         other_rack = Rack.objects.create(name="Rack 2", slot_count=30)
-        range_ = RackVlanRange(rack=other_rack, vlan=self.vlan, address_range="10.200.0.16/28")
-        with self.assertRaises(ValidationError):
+        range_ = RackVlanRange(rack=other_rack, vlan=self.vlan, address_range="10.200.0.0/26")
+        with self.assertRaises(ValidationError) as ctx:
             range_.full_clean()
+        self.assertIn("overlaps", str(ctx.exception))
+        self.assertIn("10.200.0.0/27", str(ctx.exception))
 
     def test_explicit_overlap_with_dhcp_range_raises(self) -> None:
         self.vlan.dhcp_range_start = "10.200.0.1"
@@ -883,13 +920,33 @@ class RackVlanRangeSuggestionTests(TestCase):
         with self.assertRaises(ValidationError):
             range_.full_clean()
 
-    def test_explicit_range_too_small_for_rack_slot_count_raises(self) -> None:
-        # A /30 has 4 addresses (0-3); a 4-slot rack needs slots 1-4, i.e.
-        # 5 addresses (base + slot N), so slot 4 would fall outside it.
+    def test_explicit_range_below_floor_raises(self) -> None:
+        # A /30 has 4 addresses — smaller than the /27 floor (32 addresses,
+        # ADR 0015) that applies at every slot_count, so this is rejected
+        # regardless of how small the rack actually is. Split out from the
+        # slot-count case below: before the floor existed, a 4-slot rack's
+        # own capacity (needs 6 addresses) was already enough to reject a
+        # /30 on its own, so that single test covered both reasons at once —
+        # now that the floor covers every slot_count up to 30, a rack this
+        # small can no longer exercise the slot-count branch at all.
         four_slot_rack = Rack.objects.create(name="Rack 2", slot_count=4)
         range_ = RackVlanRange(rack=four_slot_rack, vlan=self.vlan, address_range="10.200.0.0/30")
-        with self.assertRaises(ValidationError):
+        with self.assertRaises(ValidationError) as ctx:
             range_.full_clean()
+        self.assertIn("it needs 32 addresses", str(ctx.exception))
+
+    def test_explicit_range_too_small_for_rack_slot_count_raises(self) -> None:
+        # Above the /27 floor, a range still has to be sized to the rack's
+        # actual slot_count: a /27 (32 addresses) comfortably covers racks up
+        # to slot_count 30, but a 40-slot rack needs 42 (slots 1..40, plus
+        # the block's own base and top addresses reserved) — the floor no
+        # longer covers it, so this exercises the slot-count branch of
+        # _validate_range() rather than the floor.
+        forty_slot_rack = Rack.objects.create(name="Rack 2", slot_count=40)
+        range_ = RackVlanRange(rack=forty_slot_rack, vlan=self.vlan, address_range="10.200.0.0/27")
+        with self.assertRaises(ValidationError) as ctx:
+            range_.full_clean()
+        self.assertIn("it needs 42 addresses", str(ctx.exception))
 
     def test_editing_range_to_exclude_existing_switch_address_raises(self) -> None:
         RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.200.0.0/27")
@@ -962,11 +1019,15 @@ class RackSlotCountEditTests(TestCase):
         self.device_type = _make_device_type()
 
     def test_increasing_slot_count_beyond_existing_range_capacity_raises(self) -> None:
+        # Restructured around a /27 (ADR 0015): a /29 fixture for a 4-slot
+        # rack, built via objects.create() (which skips clean()/full_clean()
+        # and so bypasses _validate_range()), is now invalid at construction
+        # — every rack's smallest possible range is a /27, floor included.
+        # A /27 has 32 addresses: room for a 4-slot rack (needs 6, floored to
+        # 32) but not a 40-slot one (needs 42).
         rack = Rack.objects.create(name="Rack 1", slot_count=4)
-        # 10.200.1.0/29 has 8 addresses: room for a 4-slot rack (needs 6) but
-        # not a 10-slot one (needs 12).
-        RackVlanRange.objects.create(rack=rack, vlan=self.vlan, address_range="10.200.1.0/29")
-        rack.slot_count = 10
+        RackVlanRange.objects.create(rack=rack, vlan=self.vlan, address_range="10.200.1.0/27")
+        rack.slot_count = 40
         with self.assertRaises(ValidationError):
             rack.full_clean()
 
@@ -3880,3 +3941,99 @@ class RackTemplateAuditTests(TestCase):
         self.assertTrue(
             LogEntry.objects.filter(object_pk=str(link.pk), action=LogEntry.Action.CREATE).exists()
         )
+
+
+class RackAddressingProductionReplayTests(TestCase):
+    """The evidentiary basis for ADR 0015: replaying production's racks
+    through the real suggester (not the pure function in isolation)
+    reproduces 19 of its 21 rack bases automatically, versus 1 of 21
+    without the /27 floor. This is the test that must fail loudly if the
+    floor's arithmetic ever drifts.
+
+    Built end-to-end through the model layer — Rack, then
+    RackVlanRange(...).full_clean()/.save() — rather than by calling
+    suggest_rack_vlan_range() directly, because the pure-function version
+    would pass even if _validate_range() disagreed with the suggester,
+    which is precisely the class of drift this test guards against.
+
+    Slot counts and bases are transcribed as literals from
+    PROD-DATA-ANALYSIS.md §1 (slot counts are each rack's maximum occupied
+    slot, from prod/MPS Audio Network Standards - IP Addressing mk2.csv).
+    prod/ is gitignored, so those source files don't exist in CI — the
+    numbers below are the only record that survives here.
+    """
+
+    def setUp(self) -> None:
+        # 10.200.0.0/21, DHCP occupying the bottom /24 (ADR 0011) — this is
+        # what pushes the first rack's block to 10.200.1.0 rather than
+        # 10.200.0.0.
+        self.vlan = VLAN.objects.create(
+            name="Control",
+            vlan_id=200,
+            subnet="10.200.0.0/21",
+            dhcp_range_start="10.200.0.1",
+            dhcp_range_end="10.200.0.254",
+        )
+
+    def _create_rack(self, name: str, slot_count: int) -> tuple[Rack, RackVlanRange]:
+        rack = Rack.objects.create(name=name, slot_count=slot_count)
+        range_ = RackVlanRange(rack=rack, vlan=self.vlan)
+        range_.full_clean()
+        range_.save()
+        return rack, range_
+
+    def test_replays_19_of_21_production_bases_with_floor(self) -> None:
+        # slot_count is each rack's honest, as-built occupancy; expected is
+        # the production base it must reproduce. Creation order matters —
+        # suggest_rack_vlan_range() is first-fit, so it determines every
+        # base that follows.
+        racks = [
+            ("CONTROL", 1, "10.200.1.0/27"),
+            ("WPC1SRU", 5, "10.200.1.32/27"),
+            ("WPC2SRL", 5, "10.200.1.64/27"),
+            ("WPC3SLU", 5, "10.200.1.96/27"),
+            ("WPC4SLL", 5, "10.200.1.128/27"),
+            ("WPM1SR", 4, "10.200.1.160/27"),
+            ("WPM2SL", 4, "10.200.1.192/27"),
+            ("WPM3", 4, "10.200.1.224/27"),
+            ("XE300-1", 4, "10.200.2.0/27"),
+            ("XE300-2", 4, "10.200.2.32/27"),
+            ("W8LM1SR", 3, "10.200.2.64/27"),
+            ("W8LM2SL", 3, "10.200.2.96/27"),
+            ("W8LM3", 3, "10.200.2.128/27"),
+            ("FOH Drive #1", 2, "10.200.2.160/27"),
+            ("FOH Drive #2", 2, "10.200.2.192/27"),
+            ("CDD", 1, "10.200.2.224/27"),
+            ("AVIO", 19, "10.200.3.0/27"),
+            ("SPARE", 3, "10.200.3.32/27"),
+            ("FLOATSWITCH", 3, "10.200.3.64/27"),
+        ]
+        # CONTROL, CDD and SHURE hold no equipment, so their honest slot
+        # count isn't derivable from the addressing CSV; slot_count=1 is
+        # used for CONTROL and CDD above because Rack.slot_count has
+        # MinValueValidator(1). This is safe rather than a guess that
+        # matters: under the floor, every slot count from 1 to 30 yields a
+        # /27 (see test_required_block_size_and_prefix_floored_below_slot_
+        # count_30 above), and production occupancy here runs 2-19 — no
+        # value in the plausible range could change a single expected base.
+        for name, slot_count, expected_base in racks:
+            _rack, range_ = self._create_rack(name, slot_count)
+            self.assertEqual(range_.address_range, expected_base, f"{name} (slot_count={slot_count})")
+
+        # Without the floor, this replay reproduces 1 of 21 bases — and the
+        # one that survives is CONTROL, purely because it is created first:
+        # the first free block above the DHCP /24 starts at 10.200.1.0 no
+        # matter what size it is, so its *base* matches production even
+        # though the block itself would be a /30. Every rack after it would
+        # size its own, smaller block instead, and every later base would
+        # drift off the production offsets as a result.
+        self.assertEqual(prefix_length_for_capacity(2), 27)
+
+        # SHURE (offset 1280 = 10.200.5.0) and CONSOLES (offset 1536 =
+        # 10.200.6.0) sit behind deliberate reserved gaps — a first-fit
+        # suggester never leaves a gap, so those two must be entered by hand
+        # (ADR 0001 working as intended, not a shortfall of the floor). The
+        # 20th rack must keep packing sequentially rather than jumping to
+        # either gap.
+        _rack, twentieth = self._create_rack("Twentieth Rack", 3)
+        self.assertEqual(twentieth.address_range, "10.200.3.96/27")
