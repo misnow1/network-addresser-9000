@@ -78,6 +78,21 @@ class PortAddressing(models.TextChoices):
     DHCP = "dhcp", "DHCP"
 
 
+class SwitchAddressing(models.TextChoices):
+    """Creation-time choice of whether a switch's VLAN addresses
+    materialize (ADR 0016).
+
+    Not a reuse of ``PortAddressing``: ``NetworkSwitchAddress`` has no
+    ``is_dhcp`` field, so there's nothing for a ``DHCP`` value to
+    represent. ``MANUAL`` means "I will add addresses myself," not "this
+    switch has no addresses" — transient, never stored, same reasoning as
+    ``PortAddressing`` (see ``NetworkSwitch.address_materialization``).
+    """
+
+    STATIC = "static", "Static"
+    MANUAL = "manual", "Manual"
+
+
 class PortMode(models.TextChoices):
     """Switch port L2 mode — shared by switch Type Ports and instance ports."""
 
@@ -2070,6 +2085,14 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
     rack_slot = models.PositiveIntegerField(null=True, blank=True, validators=[MinValueValidator(1)])
     dhcp_server_enabled = models.BooleanField(default=False)
 
+    #: Class-level default for the ``address_materialization`` property
+    #: below — never a plain class attribute, since Django's
+    #: ``Model.__init__`` only accepts unknown kwargs
+    #: (``objects.create(address_materialization=...)``) when the name is
+    #: a field or a property (ADR 0016, mirroring ADR 0013's
+    #: ``NetworkDevice._port_addressing``/``port_addressing``).
+    _address_materialization: str = SwitchAddressing.STATIC
+
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=["rack", "rack_slot"], name="unique_switch_rack_slot"),
@@ -2113,6 +2136,7 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
             )
             if is_new:
                 self._materialize_ports()
+                self._materialize_addresses()
 
     def clean(self) -> None:
         super().clean()
@@ -2120,10 +2144,109 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
             switch_type = _get_related(self, "switch_type")
             if switch_type is not None and switch_type.pk is not None:
                 _validate_switch_type_port_profile(switch_type)
+            # Departure from ADR 0016, recorded there: the ADR declines this
+            # pre-flight, reasoning that a collision is the only remaining
+            # failure and _validate_static_address() already reports those
+            # clearly. That's an argument about message quality, and it
+            # misses that Django's admin calls save_model() — and therefore
+            # save(), and therefore _materialize_addresses() — *after* form
+            # validation has already passed. A ValidationError raised from
+            # inside save() has no form left to attach to; without a
+            # clean()-time check, an Editor who hits a collision creating a
+            # switch would get a 500, not a form error (the same failure
+            # mode test_admin_add_post_address_collision_renders_form_error_not_500
+            # exists to prevent on the device side).
+            if self._materializes_addresses():
+                self._check_address_materialization_possible()
         else:
             _check_locked_fields_unchanged(
                 NetworkSwitch, self.pk, {"switch_type": self.switch_type_id}, update_fields=None
             )
+
+    @property
+    def address_materialization(self) -> str:
+        """Creation-time-only choice of whether this switch's VLAN
+        addresses materialize (ADR 0016). Never stored — the materialized
+        ``NetworkSwitchAddress`` rows are the record of what was chosen;
+        setting this after creation has no effect since
+        ``_materialize_addresses()`` only runs once.
+        """
+        return self._address_materialization
+
+    @address_materialization.setter
+    def address_materialization(self, value: str) -> None:
+        if value not in SwitchAddressing.values:
+            raise ValidationError(
+                f"{value!r} is not a valid address_materialization — must be one of "
+                f"{SwitchAddressing.values}."
+            )
+        self._address_materialization = value
+
+    def _materializes_addresses(self) -> bool:
+        """Whether this (not-yet-materialized) switch will get VLAN
+        addresses — only when racked (unracked is spare pool, DHCP-
+        configured by definition per CONTEXT.md) and the static choice is
+        in effect (ADR 0016).
+        """
+        return self.rack is not None and self.address_materialization == SwitchAddressing.STATIC
+
+    def _check_address_materialization_possible(self) -> None:
+        """Pre-flight over ``self.rack``'s ``RackVlanRange`` rows for
+        whether address materialization can succeed — pure, needs no
+        switch pk, so it can run from both ``clean()`` (admin form errors)
+        and the top of ``_materialize_addresses()`` (the
+        ``objects.create()`` path, which never calls ``clean()``).
+
+        Unlike the device side, a missing range is not a failure here —
+        the rack's ranges *are* the VLAN list (ADR 0016's trade-off
+        section), so an empty list is trivially satisfied. The only
+        failure this checks for is a collision on a range that does exist.
+        """
+        if self.rack is None:
+            return  # nothing to check — mirrors _materializes_addresses()'s own guard
+        for rack_range in self.rack.vlan_ranges.select_related("vlan").order_by("vlan__vlan_id"):
+            address = _suggest_rack_slot_address(self.rack, self.rack_slot, rack_range.vlan_id)
+            if address is None:
+                continue  # rack_range.vlan itself has no usable range; nothing to validate
+            try:
+                _validate_static_address(
+                    address,
+                    rack_range.vlan,
+                    self.rack,
+                    self.rack_slot,
+                    exclude_switch_address_pk=None,
+                    exclude_device_port_pk=None,
+                )
+            except ValidationError as exc:
+                # _validate_static_address() raises keyed on "address" — the
+                # right shape for NetworkSwitchAddress.clean() (which has
+                # that field), but this call site is NetworkSwitch.clean(),
+                # which doesn't. A dict-keyed ValidationError for a
+                # nonexistent form field crashes Django's admin
+                # add_error() with a raw ValueError instead of rendering a
+                # form error, so re-raise as a plain, non-field error here
+                # (copied from NetworkDevice._check_static_materialization_
+                # possible()).
+                raise ValidationError(exc.messages) from exc
+
+    def _materialize_addresses(self) -> None:
+        """One-time creation of one ``NetworkSwitchAddress`` per
+        ``RackVlanRange`` on this switch's rack (ADR 0016), each filled by
+        the existing suggestion path. Runs inside the same transaction as
+        this switch's insert (see ``save()``), so any failure here rolls
+        back the switch and every address materialized before it.
+
+        A rack with no ranges — or an unracked switch, or the ``MANUAL``
+        choice — simply produces no addresses; that is not an error (see
+        ``_check_address_materialization_possible()``).
+        """
+        if not self._materializes_addresses() or self.rack is None:
+            return
+        self._check_address_materialization_possible()
+        for rack_range in self.rack.vlan_ranges.select_related("vlan").order_by("vlan__vlan_id"):
+            address = NetworkSwitchAddress(switch=self, vlan=rack_range.vlan, created_by=self.created_by)
+            address.full_clean()
+            address.save()
 
     def _materialize_ports(self) -> None:
         """One-time copy of ``switch_type``'s Network Switch Type Ports into
