@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 db.sqlite3
 .env
+.env.deployment
 *.egg-info/
 .mypy_cache/
 .ruff_cache/
