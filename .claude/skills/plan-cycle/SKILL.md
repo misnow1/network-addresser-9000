@@ -236,8 +236,15 @@ Report to Mike:
 - the commits produced, in order;
 - anything escalated, skipped, or left undone.
 
-Then stop. Mike runs `gh pr create` and merges. `.github/workflows/codex-review.yml`
-gives the pushed branch a third opinion in CI.
+Then stop. Mike runs `gh pr create` and merges.
+
+**There is no CI review behind this chain.** `.github/workflows/codex-review.yml` was
+removed when this skill landed: it had been disabled since 2026-07-25 because reviews
+were already being run locally, and stage 4 now does that job automatically on every
+run. So the stage-4 review is the only independent look the code gets — never skip it
+on the assumption that CI will catch things, and never report a green PR as a second
+opinion. If CI review is ever wanted back, it was added in `1ad76aa` and can be
+restored from there.
 
 ## Notes
 
