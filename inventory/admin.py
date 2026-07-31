@@ -30,6 +30,7 @@ from .models import (
     Rack,
     RackTemplate,
     RackVlanRange,
+    SwitchAddressing,
     SwitchPortVlanProfile,
 )
 
@@ -143,6 +144,24 @@ class RackVlanRangeInline(admin.TabularInline):
 class NetworkSwitchAddressInline(admin.TabularInline):
     model = NetworkSwitchAddress
     extra = 0
+
+    def has_add_permission(self, request: HttpRequest, obj: Any = None) -> bool:
+        # Blocked on the Add page (obj is None) only. ADR 0016's
+        # materialization runs from NetworkSwitch.save() — i.e. from
+        # save_model(), which the admin calls *before* save_related() saves
+        # this inline's formset. Without this, an operator who creates a
+        # switch and types an address inline on the same Add page would get
+        # both a materialized row and their hand-entered row for the same
+        # VLAN — an IntegrityError on unique_switch_vlan_address (a 500,
+        # not a form error), and materialization can't see the inline rows
+        # to avoid this by inspection because they don't exist yet when it
+        # runs. Matches how NetworkDevicePortInline already behaves (`:550`)
+        # — MANUAL then means "create the switch, then add its addresses on
+        # the change page," a two-step; the change page keeps full add/
+        # edit/delete, so nothing becomes impossible.
+        if obj is None:
+            return False
+        return super().has_add_permission(request, obj)
 
 
 class _PortCountFormSet(BaseInlineFormSet):
@@ -352,6 +371,42 @@ class NetworkDeviceAddForm(forms.ModelForm):
         # does leave the key genuinely absent). Must run before
         # super()._post_clean(), which is what calls self.instance.full_clean().
         self.instance.port_addressing = self.cleaned_data.get("port_addressing") or PortAddressing.STATIC
+        super()._post_clean()  # type: ignore[misc]
+
+
+class NetworkSwitchAddForm(forms.ModelForm):
+    """Carries the creation-time-only ``address_materialization`` choice
+    (ADR 0016) — not a model field, so it can't be expressed via
+    ``Meta.fields`` alone. Used only for the add view
+    (``NetworkSwitchAdmin.get_form()``); the choice has no effect after
+    creation, so the change form omits it entirely rather than showing a
+    field that does nothing. See ``NetworkDeviceAddForm`` — same shape.
+    """
+
+    address_materialization = forms.ChoiceField(
+        choices=SwitchAddressing.choices,
+        initial=SwitchAddressing.STATIC,
+        required=False,
+        help_text=(
+            "Only applies at creation. Ignored (no addresses materialize) for an unracked "
+            "switch. MANUAL means add this switch's addresses yourself on the change page."
+        ),
+    )
+
+    class Meta:
+        model = NetworkSwitch
+        exclude: list[str] = []
+
+    def _post_clean(self) -> None:
+        # `or`, not `.get(..., default)` alone — see NetworkDeviceAddForm's
+        # identical comment: required=False means an omitted/blank
+        # submission cleans to "" (present in cleaned_data, not absent),
+        # and a bare `.get()` default only covers a missing key. Must run
+        # before super()._post_clean(), which is what calls
+        # self.instance.full_clean().
+        self.instance.address_materialization = (
+            self.cleaned_data.get("address_materialization") or SwitchAddressing.STATIC
+        )
         super()._post_clean()  # type: ignore[misc]
 
 
@@ -704,6 +759,14 @@ class NetworkSwitchAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
         if obj is not None:
             return ["switch_type"]
         return []
+
+    def get_form(self, request: HttpRequest, obj: Any = None, change: bool = False, **kwargs: Any) -> Any:
+        # address_materialization (ADR 0016) only makes sense at creation —
+        # the change form uses the default ModelForm, which has no such
+        # field.
+        if obj is None:
+            kwargs["form"] = NetworkSwitchAddForm
+        return super().get_form(request, obj, change=change, **kwargs)
 
     def delete_view(
         self, request: HttpRequest, object_id: str, extra_context: dict[str, object] | None = None

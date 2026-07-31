@@ -31,6 +31,7 @@ from .admin import (
     NetworkDeviceAdmin,
     NetworkDevicePortInline,
     NetworkDeviceTypeAdmin,
+    NetworkSwitchAddressInline,
     NetworkSwitchAdmin,
     NetworkSwitchPortForm,
     NetworkSwitchPortInline,
@@ -64,6 +65,7 @@ from .models import (
     RackTemplate,
     RackTemplateVlan,
     RackVlanRange,
+    SwitchAddressing,
     SwitchPortVlanProfile,
     SwitchPortVlanProfileAllowedVlan,
     default_switch_port_vlan_profile,
@@ -473,9 +475,18 @@ class InlineFormsetSaveTests(TestCase):
 
 class UnsavedParentInlineSuggestionTests(TestCase):
     """Suggestions must work when adding a switch/device and its address
-    inline together on one admin "Add" page — not just when editing an
-    already-saved parent. See test above for the equivalent RackVlanRange
-    case and its explanation of why this is otherwise broken.
+    inline together against an unsaved parent instance — not just when
+    editing an already-saved one. See test above for the equivalent
+    RackVlanRange case and its explanation of why this is otherwise broken.
+
+    These build the formset directly rather than going through the admin,
+    so they exercise the suggestion path regardless of admin permissions.
+    For the switch case, that's no longer "one admin Add page" in practice:
+    ADR 0016's ``NetworkSwitchAddressInline.has_add_permission()`` blocks
+    adding an address inline on the switch's actual Add page (materialization
+    already claims each rack range's VLAN there, and adding one by hand too
+    would collide) — MANUAL creation followed by a two-step add on the
+    change page is how an operator does this for real.
     """
 
     def setUp(self) -> None:
@@ -951,7 +962,15 @@ class RackVlanRangeSuggestionTests(TestCase):
     def test_editing_range_to_exclude_existing_switch_address_raises(self) -> None:
         RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.200.0.0/27")
         switch_type = _make_switch_type()
-        switch = NetworkSwitch.objects.create(switch_type=switch_type, rack=self.rack, rack_slot=1)
+        # MANUAL — the default STATIC choice would already materialize this
+        # VLAN's address at creation (ADR 0016), colliding with the explicit
+        # create() below on unique_switch_vlan_address.
+        switch = NetworkSwitch.objects.create(  # type: ignore[misc]
+            switch_type=switch_type,
+            rack=self.rack,
+            rack_slot=1,
+            address_materialization=SwitchAddressing.MANUAL,
+        )
         NetworkSwitchAddress.objects.create(switch=switch, vlan=self.vlan, address="10.200.0.1")
         range_ = RackVlanRange.objects.get(rack=self.rack, vlan=self.vlan)
         range_.address_range = "10.200.0.32/27"
@@ -1068,7 +1087,17 @@ class EquipmentMoveRevalidationTests(TestCase):
         self.device_type = _make_device_type()
 
     def test_unracking_switch_with_existing_address_raises(self) -> None:
-        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack_a, rack_slot=1)
+        # MANUAL: this test is about re-validating an already-existing
+        # address after the switch moves, not about materialization — the
+        # default STATIC choice would materialize this same VLAN's address
+        # itself, and the explicit create() below would then collide with
+        # it on unique_switch_vlan_address (ADR 0016).
+        switch = NetworkSwitch.objects.create(  # type: ignore[misc]
+            switch_type=self.switch_type,
+            rack=self.rack_a,
+            rack_slot=1,
+            address_materialization=SwitchAddressing.MANUAL,
+        )
         NetworkSwitchAddress.objects.create(switch=switch, vlan=self.vlan, address="10.200.1.1")
         switch.rack = None
         switch.rack_slot = None
@@ -1076,7 +1105,13 @@ class EquipmentMoveRevalidationTests(TestCase):
             switch.full_clean()
 
     def test_moving_switch_to_another_racks_range_raises(self) -> None:
-        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack_a, rack_slot=1)
+        # MANUAL — see test above.
+        switch = NetworkSwitch.objects.create(  # type: ignore[misc]
+            switch_type=self.switch_type,
+            rack=self.rack_a,
+            rack_slot=1,
+            address_materialization=SwitchAddressing.MANUAL,
+        )
         NetworkSwitchAddress.objects.create(switch=switch, vlan=self.vlan, address="10.200.1.1")
         switch.rack = self.rack_b
         switch.rack_slot = 1
@@ -1115,7 +1150,16 @@ class RackSlotAddressSuggestionTests(TestCase):
         self.device_type = _make_device_type()
 
     def test_switch_address_suggested_when_racked(self) -> None:
-        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=1)
+        # MANUAL — this test builds its own NetworkSwitchAddress by hand to
+        # exercise the suggestion path directly; the default STATIC choice
+        # would already have materialized this VLAN's address at creation
+        # (ADR 0016), colliding with it on unique_switch_vlan_address.
+        switch = NetworkSwitch.objects.create(  # type: ignore[misc]
+            switch_type=self.switch_type,
+            rack=self.rack,
+            rack_slot=1,
+            address_materialization=SwitchAddressing.MANUAL,
+        )
         address = NetworkSwitchAddress(switch=switch, vlan=self.vlan)
         address.full_clean()
         self.assertEqual(address.address, "10.200.1.1")
@@ -1200,15 +1244,36 @@ class RackSlotAddressSuggestionTests(TestCase):
             port.full_clean()
 
     def test_switch_addresses_cannot_collide_on_same_vlan(self) -> None:
-        switch_a = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=1)
-        switch_b = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=2)
+        # MANUAL on both — the default STATIC choice would materialize this
+        # VLAN's address on each switch at creation (ADR 0016), so the
+        # explicit create()/conflicting-instance below would collide on
+        # unique_switch_vlan_address (switch+vlan) instead of exercising
+        # the (vlan, address) collision this test is actually about.
+        switch_a = NetworkSwitch.objects.create(  # type: ignore[misc]
+            switch_type=self.switch_type,
+            rack=self.rack,
+            rack_slot=1,
+            address_materialization=SwitchAddressing.MANUAL,
+        )
+        switch_b = NetworkSwitch.objects.create(  # type: ignore[misc]
+            switch_type=self.switch_type,
+            rack=self.rack,
+            rack_slot=2,
+            address_materialization=SwitchAddressing.MANUAL,
+        )
         NetworkSwitchAddress.objects.create(switch=switch_a, vlan=self.vlan, address="10.200.1.1")
         conflicting = NetworkSwitchAddress(switch=switch_b, vlan=self.vlan, address="10.200.1.1")
         with self.assertRaises(ValidationError):
             conflicting.full_clean()
 
     def test_device_port_address_cannot_collide_with_switch_address_on_same_vlan(self) -> None:
-        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=1)
+        # MANUAL — see test above.
+        switch = NetworkSwitch.objects.create(  # type: ignore[misc]
+            switch_type=self.switch_type,
+            rack=self.rack,
+            rack_slot=1,
+            address_materialization=SwitchAddressing.MANUAL,
+        )
         NetworkSwitchAddress.objects.create(switch=switch, vlan=self.vlan, address="10.200.1.1")
         device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=2)
         conflicting = NetworkDevicePort(
@@ -1909,9 +1974,19 @@ class StaticPortAddressingTests(TestCase):
             device_type=device_type, description="Port A", port_type=PortType.GBE_RJ45, vlan=self.vlan_a
         )
         # Slot 2 on vlan_a suggests 10.200.1.2 — occupy it first via a switch
-        # address so the second device's suggestion collides.
+        # address so the second device's suggestion collides. MANUAL: the
+        # default STATIC choice would materialize the switch's own
+        # (different) vlan_a address at slot 3 (10.200.1.3), which would
+        # collide with the explicit create() below on
+        # unique_switch_vlan_address before this test gets to the
+        # collision it's actually about.
         switch_type = _make_switch_type()
-        switch = NetworkSwitch.objects.create(switch_type=switch_type, rack=self.rack, rack_slot=3)
+        switch = NetworkSwitch.objects.create(  # type: ignore[misc]
+            switch_type=switch_type,
+            rack=self.rack,
+            rack_slot=3,
+            address_materialization=SwitchAddressing.MANUAL,
+        )
         NetworkSwitchAddress.objects.create(switch=switch, vlan=self.vlan_a, address="10.200.1.2")
         with self.assertRaises(ValidationError):
             NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=2)
@@ -2031,9 +2106,18 @@ class StaticPortAddressingTests(TestCase):
         admin_user.groups.add(Group.objects.get(name="Admin"))
         self.client.login(username="adminrole3", password="testpass123")
         # Slot 2 on vlan_a suggests 10.200.1.2 — occupy it first via a switch
-        # address so the device's suggested address collides.
+        # address so the device's suggested address collides. MANUAL — see
+        # the identical setup in test_collision_with_existing_address_
+        # refused_atomically for why the default STATIC choice would
+        # collide with the explicit create() below before this test gets
+        # to the collision it's actually about.
         switch_type = _make_switch_type()
-        switch = NetworkSwitch.objects.create(switch_type=switch_type, rack=self.rack, rack_slot=3)
+        switch = NetworkSwitch.objects.create(  # type: ignore[misc]
+            switch_type=switch_type,
+            rack=self.rack,
+            rack_slot=3,
+            address_materialization=SwitchAddressing.MANUAL,
+        )
         NetworkSwitchAddress.objects.create(switch=switch, vlan=self.vlan_a, address="10.200.1.2")
         device_type = NetworkDeviceType.objects.create(
             manufacturer="Martin Audio", model="IK-42", name="Collision Admin Type", port_count=1
@@ -2075,6 +2159,241 @@ class StaticPortAddressingTests(TestCase):
         request = RequestFactory().get(f"/admin/inventory/networkdevice/{device.pk}/change/")
         form_class = admin.get_form(request, device)
         self.assertNotIn("port_addressing", form_class.base_fields)
+
+
+class SwitchAddressMaterializationTests(TestCase):
+    """ADR 0016: switch creation materializes one NetworkSwitchAddress per
+    rack VLAN range (rack-range-base + rack-slot, ``suggest_slot_address()``
+    reused as-is — see ``NetworkSwitch._materialize_addresses()``), mirroring
+    ADR 0013's device port path.
+    """
+
+    def setUp(self) -> None:
+        self.vlan_a = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.vlan_b = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=4)
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan_a, address_range="10.200.1.0/27")
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan_b, address_range="10.201.1.0/27")
+        self.switch_type = _make_switch_type()
+
+    def test_default_materializes_one_address_per_rack_range(self) -> None:
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=2)
+        addresses = {a.vlan.name: a.address for a in switch.addresses.select_related("vlan")}
+        self.assertEqual(addresses, {"Control": "10.200.1.2", "Dante Primary": "10.201.1.2"})
+
+    def test_manual_choice_materializes_none(self) -> None:
+        switch = NetworkSwitch.objects.create(  # type: ignore[misc]
+            switch_type=self.switch_type,
+            rack=self.rack,
+            rack_slot=2,
+            address_materialization=SwitchAddressing.MANUAL,
+        )
+        self.assertFalse(switch.addresses.exists())
+
+    def test_unracked_switch_materializes_none_under_either_choice(self) -> None:
+        for choice in SwitchAddressing.values:
+            switch = NetworkSwitch.objects.create(  # type: ignore[misc]
+                switch_type=self.switch_type, address_materialization=choice
+            )
+            self.assertFalse(switch.addresses.exists())
+
+    def test_rack_with_no_ranges_produces_no_addresses_and_no_error(self) -> None:
+        empty_rack = Rack.objects.create(name="Empty Rack", slot_count=4)
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=empty_rack, rack_slot=1)
+        self.assertFalse(switch.addresses.exists())
+
+    def test_collision_rolls_back_switch_and_addresses_atomically(self) -> None:
+        # Occupies slot 2's Dante Primary address ahead of time. vlan_a
+        # (200) sorts before vlan_b (201), so materializing a slot-2 switch
+        # succeeds on Control first, then collides on Dante Primary —
+        # proving the switch *and* the Control address materialized just
+        # before the collision both get rolled back, not just that the
+        # colliding address itself is refused.
+        occupying_switch = NetworkSwitch.objects.create(  # type: ignore[misc]
+            switch_type=self.switch_type,
+            rack=self.rack,
+            rack_slot=3,
+            address_materialization=SwitchAddressing.MANUAL,
+        )
+        NetworkSwitchAddress.objects.create(switch=occupying_switch, vlan=self.vlan_b, address="10.201.1.2")
+        switch_count_before = NetworkSwitch.objects.count()
+        address_count_before = NetworkSwitchAddress.objects.count()
+        with self.assertRaises(ValidationError):
+            NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=2)
+        self.assertEqual(NetworkSwitch.objects.count(), switch_count_before)
+        self.assertEqual(NetworkSwitchAddress.objects.count(), address_count_before)
+
+    def test_addresses_materialized_in_vlan_id_order(self) -> None:
+        # vlan_high is created (and ranged) first, so it gets the lower pk —
+        # but its vlan_id (250) sorts *after* vlan_low's (100). The
+        # assertion below can only pass if materialization actually orders
+        # by vlan__vlan_id (decision 5) rather than by RackVlanRange
+        # creation order or VLAN pk.
+        vlan_high = VLAN.objects.create(name="High ID", vlan_id=250, subnet="10.250.0.0/21")
+        vlan_low = VLAN.objects.create(name="Low ID", vlan_id=100, subnet="10.100.0.0/21")
+        rack = Rack.objects.create(name="Order Rack", slot_count=4)
+        RackVlanRange.objects.create(rack=rack, vlan=vlan_high, address_range="10.250.1.0/27")
+        RackVlanRange.objects.create(rack=rack, vlan=vlan_low, address_range="10.100.1.0/27")
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=rack, rack_slot=1)
+        addresses = list(NetworkSwitchAddress.objects.filter(switch=switch).order_by("pk"))
+        self.assertEqual([a.vlan_id for a in addresses], [vlan_low.pk, vlan_high.pk])
+
+    def test_default_address_materialization_is_static(self) -> None:
+        switch = NetworkSwitch(switch_type=self.switch_type)
+        self.assertEqual(switch.address_materialization, SwitchAddressing.STATIC)
+
+    def test_address_materialization_accepted_as_create_kwarg(self) -> None:
+        switch = NetworkSwitch.objects.create(  # type: ignore[misc]
+            switch_type=self.switch_type, address_materialization=SwitchAddressing.MANUAL
+        )
+        self.assertEqual(switch.address_materialization, SwitchAddressing.MANUAL)
+
+    def test_invalid_address_materialization_rejected_not_silently_static(self) -> None:
+        with self.assertRaises(ValidationError):
+            NetworkSwitch.objects.create(  # type: ignore[misc]
+                switch_type=self.switch_type, address_materialization="bogus"
+            )
+
+    def test_admin_add_post_with_static_materializes_static(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        admin_user = User.objects.create_user("adminswitch1", password="testpass123", is_staff=True)
+        admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="adminswitch1", password="testpass123")
+
+        response = self.client.post(
+            "/admin/inventory/networkswitch/add/",
+            {
+                "switch_type": self.switch_type.pk,
+                "hostname": "sw1",
+                "serial_number": "",
+                "rack": self.rack.pk,
+                "rack_slot": "2",
+                "address_materialization": SwitchAddressing.STATIC,
+                "addresses-TOTAL_FORMS": "0",
+                "addresses-INITIAL_FORMS": "0",
+                "addresses-MIN_NUM_FORMS": "0",
+                "addresses-MAX_NUM_FORMS": "1000",
+                "ports-TOTAL_FORMS": "0",
+                "ports-INITIAL_FORMS": "0",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+            },
+        )
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        switch = NetworkSwitch.objects.get(hostname="sw1")
+        addresses = {a.vlan.name: a.address for a in switch.addresses.select_related("vlan")}
+        self.assertEqual(addresses, {"Control": "10.200.1.2", "Dante Primary": "10.201.1.2"})
+
+    def test_admin_add_post_address_collision_renders_form_error_not_500(self) -> None:
+        """Switch-side twin of ``StaticPortAddressingTests.
+        test_admin_add_post_address_collision_renders_form_error_not_500``
+        — the whole justification for ADR 0016's clean()-time pre-flight
+        departure. Left unconverted, Django's ``add_error()`` raises a raw
+        ``ValueError`` for a nonexistent form field instead of rendering a
+        validation message — an ordinary Editor creating a switch that
+        collides with an existing address would 500, not see a form error.
+        """
+        call_command("sync_roles", stdout=io.StringIO())
+        admin_user = User.objects.create_user("adminswitch2", password="testpass123", is_staff=True)
+        admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="adminswitch2", password="testpass123")
+        # MANUAL — occupies slot 2's Control address ahead of time so the
+        # new switch's own materialization attempt collides on it.
+        occupying_switch = NetworkSwitch.objects.create(  # type: ignore[misc]
+            switch_type=self.switch_type,
+            rack=self.rack,
+            rack_slot=3,
+            address_materialization=SwitchAddressing.MANUAL,
+        )
+        NetworkSwitchAddress.objects.create(switch=occupying_switch, vlan=self.vlan_a, address="10.200.1.2")
+
+        response = self.client.post(
+            "/admin/inventory/networkswitch/add/",
+            {
+                "switch_type": self.switch_type.pk,
+                "hostname": "sw2",
+                "serial_number": "",
+                "rack": self.rack.pk,
+                "rack_slot": "2",
+                "address_materialization": SwitchAddressing.STATIC,
+                "addresses-TOTAL_FORMS": "0",
+                "addresses-INITIAL_FORMS": "0",
+                "addresses-MIN_NUM_FORMS": "0",
+                "addresses-MAX_NUM_FORMS": "1000",
+                "ports-TOTAL_FORMS": "0",
+                "ports-INITIAL_FORMS": "0",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+            },
+        )
+        self.assertEqual(response.status_code, 200)  # re-renders with a form error, not a 500
+        self.assertContains(response, "10.200.1.2")
+        self.assertFalse(NetworkSwitch.objects.filter(hostname="sw2").exists())
+
+    def test_admin_add_post_with_inline_address_row_is_silently_ignored(self) -> None:
+        """ADR 0016's second departure: ``NetworkSwitchAddressInline.
+        has_add_permission()`` returns ``False`` when ``obj is None``.
+        Without it, an operator who fills in this inline for a VLAN
+        materialization already claims would hit an ``IntegrityError`` on
+        ``unique_switch_vlan_address`` once the switch saves (materialization
+        runs from ``save_model()``, *before* ``save_related()`` saves this
+        inline's formset, and can't see the not-yet-existing inline row to
+        avoid the collision by inspection). Blocking the add doesn't error —
+        Django's ``BaseInlineFormSet.has_changed()`` treats a submitted new
+        row as unchanged when ``has_add_permission`` is false, so it's
+        silently dropped and the switch saves normally.
+        """
+        call_command("sync_roles", stdout=io.StringIO())
+        admin_user = User.objects.create_user("adminswitch3", password="testpass123", is_staff=True)
+        admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="adminswitch3", password="testpass123")
+
+        response = self.client.post(
+            "/admin/inventory/networkswitch/add/",
+            {
+                "switch_type": self.switch_type.pk,
+                "hostname": "sw3",
+                "serial_number": "",
+                "rack": self.rack.pk,
+                "rack_slot": "2",
+                "address_materialization": SwitchAddressing.STATIC,
+                "addresses-TOTAL_FORMS": "1",
+                "addresses-INITIAL_FORMS": "0",
+                "addresses-MIN_NUM_FORMS": "0",
+                "addresses-MAX_NUM_FORMS": "1000",
+                "addresses-0-vlan": str(self.vlan_a.pk),
+                "addresses-0-address": "10.200.1.99",
+                "ports-TOTAL_FORMS": "0",
+                "ports-INITIAL_FORMS": "0",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+            },
+        )
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        switch = NetworkSwitch.objects.get(hostname="sw3")
+        addresses = {a.vlan.name: a.address for a in switch.addresses.select_related("vlan")}
+        self.assertEqual(addresses, {"Control": "10.200.1.2", "Dante Primary": "10.201.1.2"})
+
+    def test_admin_add_form_shows_field_preselected_static(self) -> None:
+        admin = NetworkSwitchAdmin(NetworkSwitch, AdminSite())
+        request = RequestFactory().get("/admin/inventory/networkswitch/add/")
+        form_class = admin.get_form(request, None)
+        self.assertIn("address_materialization", form_class.base_fields)
+        self.assertEqual(form_class.base_fields["address_materialization"].initial, SwitchAddressing.STATIC)
+
+    def test_admin_change_form_omits_field(self) -> None:
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type)
+        admin = NetworkSwitchAdmin(NetworkSwitch, AdminSite())
+        request = RequestFactory().get(f"/admin/inventory/networkswitch/{switch.pk}/change/")
+        form_class = admin.get_form(request, switch)
+        self.assertNotIn("address_materialization", form_class.base_fields)
+
+    def test_address_inline_add_blocked_on_add_page(self) -> None:
+        inline = NetworkSwitchAddressInline(NetworkSwitch, AdminSite())
+        request = RequestFactory().get("/admin/inventory/networkswitch/add/")
+        self.assertFalse(inline.has_add_permission(request, None))
 
 
 class PortProfileAtomicityTests(TestCase):
@@ -3231,7 +3550,15 @@ class ReviewCouncilRegressionTests(TestCase):
 
     def test_clearing_subnet_blocked_by_existing_switch_address(self) -> None:
         RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.200.1.0/27")
-        switch = NetworkSwitch.objects.create(switch_type=_make_switch_type(), rack=self.rack, rack_slot=1)
+        # MANUAL — the default STATIC choice would already materialize this
+        # VLAN's address at creation (ADR 0016), colliding with the explicit
+        # create() below on unique_switch_vlan_address.
+        switch = NetworkSwitch.objects.create(  # type: ignore[misc]
+            switch_type=_make_switch_type(),
+            rack=self.rack,
+            rack_slot=1,
+            address_materialization=SwitchAddressing.MANUAL,
+        )
         NetworkSwitchAddress.objects.create(switch=switch, vlan=self.vlan, address="10.200.1.1")
         self.vlan.subnet = ""
         self.vlan.default_gateway = None
