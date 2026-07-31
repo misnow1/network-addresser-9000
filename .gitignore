@@ -14,8 +14,13 @@ staticfiles/
 # Local testing scratchpad — drained into issues/ROADMAP, never committed
 TESTING-NOTES.md
 
-# claude scratch space
-.claude
+# Transient review notes from the plan-cycle chain — the durable record is the
+# plan's "Review response" table and the fix commits
+REVIEW-*.md
+
+# claude scratch space — except the committed project skills
+.claude/*
+!.claude/skills/
 
 # Production data for reference
 prod/

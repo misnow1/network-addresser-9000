@@ -18,7 +18,7 @@ review-council pass — check which model you are (your system prompt states it)
   a weaker model.
 - **Already Opus-class?** Say nothing. Just plan.
 
-The planning phase should use the /grill-me skill to thoroughly question the plan
+The planning phase should use the /grilling skill to thoroughly question the plan
 and make sure all ambiguous items are resolved.
 
 **When planning ends and implementation begins** — right after plan approval /
@@ -37,3 +37,26 @@ Guard rails so this stays useful instead of becoming noise:
 - `/model opus` and `/model sonnet` set the model directly; bare `/model` opens
   the picker. `/fast` is an Opus **speed** toggle, not a downgrade — it does not
   satisfy "switch to Sonnet".
+- **The Sonnet half applies only to hand implementation.** When `/plan-cycle`
+  drives the build (below), it spawns the implementer as a Sonnet subagent and
+  the orchestrating session should *stay* on Opus — folding review notes into a
+  plan is planning work. Don't fire the reminder in that case.
+
+## Plan-cycle automation
+
+`/plan-cycle` (`.claude/skills/plan-cycle/`) runs the whole ritual hands-off after
+plan approval: an independent `codex` review of the plan → fold the notes into
+`PLAN-<topic>.md` as a revision with a `## Review response` table → implement on a
+Sonnet subagent → an independent `codex` review of the code → the same subagent
+fixes or argues back against each finding → commits on the branch, then stops.
+Mike opens the PR.
+
+It comes back to Mike mid-chain in two situations. It **escalates** when a review
+finding contradicts a committed ADR (or needs a new one), changes scope, or attacks
+a decision Mike made deliberately — everything else is folded in without asking and
+summarised in the final report. It **aborts** on operational failure: codex missing,
+or an implementer that can't get the suite green.
+
+That ritual — plan reviewed independently before *and* after implementation,
+findings folded in rather than defended — is this project's convention whether or
+not the skill is driving it.
