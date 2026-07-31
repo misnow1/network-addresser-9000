@@ -32,8 +32,17 @@ def required_block_size(slot_count: int) -> int:
     broadcast address, per DESIGN.md's guidance to avoid handing devices
     addresses that read as reserved. So the block needs slots 1..slot_count
     to sit strictly below its top index: ``slot_count + 2`` addresses.
+
+    That arithmetic is floored at 32 (a ``/27``), production's uniform
+    per-rack increment regardless of occupancy (ADR 0015) — racks holding
+    as few as one or two devices still get a full ``/27`` in production, and
+    without the floor this tool can reproduce almost none of the existing
+    addressing (see ADR 0015 for the replay numbers). The floor lives here,
+    at the one place all three call sites (the suggester, hand-entered-range
+    validation, and the ``slot_count``-growth guard) inherit it from, rather
+    than in each of them separately.
     """
-    return slot_count + 2
+    return max(slot_count + 2, 32)
 
 
 def prefix_length_for_capacity(slot_count: int) -> int:
