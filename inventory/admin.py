@@ -87,6 +87,13 @@ class AuditedModelAdminMixin:
         for instance in instances:
             if instance.pk is None:
                 instance.created_by = request.user
+            elif isinstance(instance, NetworkDevicePort):
+                # ADR 0017 / codex review finding 3 — see
+                # NetworkDevicePort.refresh_locked_offset_address()'s
+                # docstring for why this must run here (immediately before
+                # save, on every existing device-port row) rather than in
+                # the model itself.
+                instance.refresh_locked_offset_address()
             instance.save()
         formset.save_m2m()
 
