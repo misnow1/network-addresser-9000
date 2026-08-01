@@ -1,0 +1,478 @@
+"""Tests for the production-data importer and its verifier.
+
+These deliberately do **not** touch ``prod/`` — that directory is gitignored,
+real site data, and the whole point of this suite is to exercise the same
+*shapes* the real import hits (first-fit base reproduction, a manual-range
+rack, an SD12-shaped ``slot_offset`` device with its DMI-DANTE card, a
+secondary switch's derived profile, the duplicate-row collapse, and the
+three deliberate address drops) against small synthetic CSVs built here, on
+a VLAN numbering (130s) and rack names invented for this suite. Model/part
+names (``IK42``, ``LM26``, ``Cisco SG300-10MP``, ``mps-avio-...``) are
+reused as-is from `PLAN-prod-import.md`/`PROD-DATA-ANALYSIS.md` — those are
+product identifiers already committed to the repo, not addresses — but
+every IP address here is invented for this suite and appears nowhere in
+`prod/`.
+"""
+
+import csv
+import ipaddress
+import tempfile
+from pathlib import Path
+
+from django.core.management import call_command
+from django.core.management.base import CommandError
+from django.test import TestCase
+
+from .models import (
+    NetworkDevice,
+    NetworkDevicePort,
+    NetworkSwitch,
+    NetworkSwitchType,
+    Rack,
+    RackVlanRange,
+)
+
+# -- Synthetic VLAN/rack scheme -----------------------------------------------------
+
+FN_CONTROL = "Audio Control"
+FN_DANTE_PRIMARY = "Dante Primary"
+FN_DANTE_SECONDARY = "Dante Secondary"
+FN_AES67 = "AES67"
+
+#: (function, vlan_id, network_address, netmask)
+VLAN_TABLE = [
+    (FN_CONTROL, 130, "10.130.0.0", "255.255.248.0"),
+    (FN_DANTE_PRIMARY, 131, "10.131.0.0", "255.255.248.0"),
+    (FN_DANTE_SECONDARY, 132, "10.132.0.0", "255.255.248.0"),
+    (FN_AES67, 137, "10.137.0.0", "255.255.248.0"),
+]
+_NETWORK_BY_FUNCTION = {row[0]: row[2] for row in VLAN_TABLE}
+_VLAN_ID_BY_FUNCTION = {row[0]: row[1] for row in VLAN_TABLE}
+
+#: (rack name, offset) in ascending order — AMPRACK1/XE300-1/AVIO/W8LMTEST are
+#: template-allocated (first-fit); SHURE/CONSOLES are manual, mirroring
+#: PLAN-prod-import.md's own two manual-range racks by name.
+RACKS = [
+    ("AMPRACK1", 256),
+    ("XE300-1", 288),
+    ("AVIO", 320),
+    ("W8LMTEST", 352),
+    ("SHURE", 800),
+    ("CONSOLES", 864),
+]
+_OFFSET_BY_RACK = dict(RACKS)
+
+
+def addr(function: str, rack: str, slot: int) -> str:
+    """``base(function's VLAN) + rack's offset + slot`` — the same formula
+    the app implements, used here only to build fixture input, not to
+    check anything.
+    """
+    network = ipaddress.IPv4Network(f"{_NETWORK_BY_FUNCTION[function]}/21", strict=True)
+    return str(network.network_address + _OFFSET_BY_RACK[rack] + slot)
+
+
+# -- Switch Ports CSV tables ---------------------------------------------------------
+# Column shape: (description, port, native VLAN label, mode, allowed, port type, note)
+
+TABLE_SG300_3XAMP_PRIMARY = [
+    ("Amp 1 Control", "1", "130 (Control)", "Access", "", "1GbE Copper", ""),
+    ("Amp 2 Control", "2", "130 (Control)", "Access", "", "1GbE Copper", ""),
+    ("Amp 3 Control", "3", "130 (Control)", "Access", "", "1GbE Copper", ""),
+    ("Amp 1 Dante", "4", "131 (Dante Primary)", "Access", "", "1GbE Copper", ""),
+    ("Amp 2 Dante", "5", "131 (Dante Primary)", "Access", "", "1GbE Copper", ""),
+    ("Amp 3 Dante", "6", "131 (Dante Primary)", "Access", "", "1GbE Copper", ""),
+    ("Patch Panel 1", "7", "131 (Dante Primary)", "Trunk", "130, 132-137", "1GbE Copper", ""),
+    ("Patch Panel 2", "8", "131 (Dante Primary)", "Trunk", "130, 132-137", "1GbE Copper", ""),
+    ("Patch Panel 3", "9", "131 (Dante Primary)", "Trunk", "130, 132-137", "Combo Port (1GbE + SFP)", ""),
+    ("Patch Panel 4", "10", "131 (Dante Primary)", "Trunk", "130, 132-137", "Combo Port (1GbE + SFP)", ""),
+]
+TABLE_SG350_2XAMP_PRIMARY = [
+    ("Amp 1 Control", "1", "130 (Control)", "Access", "", "1GbE Copper", ""),
+    ("Amp 2 Control", "2", "130 (Control)", "Access", "", "1GbE Copper", ""),
+    ("Amp 1 Dante", "3", "131 (Dante Primary)", "Access", "", "1GbE Copper", ""),
+    ("Patch Panel 1", "4", "131 (Dante Primary)", "Trunk", "130, 132-137", "1GbE Copper", ""),
+]
+TABLE_SG300_DRIVE_PRIMARY = [
+    ("WAP", "1", "131 (Dante Primary)", "Access", "", "1GbE Copper", ""),
+    ("Patch Panel 1", "2", "131 (Dante Primary)", "Trunk", "130, 132-137", "1GbE Copper", ""),
+]
+TABLE_TLSG108E = [
+    ("Audio Trunk", "1", "131 (Dante Primary)", "Trunk", "130, 132-137", "1GbE Copper", ""),
+    ("Audio Trunk", "2", "131 (Dante Primary)", "Trunk", "130, 132-137", "1GbE Copper", ""),
+]
+TABLE_SG300_26P = [
+    ("Audio Control", "1", "130 (Control)", "Access", "", "1GbE Copper", ""),
+    ("Dante Primary", "2", "131 (Dante Primary)", "Access", "", "1GbE Copper", ""),
+    ("Audio Trunk", "3", "131 (Dante Primary)", "Trunk", "130, 132-137", "1GbE Copper", ""),
+]
+
+SWITCH_PORT_TABLES = [
+    ("Cisco SG300-10MP (For 3xAmp Rack Primary)", TABLE_SG300_3XAMP_PRIMARY),
+    ("Cisco SG350-10 (For 2xAmp Rack Primary)", TABLE_SG350_2XAMP_PRIMARY),
+    ("Cisco SG300-10MP (For Drive Rack Primary)", TABLE_SG300_DRIVE_PRIMARY),
+    ("TP-Link TL-SG108E", TABLE_TLSG108E),
+    ("Cisco SG300-26P", TABLE_SG300_26P),
+]
+
+# -- Addressing CSV rows --------------------------------------------------------------
+# (description, rack, slot, control, dante_primary, dante_secondary, notes)
+
+ADDRESSING_ROWS = [
+    # AMPRACK1: primary + secondary switch, one IK42 (duplicated row — dedup test).
+    (
+        "Cisco SG300-10MP (For 3xAmp Rack Primary)",
+        "AMPRACK1",
+        1,
+        addr(FN_CONTROL, "AMPRACK1", 1),
+        addr(FN_DANTE_PRIMARY, "AMPRACK1", 1),
+        "",
+        "",
+    ),
+    (
+        "Cisco SG300-10MP (For 3xAmp Rack Secondary)",
+        "AMPRACK1",
+        2,
+        addr(FN_CONTROL, "AMPRACK1", 2),
+        "",
+        addr(FN_DANTE_SECONDARY, "AMPRACK1", 2),
+        "",
+    ),
+    (
+        "IK42",
+        "AMPRACK1",
+        3,
+        addr(FN_CONTROL, "AMPRACK1", 3),
+        addr(FN_DANTE_PRIMARY, "AMPRACK1", 3),
+        addr(FN_DANTE_SECONDARY, "AMPRACK1", 3),
+        "",
+    ),
+    (  # sheet residue: exact duplicate of the row above (PROD-DATA-ANALYSIS.md §2.2)
+        "IK42",
+        "AMPRACK1",
+        3,
+        addr(FN_CONTROL, "AMPRACK1", 3),
+        addr(FN_DANTE_PRIMARY, "AMPRACK1", 3),
+        addr(FN_DANTE_SECONDARY, "AMPRACK1", 3),
+        "",
+    ),
+    # XE300-1: IK-42s with no Dante card fitted (§5.2 — DP/DS dropped).
+    (
+        "IK42",
+        "XE300-1",
+        3,
+        addr(FN_CONTROL, "XE300-1", 3),
+        addr(FN_DANTE_PRIMARY, "XE300-1", 3),
+        addr(FN_DANTE_SECONDARY, "XE300-1", 3),
+        "",
+    ),
+    (
+        "IK42",
+        "XE300-1",
+        4,
+        addr(FN_CONTROL, "XE300-1", 4),
+        addr(FN_DANTE_PRIMARY, "XE300-1", 4),
+        addr(FN_DANTE_SECONDARY, "XE300-1", 4),
+        "",
+    ),
+    # AVIO: single-port Dante adapters (§5.3 — Control dropped).
+    (
+        "mps-avio-radial-tx",
+        "AVIO",
+        1,
+        addr(FN_CONTROL, "AVIO", 1),
+        addr(FN_DANTE_PRIMARY, "AVIO", 1),
+        "",
+        "",
+    ),
+    (
+        "mps-avio-na2-dline-1",
+        "AVIO",
+        2,
+        addr(FN_CONTROL, "AVIO", 2),
+        addr(FN_DANTE_PRIMARY, "AVIO", 2),
+        "",
+        "",
+    ),
+    # W8LMTEST: deferred Netgear switch (skipped entirely), plus an LM26
+    # (§5.1 — Control dropped, no control interface exists).
+    (
+        "Netgear Managed Switch (For W8LM Rack)",
+        "W8LMTEST",
+        1,
+        addr(FN_CONTROL, "W8LMTEST", 1),
+        addr(FN_DANTE_PRIMARY, "W8LMTEST", 1),
+        "",
+        "",
+    ),
+    (
+        "LM26",
+        "W8LMTEST",
+        2,
+        addr(FN_CONTROL, "W8LMTEST", 2),
+        addr(FN_DANTE_PRIMARY, "W8LMTEST", 2),
+        addr(FN_DANTE_SECONDARY, "W8LMTEST", 2),
+        "",
+    ),
+    # CONSOLES (manual range): an SD12-shaped Control/Engine pair whose
+    # Control row also carries the DMI-DANTE marker (synthetic, deliberately
+    # NOT base+slot — the card is re-addressed on its own ordinal, #41),
+    # plus a Control-only console.
+    (
+        "SD12-TEST-1-Control",
+        "CONSOLES",
+        1,
+        addr(FN_CONTROL, "CONSOLES", 1),
+        "10.131.9.9",
+        "10.132.9.9",
+        "Used as DMI-DANTE2 Addresses?",
+    ),
+    (
+        "SD12-TEST-1-Engine",
+        "CONSOLES",
+        2,
+        addr(FN_CONTROL, "CONSOLES", 2),
+        "",
+        "",
+        "No Dante interfaces",
+    ),
+    (
+        "SD9",
+        "CONSOLES",
+        4,
+        addr(FN_CONTROL, "CONSOLES", 4),
+        "",
+        "",
+        "",
+    ),
+]
+
+
+def _write_csv(path: Path, rows: list) -> None:
+    with path.open("w", newline="") as handle:
+        csv.writer(handle).writerows(rows)
+
+
+def _calc_lookups_rows() -> list:
+    rows: list = [[""] * 10]
+    rows.append(
+        [
+            "Function",
+            "Address Range",
+            "VLAN Base Address",
+            "Netmask",
+            "Rack",
+            "Address Offset",
+            "Control Base Address",
+            "Dante Primary Base Address",
+            "Notes",
+            "Rack Increment",
+        ]
+    )
+    for i in range(max(len(VLAN_TABLE), len(RACKS))):
+        vlan_part = VLAN_TABLE[i] if i < len(VLAN_TABLE) else ("", "", "", "")
+        rack_part = RACKS[i] if i < len(RACKS) else ("", "")
+        rows.append(
+            [
+                vlan_part[0],
+                str(vlan_part[1]) if vlan_part[1] != "" else "",
+                vlan_part[2],
+                vlan_part[3],
+                rack_part[0],
+                str(rack_part[1]) if rack_part[1] != "" else "",
+                "",
+                "",
+                "",
+                "",
+            ]
+        )
+    return rows
+
+
+def _switch_ports_rows() -> list:
+    rows: list = []
+    for index, (name, ports) in enumerate(SWITCH_PORT_TABLES):
+        if index > 0:
+            rows.append([""] * 9)
+            rows.append(["", "", "", "", "", "", "", "", name])
+        header_name = name if index == 0 else ""
+        rows.append(
+            [
+                "Description",
+                "Port",
+                "Native VLAN",
+                "Mode",
+                "Allowed VLANS",
+                "Port Type",
+                "Note",
+                "",
+                header_name,
+            ]
+        )
+        for port_row in ports:
+            rows.append(list(port_row) + [""])
+    return rows
+
+
+def _addressing_rows() -> list:
+    rows: list = [
+        [
+            "Device Description",
+            "Location/Rack",
+            "Slot",
+            "Audio Control",
+            "Dante Primary",
+            "Dante Secondary",
+            "Notes",
+        ]
+    ]
+    for row in ADDRESSING_ROWS:
+        rows.append([row[0], row[1], str(row[2]), row[3], row[4], row[5], row[6]])
+    return rows
+
+
+def write_fixture_csvs(data_dir: Path) -> None:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    _write_csv(data_dir / "MPS Audio Network Standards - IP Calc Lookups.csv", _calc_lookups_rows())
+    _write_csv(data_dir / "MPS Audio Network Standards - Switch Ports.csv", _switch_ports_rows())
+    _write_csv(data_dir / "MPS Audio Network Standards - IP Addressing mk2.csv", _addressing_rows())
+
+
+class ImportProdDataTests(TestCase):
+    _tmpdir: tempfile.TemporaryDirectory
+    data_dir: Path
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls._tmpdir = tempfile.TemporaryDirectory()
+        cls.data_dir = Path(cls._tmpdir.name)
+        write_fixture_csvs(cls.data_dir)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmpdir.cleanup()
+        super().tearDownClass()
+
+    def setUp(self) -> None:
+        call_command("import_prod_data", data_dir=str(self.data_dir))
+
+    def test_refuses_when_a_rack_already_exists(self) -> None:
+        # setUp() has already run the importer once, so at least one Rack
+        # exists — re-running must refuse rather than layer a second import
+        # on top (PLAN-prod-import.md: creation order is load-bearing).
+        self.assertTrue(Rack.objects.exists())
+        with self.assertRaises(CommandError):
+            call_command("import_prod_data", data_dir=str(self.data_dir))
+
+    def test_first_fit_bases_and_manual_ranges(self) -> None:
+        for rack_name, offset in RACKS:
+            rack = Rack.objects.get(name=rack_name)
+            for function, vlan_id, network_addr, _netmask in VLAN_TABLE[:3]:
+                expected = f"{ipaddress.IPv4Address(network_addr) + offset}/27"
+                actual = RackVlanRange.objects.get(rack=rack, vlan__vlan_id=vlan_id).address_range
+                self.assertEqual(actual, expected, f"{rack_name}/{function}")
+
+    def test_duplicate_row_collapses_to_one_device(self) -> None:
+        devices = NetworkDevice.objects.filter(rack__name="AMPRACK1", rack_slot=3)
+        self.assertEqual(devices.count(), 1)
+        self.assertEqual(devices.get().device_type.model, "IK-42")
+        self.assertEqual(devices.get().device_type.name, "with Dante Card")
+
+    def test_sd12_slot_offset_and_dmi_dante_card(self) -> None:
+        console = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=1)
+        self.assertEqual(console.hostname, "SD12-TEST-1")
+        self.assertEqual(console.device_type.model, "SD12")
+        control_port = console.ports.get(slot_offset=0)
+        engine_port = console.ports.get(slot_offset=1)
+        self.assertEqual(control_port.address, addr(FN_CONTROL, "CONSOLES", 1))
+        self.assertEqual(engine_port.address, addr(FN_CONTROL, "CONSOLES", 2))
+        # No device sits at slot 2 — the "-Engine" row was absorbed into the
+        # slot-1 device's span, not created as its own occupant.
+        self.assertFalse(NetworkDevice.objects.filter(rack__name="CONSOLES", rack_slot=2).exists())
+
+        # The DMI-DANTE card lands past every other CONSOLES occupant
+        # (slot 4 is the highest in this fixture), re-addressed on its own
+        # ordinal rather than copying the sheet's synthetic marker values.
+        card = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=5)
+        self.assertEqual(card.device_type.model, "DMI-DANTE")
+        dp_port = card.ports.get(vlan__vlan_id=_VLAN_ID_BY_FUNCTION[FN_DANTE_PRIMARY])
+        ds_port = card.ports.get(vlan__vlan_id=_VLAN_ID_BY_FUNCTION[FN_DANTE_SECONDARY])
+        self.assertEqual(dp_port.address, addr(FN_DANTE_PRIMARY, "CONSOLES", 5))
+        self.assertEqual(ds_port.address, addr(FN_DANTE_SECONDARY, "CONSOLES", 5))
+        self.assertNotEqual(dp_port.address, "10.131.9.9")
+
+    def test_secondary_switch_type_is_derived_correctly(self) -> None:
+        primary = NetworkSwitchType.objects.get(
+            manufacturer="Cisco", model="SG300-10MP", name="For 3xAmp Rack Primary"
+        )
+        secondary = NetworkSwitchType.objects.get(
+            manufacturer="Cisco", model="SG300-10MP", name="For 3xAmp Rack Secondary"
+        )
+        self.assertEqual(secondary.port_count, primary.port_count)
+
+        control_port = secondary.type_ports.get(port_number=1)
+        self.assertEqual(control_port.profile.name, "Control Access")
+        self.assertEqual(control_port.profile.native_vlan.vlan_id, 130)
+
+        dante_port = secondary.type_ports.get(port_number=4)
+        self.assertEqual(dante_port.profile.name, "Dante Secondary Access")
+        self.assertEqual(dante_port.profile.native_vlan.vlan_id, 132)
+
+        trunk_port = secondary.type_ports.get(port_number=7)
+        self.assertEqual(trunk_port.profile.name, "Audio Trunk Secondary")
+        self.assertEqual(trunk_port.profile.native_vlan.vlan_id, 132)
+        allowed = {v.vlan_id for v in trunk_port.profile.allowed_vlans.all()}
+        self.assertEqual(allowed, {130, 131, 137})
+
+        switch = NetworkSwitch.objects.get(rack__name="AMPRACK1", rack_slot=2)
+        self.assertEqual(switch.switch_type, secondary)
+
+    def test_netgear_switch_deferred_not_created(self) -> None:
+        self.assertFalse(NetworkSwitch.objects.filter(rack__name="W8LMTEST", rack_slot=1).exists())
+        # The rack itself still imports, ranges and all.
+        self.assertTrue(Rack.objects.filter(name="W8LMTEST").exists())
+
+    def test_deliberate_address_drops(self) -> None:
+        # §5.1: Lab.Gruppen has no Control interface at all.
+        lm26 = NetworkDevice.objects.get(rack__name="W8LMTEST", rack_slot=2)
+        control_id = _VLAN_ID_BY_FUNCTION[FN_CONTROL]
+        dp_id = _VLAN_ID_BY_FUNCTION[FN_DANTE_PRIMARY]
+        ds_id = _VLAN_ID_BY_FUNCTION[FN_DANTE_SECONDARY]
+        self.assertFalse(lm26.ports.filter(vlan__vlan_id=control_id).exists())
+        self.assertTrue(lm26.ports.filter(vlan__vlan_id=dp_id).exists())
+        self.assertTrue(lm26.ports.filter(vlan__vlan_id=ds_id).exists())
+
+        # §5.2: no Dante card fitted on these two.
+        for slot in (3, 4):
+            ik42 = NetworkDevice.objects.get(rack__name="XE300-1", rack_slot=slot)
+            self.assertEqual(ik42.device_type.name, "without Dante Card")
+            self.assertEqual(ik42.ports.count(), 1)
+            self.assertTrue(ik42.ports.filter(vlan__vlan_id=control_id).exists())
+
+        # §5.3: AVIO adapters are single-port, Dante Primary only.
+        for slot in (1, 2):
+            device = NetworkDevice.objects.get(rack__name="AVIO", rack_slot=slot)
+            self.assertEqual(device.ports.count(), 1)
+            self.assertEqual(device.ports.get().vlan.vlan_id, dp_id)
+
+    def test_hostnames_from_device_description(self) -> None:
+        self.assertEqual(
+            NetworkSwitch.objects.get(rack__name="AMPRACK1", rack_slot=1).hostname,
+            "Cisco SG300-10MP (For 3xAmp Rack Primary)",
+        )
+        self.assertEqual(NetworkDevice.objects.get(rack__name="W8LMTEST", rack_slot=2).hostname, "LM26")
+        self.assertEqual(
+            NetworkDevice.objects.get(rack__name="AVIO", rack_slot=1).hostname, "mps-avio-radial-tx"
+        )
+
+    def test_verify_passes_against_a_correct_import(self) -> None:
+        call_command("verify_prod_import", data_dir=str(self.data_dir))
+
+    def test_verify_catches_a_wrong_address(self) -> None:
+        port = NetworkDevicePort.objects.filter(
+            device__rack__name="AVIO", device__rack_slot=1, address__isnull=False
+        ).get()
+        NetworkDevicePort.objects.filter(pk=port.pk).update(address="10.131.250.250")
+        with self.assertRaises(CommandError):
+            call_command("verify_prod_import", data_dir=str(self.data_dir))
