@@ -92,7 +92,7 @@ exercise into a search for missing *rules* rather than missing features — see
 - [x] Implement ADR 0015 — one-line change to `required_block_size`, three existing tests to update
 - [x] Implement ADR 0016
 - [x] Implement ADR 0017 — `slot_offset`, derived offset-port addressing, span-aware rack-slot occupancy, and the narrowed same-VLAN pre-flight; see `PLAN-adr-0017.md`
-- [ ] Production import — see `PLAN-prod-import.md`; blocked on switch profile names, the rack↔switch-type mapping, and the AVIO/console hostname→model mapping
+- [ ] Production import — see `PLAN-prod-import.md` (revision 2). 9 of 10 blockers cleared; unblocked and ready to build. Two known gaps, neither blocking: the Netgear model (defers 3 of 23 switches to a second pass) and the per-device-type wiring rule for patch-panel-fed devices. Four items filed as `deferred`: #41, #42, #43, #44
 
 ## Later / not yet designed
 
