@@ -1,9 +1,12 @@
 # Plan: importing the production addressing data
 
-**Revision 2.** Revised after a working session that cleared 9 of the 10 blockers and against
-a corrected set of export CSVs. See `## Review response` at the end for what changed and why.
-Where this revision contradicts the first, the first was wrong — those points are called out
-in place rather than silently overwritten.
+> **Revision 3** — incorporates review notes from `REVIEW-1-PLAN-prod-import.md`.
+> See "Review response" for the mapping.
+
+**Revision 2** revised the plan after a working session that cleared 9 of the 10 blockers and
+against a corrected set of export CSVs. See `## Review response` at the end for what changed
+and why. Where a revision contradicts an earlier one, the earlier one was wrong — those points
+are called out in place rather than silently overwritten.
 
 Design for loading the production CSVs (see `PROD-DATA-ANALYSIS.md`) into the app.
 **Nothing here is built yet** — there is no CSV importer today, and the Django admin is the
@@ -48,21 +51,59 @@ Two consequences:
   racks holding blocks that a re-run would allocate differently. The importer should run
   inside one transaction and roll back entirely on any failure, and should refuse to start
   if any `Rack` already exists.
+
 - **`SHURE` and `CONSOLES` must be created without a template.** Their bases sit behind
   deliberate gaps (14 and 8 increments) that first-fit will never leave, so all three of
   their ranges are entered explicitly. Per ADR 0014 decision 11, naming the same VLAN in
   both a template and a manual inline row is a validation error — so these two racks take
   manual ranges only, not template-plus-overrides.
 
+**"No racks exist" plus one transaction is not concurrency-safe, and the importer must not
+pretend otherwise.** Range suggestion reads are unlocked, so a concurrent rack creation can
+interleave and change first-fit's answer mid-import, or commit after the importer rolls back
+— at which point the "refuse if any `Rack` exists" guard blocks the retry that would fix it.
+`RackSlotAssignmentMixin` already documents its own occupancy check as "an interim,
+form/full_clean-time guard, not a concurrency-safe one", so this is the same known weakness
+rather than a new one.
+
+**The app must be quiesced for the import.** No other writer, admin session included. This is
+stated as an operational precondition rather than solved with an allocation lock, because a
+lock shared with ordinary rack creation is a design change to a shipped path (ADR 0001,
+ADR 0014) for the sake of a one-off run. The importer should say so in its own help text and
+fail loudly rather than assume it.
+
 ## Sequence
 
 `manage.py seed_defaults` already provides VLAN 1 ("Default VLAN", L2-only) and the system
 `Default` switch port profile at container start; the import builds on top of that.
 
+### The rule every stage below obeys: construct → `full_clean()` → `save()`
+
+**`objects.create()` and `save()` never call `clean()`**, so any row written directly bypasses
+its own validation. This is not theoretical here: `RackVlanRange` defines `clean()` and
+`_validate_range()` but **no `save()` override** (`inventory/models.py:1124`), so a manually
+entered `SHURE`/`CONSOLES` range written with `objects.create()` would skip the subnet,
+capacity, overlap and DHCP-collision checks entirely — the exact checks that make those two
+racks safe to enter by hand.
+
+So, for every row the importer writes:
+
+- Construct blank, `full_clean()`, then `save()`. No exceptions, and **no `bulk_create()`** —
+  it bypasses both `save()` and `clean()`.
+- Let the models' own materialization paths run rather than hand-writing their output:
+  `Rack._apply_template()` (ADR 0014), `NetworkSwitch._materialize_ports()` and its address
+  materialization (ADR 0016), `NetworkDevice._materialize_ports()` (ADR 0013, ADR 0017).
+  Reimplementing their arithmetic in the importer would make the import prove nothing about
+  the app.
+
+This is the same construct-blank → `full_clean()` → `save()` sequence ADR 0013, ADR 0014
+decision 7 and ADR 0016 decision 4 each specify for their own materialization, applied to the
+import for the same reason.
+
 ### 1. Audit identity
 
 Create a dedicated import user and set `created_by` on every row. `AuditedModel.created_by`
-is nullable (`inventory/models.py:378`), so leaving it null would work — but ADR 0004 exists
+is nullable (`inventory/models.py:445`), so leaving it null would work — but ADR 0004 exists
 to make provenance traceable, and "imported from the production spreadsheet on date X" is
 exactly the kind of provenance worth keeping.
 
@@ -160,9 +201,30 @@ no gear yet, so it stays unexercised rather than unused.
 
 ### 5. Racks — 21 rows, in ascending offset order
 
-Slot counts from real occupancy, with whatever headroom is wanted, capped at 30 (a `/27`
-holds 30 usable ordinals; above that ADR 0015's floor gives way to the normal sizing and the
-block becomes a `/26`, which would break the uniform 32-address spacing).
+**`slot_count` is 30 for all 21 racks.** Not "real occupancy plus headroom" — that was
+underspecified, and three racks (`CONTROL`, `CDD`, `SHURE`) have no occupancy to derive a
+number from at all.
+
+30 is not arbitrary: `required_block_size(30)` is `max(30 + 2, 32)` = 32, and 31 would be 33,
+tipping every block to a `/26` and breaking the uniform 32-address spacing production has.
+**30 is exactly the largest slot count that still yields a `/27`**, so a uniform 30 gives every
+rack maximum headroom while reproducing production's uniform per-rack increment — which is
+ADR 0015's entire point. Deriving per-rack counts from occupancy would produce different
+numbers with identical block sizes, i.e. arbitrary variation with no effect.
+
+For the record, highest occupied ordinal per rack, all comfortably inside 30:
+
+| Rack | Max | Rack | Max | Rack | Max |
+|---|---|---|---|---|---|
+| CONTROL | *empty* | WPM3 | 4 | FOH Drive #1 | 2 |
+| WPC1SRU | 5 | XE300-1 | 4 | FOH Drive #2 | 2 |
+| WPC2SRL | 5 | XE300-2 | 4 | CDD | *empty* |
+| WPC3SLU | 5 | W8LM1SR | 3 | AVIO | 19 |
+| WPC4SLL | 5 | W8LM2SL | 3 | SPARE | 3 |
+| WPM1SR | 4 | W8LM3 | 3 | FLOATSWITCH | 3 |
+| WPM2SL | 4 | SHURE | *empty* | CONSOLES | 17 |
+
+`CONSOLES` reaches 17 rather than 16 once the DMI-DANTE card takes its own ordinal (§9).
 
 Under ADR 0017, a rack's `slot_count` must also cover `rack_slot + max(slot_offset)` for
 every occupant — `CONSOLES` holds SD12s at slots 7 and 9 each spanning two ordinals, so 8
@@ -314,7 +376,7 @@ ago, so "Lake" names the DSP inside the box, not the company that makes it — c
 a manufacturer that isn't one; corrected in this change, along with a note recording the
 no-control-interface rule for the whole product line.
 
-**Tier 2 — resolved. 15 console rows.** The models read out of the hostnames:
+**Tier 2 — resolved. 13 console rows.** The models read out of the hostnames:
 `DM7C-1` → Yamaha DM7C, `SD12-96-1/2` → DiGiCo SD12, `SD9`/`SD11` → DiGiCo, `SQ5-1` → Allen
 & Heath SQ-5, `bej-tio1608-d2-1` → Yamaha Tio1608-D2, `bej-dm3-1` → Yamaha DM3. Under ADR
 0017 the four SD12 rows collapse to two devices.
@@ -440,7 +502,7 @@ later ADR (#31).
 
 ### 8. Switches
 
-**20 of the 23 addressed switches are imported**: 11 primaries, 7 secondaries, 3
+**20 of the 23 addressed switches are imported**: 9 primaries, 7 secondaries, 3
 `mps-tlsg108e-*`, and 1 `Spare SG300-26P` — each at its rack and slot, typed from the table in
 §6. The three W8LM Netgear switches are deferred to a second pass pending their model (§6).
 
@@ -479,8 +541,19 @@ conflated row, and which the sheet itself annotates `Used as DMI-DANTE2 Addresse
 places whatever `base + N` its ordinal gives, and the physical card is reconfigured to match
 next time it is out of the console. This keeps ordinal and address in agreement and avoids a
 permanent override describing nothing. It does mean the two addresses differ from the sheet
-by design until the hardware catches up — filed so it is not forgotten. `CONSOLES` has room
-either way: 16 of 30 usable ordinals in use, and slots 1–3 are free.
+by design until the hardware catches up — filed as #41 so it is not forgotten.
+
+**The card goes in `CONSOLES` slot 17**, taking `10.201.6.17` and `10.202.6.17`. Its ordinal
+has to be pinned rather than left to judgement, because those two addresses are what §9's
+"2 differing by design" means in the Verification section — unpinned, the pass condition is
+uncheckable, and someone has to type the result into a physical card.
+
+17 appends after the last current occupant (`bej-dm3-1-device-control` at 16) rather than
+backfilling `CONSOLES` slots 1–3. Those three are free but sit where every other rack keeps
+its switch pair, and slots 2–3 were only just deleted as unallocated. Appending keeps that
+convention available and makes the card visibly the newest occupant. This is a judgement
+call with no technical constraint behind it — slots 1–3 would work identically, and changing
+it is a one-line edit here plus the address someone programs into the card.
 
 The two Yamaha `Device Control Interface` devices also take their own ordinals, at slots 4 and
 16 where the export already has them — no re-addressing needed there, since the export's own
@@ -585,14 +658,43 @@ The export is its own test oracle, which is the best property this import has:
   which is itself a useful check on the analysis. A faithful import is *supposed* to place
   materially fewer device addresses than the spreadsheet holds, and an import that reproduces
   all 157 has faithfully copied 34 mistakes.
-- **Rack bases.** All 21 `RackVlanRange` blocks on VLAN 200 should equal the offsets in
-  `PROD-DATA-ANALYSIS.md` §1. This is the check that catches a creation-order mistake, and
-  it should run before any equipment is created — a wrong base is much cheaper to find at
-  stage 5 than at stage 9.
+- **Rack ranges — all 63, not just VLAN 200.** Assert every `(rack, VLAN, CIDR)` triple
+  across 21 racks × 3 VLANs. Checking only the VLAN 200 bases, as an earlier revision
+  proposed, cannot detect a wrong 201 or 202 range on a rack with no equipment in it —
+  `CONTROL`, `CDD` and `SHURE` are exactly that, and the cross-VLAN alignment check below
+  is derived from device addresses, so it cannot cover them either. This runs before any
+  equipment is created: a wrong base is much cheaper to find at stage 5 than at stage 9.
+- **Compare keyed records, not bare address strings.** A set of 183 matching strings does not
+  prove the right device holds each one. The oracle is a manifest of
+  `(rack, slot, device-or-switch identity, port/VLAN, address)` tuples, diffed as records.
+  Two addresses can be individually correct and attached to the wrong occupants, and a string
+  diff passes that.
+- **The things nothing currently checks**, each of which the import creates and none of which
+  an address diff touches:
+  - **Hostnames**, from the addressing sheet's `Device Description` column.
+  - **Type assignment** — every switch and device holds the type §6/§7 names for it.
+  - **All seven switch port matrices** — `port_number` contiguous `1..port_count`, and each
+    port's profile matching the export's table. The two secondary types have no table of
+    their own, so their oracle is *derived*: take the primary's matrix, move Native 201→202,
+    swap 201 into the allowed list in place of 202, leave the control ports untouched (§3).
+    Generating that oracle independently of the importer is the point — if both read the same
+    helper, the check proves nothing.
+  - **Device type ports** — count, VLAN, `port_type`, and `slot_offset` (0 everywhere except
+    the SD12's engine port).
+  - **`dhcp_server_enabled`** on the two FOH Drive primary switches, and nowhere else.
 - **Cross-VLAN alignment.** Assert that every device's addresses share a host octet across
   200/201/202. Nothing in the system enforces this (analysis §6.1), so the import is the
   one moment it can be checked cheaply against a known-good answer.
 - **Nothing ends `.255`**, and nothing lands in a DHCP range or on a gateway.
+
+A note on `PROD-DATA-ANALYSIS.md`: parts of it still describe the *original* export — "102
+data rows: 99 equipment rows", "89 distinct `(rack, slot)` pairs", "five stacked per-model
+tables", and a "Switches with no port configuration recorded" section listing four gaps that
+the corrected export has since closed. The current CSVs give 94 data rows, 91 racked rows, 87
+pairs and seven switch tables. Those passages should be marked historical rather than
+rewritten — the analysis is a dated record of what the first export showed, and its
+conclusions (notably the 34 dropped addresses in §5.1–5.3) still hold exactly. Anyone reading
+it as a live description of `prod/` will be misled.
 
 Whether the importer ships as a management command or as a one-off script is worth deciding
 on its own merits. It runs once, but the verification steps above are worth keeping
@@ -600,8 +702,31 @@ runnable, and a command is easier to test than a script.
 
 ## Review response
 
-Revision 2. Each row is a question the first revision left open or got wrong, the answer, and
-what moved as a result.
+### Revision 3 — `REVIEW-1-PLAN-prod-import.md`
+
+Independent codex review of revision 2. It recomputed the verification counts from the CSVs
+itself and got **183 placed / 161 byte-identical / 2 DMI differences / 20 switch extras / 34
+dropped**, matching revision 2 exactly — no P0. It also confirmed the sequencing holds (all
+`PROTECT` targets precede their dependents), that `:1955`, `:2159` and `:2995-3004` are exact,
+and that the secondary-switch derivation is unambiguous.
+
+| Note | Resolution | Section |
+|---|---|---|
+| 1 (P1) — `slot_count` unspecified; DMI-DANTE slot unassigned | **Fixed.** `slot_count` is 30 for all 21 racks, with the reasoning for why 30 rather than per-rack occupancy. DMI-DANTE pinned to `CONSOLES` 17. | §5, §9 |
+| 2 (P1) — plan doesn't require `full_clean()` before saves | **Fixed.** New subsection making construct → `full_clean()` → `save()` a rule for every written row, banning `bulk_create()`, and requiring the models' own materialization paths. Verified: `RackVlanRange` has `clean()` and `_validate_range()` but no `save()` override. | §Sequence |
+| 3 (P1) — one transaction is not concurrency-safe | **Fixed, as a precondition rather than a lock.** The app must be quiesced. An allocation lock shared with ordinary rack creation would be a design change to a shipped path for the sake of a one-off run. | §Creation order |
+| 4 (P1) — verification proves totals, not a complete import | **Fixed.** All 63 `(rack, VLAN, CIDR)` ranges rather than VLAN 200 only; keyed-record diffing rather than address strings; and explicit checks for hostnames, type assignment, all seven port matrices with a derived secondary oracle, device type ports, and `dhcp_server_enabled`. | §Verification |
+| 5 (P2) — two stale subtotals | **Fixed.** Tier 2 is 13 console rows, not 15 (32 + 13 + 19 = 64). The 20 imported switches are 9 primaries + 7 secondaries + 3 TP-Link + 1 spare; the W8LM Netgears carry no "Primary" in their description and were miscounted into that figure. Headline totals were unaffected. | §7, §8 |
+| 6 (P2) — `PROD-DATA-ANALYSIS.md` still describes the old export | **Folded in as an instruction, not a rewrite.** Marked historical rather than updated: the analysis is a dated record of the first export, and its conclusions still hold. Rewriting it would destroy the provenance of the 34-address finding. | §Verification |
+| 7 (P3) — `models.py:378` stale | **Fixed** → `:445`. | §1 |
+
+Nothing hit the escalation gate: no finding contradicted an ADR, changed scope, or touched a
+settled decision.
+
+### Revision 2 — working session
+
+Each row is a question the first revision left open or got wrong, the answer, and what moved
+as a result.
 
 | # | Question | Answer | Changed |
 |---|---|---|---|
