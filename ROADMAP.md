@@ -91,7 +91,7 @@ exercise into a search for missing *rules* rather than missing features — see
 - [x] Derived same-VLAN addresses via per-port slot offsets, for DiGiCo control+engine consoles — see ADR 0017 (partially supersedes ADR 0003)
 - [x] Implement ADR 0015 — one-line change to `required_block_size`, three existing tests to update
 - [x] Implement ADR 0016
-- [ ] Implement ADR 0017 — its own plan; touches the type-port schema, materialization, locked fields, rack-slot validation, and the same-VLAN pre-flight
+- [x] Implement ADR 0017 — `slot_offset`, derived offset-port addressing, span-aware rack-slot occupancy, and the narrowed same-VLAN pre-flight; see `PLAN-adr-0017.md`
 - [ ] Production import — see `PLAN-prod-import.md`; blocked on switch profile names, the rack↔switch-type mapping, and the AVIO/console hostname→model mapping
 
 ## Later / not yet designed

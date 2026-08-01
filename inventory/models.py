@@ -33,6 +33,7 @@ from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models, transaction
+from django.db.models.functions import Coalesce
 
 from .suggestions import (
     dhcp_range_overlaps_cidr,
@@ -119,6 +120,29 @@ def _get_related(instance: Any, field_name: str) -> Any | None:
         return None
 
 
+def _normalize_update_fields(
+    model_cls: type[models.Model], update_fields: "list[str] | frozenset[str] | None"
+) -> "frozenset[str] | None":
+    """Normalize ``update_fields`` to field names (Django's own
+    ``update_fields`` validation accepts either a field's name or its
+    attname, e.g. both ``"switch_type"`` and ``"switch_type_id"``) so
+    callers can test set membership without caring which spelling was
+    passed. ``None`` (an unrestricted save) passes through unchanged —
+    callers must treat that as "everything," not "nothing."
+
+    Shared by ``_check_locked_fields_unchanged`` (below) and
+    ``NetworkDevicePort.save()``'s offset-sibling cascade gate (ADR 0017),
+    which needs the identical normalization to decide whether a given
+    ``save(update_fields=...)`` actually touched ``address``/``is_dhcp``.
+    """
+    if update_fields is None:
+        return None
+    attname_to_name = {
+        field.attname: field.name for field in model_cls._meta.concrete_fields if field.attname != field.name
+    }
+    return frozenset(attname_to_name.get(name, name) for name in update_fields)
+
+
 def _check_locked_fields_unchanged(
     model_cls: type[models.Model],
     pk: int,
@@ -169,15 +193,9 @@ def _check_locked_fields_unchanged(
     still bypasses both and is unsupported, consistent with the
     ``QuerySet.update()``/``bulk_create()`` gap above.
     """
-    if update_fields is not None:
-        attname_to_name = {
-            field.attname: field.name
-            for field in model_cls._meta.concrete_fields
-            if field.attname != field.name
-        }
-        normalized_update_fields = {attname_to_name.get(name, name) for name in update_fields}
-        if not (set(current_values) & normalized_update_fields):
-            return
+    normalized_update_fields = _normalize_update_fields(model_cls, update_fields)
+    if normalized_update_fields is not None and not (set(current_values) & normalized_update_fields):
+        return
     original = model_cls._default_manager.filter(pk=pk).values(*current_values.keys()).first()
     if original is None:
         return  # row not visible (e.g. mid-delete elsewhere) — nothing to compare against
@@ -232,8 +250,19 @@ def _validate_switch_type_port_profile(switch_type: "NetworkSwitchType") -> None
 
 def _validate_device_type_port_profile(device_type: "NetworkDeviceType") -> None:
     """Raise ``ValidationError`` if ``device_type``'s port profile is
-    incomplete. Device type ports have no numbering requirement (unlike
-    switch type ports) since ``port_number`` is optional for these.
+    incomplete, or a non-zero ``slot_offset`` port has no offset-0 port on
+    the same VLAN to derive its address from. Device type ports have no
+    numbering requirement (unlike switch type ports) since ``port_number``
+    is optional for these.
+
+    Called unconditionally from both ``NetworkDevice.clean()`` and
+    ``_materialize_ports()`` — every addressing path, not only the static
+    one. The offset check in particular must live here rather than in
+    ``_check_static_materialization_possible()`` (ADR 0017 plan review,
+    note 4): that method only runs for a racked+static device, so a DHCP
+    or unracked device would otherwise sail past it and materialize an
+    offset port with nothing to derive an address from — a row that could
+    never correctly be made static later either.
     """
     count = device_type.type_ports.count()
     if count != device_type.port_count:
@@ -242,13 +271,36 @@ def _validate_device_type_port_profile(device_type: "NetworkDeviceType") -> None
             f"{count} Network Device Type Port(s) defined — define all of them before "
             "creating a device of this type."
         )
+    offsets_by_vlan: dict[int, set[int]] = {}
+    vlan_by_id: dict[int, VLAN] = {}
+    for type_port in device_type.type_ports.select_related("vlan"):
+        offsets_by_vlan.setdefault(type_port.vlan_id, set()).add(type_port.slot_offset)
+        vlan_by_id[type_port.vlan_id] = type_port.vlan
+    for vlan_id, offsets in offsets_by_vlan.items():
+        if 0 not in offsets:
+            vlan = vlan_by_id[vlan_id]
+            raise ValidationError(
+                f"{device_type} has a slot_offset port on {vlan} with no offset-0 port on "
+                f"that VLAN to derive its address from — add one, or set every port on "
+                f"{vlan} to slot_offset 0."
+            )
 
 
-def _suggest_rack_slot_address(rack: "Rack | None", rack_slot: int | None, vlan_id: int) -> str | None:
+def _suggest_rack_slot_address(
+    rack: "Rack | None", rack_slot: int | None, vlan_id: int, slot_offset: int = 0
+) -> str | None:
     """Suggested static address for a rack-slot occupant on ``vlan_id``.
 
     ``None`` if unracked, or no ``RackVlanRange`` exists yet for that VLAN.
     Shared by ``NetworkSwitchAddress`` and ``NetworkDevicePort``.
+
+    ``slot_offset`` (ADR 0017) shifts the suggestion past the occupant's
+    own ordinal — ``range_base + rack_slot + slot_offset`` — for a device
+    port whose address is derived from another port's rather than its own
+    slot. Every other caller takes the default ``0``, which is exactly
+    today's ``range_base + rack_slot`` and leaves their behaviour
+    unchanged. This introduces no new arithmetic — ``suggest_slot_address``
+    itself is unchanged; offsets only change what's passed as its ``slot``.
     """
     if rack is None or rack_slot is None:
         return None
@@ -261,11 +313,11 @@ def _suggest_rack_slot_address(rack: "Rack | None", rack_slot: int | None, vlan_
     except ValidationError:
         return None  # that range's own malformed value; its own clean() would report it
     try:
-        return suggest_slot_address(rack_range.address_range, rack_slot)
+        return suggest_slot_address(rack_range.address_range, rack_slot + slot_offset)
     except ValueError:
-        # rack_slot bypassed clean()'s rack_slot <= rack.slot_count guard
-        # (save() alone never enforces it) and overflows this range's block —
-        # its own clean() would report that.
+        # rack_slot (+ slot_offset) bypassed clean()'s span-vs-slot_count
+        # guard (save() alone never enforces it) and overflows this range's
+        # block — its own clean() would report that.
         return None
 
 
@@ -1241,21 +1293,39 @@ class RackSlotAssignmentMixin:
     """Shared ``clean()`` logic for equipment with a ``rack``/``rack_slot`` pair.
 
     A slot is 1-based; ``rack`` and ``rack_slot`` are all-or-neither; when both
-    are set, ``rack_slot`` must fall within the rack's ``slot_count`` — this
-    last check is cross-table so it can't be expressed as a DB constraint.
+    are set, ``rack_slot`` plus this occupant's ``slot_span`` must fall
+    within the rack's ``slot_count`` — this last check is cross-table so it
+    can't be expressed as a DB constraint.
 
     Also cross-checks the *other* equipment table so a switch and a device
-    can't both claim the same physical slot. This is an interim, form/
-    full_clean-time guard, not a concurrency-safe one — a shared rack-
-    occupancy table would be needed to close the direct-ORM/race-condition
-    gap; that's a bigger schema change better suited to phase 3's "Overlap
-    validation" work (see ROADMAP.md) than a scaffolding fix.
+    can't both claim an occupied ordinal — since ADR 0017 lets a device
+    span several ordinals (``slot_span`` > 1), this is a range-overlap
+    check, not just an exact-match one; see ``_check_rack_slot_not_
+    occupied()`` on each subclass. This is an interim, form/full_clean-time
+    guard, not a concurrency-safe one — a shared rack-occupancy table would
+    be needed to close the direct-ORM/race-condition gap. That's re-filed
+    under ``ROADMAP.md``'s "Later / not yet designed" section (the "Rack
+    *slot* occupancy has no DB-level overlap guarantee..." item) rather
+    than any phase still in flight — this docstring used to point at
+    phase 3's "Overlap validation" work, which shipped rack-range-vs-range
+    and rack-range-vs-DHCP overlap, a different table and a different
+    problem; that pointer was stale and this corrects it (ADR 0017).
     """
 
     rack: Rack | None
     rack_slot: int | None
 
     pk: int | None
+
+    @property
+    def slot_span(self) -> int:
+        """Number of consecutive ordinals, starting at ``rack_slot``, this
+        occupant claims. ``1`` for everything except ``NetworkDevice``,
+        which overrides this to delegate to its type's ``slot_span`` (ADR
+        0017 — a device whose type declares offset ports occupies more
+        than its own ``rack_slot``).
+        """
+        return 1
 
     def clean(self) -> None:
         super().clean()  # type: ignore[misc]
@@ -1264,9 +1334,17 @@ class RackSlotAssignmentMixin:
                 "rack and rack_slot must both be set (racked) or both be empty (spare pool)."
             )
         if self.rack is not None and self.rack_slot is not None:
-            if self.rack_slot > self.rack.slot_count:
+            span = self.slot_span
+            if self.rack_slot + span - 1 > self.rack.slot_count:
+                if span == 1:
+                    raise ValidationError(
+                        f"rack_slot {self.rack_slot} exceeds {self.rack}'s slot_count "
+                        f"({self.rack.slot_count})."
+                    )
                 raise ValidationError(
-                    f"rack_slot {self.rack_slot} exceeds {self.rack}'s slot_count ({self.rack.slot_count})."
+                    f"rack_slot {self.rack_slot} plus this occupant's span ({span}, ending at "
+                    f"ordinal {self.rack_slot + span - 1}) exceeds {self.rack}'s slot_count "
+                    f"({self.rack.slot_count})."
                 )
             self._check_rack_slot_not_occupied()
         if self.pk is not None:
@@ -2272,7 +2350,21 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
             )
 
     def _check_rack_slot_not_occupied(self) -> None:
-        if NetworkDevice.objects.filter(rack=self.rack, rack_slot=self.rack_slot).exists():
+        # A plain rack_slot=self.rack_slot equality test (pre-ADR-0017)
+        # can't see a device that starts at an earlier ordinal and spans
+        # through this switch's slot (e.g. a device at 7 with slot_span 2
+        # occupying 7-8, and a switch trying to claim 8) — so this is a
+        # range-overlap query against the annotated device end, not an
+        # equality test, even though a switch itself always spans exactly
+        # one ordinal (plan review note 6).
+        conflict = (
+            NetworkDevice.objects.filter(rack=self.rack, rack_slot__lte=self.rack_slot)
+            .annotate(_span=Coalesce(models.Max("device_type__type_ports__slot_offset"), 0) + 1)
+            .annotate(_end=models.F("rack_slot") + models.F("_span") - 1)
+            .filter(_end__gte=self.rack_slot)
+            .first()
+        )
+        if conflict is not None:
             raise ValidationError(
                 f"Rack slot {self.rack_slot} in {self.rack} is already occupied by a device."
             )
@@ -2561,6 +2653,25 @@ class NetworkDeviceType(AuditedModel):
                 force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
             )
 
+    @property
+    def slot_span(self) -> int:
+        """Ordinal range an instance of this type occupies:
+        ``max(slot_offset) + 1`` across its type ports (ADR 0017), or ``1``
+        for a type with no offset ports (or no ports at all yet).
+
+        Computed, not stored — a type's port list is immutable once any
+        instance exists (ADR 0010), so this can never drift from what a
+        created device actually occupies (decided over denormalizing it
+        onto ``NetworkDevice``: both are stable, and either is a single
+        query, so the query-cost argument for a stored copy is a wash).
+        Unconditional over *every* type port, not just addressable/static
+        ones — a DHCP-materialized console still spans its type's
+        ordinals, since ``is_dhcp`` is editable per port after creation
+        and a span that depended on it would drift.
+        """
+        max_offset = self.type_ports.aggregate(models.Max("slot_offset"))["slot_offset__max"]
+        return (max_offset or 0) + 1
+
     def clean(self) -> None:
         super().clean()
         if self.pk is not None and self.devices.exists():
@@ -2605,6 +2716,19 @@ class NetworkDeviceTypePort(AuditedModel):
     (not ``port_number``) is the identity — most of these devices have a
     fixed purpose per port but no meaningful port number (e.g. "Dante
     Primary").
+
+    ``slot_offset`` (ADR 0017) is the mechanism for hardware that computes
+    a second port's address from a first one and refuses to let anyone
+    change it (a DiGiCo console's audio engine, always control address +
+    1) — every type port defaults to offset 0 (its own slot), and a VLAN
+    with any non-zero-offset port must also carry an offset-0 port on that
+    VLAN (``_validate_device_type_port_profile``). This is a narrow,
+    mechanism-only carve-out, not a general multi-part-hardware feature —
+    see ADR 0017's scope-boundary section for the test ("does the hardware
+    compute the second address from the first and refuse to let anyone
+    change it?") that keeps ordinary multi-device hardware (a console plus
+    a separately-addressed extender, an add-in card) as separate,
+    independently-addressed ``NetworkDevice`` rows instead.
     """
 
     device_type = models.ForeignKey(NetworkDeviceType, on_delete=models.CASCADE, related_name="type_ports")
@@ -2614,6 +2738,14 @@ class NetworkDeviceTypePort(AuditedModel):
     )
     port_type = models.CharField(max_length=20, choices=PortType.choices)
     vlan = models.ForeignKey(VLAN, on_delete=models.PROTECT, related_name="+")
+    slot_offset = models.PositiveIntegerField(
+        default=0,
+        help_text=(
+            "Address offset from the device's slot. Leave at 0 unless the hardware itself "
+            "derives this port's address from another port's (e.g. a console engine at "
+            "control + 1)."
+        ),
+    )
     ordinal = models.PositiveIntegerField(
         editable=False,
         default=0,
@@ -2812,6 +2944,20 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
             )
         self._port_addressing = value
 
+    @property
+    def slot_span(self) -> int:
+        """Delegates to ``device_type.slot_span`` (ADR 0017) — overrides
+        ``RackSlotAssignmentMixin``'s default of 1. Reads ``device_type``
+        via ``_get_related()`` so an unsaved device with no type assigned
+        yet still cleans (mirrors the same defensive pattern used
+        throughout this module for a possibly-unset FK on an in-progress
+        instance).
+        """
+        device_type = _get_related(self, "device_type")
+        if device_type is None or device_type.pk is None:
+            return 1
+        return device_type.slot_span
+
     def _materializes_static(self) -> bool:
         """Whether this (not-yet-materialized) device will get static
         addresses — only when racked (decision 3: unracked is always DHCP,
@@ -2829,17 +2975,27 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
 
         Skips L2-only-VLAN ports entirely (decision 4: those always
         materialize DHCP and that's not a failure). For the rest: any VLAN
-        shared by more than one port can't be addressed by
-        ``suggest_slot_address()``'s one-address-per-(slot, VLAN) model
-        (decision 5, Switched Mode devices), and each remaining port's
-        suggested address must actually be usable
-        (``_validate_static_address``).
+        shared by more than one port **at the same slot_offset** can't be
+        addressed by ``suggest_slot_address()``'s one-address-per-(slot,
+        VLAN) model (decision 5, Switched Mode devices — ADR 0017 narrows
+        this from "same VLAN" to "same VLAN and same offset", so it still
+        catches Switched Mode but no longer catches a console's derived
+        engine port), and each remaining port's suggested address must
+        actually be usable (``_validate_static_address``).
+
+        Also enforces the ``.255`` bound here (ADR 0017 plan review, note
+        3), not only in ``RackSlotAssignmentMixin.clean()`` — this method
+        runs on the ``objects.create()`` path via ``_materialize_ports()``,
+        which never calls ``clean()`` at all, so without a copy of the
+        bound here a device created directly past a rack's slot_count
+        would still materialize an address that reads as that block's
+        broadcast address (see ``required_block_size()``/ADR 0015).
         """
         addressable = [tp for tp in self.device_type.type_ports.select_related("vlan") if tp.vlan.subnet]
-        by_vlan: dict[int, list[NetworkDeviceTypePort]] = {}
+        by_vlan_offset: dict[tuple[int, int], list[NetworkDeviceTypePort]] = {}
         for type_port in addressable:
-            by_vlan.setdefault(type_port.vlan_id, []).append(type_port)
-        for type_port_group in by_vlan.values():
+            by_vlan_offset.setdefault((type_port.vlan_id, type_port.slot_offset), []).append(type_port)
+        for type_port_group in by_vlan_offset.values():
             if len(type_port_group) > 1:
                 names = ", ".join(tp.description for tp in type_port_group)
                 raise ValidationError(
@@ -2847,8 +3003,18 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                     f"({names}) — static materialization needs one address per VLAN, and this "
                     "device has no way to give one address to all of them. Use DHCP for this device."
                 )
+        if self.rack is not None and self.rack_slot is not None:
+            span = self.device_type.slot_span
+            if self.rack_slot + span - 1 > self.rack.slot_count:
+                raise ValidationError(
+                    f"rack_slot {self.rack_slot} plus {self.device_type}'s span ({span}, ending "
+                    f"at ordinal {self.rack_slot + span - 1}) exceeds {self.rack}'s slot_count "
+                    f"({self.rack.slot_count})."
+                )
         for type_port in addressable:
-            address = _suggest_rack_slot_address(self.rack, self.rack_slot, type_port.vlan_id)
+            address = _suggest_rack_slot_address(
+                self.rack, self.rack_slot, type_port.vlan_id, type_port.slot_offset
+            )
             if address is None:
                 raise ValidationError(
                     f"No usable address range for {type_port.vlan} in {self.rack} — assign a "
@@ -2881,6 +3047,14 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         0010's always-DHCP rule). Runs inside the same transaction as this
         device's insert (see ``save()``), so any failure here rolls back
         the device and every port materialized before it.
+
+        Each port's ``slot_offset`` is copied from its type port (ADR
+        0017), and each port's own address is computed from its own
+        offset independently (``_suggest_rack_slot_address`` inside
+        ``NetworkDevicePort.clean()``) — so, unlike the derive-on-edit
+        cascade (``NetworkDevicePort._derive_offset_siblings``), no
+        offset-0-first ordering is required here; the loop stays ordered
+        by ``ordinal`` as it always has.
         """
         _validate_device_type_port_profile(self.device_type)
         static = self._materializes_static()
@@ -2895,6 +3069,7 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                     vlan=type_port.vlan,
                     port_type=type_port.port_type,
                     ordinal=type_port.ordinal,
+                    slot_offset=type_port.slot_offset,
                     source_type_port=type_port,
                     is_dhcp=False,
                     address=None,
@@ -2913,6 +3088,7 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                     vlan=type_port.vlan,
                     port_type=type_port.port_type,
                     ordinal=type_port.ordinal,
+                    slot_offset=type_port.slot_offset,
                     source_type_port=type_port,
                     is_dhcp=True,
                     address=None,
@@ -2920,9 +3096,40 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                 )
 
     def _check_rack_slot_not_occupied(self) -> None:
-        if NetworkSwitch.objects.filter(rack=self.rack, rack_slot=self.rack_slot).exists():
+        if self.rack_slot is None:
+            return  # only ever called from clean() once rack/rack_slot are both set
+        my_start = self.rack_slot
+        my_end = self.rack_slot + self.slot_span - 1
+        if NetworkSwitch.objects.filter(
+            rack=self.rack, rack_slot__gte=my_start, rack_slot__lte=my_end
+        ).exists():
             raise ValidationError(
-                f"Rack slot {self.rack_slot} in {self.rack} is already occupied by a switch."
+                f"Rack slot(s) {my_start}-{my_end} in {self.rack} are already occupied by a switch."
+                if my_end != my_start
+                else f"Rack slot {self.rack_slot} in {self.rack} is already occupied by a switch."
+            )
+        # Devices only — unique(rack, rack_slot) already catches an equal
+        # starting ordinal at the DB level; this catches the case that
+        # constraint can't: another device's span overlapping ours without
+        # sharing a starting ordinal (a device at 7 spanning 7-8, a new one
+        # at 8). Annotates every other device's own end ordinal from its
+        # type's slot_span (a switch always spans 1, so only this side
+        # needs the aggregate — plan review note 6) and tests range overlap
+        # against it, not equality.
+        conflict = (
+            NetworkDevice.objects.filter(rack=self.rack, rack_slot__lte=my_end)
+            .exclude(pk=self.pk)
+            .annotate(_span=Coalesce(models.Max("device_type__type_ports__slot_offset"), 0) + 1)
+            .annotate(_end=models.F("rack_slot") + models.F("_span") - 1)
+            .filter(_end__gte=my_start)
+            .first()
+        )
+        if conflict is not None:
+            assert conflict.rack_slot is not None  # DB constraint: rack and rack_slot are all-or-neither
+            conflict_end = conflict.rack_slot + conflict.slot_span - 1
+            raise ValidationError(
+                f"Rack slot(s) {my_start}-{my_end} in {self.rack} overlap {conflict}'s existing "
+                f"occupied range ({conflict.rack_slot}-{conflict_end})."
             )
 
     def _validate_existing_addresses_still_fit(self) -> None:
@@ -2945,15 +3152,20 @@ class NetworkDevicePort(AuditedModel):
     Materialized exactly once from the device's ``device_type`` when the
     device is first created (``NetworkDevice._materialize_ports``) —
     static by default when racked, computed rack-range-base + rack-slot
-    like every other static address here, or DHCP-configured
-    (``is_dhcp=True``, ``address=None``) when unracked or explicitly chosen
-    (ADR 0013, revising ADR 0010's always-DHCP rule); an operator can flip
-    a port's addressing afterward either way. ``description`` (this
-    port's purpose), ``vlan``, and ``port_type`` are locked hardware/
-    purpose facts copied from the type port (ADR 0010); only
-    ``is_dhcp``/``address``/``switch_port`` are editable. Identity is
-    ``(device, description)`` — ``port_number``, when present at all, is
-    neither required nor unique.
+    (or, at a non-zero ``slot_offset``, rack-range-base + rack-slot +
+    offset — ADR 0017) like every other static address here, or DHCP-
+    configured (``is_dhcp=True``, ``address=None``) when unracked or
+    explicitly chosen (ADR 0013, revising ADR 0010's always-DHCP rule).
+    ``description`` (this port's purpose), ``vlan``, ``port_type``, and
+    ``slot_offset`` are locked hardware/purpose facts copied from the type
+    port (ADR 0010, ADR 0017); ``is_dhcp``/``address``/``switch_port`` are
+    editable — **except** ``address`` on a ``slot_offset > 0`` port, which
+    is derived from the offset-0 port on the same ``(device, vlan)`` and
+    locked (see ``_locked_fields()``/``_derive_offset_siblings()``): an
+    operator can flip *that* port's addressing either way, and every
+    offset sibling follows it automatically. Identity is ``(device,
+    description)`` — ``port_number``, when present at all, is neither
+    required nor unique.
 
     ``switch`` is not stored directly — it's redundant with (and could
     contradict) ``switch_port``, so it's derived from it via a property.
@@ -2965,8 +3177,22 @@ class NetworkDevicePort(AuditedModel):
     are bridged into one logical interface (e.g. Shure ULXD4Q/D "Switched"
     mode) can be tracked as two ordinary ports here, but the system won't
     stop them from being given two different addresses, which wouldn't
-    reflect the real, single-IP hardware.
+    reflect the real, single-IP hardware — ``slot_offset`` (ADR 0017) does
+    not cover this case, and is deliberately narrower: it's for a port
+    whose address the *hardware itself* computes from another port's and
+    refuses to let anyone change, not general multi-jack/multi-part
+    hardware. See ADR 0017's scope-boundary section.
     """
+
+    #: Set only by ``_derive_offset_siblings()`` while it writes a derived
+    #: address onto an offset sibling, and consulted by ``_locked_fields()``
+    #: — the single legitimate writer of an offset port's otherwise-locked
+    #: ``address``. Never a field, never persisted; a plain class-level
+    #: default like ``created_by``'s pattern elsewhere in this module isn't
+    #: used here because this genuinely never needs to be constructor-
+    #: settable the way ``port_addressing``/``address_materialization`` are
+    #: — nothing outside this class should ever set it.
+    _deriving_address: bool = False
 
     device = models.ForeignKey(NetworkDevice, on_delete=models.CASCADE, related_name="ports")
     port_number = models.PositiveIntegerField(null=True, blank=True, validators=[MinValueValidator(1)])
@@ -2979,6 +3205,14 @@ class NetworkDevicePort(AuditedModel):
         choices=PortType.choices,
         blank=True,
         help_text="Physical hardware fact, copied from the device's type — locked after creation.",
+    )
+    slot_offset = models.PositiveIntegerField(
+        default=0,
+        help_text=(
+            "Address offset from the device's slot, copied from the device's type — locked "
+            "after creation. Above 0, this port's address is derived from the offset-0 port "
+            "on the same VLAN and can't be edited directly."
+        ),
     )
     ordinal = models.PositiveIntegerField(editable=False, default=0)
     # Materialization always passes is_dhcp explicitly, one way or the
@@ -3042,9 +3276,44 @@ class NetworkDevicePort(AuditedModel):
             # profile changes; see _lock_switch_port_rows().
             persisted_switch_port_id = self._persisted_switch_port_id()
             _lock_switch_port_rows(self.switch_port_id, persisted_switch_port_id)
+
+            # Snapshot the *persisted* address/is_dhcp before super().save()
+            # overwrites them (ADR 0017 plan review, note 2) — needed only
+            # to decide, after the write, whether to cascade a derived
+            # recompute to this port's offset siblings. Restricted to an
+            # existing (self.pk is not None) offset-0 port: a brand new row
+            # has no persisted state to compare against and no siblings yet
+            # to cascade to (materialization derives each offset port's own
+            # address directly, not via this cascade — see
+            # NetworkDevice._materialize_ports()); an offset>0 port is
+            # itself a cascade *target*, never a trigger, so it never needs
+            # this snapshot either.
+            pre_save_pk = self.pk
+            persisted = None
+            if pre_save_pk is not None and self.slot_offset == 0:
+                persisted = (
+                    NetworkDevicePort._default_manager.filter(pk=pre_save_pk)
+                    .values("address", "is_dhcp")
+                    .first()
+                )
+
             super().save(
                 force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
             )
+
+            if persisted is not None:
+                # Gate on *normalized* update_fields actually including one
+                # of address/is_dhcp, not merely on the in-memory value
+                # looking different from the snapshot — otherwise
+                # save(update_fields=["switch_port"]) with a stale/dirty
+                # in-memory address would wrongly cascade a recompute the
+                # database write never actually made (note 2).
+                normalized = _normalize_update_fields(NetworkDevicePort, update_fields)
+                touches_control_fields = normalized is None or bool(normalized & {"address", "is_dhcp"})
+                if touches_control_fields and (
+                    persisted["address"] != self.address or persisted["is_dhcp"] != self.is_dhcp
+                ):
+                    self._derive_offset_siblings()
 
     def clean(self) -> None:
         super().clean()
@@ -3064,7 +3333,9 @@ class NetworkDevicePort(AuditedModel):
                     "the device first, or use is_dhcp for this port instead."
                 )
             if self.pk is None and not self.address and device is not None and vlan is not None:
-                suggestion = _suggest_rack_slot_address(device.rack, device.rack_slot, vlan.pk)
+                suggestion = _suggest_rack_slot_address(
+                    device.rack, device.rack_slot, vlan.pk, self.slot_offset
+                )
                 if suggestion:
                     self.address = suggestion
             if not self.address:
@@ -3080,13 +3351,13 @@ class NetworkDevicePort(AuditedModel):
                 )
 
     def _locked_fields(self) -> dict[str, Any]:
-        # ``device``/``port_number``/``ordinal``/``source_type_port``
-        # identify which physical port this row represents (materialized
-        # once from the device's type, ADR 0010) — only
+        # ``device``/``port_number``/``ordinal``/``source_type_port``/
+        # ``slot_offset`` identify which physical port this row represents
+        # (materialized once from the device's type, ADR 0010/0017) — only
         # ``is_dhcp``/``address``/``switch_port`` are meant to be editable,
         # so a plain save() must not be able to silently move, renumber, or
-        # reorder a materialized port.
-        return {
+        # reorder a materialized port, or change its offset.
+        fields: dict[str, Any] = {
             "device": self.device_id,
             "port_number": self.port_number,
             "description": self.description,
@@ -3094,7 +3365,56 @@ class NetworkDevicePort(AuditedModel):
             "port_type": self.port_type,
             "ordinal": self.ordinal,
             "source_type_port": self.source_type_port_id,
+            "slot_offset": self.slot_offset,
         }
+        # ADR 0017: a slot_offset > 0 port's address is derived from the
+        # offset-0 port on its VLAN, not independently settable — lock it
+        # the same way as the identity fields above, *unless* this write is
+        # the one privileged writer of a derived address
+        # (_derive_offset_siblings(), which sets _deriving_address before
+        # writing). An offset-0 port's address is never added here — it
+        # stays editable exactly as ADR 0003 requires.
+        if self.slot_offset > 0 and not self._deriving_address:
+            fields["address"] = self.address
+        return fields
+
+    def _derive_offset_siblings(self) -> None:
+        """Recompute every offset sibling's ``address``/``is_dhcp`` after
+        this offset-0 port's own values changed (ADR 0017) — called only
+        from ``save()``, only for an offset-0 port whose persisted
+        address/DHCP state this save actually changed (see ``save()`` for
+        the snapshot-before-write reasoning that decides that).
+
+        This is the single legitimate writer of a locked offset port's
+        ``address`` — each sibling's ``_deriving_address`` is set before
+        ``full_clean()``/``save()`` so ``_locked_fields()`` lifts the lock
+        for exactly this write. Runs inside the caller's
+        ``transaction.atomic()`` block (``save()``'s), so a derived address
+        that collides with an existing one, or falls outside the rack's
+        range, raises from ``full_clean()`` and rolls back the control
+        edit that triggered this cascade too — nothing is left half-
+        updated.
+
+        Going DHCP (``self.is_dhcp`` or ``self.address is None``) takes
+        every sibling to DHCP with it (``address=None``); coming back to
+        static re-derives ``control_address + sibling.slot_offset`` for
+        each. Same reasoning ADR 0017 gives for deriving the engine address
+        at all: an engine address stored against a control address that no
+        longer exists is worse than one that's simply gone.
+        """
+        siblings = NetworkDevicePort.objects.filter(
+            device_id=self.device_id, vlan_id=self.vlan_id, slot_offset__gt=0
+        )
+        for sibling in siblings:
+            sibling._deriving_address = True
+            if self.is_dhcp or self.address is None:
+                sibling.is_dhcp = True
+                sibling.address = None
+            else:
+                sibling.is_dhcp = False
+                sibling.address = str(ipaddress.IPv4Address(self.address) + sibling.slot_offset)
+            sibling.full_clean()
+            sibling.save()
 
     def _persisted_switch_port_id(self) -> int | None:
         if self.pk is None:
