@@ -3148,11 +3148,17 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
 
 class NetworkDevicePortQuerySet(models.QuerySet):
     """Blocks bulk ``QuerySet.delete()`` from orphaning an offset port
-    (ADR 0017, codex review finding 5) — the model's own ``delete()``
-    override below only guards a single ``instance.delete()``; a queryset
-    delete bypasses ``Model.delete()`` for every row, the same reason
+    (ADR 0017) — the model's own ``delete()`` override below only guards a
+    single ``instance.delete()``; a queryset delete bypasses
+    ``Model.delete()`` for every row, the same reason
     ``NetworkDeviceTypePortQuerySet``/``NetworkSwitchTypePortQuerySet``
     already carry their own ``delete()`` override alongside the model's.
+
+    Unlike the model's ``delete()``, this has no in-memory-identity hole to
+    guard against: ``self`` here is the queryset being deleted, so
+    ``.values("device_id", "vlan_id")`` below reads straight from the
+    database for whichever rows actually match the delete, not from any
+    caller-supplied Python instance's (possibly tampered) attributes.
 
     Deliberately does **not** guard ``NetworkDevice``'s own cascade delete
     (``on_delete=CASCADE`` on ``NetworkDevicePort.device``) — Django's
@@ -3348,16 +3354,16 @@ class NetworkDevicePort(AuditedModel):
 
             if persisted is not None:
                 # *Effective* post-save values, not necessarily self.address/
-                # self.is_dhcp directly (codex review finding 1). When
-                # update_fields restricts the write, a field it excludes
-                # keeps its persisted value in the database regardless of
-                # whatever's dirty in memory — e.g. save(update_fields=
-                # ["address"]) with a stale, never-actually-saved self.is_dhcp
-                # left over from some earlier unrelated edit. Deriving
-                # straight from self.is_dhcp/self.address would let that
-                # stale value dictate every sibling's address even though
-                # the database's own is_dhcp never changed; falling back to
-                # the pre-save snapshot for an excluded field guarantees we
+                # self.is_dhcp directly. When update_fields restricts the
+                # write, a field it excludes keeps its persisted value in
+                # the database regardless of whatever's dirty in memory —
+                # e.g. save(update_fields=["address"]) with a stale,
+                # never-actually-saved self.is_dhcp left over from some
+                # earlier unrelated edit. Deriving straight from
+                # self.is_dhcp/self.address would let that stale value
+                # dictate every sibling's address even though the
+                # database's own is_dhcp never changed; falling back to the
+                # pre-save snapshot for an excluded field guarantees we
                 # only ever derive from what this save actually persisted.
                 normalized = _normalize_update_fields(NetworkDevicePort, update_fields)
                 effective_address = (
@@ -3370,21 +3376,29 @@ class NetworkDevicePort(AuditedModel):
                     self._derive_offset_siblings(effective_address, effective_is_dhcp)
 
     def delete(self, using=None, keep_parents=False) -> tuple[int, dict[str, int]]:
-        # Codex review finding 5: block deleting an offset-0 port that
-        # still has offset siblings on its VLAN — they derive their
-        # address from this row, and losing it would leave them locked,
-        # persisted, and permanently pointed at nothing. Deliberately does
-        # *not* run for a whole-device delete (device.delete() cascades to
-        # every port, including these, via on_delete=CASCADE) — Django's
-        # deletion Collector issues that DELETE directly, bypassing both
-        # this override and NetworkDevicePortQuerySet.delete() (see that
+        # ADR 0017: block deleting an offset-0 port that still has offset
+        # siblings on its VLAN — they derive their address from this row,
+        # and losing it would leave them locked, persisted, and
+        # permanently pointed at nothing. Deliberately does *not* run for
+        # a whole-device delete (device.delete() cascades to every port,
+        # including these, via on_delete=CASCADE) — Django's deletion
+        # Collector issues that DELETE directly, bypassing both this
+        # override and NetworkDevicePortQuerySet.delete() (see that
         # queryset's docstring), so removing a device still works in one
         # step.
+        #
+        # Reads the *persisted* slot_offset/device_id/vlan_id
+        # (_persisted_delete_guard_fields()), not self's in-memory ones —
+        # see that method's docstring for why: delete() has no
+        # locked-field validation at all, so self's identity fields are
+        # untrusted here in a way they aren't in save()/clean().
         with transaction.atomic():
+            persisted = self._persisted_delete_guard_fields()
             if (
-                self.slot_offset == 0
+                persisted is not None
+                and persisted["slot_offset"] == 0
                 and NetworkDevicePort.objects.filter(
-                    device_id=self.device_id, vlan_id=self.vlan_id, slot_offset__gt=0
+                    device_id=persisted["device_id"], vlan_id=persisted["vlan_id"], slot_offset__gt=0
                 ).exists()
             ):
                 raise ValidationError(
@@ -3455,10 +3469,10 @@ class NetworkDevicePort(AuditedModel):
         # stays editable exactly as ADR 0003 requires.
         #
         # Whether to lock ``address`` is decided from the *persisted*
-        # slot_offset (``_persisted_slot_offset()``), not ``self.slot_offset``
-        # (codex review finding 2) — slot_offset is itself one of the fields
-        # above this method exists to protect. Trusting the in-memory value
-        # here would let a caller set ``slot_offset = 0`` on an already-
+        # slot_offset (``_persisted_slot_offset()``), not
+        # ``self.slot_offset`` — slot_offset is itself one of the fields
+        # above this method exists to protect. Trusting the in-memory
+        # value here would let a caller set ``slot_offset = 0`` on an already-
         # materialized offset port and pair it with an address edit: the
         # bogus in-memory offset would drop ``"address"`` from this dict
         # *before* the caller ever compares ``slot_offset`` against what's
@@ -3481,9 +3495,9 @@ class NetworkDevicePort(AuditedModel):
         ``save()`` for the snapshot-before-write reasoning that decides
         that, and for why ``control_address``/``control_is_dhcp`` are
         passed in rather than read from ``self.address``/``self.is_dhcp``
-        directly — codex review finding 1: those attributes can hold a
-        dirty, never-actually-persisted value when ``update_fields``
-        excluded them from this save).
+        directly — those attributes can hold a dirty, never-actually-
+        persisted value when ``update_fields`` excluded them from this
+        save).
 
         This is the single legitimate writer of a locked offset port's
         ``address`` — each sibling's ``_deriving_address`` is set before
@@ -3491,12 +3505,12 @@ class NetworkDevicePort(AuditedModel):
         for exactly this write. Runs inside the caller's
         ``transaction.atomic()`` block (``save()``'s), so a derived address
         that collides with an existing one, falls outside the rack's
-        range, or overflows past the top of IPv4 address space (codex
-        review finding 4 — ``ipaddress.AddressValueError`` is caught and
-        re-raised as a ``ValidationError`` below, since the former isn't
-        one and would otherwise reach the admin as a bare 500) raises and
-        rolls back the control edit that triggered this cascade too —
-        nothing is left half-updated.
+        range, or overflows past the top of IPv4 address space
+        (``ipaddress.AddressValueError`` is caught and re-raised as a
+        ``ValidationError`` below, since the former isn't one and would
+        otherwise reach the admin as a bare 500) raises and rolls back the
+        control edit that triggered this cascade too — nothing is left
+        half-updated.
 
         Going DHCP (``control_is_dhcp`` or ``control_address is None``)
         takes every sibling to DHCP with it (``address=None``); coming
@@ -3544,10 +3558,38 @@ class NetworkDevicePort(AuditedModel):
             .first()
         )
 
+    def _persisted_delete_guard_fields(self):
+        """The persisted ``slot_offset``/``device_id``/``vlan_id`` for this
+        row, fetched fresh in one query — never ``self.slot_offset``/
+        ``self.device_id``/``self.vlan_id`` directly.
+
+        ``delete()`` (below) has no locked-field validation the way
+        ``save()``/``clean()`` do — ``_check_locked_fields_unchanged()`` is
+        never called on the delete path — so nothing stops a caller from
+        mutating this instance's identity fields in memory before calling
+        ``.delete()``. A tampered ``slot_offset`` would make the offset-0
+        guard below think an offset-0 row isn't one at all (skipping the
+        check entirely) or that some other row is (checking the wrong
+        VLAN's siblings), and a tampered ``device_id``/``vlan_id`` would
+        point the sibling lookup at the wrong device or VLAN — while
+        ``super().delete()`` still deletes the real, persisted row by
+        ``pk`` regardless of any of that. Reading these three fresh from
+        the database is what keeps the guard meaningful against a caller
+        that's already tampering with the exact fields it exists to
+        protect.
+        """
+        if self.pk is None:
+            return None
+        return (
+            NetworkDevicePort._default_manager.filter(pk=self.pk)
+            .values("slot_offset", "device_id", "vlan_id")
+            .first()
+        )
+
     def refresh_locked_offset_address(self) -> None:
         """Re-sync ``address``/``is_dhcp`` from what's currently persisted
-        — offset ports only (ADR 0017, codex review finding 3). A no-op
-        for an offset-0 port (never called on unsaved rows either) — see
+        — offset ports only (ADR 0017). A no-op for an offset-0 port
+        (never called on unsaved rows either) — see
         ``AuditedModelAdminMixin.save_formset()``, the only caller.
 
         Exists for exactly one race: ``NetworkDevicePortForm`` disables

@@ -2484,9 +2484,8 @@ class SlotOffsetAddressingTests(TestCase):
         saved = form.save()
         self.assertEqual(saved.address, original_address)
 
-    # Codex review (post-fba0a89) finding 1 [P1]: derive from what
-    # update_fields actually persisted, not from whatever's dirty in
-    # memory on an excluded field.
+    # The cascade must derive from what update_fields actually persisted,
+    # not from whatever's dirty in memory on an excluded field.
     def test_update_fields_address_only_ignores_dirty_in_memory_is_dhcp(self) -> None:
         device_type = self._make_sd12_type(name="SD12 Effective Values")
         device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
@@ -2506,8 +2505,8 @@ class SlotOffsetAddressingTests(TestCase):
         self.assertFalse(engine.is_dhcp)
         self.assertEqual(engine.address, "10.200.1.6")
 
-    # Codex review finding 2 [P1]: the address lock must key off the
-    # *persisted* slot_offset, not a caller-tampered in-memory one.
+    # The address lock must key off the *persisted* slot_offset, not a
+    # caller-tampered in-memory one.
     def test_locked_field_check_uses_persisted_offset_not_in_memory(self) -> None:
         device_type = self._make_sd12_type(name="SD12 Persisted Offset Lock")
         device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
@@ -2522,9 +2521,9 @@ class SlotOffsetAddressingTests(TestCase):
         self.assertEqual(engine.slot_offset, 1)
         self.assertEqual(engine.address, "10.200.1.2")
 
-    # Codex review finding 3 [P2]: a single admin submission editing both
-    # the control row's address and an offset row's other editable field
-    # (switch_port) must not be rejected over a stale formset snapshot.
+    # A single admin submission editing both the control row's address and
+    # an offset row's other editable field (switch_port) must not be
+    # rejected over a stale formset snapshot.
     def test_formset_save_refreshes_stale_offset_address_before_saving(self) -> None:
         device_type = self._make_sd12_type(name="SD12 Formset Staleness")
         device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
@@ -2568,9 +2567,9 @@ class SlotOffsetAddressingTests(TestCase):
         self.assertEqual(engine.address, "10.200.1.6")  # derived, not rejected
         self.assertEqual(engine.switch_port, switch_port)
 
-    # Codex review finding 4 [P2]: an IPv4 overflow while deriving a
-    # sibling's address must raise ValidationError, not a bare
-    # ipaddress.AddressValueError (which would 500 the admin).
+    # An IPv4 overflow while deriving a sibling's address must raise
+    # ValidationError, not a bare ipaddress.AddressValueError (which
+    # would 500 the admin).
     def test_derived_overflow_raises_validation_error(self) -> None:
         device_type = self._make_sd12_type(name="SD12 Overflow")
         device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
@@ -2584,9 +2583,9 @@ class SlotOffsetAddressingTests(TestCase):
         self.assertEqual(control.address, "10.200.1.1")
         self.assertEqual(device.ports.get(description="Engine").address, "10.200.1.2")
 
-    # Codex review finding 5 [P2]: deleting an offset-0 port must not
-    # orphan its offset siblings — single delete, queryset delete, and the
-    # whole-device cascade (which must still work in one step).
+    # Deleting an offset-0 port must not orphan its offset siblings —
+    # single delete, queryset delete, and the whole-device cascade (which
+    # must still work in one step).
     def test_delete_offset_zero_port_with_siblings_blocked(self) -> None:
         device_type = self._make_sd12_type(name="SD12 Delete Guard")
         device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
@@ -2601,6 +2600,46 @@ class SlotOffsetAddressingTests(TestCase):
         with self.assertRaises(ValidationError):
             NetworkDevicePort.objects.filter(device=device, description="Control").delete()
         self.assertTrue(device.ports.filter(description="Control").exists())
+
+    # The delete guard must key off the *persisted* slot_offset/device/
+    # vlan, not an in-memory one — delete() has no locked-field validation
+    # the way save()/clean() do, so nothing else stops a caller from
+    # tampering with an instance's identity fields before calling
+    # .delete(). Two vectors: masking an offset-0 row as if it weren't one
+    # (slot_offset), and pointing the sibling lookup at an unrelated
+    # device/VLAN with nothing to conflict on (device_id/vlan_id) — either
+    # way, super().delete() still removes the real row by pk regardless of
+    # what's in memory, so a guard that trusts self would let it through.
+    def test_delete_guard_uses_persisted_slot_offset_not_in_memory(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Delete Guard Tamper Offset")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+        control = device.ports.get(description="Control")
+
+        control.slot_offset = 1  # tampered — must not make the guard think this isn't offset-0
+        with self.assertRaises(ValidationError):
+            control.delete()
+
+        self.assertTrue(NetworkDevicePort.objects.filter(pk=control.pk).exists())
+        self.assertTrue(device.ports.filter(description="Engine").exists())
+
+    def test_delete_guard_uses_persisted_device_and_vlan_not_in_memory(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Delete Guard Tamper Relations")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+        control = device.ports.get(description="Control")
+        # An unrelated device/VLAN with no offset siblings at all — if the
+        # guard trusted these tampered in-memory ids, it would find no
+        # conflict here and let the real (Control's actual) row through.
+        other_type = _make_device_type(port_count=1, vlan=self.vlan_b, name="SD12 Delete Guard Tamper Other")
+        other_device = NetworkDevice.objects.create(device_type=other_type, rack=self.rack, rack_slot=5)
+        other_port = other_device.ports.get()
+
+        control.device_id = other_port.device_id
+        control.vlan_id = other_port.vlan_id
+        with self.assertRaises(ValidationError):
+            control.delete()
+
+        self.assertTrue(NetworkDevicePort.objects.filter(pk=control.pk).exists())
+        self.assertTrue(device.ports.filter(description="Engine").exists())
 
     def test_delete_offset_zero_port_without_siblings_allowed(self) -> None:
         plain_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="SD12 Delete Guard Plain")
