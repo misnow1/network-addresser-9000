@@ -87,6 +87,13 @@ class AuditedModelAdminMixin:
         for instance in instances:
             if instance.pk is None:
                 instance.created_by = request.user
+            elif isinstance(instance, NetworkDevicePort):
+                # ADR 0017 — see
+                # NetworkDevicePort.refresh_locked_offset_address()'s
+                # docstring for why this must run here (immediately before
+                # save, on every existing device-port row) rather than in
+                # the model itself.
+                instance.refresh_locked_offset_address()
             instance.save()
         formset.save_m2m()
 
@@ -513,7 +520,7 @@ class NetworkDeviceTypePortInline(admin.TabularInline):
     model = NetworkDeviceTypePort
     formset = NetworkDeviceTypePortFormSet
     extra = 0
-    fields = ["port_number", "description", "port_type", "vlan"]
+    fields = ["port_number", "description", "port_type", "vlan", "slot_offset"]
 
     def has_add_permission(self, request: HttpRequest, obj: Any = None) -> bool:
         if _profile_locked(obj, "devices"):
@@ -576,25 +583,63 @@ class NetworkSwitchPortInline(admin.TabularInline):
         return False
 
 
+class NetworkDevicePortForm(forms.ModelForm):
+    """Disables ``address`` on a materialized offset port (``slot_offset``
+    > 0, ADR 0017) — its address is derived from the offset-0 port on the
+    same VLAN and locked at the model level
+    (``NetworkDevicePort._locked_fields()``); this is the admin-form half
+    of that same lock, same ``disabled=True`` reasoning as
+    ``NetworkSwitchPortForm`` (``InlineModelAdmin.get_readonly_fields()``
+    can't vary per row, and ``disabled=True`` — not just omitting the field
+    — stops a crafted POST from smuggling a value past it, since Django
+    ignores a disabled field's submitted data and keeps the form's initial
+    value instead).
+    """
+
+    class Meta:
+        model = NetworkDevicePort
+        fields = [
+            "description",
+            "port_number",
+            "port_type",
+            "vlan",
+            "slot_offset",
+            "is_dhcp",
+            "address",
+            "switch_port",
+        ]
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        if self.instance.pk and self.instance.slot_offset > 0:
+            self.fields["address"].disabled = True
+
+
 class NetworkDevicePortInline(admin.TabularInline):
     """See ``NetworkSwitchPortInline`` — same materialized-only reasoning.
-    ``description``/``vlan``/``port_type`` are locked; only DHCP/address/
-    the connected switch port stay editable. ``default_gateway`` is a
-    read-only derived property (ADR 0010), shown but never editable.
+    ``description``/``vlan``/``port_type``/``slot_offset`` are locked; only
+    DHCP/address/the connected switch port stay editable — and, on a
+    ``slot_offset > 0`` row, ``address`` is disabled too
+    (``NetworkDevicePortForm``, ADR 0017): that port's address is derived
+    from the offset-0 port on the same VLAN, not independently settable.
+    ``default_gateway`` is a read-only derived property (ADR 0010), shown
+    but never editable.
     """
 
     model = NetworkDevicePort
+    form = NetworkDevicePortForm
     fields = [
         "description",
         "port_number",
         "port_type",
         "vlan",
+        "slot_offset",
         "is_dhcp",
         "address",
         "default_gateway",
         "switch_port",
     ]
-    readonly_fields = ["description", "port_number", "vlan", "port_type", "default_gateway"]
+    readonly_fields = ["description", "port_number", "vlan", "port_type", "slot_offset", "default_gateway"]
     extra = 0
 
     def get_queryset(self, request: HttpRequest) -> QuerySet:

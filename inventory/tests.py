@@ -29,6 +29,7 @@ from django.test.utils import CaptureQueriesContext
 from .admin import (
     AuditedModelAdminMixin,
     NetworkDeviceAdmin,
+    NetworkDevicePortForm,
     NetworkDevicePortInline,
     NetworkDeviceTypeAdmin,
     NetworkSwitchAddressInline,
@@ -2159,6 +2160,499 @@ class StaticPortAddressingTests(TestCase):
         request = RequestFactory().get(f"/admin/inventory/networkdevice/{device.pk}/change/")
         form_class = admin.get_form(request, device)
         self.assertNotIn("port_addressing", form_class.base_fields)
+
+
+class SlotOffsetAddressingTests(TestCase):
+    """ADR 0017: ``NetworkDeviceTypePort.slot_offset`` (+ its
+    ``NetworkDevicePort`` copy) — a materialized offset port's address
+    becomes ``range_base + rack_slot + slot_offset``, a device occupies the
+    ordinal range its type's max offset implies, and the same-VLAN
+    pre-flight narrows from "same VLAN" to "same VLAN and same offset".
+
+    Reuses ``StaticPortAddressingTests``' rack/VLAN fixture shape. Maps
+    onto ``PLAN-adr-0017.md``'s 14-case verification list — not 1:1; a few
+    cases split into a static/DHCP/unracked trio or a both-directions pair,
+    since each half is materially different code (note 4/6 in the plan's
+    review response).
+    """
+
+    def setUp(self) -> None:
+        self.vlan_a = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.vlan_b = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=10)
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan_a, address_range="10.200.1.0/27")
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan_b, address_range="10.201.1.0/27")
+
+    def _make_sd12_type(self, **kwargs) -> NetworkDeviceType:
+        """SD12-shaped type (ADR 0017's motivating example): Control at
+        offset 0, Engine at offset 1, both on ``vlan_a`` — the
+        console-with-derived-engine shape the ADR exists to represent.
+        """
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="DiGiCo", model="SD12", port_count=2, **kwargs
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type,
+            description="Control",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_a,
+            slot_offset=0,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type,
+            description="Engine",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_a,
+            slot_offset=1,
+        )
+        return device_type
+
+    def _make_orphan_offset_type(self, **kwargs) -> NetworkDeviceType:
+        """A VLAN with only an offset-1 port and no offset-0 sibling — the
+        shape ``_validate_device_type_port_profile`` must refuse on every
+        addressing path (plan review note 4), not only the static one.
+        """
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="Test", model="Orphan", port_count=1, **kwargs
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type,
+            description="Engine Only",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_a,
+            slot_offset=1,
+        )
+        return device_type
+
+    # Case 1: materializes base+slot and base+slot+offset.
+    def test_offset_port_materializes_base_plus_slot_plus_offset(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Materialize")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=7)
+        ports = {p.description: p for p in device.ports.all()}
+        self.assertFalse(ports["Control"].is_dhcp)
+        self.assertEqual(ports["Control"].address, "10.200.1.7")
+        self.assertFalse(ports["Engine"].is_dhcp)
+        self.assertEqual(ports["Engine"].address, "10.200.1.8")
+        self.assertEqual(ports["Engine"].slot_offset, 1)
+
+    # Case 2: offset port's address rejected as read-only after creation.
+    def test_offset_port_address_rejected_as_readonly_after_creation(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Locked")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+        engine = device.ports.get(description="Engine")
+        engine.address = "10.200.1.99"
+        with self.assertRaises(ValidationError):
+            engine.save()
+
+    # Case 3: offset port recomputed when the offset-0 address is edited.
+    def test_offset_port_recomputed_when_control_address_edited(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Recompute")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+        control = device.ports.get(description="Control")
+        control.address = "10.200.1.5"
+        control.save()
+        engine = device.ports.get(description="Engine")
+        self.assertEqual(engine.address, "10.200.1.6")
+
+    # Case 4: DHCP cascade both ways.
+    def test_dhcp_cascade_both_ways(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 DHCP Cascade")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=2)
+        control = device.ports.get(description="Control")
+
+        control.is_dhcp = True
+        control.address = None
+        control.save()
+        engine = device.ports.get(description="Engine")
+        self.assertTrue(engine.is_dhcp)
+        self.assertIsNone(engine.address)
+
+        control.is_dhcp = False
+        control.address = "10.200.1.9"
+        control.save()
+        engine.refresh_from_db()
+        self.assertFalse(engine.is_dhcp)
+        self.assertEqual(engine.address, "10.200.1.10")
+
+    # Case 5: rollback — a derived collision rolls back the control edit too.
+    def test_rollback_on_derived_collision(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Rollback")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+        # Occupy 10.200.1.6 — the address the Engine would derive to once
+        # Control moves to .5 — with an unrelated device's port, so the
+        # collision below is deliberate, not incidental.
+        blocker_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="SD12 Rollback Blocker")
+        NetworkDevice.objects.create(device_type=blocker_type, rack=self.rack, rack_slot=6)
+
+        control = device.ports.get(description="Control")
+        control.address = "10.200.1.5"
+        with self.assertRaises(ValidationError):
+            control.save()
+
+        control.refresh_from_db()
+        self.assertEqual(control.address, "10.200.1.1")
+        self.assertEqual(device.ports.get(description="Engine").address, "10.200.1.2")
+
+    # Case 6: update_fields discipline — a dirty in-memory address must not
+    # cascade when update_fields excludes it.
+    def test_update_fields_switch_port_only_does_not_cascade(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Update Fields")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+        switch_type = _make_switch_type(port_count=1)
+        switch = NetworkSwitch.objects.create(switch_type=switch_type)
+        switch_port = switch.ports.get()
+
+        control = device.ports.get(description="Control")
+        control.switch_port = switch_port
+        control.address = "10.200.1.9"  # dirty in-memory only — must not persist or cascade
+        control.save(update_fields=["switch_port"])
+
+        control.refresh_from_db()
+        self.assertEqual(control.address, "10.200.1.1")
+        self.assertEqual(control.switch_port, switch_port)
+        self.assertEqual(device.ports.get(description="Engine").address, "10.200.1.2")
+
+    # Case 7 (both directions): a second occupant refused inside an
+    # existing occupant's span.
+    def test_device_span_refused_over_existing_switch(self) -> None:
+        switch_type = _make_switch_type(port_count=1)
+        NetworkSwitch.objects.create(  # type: ignore[misc]
+            switch_type=switch_type,
+            rack=self.rack,
+            rack_slot=8,
+            address_materialization=SwitchAddressing.MANUAL,
+        )
+        device_type = self._make_sd12_type(name="SD12 Over Switch")
+        device = NetworkDevice(device_type=device_type, rack=self.rack, rack_slot=7)  # spans 7-8
+        with self.assertRaises(ValidationError):
+            device.full_clean()
+
+    def test_switch_refused_inside_existing_device_span(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Under Switch")
+        NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=7)  # spans 7-8
+        switch_type = _make_switch_type(port_count=1)
+        switch = NetworkSwitch(  # type: ignore[misc]
+            switch_type=switch_type,
+            rack=self.rack,
+            rack_slot=8,
+            address_materialization=SwitchAddressing.MANUAL,
+        )
+        with self.assertRaises(ValidationError):
+            switch.full_clean()
+
+    # Case 8: span-query edge cases.
+    def test_device_excludes_itself_on_resave(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Resave")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+        device.hostname = "renamed"
+        device.full_clean()  # must not raise — the occupancy check must not see itself
+        device.save()
+
+    def test_type_with_zero_ports_yields_span_one(self) -> None:
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="Generic", model="Empty", name="Zero Ports", port_count=0
+        )
+        self.assertEqual(device_type.slot_span, 1)
+
+    def test_unracked_devices_ignored_by_span_occupancy_check(self) -> None:
+        unracked_type = self._make_sd12_type(name="SD12 Unracked")
+        NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=unracked_type, port_addressing=PortAddressing.DHCP
+        )
+        other = NetworkDevice(
+            device_type=self._make_sd12_type(name="SD12 Unracked Other"), rack=self.rack, rack_slot=1
+        )
+        other.full_clean()  # must not raise — the unracked device isn't a conflict
+
+    # Case 9/10: the .255 bound, via clean() and via objects.create()
+    # (which bypasses clean() entirely).
+    def test_span_exceeding_slot_count_refused_via_full_clean(self) -> None:
+        # A `.224`-aligned /27, where the failure mode is a `.255` address —
+        # ADR 0017's exact motivating scenario for this bound.
+        aligned_rack = Rack.objects.create(name="Aligned Rack", slot_count=30)
+        RackVlanRange.objects.create(rack=aligned_rack, vlan=self.vlan_a, address_range="10.200.1.224/27")
+        device_type = self._make_sd12_type(name="SD12 Boundary Clean")
+        device = NetworkDevice(device_type=device_type, rack=aligned_rack, rack_slot=30)  # spans 30-31: .255
+        with self.assertRaises(ValidationError):
+            device.full_clean()
+
+    def test_span_exceeding_slot_count_refused_via_objects_create(self) -> None:
+        aligned_rack = Rack.objects.create(name="Aligned Rack 2", slot_count=30)
+        RackVlanRange.objects.create(rack=aligned_rack, vlan=self.vlan_a, address_range="10.200.1.224/27")
+        device_type = self._make_sd12_type(name="SD12 Boundary Create")
+        with self.assertRaises(ValidationError):
+            NetworkDevice.objects.create(device_type=device_type, rack=aligned_rack, rack_slot=30)
+        self.assertFalse(NetworkDevice.objects.filter(device_type=device_type).exists())
+
+    # Case 11: Switched Mode (same VLAN, same offset) is still refused —
+    # the pre-flight narrowed, not lost, this case.
+    def test_switched_mode_still_refused_same_vlan_same_offset(self) -> None:
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="Shure", model="ULXD4Q", name="Switched Offset Check", port_count=2
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type,
+            description="Dante A",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_b,
+            slot_offset=0,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type,
+            description="Dante B",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_b,
+            slot_offset=0,
+        )
+        with self.assertRaises(ValidationError) as ctx:
+            NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=2)
+        self.assertIn("Dante A", str(ctx.exception))
+        self.assertIn("Dante B", str(ctx.exception))
+
+    # Case 12: a VLAN with an offset-1 port and no offset-0 port is
+    # refused on every addressing path, including DHCP and unracked, which
+    # skip the static pre-flight entirely.
+    def test_offset_without_offset_zero_refused_static(self) -> None:
+        device_type = self._make_orphan_offset_type(name="Orphan Static")
+        with self.assertRaises(ValidationError):
+            NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+
+    def test_offset_without_offset_zero_refused_dhcp(self) -> None:
+        device_type = self._make_orphan_offset_type(name="Orphan DHCP")
+        with self.assertRaises(ValidationError):
+            NetworkDevice.objects.create(  # type: ignore[misc]
+                device_type=device_type, rack=self.rack, rack_slot=1, port_addressing=PortAddressing.DHCP
+            )
+
+    def test_offset_without_offset_zero_refused_unracked(self) -> None:
+        device_type = self._make_orphan_offset_type(name="Orphan Unracked")
+        with self.assertRaises(ValidationError):
+            NetworkDevice.objects.create(device_type=device_type)
+
+    # Case 13: a move leaves stored addresses unchanged, and is blocked
+    # when the new position would no longer fit — nothing recomputes on a
+    # move (ADR 0017's "what does not change").
+    def test_move_leaves_addresses_unchanged_and_blocked_if_no_longer_fits(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Move")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+        control_before = device.ports.get(description="Control").address
+        engine_before = device.ports.get(description="Engine").address
+
+        device.rack_slot = 2
+        device.full_clean()
+        device.save()
+        self.assertEqual(device.ports.get(description="Control").address, control_before)
+        self.assertEqual(device.ports.get(description="Engine").address, engine_before)
+
+        # slot_count=10: a move to 10 spans 10-11, one past the end.
+        device.rack_slot = 10
+        with self.assertRaises(ValidationError):
+            device.full_clean()
+        device.refresh_from_db()
+        self.assertEqual(device.rack_slot, 2)
+        self.assertEqual(device.ports.get(description="Control").address, control_before)
+        self.assertEqual(device.ports.get(description="Engine").address, engine_before)
+
+    # Case 14: admin — the offset row's address widget is disabled, and a
+    # POST that tries to smuggle a value past it is ignored.
+    def test_admin_offset_row_address_widget_disabled(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Admin Disabled")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+        engine = device.ports.get(description="Engine")
+        control = device.ports.get(description="Control")
+        self.assertTrue(NetworkDevicePortForm(instance=engine).fields["address"].disabled)
+        self.assertFalse(NetworkDevicePortForm(instance=control).fields["address"].disabled)
+
+    def test_admin_offset_row_address_post_smuggle_ignored(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Admin Smuggle")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+        engine = device.ports.get(description="Engine")
+        original_address = engine.address
+
+        form = NetworkDevicePortForm(
+            data={
+                "description": engine.description,
+                "port_number": engine.port_number or "",
+                "port_type": engine.port_type,
+                "vlan": str(engine.vlan_id),
+                "slot_offset": str(engine.slot_offset),
+                "address": "10.200.1.250",  # smuggled — the field is disabled, so this must be ignored
+            },
+            instance=engine,
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        saved = form.save()
+        self.assertEqual(saved.address, original_address)
+
+    # The cascade must derive from what update_fields actually persisted,
+    # not from whatever's dirty in memory on an excluded field.
+    def test_update_fields_address_only_ignores_dirty_in_memory_is_dhcp(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Effective Values")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+        control = device.ports.get(description="Control")
+
+        # is_dhcp is dirty in memory only — save(update_fields=["address"])
+        # must not let it influence the cascade, since the database's own
+        # is_dhcp column is never touched by this save.
+        control.address = "10.200.1.5"
+        control.is_dhcp = True
+        control.save(update_fields=["address"])
+
+        control.refresh_from_db()
+        self.assertFalse(control.is_dhcp)
+        self.assertEqual(control.address, "10.200.1.5")
+        engine = device.ports.get(description="Engine")
+        self.assertFalse(engine.is_dhcp)
+        self.assertEqual(engine.address, "10.200.1.6")
+
+    # The address lock must key off the *persisted* slot_offset, not a
+    # caller-tampered in-memory one.
+    def test_locked_field_check_uses_persisted_offset_not_in_memory(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Persisted Offset Lock")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+        engine = device.ports.get(description="Engine")
+
+        engine.slot_offset = 0  # tampered in memory — must not evade the address lock
+        engine.address = "10.200.1.9"  # otherwise-valid — isolates the lock check specifically
+        with self.assertRaises(ValidationError):
+            engine.save(update_fields=["address"])
+
+        engine.refresh_from_db()
+        self.assertEqual(engine.slot_offset, 1)
+        self.assertEqual(engine.address, "10.200.1.2")
+
+    # A single admin submission editing both the control row's address and
+    # an offset row's other editable field (switch_port) must not be
+    # rejected over a stale formset snapshot.
+    def test_formset_save_refreshes_stale_offset_address_before_saving(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Formset Staleness")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+        control = device.ports.get(description="Control")
+        engine = device.ports.get(description="Engine")
+        switch_type = _make_switch_type(port_count=1)
+        switch = NetworkSwitch.objects.create(switch_type=switch_type)
+        switch_port = switch.ports.get()
+        user = User.objects.create_user(username="formset-editor", password="x")
+
+        FormSet = inlineformset_factory(
+            NetworkDevice,
+            NetworkDevicePort,
+            form=NetworkDevicePortForm,
+            fields=["is_dhcp", "address", "switch_port"],
+            extra=0,
+            can_delete=False,
+        )
+        data = {
+            "ports-TOTAL_FORMS": "2",
+            "ports-INITIAL_FORMS": "2",
+            "ports-MIN_NUM_FORMS": "0",
+            "ports-MAX_NUM_FORMS": "1000",
+            "ports-0-id": str(control.pk),
+            "ports-0-address": "10.200.1.5",  # control edit — must cascade to Engine
+            "ports-1-id": str(engine.pk),
+            "ports-1-address": engine.address,  # disabled — submitted value is ignored either way
+            "ports-1-switch_port": str(switch_port.pk),  # engine's own, unrelated, legitimate edit
+        }
+        formset = FormSet(data, instance=device, prefix="ports")
+        self.assertTrue(formset.is_valid(), formset.errors)
+
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        request = RequestFactory().post(f"/admin/inventory/networkdevice/{device.pk}/change/")
+        request.user = user
+        admin.save_formset(request, form=None, formset=formset, change=True)
+
+        control.refresh_from_db()
+        engine.refresh_from_db()
+        self.assertEqual(control.address, "10.200.1.5")
+        self.assertEqual(engine.address, "10.200.1.6")  # derived, not rejected
+        self.assertEqual(engine.switch_port, switch_port)
+
+    # An IPv4 overflow while deriving a sibling's address must raise
+    # ValidationError, not a bare ipaddress.AddressValueError (which
+    # would 500 the admin).
+    def test_derived_overflow_raises_validation_error(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Overflow")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+        control = device.ports.get(description="Control")
+
+        control.address = "255.255.255.255"
+        with self.assertRaises(ValidationError):
+            control.save()
+
+        control.refresh_from_db()
+        self.assertEqual(control.address, "10.200.1.1")
+        self.assertEqual(device.ports.get(description="Engine").address, "10.200.1.2")
+
+    # Deleting an offset-0 port must not orphan its offset siblings —
+    # single delete, queryset delete, and the whole-device cascade (which
+    # must still work in one step).
+    def test_delete_offset_zero_port_with_siblings_blocked(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Delete Guard")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+        control = device.ports.get(description="Control")
+        with self.assertRaises(ValidationError):
+            control.delete()
+        self.assertTrue(NetworkDevicePort.objects.filter(pk=control.pk).exists())
+
+    def test_delete_offset_zero_port_with_siblings_blocked_via_queryset(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Delete Guard Bulk")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+        with self.assertRaises(ValidationError):
+            NetworkDevicePort.objects.filter(device=device, description="Control").delete()
+        self.assertTrue(device.ports.filter(description="Control").exists())
+
+    # The delete guard must key off the *persisted* slot_offset/device/
+    # vlan, not an in-memory one — delete() has no locked-field validation
+    # the way save()/clean() do, so nothing else stops a caller from
+    # tampering with an instance's identity fields before calling
+    # .delete(). Two vectors: masking an offset-0 row as if it weren't one
+    # (slot_offset), and pointing the sibling lookup at an unrelated
+    # device/VLAN with nothing to conflict on (device_id/vlan_id) — either
+    # way, super().delete() still removes the real row by pk regardless of
+    # what's in memory, so a guard that trusts self would let it through.
+    def test_delete_guard_uses_persisted_slot_offset_not_in_memory(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Delete Guard Tamper Offset")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+        control = device.ports.get(description="Control")
+
+        control.slot_offset = 1  # tampered — must not make the guard think this isn't offset-0
+        with self.assertRaises(ValidationError):
+            control.delete()
+
+        self.assertTrue(NetworkDevicePort.objects.filter(pk=control.pk).exists())
+        self.assertTrue(device.ports.filter(description="Engine").exists())
+
+    def test_delete_guard_uses_persisted_device_and_vlan_not_in_memory(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Delete Guard Tamper Relations")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+        control = device.ports.get(description="Control")
+        # An unrelated device/VLAN with no offset siblings at all — if the
+        # guard trusted these tampered in-memory ids, it would find no
+        # conflict here and let the real (Control's actual) row through.
+        other_type = _make_device_type(port_count=1, vlan=self.vlan_b, name="SD12 Delete Guard Tamper Other")
+        other_device = NetworkDevice.objects.create(device_type=other_type, rack=self.rack, rack_slot=5)
+        other_port = other_device.ports.get()
+
+        control.device_id = other_port.device_id
+        control.vlan_id = other_port.vlan_id
+        with self.assertRaises(ValidationError):
+            control.delete()
+
+        self.assertTrue(NetworkDevicePort.objects.filter(pk=control.pk).exists())
+        self.assertTrue(device.ports.filter(description="Engine").exists())
+
+    def test_delete_offset_zero_port_without_siblings_allowed(self) -> None:
+        plain_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="SD12 Delete Guard Plain")
+        device = NetworkDevice.objects.create(device_type=plain_type, rack=self.rack, rack_slot=5)
+        port = device.ports.get()
+        port.delete()  # offset 0, no siblings — must not raise
+        self.assertFalse(NetworkDevicePort.objects.filter(pk=port.pk).exists())
+
+    def test_deleting_whole_device_cascades_without_blocking(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Delete Guard Cascade")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+        device.delete()  # must not raise despite Control having an offset sibling
+        self.assertFalse(NetworkDevicePort.objects.filter(device_id=device.pk).exists())
 
 
 class SwitchAddressMaterializationTests(TestCase):
