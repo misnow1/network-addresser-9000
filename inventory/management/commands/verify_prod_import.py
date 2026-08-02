@@ -815,6 +815,16 @@ def _check_device_type_ports(findings: _Findings, vlan_id_by_function: dict[str,
     type ports — count, VLAN, port_type, and slot_offset"). Checking
     ``slot_offset`` alone would pass a wrong port count, VLAN, description
     or ``port_type`` in the importer's hardcoded catalog.
+
+    "Count" is checked twice, deliberately: ``device_type.port_count`` (the
+    stored field) against the expected count, *and* the number of actual
+    ``NetworkDeviceTypePort`` rows against the expected count. The model's
+    own ``_validate_device_type_port_profile()`` (``inventory/models.py``)
+    already keeps these two in sync on every path that creates an instance
+    — but this command's job is to verify what it advertises, not to lean
+    on an upstream guarantee it never actually reads. A row-count match
+    with a corrupted stored ``port_count`` is exactly the state that
+    checking only ``len(actual_ports)`` sails past.
     """
     for device_type in NetworkDeviceType.objects.prefetch_related("type_ports__vlan"):
         identity = (device_type.manufacturer, device_type.model, device_type.name)
@@ -825,6 +835,12 @@ def _check_device_type_ports(findings: _Findings, vlan_id_by_function: dict[str,
             )
             continue
         actual_ports = list(device_type.type_ports.all())
+        if device_type.port_count != len(expected_ports):
+            findings.fail(
+                "device_type_ports",
+                f"{device_type}: stored port_count {device_type.port_count} != expected "
+                f"{len(expected_ports)}.",
+            )
         if len(actual_ports) != len(expected_ports):
             findings.fail(
                 "device_type_ports",

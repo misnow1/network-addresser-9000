@@ -546,6 +546,18 @@ class ImportProdDataTests(TestCase):
         with self.assertRaises(CommandError):
             call_command("verify_prod_import", data_dir=str(self.data_dir))
 
+    def test_verify_catches_a_corrupted_stored_port_count(self) -> None:
+        # The actual NetworkDeviceTypePort rows are left untouched — only
+        # the stored port_count field is wrong. A check that only counts
+        # actual rows (matching the expected count either way) sails past
+        # this; the stored field has to be compared too.
+        device_type = NetworkDeviceType.objects.get(
+            manufacturer="Lab.Gruppen", model="LM26", name="Redundant Mode"
+        )
+        NetworkDeviceType.objects.filter(pk=device_type.pk).update(port_count=device_type.port_count + 1)
+        with self.assertRaises(CommandError):
+            call_command("verify_prod_import", data_dir=str(self.data_dir))
+
 
 class ImportProdDataMalformedDmiDanteTests(TestCase):
     """The DMI-DANTE card's rack/slot is pinned (PLAN-prod-import.md §9),
