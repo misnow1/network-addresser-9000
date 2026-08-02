@@ -94,11 +94,27 @@ exercise into a search for missing *rules* rather than missing features — see
 - [x] Implement ADR 0017 — `slot_offset`, derived offset-port addressing, span-aware rack-slot occupancy, and the narrowed same-VLAN pre-flight; see `PLAN-adr-0017.md`
 - [x] Production import — see `PLAN-prod-import.md` (revision 3), implemented as `manage.py import_prod_data` plus an independent `manage.py verify_prod_import`. Run against the real export: **183 addresses placed, 161 byte-identical, 2 differing by design (the DMI-DANTE pair), 20 correct-but-unrecorded switch addresses** — the plan's prediction exactly, 19 of 19 automatically-allocated rack bases reproduced, and every other `## Verification` check green. Two known gaps carried forward, neither blocking: the Netgear model (defers 3 of 23 switches to a second pass) and the per-device-type wiring rule for patch-panel-fed devices. Four items filed as `deferred`: #41, #42, #43, #44
 
+## 13. Device companions
+
+Hardware that comes in two independently-addressed pieces, one of which cannot exist without
+the other — a Yamaha DM7C/DM3 console and its Device Control Interface. The production import
+created both as unlinked devices because the model has no way to say one requires the other;
+`slot_offset` is deliberately not that way (ADR 0017's scope boundary).
+
+- [x] Design decided: a type declares a `companion_type`, the host materializes its companion at
+      creation, deletion cascades from the host and is refused from the companion, and the pair
+      moves as a unit — addresses stay independent throughout. See ADR 0018 (extends ADR 0007's
+      removal rules and ADR 0010's materialization; does **not** close #42)
+- [ ] Implement ADR 0018 — schema + backfill migration, companion materialization in
+      `NetworkDevice.save()`, the delete guard and its queryset twin, host-managed companion
+      placement in the admin, and the importer/verifier pairing pass
+
 ## Later / not yet designed
 
 - Purpose-built frontend beyond Django admin (rack visualizations, address-utilization views)
 - Device-replacement workflow (swapping a spare into an already-addressed slot) — flagged in ADR 0003, design deferred
 - Addressing modeled per `(device, VLAN)` instead of per port — the actual fix for Switched Mode's bridged-jack limitation (ADR 0010, ADR 0013) — see #27
+- Two *independent* static addresses on one VLAN (a Yamaha console's "For Device Control" interface) — see #42. ADR 0018 covers the same hardware but solves a different problem (existence and lifecycle, not addressing) and leaves this open: if it ever lands, those consoles collapse to one device and their companion links fall away
 - Slot moves don't re-suggest an already-static device port's address (armed by default now that static materializes by default, ADR 0013; follows from ADR 0003's "stored, not immutable") — see #28
 - Multicast configuration: port-level filtering plus switch-level IGMP snooping — see #22
 - Populated rack templates: slot layouts that materialize equipment (needs Type `PROTECT`, unlike the VLAN-only feature) — see #30
