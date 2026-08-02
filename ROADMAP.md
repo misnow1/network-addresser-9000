@@ -2,7 +2,7 @@
 
 High-level phases only — day-to-day task tracking belongs in GitHub Issues once there's code to file issues against. This file exists so it's obvious what phase the project is in and what's next, even after a fresh start.
 
-**Current phase: 12 — designed, not yet built.**
+**Current phase: 12 — done. Nothing currently in flight; see "Later / not yet designed" for candidates.**
 
 ## 1. Foundation — done
 
@@ -78,7 +78,7 @@ High-level phases only — day-to-day task tracking belongs in GitHub Issues onc
 - [x] Domain-level apply operation (construct-blank → `full_clean()` → `save()` per VLAN, all-or-nothing, reachable from programmatic creation — not admin-only)
 - [x] Tests: successful suggestion via the template path; rollback when one of several VLANs can't be allocated
 
-## 12. Production data validation — designed, not yet built
+## 12. Production data validation — done
 
 Three CSVs exported from the production spreadsheet were validated against the code's own
 arithmetic. The formula matches exactly (259/259 address assignments), which turned the
@@ -92,7 +92,7 @@ exercise into a search for missing *rules* rather than missing features — see
 - [x] Implement ADR 0015 — one-line change to `required_block_size`, three existing tests to update
 - [x] Implement ADR 0016
 - [x] Implement ADR 0017 — `slot_offset`, derived offset-port addressing, span-aware rack-slot occupancy, and the narrowed same-VLAN pre-flight; see `PLAN-adr-0017.md`
-- [ ] Production import — see `PLAN-prod-import.md`; blocked on switch profile names, the rack↔switch-type mapping, and the AVIO/console hostname→model mapping
+- [x] Production import — see `PLAN-prod-import.md` (revision 3), implemented as `manage.py import_prod_data` plus an independent `manage.py verify_prod_import`. Run against the real export: **183 addresses placed, 161 byte-identical, 2 differing by design (the DMI-DANTE pair), 20 correct-but-unrecorded switch addresses** — the plan's prediction exactly, 19 of 19 automatically-allocated rack bases reproduced, and every other `## Verification` check green. Two known gaps carried forward, neither blocking: the Netgear model (defers 3 of 23 switches to a second pass) and the per-device-type wiring rule for patch-panel-fed devices. Four items filed as `deferred`: #41, #42, #43, #44
 
 ## Later / not yet designed
 

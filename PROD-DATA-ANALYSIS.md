@@ -68,11 +68,22 @@ equipment row carries a description, a rack, a slot, and up to three addresses �
 for Audio Control, Dante Primary, and Dante Secondary. The 99 rows cover 89 distinct
 `(rack, slot)` pairs; the 10-row surplus is discussed in §2.2.
 
+> **Historical.** The figures above (102/99/89) describe the *first* export. The corrected
+> export `PLAN-prod-import.md` implements against gives 94 data rows, 91 racked rows and 87
+> distinct `(rack, slot)` pairs — see that plan's Verification section. This passage is a
+> dated record of what the first export showed and is left as originally written rather than
+> updated in place.
+
 ### `Switch Ports.csv` — L2 port configuration
 
 Five stacked per-model tables (description, port, VLAN, access/trunk mode, note). No
 addresses anywhere — this file is purely switch port configuration, and maps onto
 `NetworkSwitchType` / `NetworkSwitchTypePort` / `SwitchPortVlanProfile`. Details in §4.
+
+> **Historical.** "Five stacked per-model tables" describes the first export. The corrected
+> export has seven: it gained a TP-Link TL-SG108E table and a Cisco SG300-26P table, and the
+> derivation rule for secondary-switch profiles that made a sixth table unnecessary — see
+> `PLAN-prod-import.md` §6.
 
 ## 2. Validation results
 
@@ -152,6 +163,10 @@ ADR's floor and no such rack exists here.
 Eighteen of 21 racks hold equipment; `CONTROL`, `CDD`, and `SHURE` are empty. Occupancy
 ranges from 2 to 19 slots. Collapsing the duplicate rows (§2.2), the 89 distinct slots hold
 **23 addressed switches and 66 devices**.
+
+> **Historical.** 89/66 describe the first export. The corrected export gives 87 distinct
+> slots — 23 addressed switches (unchanged) and 64 device slots, which become 63
+> `NetworkDevice` rows under ADR 0017's SD12 collapse — see `PLAN-prod-import.md` §7.
 
 Two gaps worth noting, with different explanations:
 
@@ -415,6 +430,12 @@ section: a device type whose ports are chosen from a short list of real hardware
 assembled a port at a time, and all 34 of these would have been unrepresentable under it.
 
 ### Switches with no port configuration recorded
+
+> **Historical.** This section describes the first export's gaps. The corrected export
+> closed all four: it gained the TP-Link TL-SG108E and Cisco SG300-26P tables, a documented
+> derivation rule for the redundant-switch layout, and `CONSOLES` slots 2–3 were deleted as
+> genuinely unallocated rather than lost data — see `PLAN-prod-import.md` §6. Left as
+> originally written rather than updated in place.
 
 Four switch profiles are deployed but absent from the ports file entirely — detailed in
 `PLAN-prod-import.md` §6. Briefly: no redundant-switch layout exists anywhere (7 are
