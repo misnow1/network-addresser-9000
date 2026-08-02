@@ -6,12 +6,28 @@ real site data, and the whole point of this suite is to exercise the same
 rack, an SD12-shaped ``slot_offset`` device with its DMI-DANTE card, a
 secondary switch's derived profile, the duplicate-row collapse, and the
 three deliberate address drops) against small synthetic CSVs built here, on
-a VLAN numbering (130s) and rack names invented for this suite. Model/part
+an invented VLAN numbering (130s) whose addresses appear nowhere in
+``prod/``.
+
+**Rack and product names are a different case, reused on purpose, not
+invented.** ``AMPRACK1``/``W8LMTEST`` are made up, but ``XE300-1``,
+``AVIO``, ``SHURE`` and ``CONSOLES`` are the real production rack names —
+and have to be, because ``import_prod_data.py`` classifies several
+behaviours (the manual-range racks, the no-Dante-card IK-42 slots, the
+AVIO Control-address drop) by hardcoded, site-specific rack name, per
+PLAN-prod-import.md's own design (§"The constraint that shapes
+everything": "SHURE and CONSOLES must be created without a template").
+Inventing fictional names for these racks would mean either not exercising
+that hardcoded matching at all, or duplicating it under different literals
+— testing a parallel implementation instead of the real one. Model/part
 names (``IK42``, ``LM26``, ``Cisco SG300-10MP``, ``mps-avio-...``) are
-reused as-is from `PLAN-prod-import.md`/`PROD-DATA-ANALYSIS.md` — those are
-product identifiers already committed to the repo, not addresses — but
-every IP address here is invented for this suite and appears nowhere in
-`prod/`.
+reused the same way. None of this is site data the way row-level address
+assignments are: every rack and product name here already appears verbatim,
+in full, in `PLAN-prod-import.md`/`PROD-DATA-ANALYSIS.md` — committed,
+non-gitignored files in this repo — so reusing them discloses nothing that
+isn't already public. What ``prod/`` actually protects, and what this
+suite genuinely invents, is the *address* assignments: every IP address
+below is fabricated for this suite and appears in no CSV under ``prod/``.
 """
 
 import csv
@@ -19,6 +35,7 @@ import ipaddress
 import tempfile
 from pathlib import Path
 
+from django.contrib.auth import get_user_model
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import TestCase
@@ -26,7 +43,10 @@ from django.test import TestCase
 from .models import (
     NetworkDevice,
     NetworkDevicePort,
+    NetworkDeviceType,
+    NetworkDeviceTypePort,
     NetworkSwitch,
+    NetworkSwitchAddress,
     NetworkSwitchType,
     Rack,
     RackVlanRange,
@@ -314,7 +334,7 @@ def _switch_ports_rows() -> list:
     return rows
 
 
-def _addressing_rows() -> list:
+def _addressing_rows(source_rows: list | None = None) -> list:
     rows: list = [
         [
             "Device Description",
@@ -326,16 +346,19 @@ def _addressing_rows() -> list:
             "Notes",
         ]
     ]
-    for row in ADDRESSING_ROWS:
+    for row in ADDRESSING_ROWS if source_rows is None else source_rows:
         rows.append([row[0], row[1], str(row[2]), row[3], row[4], row[5], row[6]])
     return rows
 
 
-def write_fixture_csvs(data_dir: Path) -> None:
+def write_fixture_csvs(data_dir: Path, addressing_source_rows: list | None = None) -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     _write_csv(data_dir / "MPS Audio Network Standards - IP Calc Lookups.csv", _calc_lookups_rows())
     _write_csv(data_dir / "MPS Audio Network Standards - Switch Ports.csv", _switch_ports_rows())
-    _write_csv(data_dir / "MPS Audio Network Standards - IP Addressing mk2.csv", _addressing_rows())
+    _write_csv(
+        data_dir / "MPS Audio Network Standards - IP Addressing mk2.csv",
+        _addressing_rows(addressing_source_rows),
+    )
 
 
 class ImportProdDataTests(TestCase):
@@ -391,15 +414,16 @@ class ImportProdDataTests(TestCase):
         # slot-1 device's span, not created as its own occupant.
         self.assertFalse(NetworkDevice.objects.filter(rack__name="CONSOLES", rack_slot=2).exists())
 
-        # The DMI-DANTE card lands past every other CONSOLES occupant
-        # (slot 4 is the highest in this fixture), re-addressed on its own
-        # ordinal rather than copying the sheet's synthetic marker values.
-        card = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=5)
+        # The DMI-DANTE card lands at CONSOLES slot 17, pinned rather than
+        # derived (PLAN-prod-import.md §9) — the fixture's other CONSOLES
+        # occupants (slots 1, 2, 4) are nowhere near it, so this also proves
+        # the pin isn't just an accident of "highest slot + 1" here.
+        card = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=17)
         self.assertEqual(card.device_type.model, "DMI-DANTE")
         dp_port = card.ports.get(vlan__vlan_id=_VLAN_ID_BY_FUNCTION[FN_DANTE_PRIMARY])
         ds_port = card.ports.get(vlan__vlan_id=_VLAN_ID_BY_FUNCTION[FN_DANTE_SECONDARY])
-        self.assertEqual(dp_port.address, addr(FN_DANTE_PRIMARY, "CONSOLES", 5))
-        self.assertEqual(ds_port.address, addr(FN_DANTE_SECONDARY, "CONSOLES", 5))
+        self.assertEqual(dp_port.address, addr(FN_DANTE_PRIMARY, "CONSOLES", 17))
+        self.assertEqual(ds_port.address, addr(FN_DANTE_SECONDARY, "CONSOLES", 17))
         self.assertNotEqual(dp_port.address, "10.131.9.9")
 
     def test_secondary_switch_type_is_derived_correctly(self) -> None:
@@ -476,3 +500,120 @@ class ImportProdDataTests(TestCase):
         NetworkDevicePort.objects.filter(pk=port.pk).update(address="10.131.250.250")
         with self.assertRaises(CommandError):
             call_command("verify_prod_import", data_dir=str(self.data_dir))
+
+    def test_verify_catches_a_wrong_extra_switch_address(self) -> None:
+        # AMPRACK1's primary switch's Dante Secondary column is blank in the
+        # sheet — the "extra" address §8 documents. Corrupting it must be
+        # caught by deriving base + slot independently, not merely by
+        # confirming *something* is there.
+        address = NetworkSwitchAddress.objects.get(
+            switch__rack__name="AMPRACK1",
+            switch__rack_slot=1,
+            vlan__vlan_id=_VLAN_ID_BY_FUNCTION[FN_DANTE_SECONDARY],
+        )
+        NetworkSwitchAddress.objects.filter(pk=address.pk).update(address="10.132.250.250")
+        with self.assertRaises(CommandError):
+            call_command("verify_prod_import", data_dir=str(self.data_dir))
+
+    def test_verify_catches_a_device_reassigned_to_a_same_shaped_type(self) -> None:
+        # An LM26 relabelled as an LM44 in the database is the same port
+        # shape (Dante Primary + Dante Secondary, no Control) and would
+        # materialize identical addresses — only the type identity differs.
+        lm26 = NetworkDevice.objects.get(rack__name="W8LMTEST", rack_slot=2)
+        lm44_type = NetworkDeviceType.objects.get(
+            manufacturer="Lab.Gruppen", model="LM44", name="Redundant Mode"
+        )
+        NetworkDevice.objects.filter(pk=lm26.pk).update(device_type=lm44_type)
+        with self.assertRaises(CommandError):
+            call_command("verify_prod_import", data_dir=str(self.data_dir))
+
+    def test_verify_catches_a_switch_reassigned_to_a_same_shaped_type(self) -> None:
+        # The AMPRACK1 primary switch relabelled as the secondary type:
+        # same manufacturer/model/port_count, wrong profile assignment.
+        primary_switch = NetworkSwitch.objects.get(rack__name="AMPRACK1", rack_slot=1)
+        secondary_type = NetworkSwitchType.objects.get(
+            manufacturer="Cisco", model="SG300-10MP", name="For 3xAmp Rack Secondary"
+        )
+        NetworkSwitch.objects.filter(pk=primary_switch.pk).update(switch_type=secondary_type)
+        with self.assertRaises(CommandError):
+            call_command("verify_prod_import", data_dir=str(self.data_dir))
+
+    def test_verify_catches_a_wrong_device_type_port(self) -> None:
+        # A wrong port_type in the catalog is exactly what a slot_offset-only
+        # check would miss.
+        type_port = NetworkDeviceTypePort.objects.get(device_type__model="LM26", description="Dante Primary")
+        NetworkDeviceTypePort.objects.filter(pk=type_port.pk).update(port_type="1gbe_sfp")
+        with self.assertRaises(CommandError):
+            call_command("verify_prod_import", data_dir=str(self.data_dir))
+
+
+class ImportProdDataMalformedDmiDanteTests(TestCase):
+    """The DMI-DANTE card's rack/slot is pinned (PLAN-prod-import.md §9),
+    not derived — this is the "refuse rather than guess" half of that fix,
+    exercised against its own one-off fixture rather than the shared one
+    above, since it needs an extra, deliberately-malformed row.
+    """
+
+    def test_refuses_when_the_marker_appears_on_an_unexpected_rack(self) -> None:
+        malformed_rows = [
+            *ADDRESSING_ROWS,
+            (
+                "BOGUS-Control",
+                "AMPRACK1",
+                20,
+                addr(FN_CONTROL, "AMPRACK1", 20),
+                "10.131.9.9",
+                "10.132.9.9",
+                "",
+            ),
+            (
+                "BOGUS-Engine",
+                "AMPRACK1",
+                21,
+                addr(FN_CONTROL, "AMPRACK1", 21),
+                "",
+                "",
+                "",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_fixture_csvs(data_dir, addressing_source_rows=malformed_rows)
+            with self.assertRaises(CommandError):
+                call_command("import_prod_data", data_dir=str(data_dir))
+
+
+class ImportUserIdentityTests(TestCase):
+    """Stage 1's dedicated audit identity (ADR 0004) — construct ->
+    full_clean() -> save() like every other row this command writes, and
+    refuses rather than silently adopting or disabling a pre-existing
+    account under its username.
+    """
+
+    _tmpdir: tempfile.TemporaryDirectory
+    data_dir: Path
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls._tmpdir = tempfile.TemporaryDirectory()
+        cls.data_dir = Path(cls._tmpdir.name)
+        write_fixture_csvs(cls.data_dir)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmpdir.cleanup()
+        super().tearDownClass()
+
+    def test_creates_a_disabled_import_identity(self) -> None:
+        call_command("import_prod_data", data_dir=str(self.data_dir))
+        user = get_user_model().objects.get(username="prod-import")
+        self.assertFalse(user.is_staff)
+        self.assertFalse(user.is_active)
+        self.assertFalse(user.has_usable_password())
+
+    def test_refuses_when_username_taken_by_a_real_account(self) -> None:
+        get_user_model().objects.create_user(username="prod-import", password="a-real-password")
+        with self.assertRaises(CommandError):
+            call_command("import_prod_data", data_dir=str(self.data_dir))
+        self.assertFalse(Rack.objects.exists())  # refused before any writes committed

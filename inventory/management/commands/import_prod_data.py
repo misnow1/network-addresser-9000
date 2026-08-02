@@ -92,6 +92,15 @@ DHCP_SERVER_RACKS = frozenset({"FOH Drive #1", "FOH Drive #2"})
 #: created, since "Managed Switch" is not a model (PLAN-prod-import.md §6).
 NETGEAR_DESCRIPTION = "Netgear Managed Switch (For W8LM Rack)"
 
+#: Pinned, not derived. PLAN-prod-import.md §9 is explicit that the
+#: DMI-DANTE card's rack and ordinal must be predictable rather than
+#: computed, since the two resulting addresses get programmed into the
+#: physical card. A `max(occupied slot) + 1` derivation would silently
+#: follow a later or malformed row above slot 16 instead of catching it —
+#: see ``_classify_addressing_rows()``'s collision guard below.
+DMI_DANTE_RACK = "CONSOLES"
+DMI_DANTE_SLOT = 17
+
 #: Every switch-ports-CSV table name actually used to build a
 #: ``NetworkSwitchType`` — excludes the Netgear and Unmanaged tables, which
 #: name no real type (§6).
@@ -449,11 +458,36 @@ class _Importer:
     # -- Stage 1: audit identity -------------------------------------------------
 
     def _stage1_import_user(self) -> None:
+        """Resolve the dedicated, disabled import identity every row's
+        ``created_by`` points at (ADR 0004).
+
+        Not ``get_or_create()``: that skips ``full_clean()`` like every
+        other direct-write shortcut this command avoids, and — the more
+        pointed problem — ``defaults`` are only applied on *insert*, so a
+        pre-existing row under this username would be adopted as-is
+        regardless of its ``is_staff``/``is_active``/password state. A
+        real, usable account that happens to be named ``prod-import``
+        would then silently own every row's provenance instead of the
+        intended disabled audit identity. This refuses that case loudly
+        instead of either adopting a real account or silently disabling
+        one out from under whoever it belongs to.
+        """
         User = get_user_model()
-        user, _ = User.objects.get_or_create(
-            username=IMPORT_USERNAME,
-            defaults={"is_staff": False, "is_active": False},
-        )
+        try:
+            user = User.objects.get(username=IMPORT_USERNAME)
+        except User.DoesNotExist:
+            user = User(username=IMPORT_USERNAME, is_staff=False, is_active=False)
+            user.set_unusable_password()
+            user.full_clean()
+            user.save()
+        else:
+            if user.is_staff or user.is_active or user.has_usable_password():
+                raise CommandError(
+                    f"A user named {IMPORT_USERNAME!r} already exists and is not the dedicated, "
+                    "disabled import identity this command expects (is_staff=False, "
+                    "is_active=False, no usable password) — rename or remove that account "
+                    "before importing, so this run doesn't attribute every row to it."
+                )
         self.user = user
 
     # -- Stage 2: VLANs -----------------------------------------------------------
@@ -775,9 +809,25 @@ class _Importer:
             device_entries.append(_DeviceEntry(row.rack, row.slot, hostname, type_key))
             consumed.add(key)
 
-        for rack in sorted(dmi_dante_racks):
-            slot = max_slot_by_rack[rack] + 1
-            device_entries.append(_DeviceEntry(rack, slot, "", "dmi_dante"))
+        if dmi_dante_racks:
+            if dmi_dante_racks != {DMI_DANTE_RACK}:
+                raise CommandError(
+                    f"DMI-DANTE marker found on {sorted(dmi_dante_racks)}, but "
+                    f"PLAN-prod-import.md §9 pins the card to {DMI_DANTE_RACK} slot "
+                    f"{DMI_DANTE_SLOT} — refusing to guess a slot for a different rack."
+                )
+            if (DMI_DANTE_RACK, DMI_DANTE_SLOT) in by_key:
+                raise CommandError(
+                    f"{DMI_DANTE_RACK} slot {DMI_DANTE_SLOT} is pinned for the DMI-DANTE card "
+                    "(PLAN-prod-import.md §9) but the addressing sheet already has a row there."
+                )
+            if max_slot_by_rack.get(DMI_DANTE_RACK, 0) >= DMI_DANTE_SLOT:
+                raise CommandError(
+                    f"{DMI_DANTE_RACK} already has an occupant at or past the pinned DMI-DANTE "
+                    f"slot {DMI_DANTE_SLOT} (PLAN-prod-import.md §9) — the export has grown past "
+                    "what the pin assumed; resolve this before importing."
+                )
+            device_entries.append(_DeviceEntry(DMI_DANTE_RACK, DMI_DANTE_SLOT, "", "dmi_dante"))
 
         return switch_entries, device_entries
 

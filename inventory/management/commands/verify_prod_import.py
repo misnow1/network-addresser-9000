@@ -30,6 +30,7 @@ from inventory.models import (
     VLAN,
     NetworkDevice,
     NetworkDevicePort,
+    NetworkDeviceType,
     NetworkDeviceTypePort,
     NetworkSwitch,
     NetworkSwitchAddress,
@@ -60,6 +61,15 @@ FN_DANTE_SECONDARY = "Dante Secondary"
 MANUAL_RANGE_RACKS = frozenset({"SHURE", "CONSOLES"})
 DHCP_SERVER_RACKS = frozenset({"FOH Drive #1", "FOH Drive #2"})
 NETGEAR_DESCRIPTION = "Netgear Managed Switch (For W8LM Rack)"
+
+#: Pinned, not derived — re-declared independently of
+#: ``import_prod_data.DMI_DANTE_RACK``/``DMI_DANTE_SLOT``. PLAN-prod-import.md
+#: §9 pins the card to CONSOLES slot 17 deliberately, specifically so the
+#: resulting addresses are predictable enough to program into physical
+#: hardware — a `max(slot) + 1` derivation on either side of the import
+#: would silently follow a later or malformed row instead of catching it.
+DMI_DANTE_RACK = "CONSOLES"
+DMI_DANTE_SLOT = 17
 
 #: Re-declared independently of ``import_prod_data.SWITCH_DESCRIPTION_TO_TABLE``
 #: — same source knowledge, separately typed in, so a mistake in one isn't
@@ -105,6 +115,153 @@ SECONDARY_TABLE_TO_TYPE_NAME = {
     "Cisco SG350-10 (For 2xAmp Rack Primary)": "For 2xAmp Rack Secondary",
 }
 
+#: Independently-declared expected ``(manufacturer, model, name)`` per
+#: addressing-sheet Device Description, for ordinary (non-switch, non-SD12)
+#: device rows — re-typed from PLAN-prod-import.md §7, not imported from
+#: ``import_prod_data.DESCRIPTION_TO_DEVICE_KEY``.
+DESCRIPTION_TO_DEVICE_IDENTITY: dict[str, tuple[str, str, str]] = {
+    "IK42": ("Martin Audio", "IK-42", "with Dante Card"),
+    "IK81": ("Martin Audio", "IK-81", "with Dante Card"),
+    "LM26": ("Lab.Gruppen", "LM26", "Redundant Mode"),
+    "LM44": ("Lab.Gruppen", "LM44", "Redundant Mode"),
+    "PLM20000Q": ("Lab.Gruppen", "PLM20000Q", "Redundant Mode"),
+    "SD9": ("DiGiCo", "SD9", "Default"),
+    "SD11": ("DiGiCo", "SD11", "Default"),
+    "DM7C-1": ("Yamaha", "DM7C", "Default"),
+    "dm7c-1-device-control": ("Yamaha", "DM7C", "Device Control Interface"),
+    "DM7-EX-1": ("Yamaha", "DM7-EX", "Default"),
+    "bej-dm3-1": ("Yamaha", "DM3", "Default"),
+    "bej-dm3-1-device-control": ("Yamaha", "DM3", "Device Control Interface"),
+    "bej-tio1608-d2-1": ("Yamaha", "Tio1608-D2", "Default"),
+    "SQ5-1": ("Allen & Heath", "SQ-5", "Default"),
+}
+
+#: §5.2: these two IK-42 rows have no Dante card fitted, a different type
+#: from every other "IK42" row.
+IK42_WITHOUT_DANTE_CARD: frozenset[tuple[str, int]] = frozenset({("XE300-1", 3), ("XE300-1", 4)})
+
+#: AVIO hostname prefix -> expected identity (§7 tier 3), most-specific
+#: pattern first — see ``import_prod_data.AVIO_PATTERNS`` for why order
+#: matters here (independently re-declared, not shared).
+AVIO_IDENTITY_PATTERNS: tuple[tuple[re.Pattern[str], tuple[str, str, str]], ...] = (
+    (re.compile(r"^mps-avio-amph-output-\d+$"), ("Amphenol", "RJD1212-0050", "Default")),
+    (re.compile(r"^mps-avio-avio-aes-io-\d+$"), ("Amphenol", "RJD32A3-0050", "Default")),
+    (re.compile(r"^mps-avio-avio-usb-io-\d+$"), ("Amphenol", "RJD32U1-0050", "Default")),
+    (re.compile(r"^mps-avio-avio-input-\d+$"), ("Amphenol", "RJD2203-0050", "Default")),
+    (re.compile(r"^mps-avio-avio-output-\d+$"), ("Audinate", "AVIO-AO2", "Default")),
+    (re.compile(r"^mps-avio-na2-dline-\d+$"), ("Neutrik", "NA2-DLINE", "Default")),
+    (re.compile(r"^mps-avio-radial-tx$"), ("Radial", "DiNET DAN-TX", "Default")),
+    (re.compile(r"^mps-avio-radial-rx-\d+$"), ("Radial", "DiNET DAN-RX", "Default")),
+)
+
+SD12_IDENTITY = ("DiGiCo", "SD12", "Default")
+DMI_DANTE_IDENTITY = ("DiGiCo", "DMI-DANTE", "Default")
+
+#: A plain 1GbE copper jack is the only device port type in this dataset
+#: (PROD-DATA-ANALYSIS.md §7.3) — re-declared as a literal here rather than
+#: importing ``inventory.models.PortType``, so this check owes the app's
+#: enum nothing either.
+EXPECTED_DEVICE_PORT_TYPE = "1gbe_rj45"
+
+#: Independently-declared expected port catalog per device type identity —
+#: ``(manufacturer, model, name) -> ((description, VLAN function,
+#: slot_offset), ...)``. Re-typed from PLAN-prod-import.md §7, not imported
+#: from ``import_prod_data.DEVICE_TYPES``.
+EXPECTED_DEVICE_TYPE_PORTS: dict[tuple[str, str, str], tuple[tuple[str, str, int], ...]] = {
+    ("Martin Audio", "IK-42", "with Dante Card"): (
+        ("Control", FN_CONTROL, 0),
+        ("Dante Primary", FN_DANTE_PRIMARY, 0),
+        ("Dante Secondary", FN_DANTE_SECONDARY, 0),
+    ),
+    ("Martin Audio", "IK-42", "without Dante Card"): (("Control", FN_CONTROL, 0),),
+    ("Martin Audio", "IK-81", "with Dante Card"): (
+        ("Control", FN_CONTROL, 0),
+        ("Dante Primary", FN_DANTE_PRIMARY, 0),
+        ("Dante Secondary", FN_DANTE_SECONDARY, 0),
+    ),
+    ("Lab.Gruppen", "LM26", "Redundant Mode"): (
+        ("Dante Primary", FN_DANTE_PRIMARY, 0),
+        ("Dante Secondary", FN_DANTE_SECONDARY, 0),
+    ),
+    ("Lab.Gruppen", "LM44", "Redundant Mode"): (
+        ("Dante Primary", FN_DANTE_PRIMARY, 0),
+        ("Dante Secondary", FN_DANTE_SECONDARY, 0),
+    ),
+    ("Lab.Gruppen", "PLM20000Q", "Redundant Mode"): (
+        ("Dante Primary", FN_DANTE_PRIMARY, 0),
+        ("Dante Secondary", FN_DANTE_SECONDARY, 0),
+    ),
+    SD12_IDENTITY: (("Control", FN_CONTROL, 0), ("Engine", FN_CONTROL, 1)),
+    ("DiGiCo", "SD9", "Default"): (("Control", FN_CONTROL, 0),),
+    ("DiGiCo", "SD11", "Default"): (("Control", FN_CONTROL, 0),),
+    DMI_DANTE_IDENTITY: (
+        ("Dante Primary", FN_DANTE_PRIMARY, 0),
+        ("Dante Secondary", FN_DANTE_SECONDARY, 0),
+    ),
+    ("Yamaha", "DM7C", "Default"): (
+        ("Control", FN_CONTROL, 0),
+        ("Dante Primary", FN_DANTE_PRIMARY, 0),
+        ("Dante Secondary", FN_DANTE_SECONDARY, 0),
+    ),
+    ("Yamaha", "DM7C", "Device Control Interface"): (("Dante Primary", FN_DANTE_PRIMARY, 0),),
+    ("Yamaha", "DM7-EX", "Default"): (("Control", FN_CONTROL, 0),),
+    ("Yamaha", "DM3", "Default"): (
+        ("Control", FN_CONTROL, 0),
+        ("Dante Primary", FN_DANTE_PRIMARY, 0),
+        ("Dante Secondary", FN_DANTE_SECONDARY, 0),
+    ),
+    ("Yamaha", "DM3", "Device Control Interface"): (("Dante Primary", FN_DANTE_PRIMARY, 0),),
+    ("Yamaha", "Tio1608-D2", "Default"): (
+        ("Control", FN_CONTROL, 0),
+        ("Dante Primary", FN_DANTE_PRIMARY, 0),
+        ("Dante Secondary", FN_DANTE_SECONDARY, 0),
+    ),
+    ("Allen & Heath", "SQ-5", "Default"): (
+        ("Control", FN_CONTROL, 0),
+        ("Dante Primary", FN_DANTE_PRIMARY, 0),
+        ("Dante Secondary", FN_DANTE_SECONDARY, 0),
+    ),
+    ("Amphenol", "RJD1212-0050", "Default"): (("Dante Primary", FN_DANTE_PRIMARY, 0),),
+    ("Amphenol", "RJD2203-0050", "Default"): (("Dante Primary", FN_DANTE_PRIMARY, 0),),
+    ("Amphenol", "RJD32A3-0050", "Default"): (("Dante Primary", FN_DANTE_PRIMARY, 0),),
+    ("Amphenol", "RJD32U1-0050", "Default"): (("Dante Primary", FN_DANTE_PRIMARY, 0),),
+    ("Audinate", "AVIO-AO2", "Default"): (("Dante Primary", FN_DANTE_PRIMARY, 0),),
+    ("Neutrik", "NA2-DLINE", "Default"): (("Dante Primary", FN_DANTE_PRIMARY, 0),),
+    ("Radial", "DiNET DAN-TX", "Default"): (("Dante Primary", FN_DANTE_PRIMARY, 0),),
+    ("Radial", "DiNET DAN-RX", "Default"): (("Dante Primary", FN_DANTE_PRIMARY, 0),),
+}
+
+
+def _expected_device_identity(row: AddressingRow) -> tuple[str, str, str]:
+    """Independently-derived expected ``(manufacturer, model, name)`` for an
+    ordinary device row — a separate classification from
+    ``import_prod_data.py``'s, not a call into it.
+    """
+    if row.description == "IK42" and (row.rack, row.slot) in IK42_WITHOUT_DANTE_CARD:
+        return ("Martin Audio", "IK-42", "without Dante Card")
+    mapped = DESCRIPTION_TO_DEVICE_IDENTITY.get(row.description)
+    if mapped is not None:
+        return mapped
+    for pattern, identity in AVIO_IDENTITY_PATTERNS:
+        if pattern.match(row.description):
+            return identity
+    raise CommandError(f"Cannot independently classify device {row.description!r} at {row.rack}/{row.slot}.")
+
+
+def _expected_switch_identity(description: str) -> tuple[str, str, str]:
+    """Independently-derived expected ``(manufacturer, model, name)`` for a
+    switch row's Device Description — a separate parse from
+    ``import_prod_data.SWITCH_DESCRIPTION_TO_TABLE``, not a call into it.
+    """
+    if description == "Spare SG300-26P":
+        return ("Cisco", "SG300-26P", "Default")
+    if _TLSG108E_RE.match(description):
+        return ("TP-Link", "TL-SG108E", "Default")
+    match = re.match(r"^([\w.\-]+) ([\w.\-]+) \(([^)]+)\)$", description)
+    if match is None:
+        raise CommandError(f"Cannot independently classify switch {description!r}.")
+    return match.group(1), match.group(2), match.group(3)
+
 
 @dataclass
 class _Mismatch:
@@ -122,6 +279,14 @@ class _Findings:
 
     def count(self, name: str, n: int = 1) -> None:
         self.counters[name] = self.counters.get(name, 0) + n
+
+
+def _check_device_type_identity(
+    findings: _Findings, label: str, actual: NetworkDevice, expected_identity: tuple[str, str, str]
+) -> None:
+    actual_identity = (actual.device_type.manufacturer, actual.device_type.model, actual.device_type.name)
+    if actual_identity != expected_identity:
+        findings.fail("type_assignment", f"{label}: device type {actual_identity} != {expected_identity}.")
 
 
 class Command(BaseCommand):
@@ -163,7 +328,7 @@ class Command(BaseCommand):
         )
         real_vlan_ids = frozenset(vlan_subnet_by_id.keys())
         _check_switch_port_matrices(findings, switch_port_tables, vlan_id_by_function, real_vlan_ids)
-        _check_device_type_ports(findings)
+        _check_device_type_ports(findings, vlan_id_by_function)
         _check_dhcp_server_enabled(findings)
         _check_cross_vlan_alignment(findings)
         _check_broadcast_dhcp_gateway(findings, vlan_rows)
@@ -250,9 +415,6 @@ def _check_hostnames_and_types_and_addresses(
 ) -> None:
     by_key = {(r.rack, r.slot): r for r in addressing_rows}
     consumed: set[tuple[str, int]] = set()
-    max_slot_by_rack: dict[str, int] = {}
-    for row in addressing_rows:
-        max_slot_by_rack[row.rack] = max(max_slot_by_rack.get(row.rack, 0), row.slot)
 
     actual_switch_addresses: dict[tuple[str, int, int], str | None] = {}
     for a in NetworkSwitchAddress.objects.select_related("switch__rack", "vlan"):
@@ -270,6 +432,14 @@ def _check_hostnames_and_types_and_addresses(
         if d.rack is not None and d.rack_slot is not None:
             actual_devices[(d.rack.name, d.rack_slot)] = d
 
+    # Every rack's range CIDR, keyed by (rack name, VLAN id) — lets the
+    # "extra" switch-address branch below derive base + slot independently
+    # rather than merely confirming *something* is there.
+    rack_range_cidr: dict[tuple[str, int], str] = {}
+    for rack_obj in Rack.objects.prefetch_related("vlan_ranges__vlan"):
+        for rng in rack_obj.vlan_ranges.all():
+            rack_range_cidr[(rack_obj.name, rng.vlan.vlan_id)] = rng.address_range
+
     total_placed = (
         NetworkSwitchAddress.objects.count() + NetworkDevicePort.objects.filter(address__isnull=False).count()
     )
@@ -277,6 +447,7 @@ def _check_hostnames_and_types_and_addresses(
 
     byte_identical = 0
     differs_by_design = 0
+    extra_verified = 0
     dmi_dante_rack_slot: dict[str, int] = {}
 
     for row in addressing_rows:
@@ -302,12 +473,16 @@ def _check_hostnames_and_types_and_addresses(
                     "hostnames",
                     f"{row.rack} slot {row.slot}: hostname {switch.hostname!r} != {row.description!r}.",
                 )
-            expected_type_name = _expected_switch_type_name(row.description)
-            if switch.switch_type.name != expected_type_name:
+            expected_identity = _expected_switch_identity(row.description)
+            actual_identity = (
+                switch.switch_type.manufacturer,
+                switch.switch_type.model,
+                switch.switch_type.name,
+            )
+            if actual_identity != expected_identity:
                 findings.fail(
                     "type_assignment",
-                    f"{row.rack} slot {row.slot}: switch type name {switch.switch_type.name!r} != "
-                    f"{expected_type_name!r}.",
+                    f"{row.rack} slot {row.slot}: switch type {actual_identity} != {expected_identity}.",
                 )
             for function, sheet_value in (
                 (FN_CONTROL, row.control),
@@ -323,16 +498,36 @@ def _check_hostnames_and_types_and_addresses(
                     )
                     continue
                 if sheet_value:
-                    if actual_value == sheet_value:
-                        byte_identical += 1
-                    else:
-                        findings.fail(
-                            "address_diff",
-                            f"switch {row.rack}/{row.slot} {function}: sheet {sheet_value}, "
-                            f"got {actual_value}.",
-                        )
-                # else: sheet leaves this column blank (the "extra" switch
-                # address §8 documents) — nothing to compare against.
+                    byte_identical += _compare(
+                        findings,
+                        "address_diff",
+                        f"switch {row.rack}/{row.slot} {function}",
+                        sheet_value,
+                        actual_value,
+                    )
+                    continue
+                # Sheet leaves this column blank — the "extra" switch
+                # address §8 documents. Derive base + slot independently
+                # and assert it exactly, rather than merely confirming
+                # *something* is there (that let a wrong third address, or
+                # arbitrary extra addressed equipment, pass silently).
+                range_cidr = rack_range_cidr.get((row.rack, vlan_id))
+                if range_cidr is None:
+                    findings.fail(
+                        "address_diff",
+                        f"switch {row.rack}/{row.slot} {function}: no RackVlanRange to derive the "
+                        "expected extra address from.",
+                    )
+                    continue
+                expected_extra = suggest_slot_address(range_cidr, row.slot)
+                if actual_value == expected_extra:
+                    extra_verified += 1
+                else:
+                    findings.fail(
+                        "address_diff",
+                        f"switch {row.rack}/{row.slot} {function}: expected derived {expected_extra} "
+                        f"(sheet blank), got {actual_value}.",
+                    )
             continue
 
         # -- device rows ------------------------------------------------------
@@ -353,6 +548,9 @@ def _check_hostnames_and_types_and_addresses(
                     findings.fail(
                         "hostnames", f"{row.rack} slot {row.slot}: hostname {device.hostname!r} != {stem!r}."
                     )
+                _check_device_type_identity(
+                    findings, f"{row.rack}/{row.slot} ({stem})", device, SD12_IDENTITY
+                )
                 control_vlan = vlan_id_by_function[FN_CONTROL]
                 control_actual = _device_address(device, control_vlan, offset=0)
                 engine_actual = _device_address(device, control_vlan, offset=1)
@@ -363,7 +561,17 @@ def _check_hostnames_and_types_and_addresses(
                     findings, "address_diff", f"{stem} Engine", engine_row.control, engine_actual
                 )
                 if row.dante_primary or row.dante_secondary:
-                    dmi_dante_rack_slot[row.rack] = max_slot_by_rack[row.rack] + 1
+                    # Pinned, not derived (PLAN-prod-import.md §9) — see
+                    # DMI_DANTE_RACK/DMI_DANTE_SLOT. A marker found anywhere
+                    # else is refused rather than guessed at.
+                    if row.rack != DMI_DANTE_RACK:
+                        findings.fail(
+                            "devices",
+                            f"DMI-DANTE marker found on {row.rack}/{row.slot}, but it's pinned to "
+                            f"{DMI_DANTE_RACK} slot {DMI_DANTE_SLOT} (PLAN-prod-import.md §9).",
+                        )
+                    else:
+                        dmi_dante_rack_slot[row.rack] = DMI_DANTE_SLOT
                 continue
 
         # ordinary device row
@@ -379,6 +587,10 @@ def _check_hostnames_and_types_and_addresses(
                 "hostnames",
                 f"{row.rack} slot {row.slot}: hostname {device.hostname!r} != {row.description!r}.",
             )
+        expected_identity = _expected_device_identity(row)
+        _check_device_type_identity(
+            findings, f"{row.rack}/{row.slot} ({row.description})", device, expected_identity
+        )
         for column_name, function, sheet_value in (
             ("control", FN_CONTROL, row.control),
             ("dante_primary", FN_DANTE_PRIMARY, row.dante_primary),
@@ -416,14 +628,14 @@ def _check_hostnames_and_types_and_addresses(
         if device is None:
             findings.fail("devices", f"{rack} slot {slot}: expected the DMI-DANTE card device, none found.")
             continue
-        rack_obj = Rack.objects.get(name=rack)
+        _check_device_type_identity(findings, f"DMI-DANTE {rack}/{slot}", device, DMI_DANTE_IDENTITY)
         for function in (FN_DANTE_PRIMARY, FN_DANTE_SECONDARY):
             vlan_id = vlan_id_by_function[function]
-            rack_range = rack_obj.vlan_ranges.filter(vlan__vlan_id=vlan_id).first()
-            if rack_range is None:
+            range_cidr = rack_range_cidr.get((rack, vlan_id))
+            if range_cidr is None:
                 findings.fail("address_diff", f"DMI-DANTE {rack}: no RackVlanRange for {function}.")
                 continue
-            expected = suggest_slot_address(rack_range.address_range, slot)
+            expected = suggest_slot_address(range_cidr, slot)
             actual_value = _device_address(device, vlan_id, offset=0)
             if actual_value != expected:
                 findings.fail(
@@ -435,7 +647,16 @@ def _check_hostnames_and_types_and_addresses(
 
     findings.count("byte_identical", byte_identical)
     findings.count("differs_by_design", differs_by_design)
-    findings.count("extra_unrecorded_switch_addresses", total_placed - byte_identical - differs_by_design)
+    findings.count("extra_unrecorded_switch_addresses", extra_verified)
+    accounted = byte_identical + differs_by_design + extra_verified
+    if accounted != total_placed:
+        findings.fail(
+            "address_diff",
+            f"{total_placed} addresses are placed in the database, but only {accounted} were "
+            f"accounted for by byte_identical ({byte_identical}) + differs_by_design "
+            f"({differs_by_design}) + verified-extra ({extra_verified}) — "
+            f"{total_placed - accounted} placed address(es) match no expected row at all.",
+        )
 
 
 def _device_address(device: NetworkDevice, vlan_id: int, *, offset: int) -> str | None:
@@ -451,17 +672,6 @@ def _compare(findings: _Findings, check: str, label: str, expected: str, actual:
         findings.fail(check, f"{label}: expected {expected}, got {actual}.")
         return 0
     return 1
-
-
-def _expected_switch_type_name(description: str) -> str:
-    if description == "Spare SG300-26P":
-        return "Default"
-    if _TLSG108E_RE.match(description):
-        return "Default"
-    match = re.search(r"\(([^)]+)\)$", description)
-    if match is None:
-        raise CommandError(f"Cannot read a type name out of switch description {description!r}.")
-    return match.group(1)
 
 
 # -- Switch port matrices, with an independently-derived secondary oracle ----------
@@ -595,23 +805,55 @@ def _manufacturer_model_from_table(table_name: str) -> tuple[str, str]:
     return match.group(1), match.group(2)
 
 
-# -- Device type ports, incl. slot_offset ------------------------------------------
+# -- Device type ports: count, VLAN, port_type, slot_offset ------------------------
 
 
-def _check_device_type_ports(findings: _Findings) -> None:
-    """Every ``NetworkDeviceTypePort`` should carry ``slot_offset=0`` except
-    the DiGiCo SD12's Engine port (offset 1) — ADR 0017's only offset in
-    this dataset.
+def _check_device_type_ports(findings: _Findings, vlan_id_by_function: dict[str, int]) -> None:
+    """Every ``NetworkDeviceType``'s port list against
+    ``EXPECTED_DEVICE_TYPE_PORTS`` — count, VLAN, ``port_type`` *and*
+    ``slot_offset``, per PLAN-prod-import.md's ``## Verification`` ("Device
+    type ports — count, VLAN, port_type, and slot_offset"). Checking
+    ``slot_offset`` alone would pass a wrong port count, VLAN, description
+    or ``port_type`` in the importer's hardcoded catalog.
     """
-    for type_port in NetworkDeviceTypePort.objects.select_related("device_type"):
-        is_sd12_engine = type_port.device_type.model == "SD12" and type_port.description == "Engine"
-        expected_offset = 1 if is_sd12_engine else 0
-        if type_port.slot_offset != expected_offset:
+    for device_type in NetworkDeviceType.objects.prefetch_related("type_ports__vlan"):
+        identity = (device_type.manufacturer, device_type.model, device_type.name)
+        expected_ports = EXPECTED_DEVICE_TYPE_PORTS.get(identity)
+        if expected_ports is None:
+            findings.fail(
+                "device_type_ports", f"{device_type}: not in the independently-declared expected catalog."
+            )
+            continue
+        actual_ports = list(device_type.type_ports.all())
+        if len(actual_ports) != len(expected_ports):
             findings.fail(
                 "device_type_ports",
-                f"{type_port.device_type} / {type_port.description}: slot_offset "
-                f"{type_port.slot_offset} != {expected_offset}.",
+                f"{device_type}: port count {len(actual_ports)} != expected {len(expected_ports)}.",
             )
+            continue
+        actual_by_description = {p.description: p for p in actual_ports}
+        for description, function, expected_offset in expected_ports:
+            actual = actual_by_description.get(description)
+            if actual is None:
+                findings.fail("device_type_ports", f"{device_type}: missing expected port {description!r}.")
+                continue
+            expected_vlan_id = vlan_id_by_function[function]
+            if actual.vlan.vlan_id != expected_vlan_id:
+                findings.fail(
+                    "device_type_ports",
+                    f"{device_type} / {description}: vlan {actual.vlan.vlan_id} != {expected_vlan_id}.",
+                )
+            if actual.port_type != EXPECTED_DEVICE_PORT_TYPE:
+                findings.fail(
+                    "device_type_ports",
+                    f"{device_type} / {description}: port_type {actual.port_type} != "
+                    f"{EXPECTED_DEVICE_PORT_TYPE}.",
+                )
+            if actual.slot_offset != expected_offset:
+                findings.fail(
+                    "device_type_ports",
+                    f"{device_type} / {description}: slot_offset {actual.slot_offset} != {expected_offset}.",
+                )
     findings.count("device_type_ports_checked", NetworkDeviceTypePort.objects.count())
 
 
