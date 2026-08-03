@@ -145,6 +145,13 @@ class DeviceTypeSpec:
     devices state it explicitly; nothing elsewhere contradicts it), so
     ``port_type`` isn't part of the spec — the importer applies it
     uniformly when materializing type ports below.
+
+    ``companion_key`` (ADR 0018) names another spec in this same catalog
+    that this type's instances materialize as an inseparable companion —
+    ``None`` for every ordinary type. Resolved to a real
+    ``NetworkDeviceType.companion_type`` FK by ``_stage7_device_types()``'s
+    second linking pass, not the catalog loop itself, since a companion
+    spec (``dm7c_devctrl``) is declared *after* its host (``dm7c``) here.
     """
 
     key: str
@@ -152,6 +159,7 @@ class DeviceTypeSpec:
     model: str
     name: str
     ports: tuple[tuple[str, str, int], ...]
+    companion_key: str | None = None
 
 
 #: Tier 1 (six unambiguous types), the console/card types, and tier 3
@@ -225,6 +233,7 @@ DEVICE_TYPES: tuple[DeviceTypeSpec, ...] = (
             ("Dante Primary", FN_DANTE_PRIMARY, 0),
             ("Dante Secondary", FN_DANTE_SECONDARY, 0),
         ),
+        companion_key="dm7c_devctrl",
     ),
     DeviceTypeSpec(
         "dm7c_devctrl",
@@ -244,6 +253,7 @@ DEVICE_TYPES: tuple[DeviceTypeSpec, ...] = (
             ("Dante Primary", FN_DANTE_PRIMARY, 0),
             ("Dante Secondary", FN_DANTE_SECONDARY, 0),
         ),
+        companion_key="dm3_devctrl",
     ),
     DeviceTypeSpec(
         "dm3_devctrl", "Yamaha", "DM3", "Device Control Interface", (("Dante Primary", FN_DANTE_PRIMARY, 0),)
@@ -295,6 +305,31 @@ DEVICE_TYPES: tuple[DeviceTypeSpec, ...] = (
         "avio_radial_rx", "Radial", "DiNET DAN-RX", "Default", (("Dante Primary", FN_DANTE_PRIMARY, 0),)
     ),
 )
+
+
+def _build_spec_by_key(specs: tuple[DeviceTypeSpec, ...]) -> dict[str, DeviceTypeSpec]:
+    """``DEVICE_TYPES`` is a tuple, not a mapping — indexing it by key
+    (``DEVICE_TYPES[some_key]``) raises ``TypeError``, not ``KeyError``.
+    Builds the real lookup once, raising loudly on a duplicate key rather
+    than letting a later entry silently shadow an earlier one.
+    """
+    by_key: dict[str, DeviceTypeSpec] = {}
+    for spec in specs:
+        if spec.key in by_key:
+            raise ValueError(f"Duplicate DeviceTypeSpec key: {spec.key!r}")
+        by_key[spec.key] = spec
+    return by_key
+
+
+#: The real lookup for ``DEVICE_TYPES`` — see ``_build_spec_by_key()``.
+SPEC_BY_KEY: dict[str, DeviceTypeSpec] = _build_spec_by_key(DEVICE_TYPES)
+
+#: Case-insensitive hostname suffix identifying a companion device-control
+#: interface row (ADR 0018) — the same convention
+#: ``0011_device_companions.link_production_companions()`` uses to backfill
+#: pre-existing data, stated once here since the importer is the
+#: forward-going path.
+DEVICE_CONTROL_SUFFIX = "-device-control"
 
 #: Addressing-sheet Device Description -> device type key, for the rows
 #: whose description is a plain model/hostname string (tiers 1 and 2 minus
@@ -407,6 +442,13 @@ class _DeviceEntry:
     slot: int
     hostname: str
     type_key: str
+    #: ADR 0018 — set only when ``type_key``'s ``DeviceTypeSpec`` declares
+    #: a ``companion_key``: the companion's own rack slot and hostname,
+    #: found by the pre-pass below and carried alongside the host entry so
+    #: ``_stage9_devices()`` can pass them straight to ``NetworkDevice``'s
+    #: creation-time companion inputs.
+    companion_slot: int | None = None
+    companion_hostname: str | None = None
 
 
 class _Importer:
@@ -749,6 +791,19 @@ class _Importer:
                 type_port.save()
             self.device_types_by_key[spec.key] = device_type
 
+        # Second linking pass (ADR 0018): a companion spec (dm7c_devctrl)
+        # is declared *after* its host (dm7c) in DEVICE_TYPES above, so a
+        # single-pass lookup while creating dm7c would KeyError on
+        # dm7c_devctrl not existing yet. No devices exist at this point in
+        # the import, so companion_type isn't locked for any of these yet.
+        for spec in DEVICE_TYPES:
+            if spec.companion_key is None:
+                continue
+            device_type = self.device_types_by_key[spec.key]
+            device_type.companion_type = self.device_types_by_key[spec.companion_key]
+            device_type.full_clean()
+            device_type.save()
+
     # -- Row classification (dedup, switch/device split, SD12 collapse, DMI-DANTE) ----
 
     def _classify_addressing_rows(self) -> tuple[list[_SwitchEntry], list[_DeviceEntry]]:
@@ -762,6 +817,14 @@ class _Importer:
 
         for row in deduped:
             max_slot_by_rack[row.rack] = max(max_slot_by_rack.get(row.rack, 0), row.slot)
+
+        # Companion pre-pass (ADR 0018) — runs to completion before the
+        # main per-row loop below, so a companion row is always consumed
+        # before that loop reaches it regardless of CSV order (the DM7C
+        # companion row precedes its host; the DM3's follows it). See
+        # _classify_companion_pairs()'s own docstring for why this can't
+        # be expressed as the SD12 pass's slot-adjacency instead.
+        self._classify_companion_pairs(deduped, consumed, device_entries)
 
         for row in deduped:
             key = (row.rack, row.slot)
@@ -831,6 +894,73 @@ class _Importer:
 
         return switch_entries, device_entries
 
+    def _classify_companion_pairs(
+        self,
+        deduped: list[AddressingRow],
+        consumed: set[tuple[str, int]],
+        device_entries: list[_DeviceEntry],
+    ) -> None:
+        """Pairs a ``<host>-device-control`` row with its host (ADR 0018),
+        emitting one merged ``_DeviceEntry`` at the *host's* slot (carrying
+        the companion's own slot and hostname) and marking both rows
+        consumed — before ``_classify_addressing_rows()``'s main per-row
+        loop ever reaches either of them.
+
+        Keyed on hostname, not the SD12 pass's slot-adjacency
+        (``row.slot + 1``) — that can't express a companion sitting
+        *below* its host (the DM7C's interface, one address below its
+        console) and *above* it (the DM3's, one address above) in the
+        same catalog. Matches case-insensitively, within one rack — the
+        same convention ``0011_device_companions.link_production_
+        companions()`` uses to backfill data that predates this importer
+        change, stated once here since the importer is the forward-going
+        path (ADR 0018 decision 5).
+
+        Zero or several stem matches, or a companion/host pair whose
+        types don't agree with the catalog's own declared
+        ``companion_key`` (a rename, or a row misclassified as a
+        companion) is a loud ``CommandError`` citing ADR 0018 — never a
+        guess.
+        """
+        for row in deduped:
+            key = (row.rack, row.slot)
+            if key in consumed or not row.description.lower().endswith(DEVICE_CONTROL_SUFFIX):
+                continue
+            stem = row.description[: -len(DEVICE_CONTROL_SUFFIX)]
+            matches = [
+                other
+                for other in deduped
+                if other.rack == row.rack and other is not row and other.description.lower() == stem.lower()
+            ]
+            if len(matches) != 1:
+                raise CommandError(
+                    f"Companion row {row.description!r} at {row.rack} slot {row.slot} (ADR "
+                    f"0018): expected exactly one host row matching {stem!r} (case-insensitive) "
+                    f"in the same rack, found {len(matches)}."
+                )
+            host_row = matches[0]
+            host_key = self._device_type_key_for(host_row)
+            companion_key = self._device_type_key_for(row)
+            host_spec = SPEC_BY_KEY[host_key]
+            if host_spec.companion_key != companion_key:
+                raise CommandError(
+                    f"Companion row {row.description!r} (type {companion_key!r}) does not match "
+                    f"{host_row.description!r}'s declared companion type "
+                    f"({host_spec.companion_key!r}) — ADR 0018 catalog mismatch."
+                )
+            device_entries.append(
+                _DeviceEntry(
+                    host_row.rack,
+                    host_row.slot,
+                    host_row.description,
+                    host_key,
+                    companion_slot=row.slot,
+                    companion_hostname=row.description,
+                )
+            )
+            consumed.add((host_row.rack, host_row.slot))
+            consumed.add(key)
+
     @staticmethod
     def _dedupe_rows(rows: list[AddressingRow]) -> list[AddressingRow]:
         """Collapse repeated ``(rack, slot)`` rows to their first occurrence
@@ -884,12 +1014,18 @@ class _Importer:
         for entry in entries:
             device_type = self.device_types_by_key[entry.type_key]
             rack = self.racks_by_name[entry.rack]
-            device = NetworkDevice(
+            device = NetworkDevice(  # type: ignore[misc]
                 device_type=device_type,
                 rack=rack,
                 rack_slot=entry.slot,
                 hostname=entry.hostname,
+                # ADR 0018 — None for every ordinary entry; set only by
+                # _classify_companion_pairs() for a paired host entry, and
+                # NetworkDevice.save() ignores both unless device_type
+                # actually declares a companion_type.
+                companion_rack_slot=entry.companion_slot,
+                companion_hostname=entry.companion_hostname,
                 created_by=self.user,
             )
             device.full_clean()
-            device.save()  # materializes static addresses (ADR 0013, ADR 0017)
+            device.save()  # materializes static addresses + companion (ADR 0013, 0017, 0018)

@@ -105,9 +105,9 @@ created both as unlinked devices because the model has no way to say one require
       creation, deletion cascades from the host and is refused from the companion, and the pair
       moves as a unit — addresses stay independent throughout. See ADR 0018 (extends ADR 0007's
       removal rules and ADR 0010's materialization; does **not** close #42)
-- [ ] Implement ADR 0018 — schema + backfill migration, companion materialization in
+- [x] Implement ADR 0018 — schema + backfill migration, companion materialization in
       `NetworkDevice.save()`, the delete guard and its queryset twin, host-managed companion
-      placement in the admin, and the importer/verifier pairing pass
+      placement in the admin, and the importer/verifier pairing pass; #42 stays open — see below
 
 ## Later / not yet designed
 

@@ -17,7 +17,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.contrib.messages import get_messages
 from django.contrib.messages.storage.fallback import FallbackStorage
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import IntegrityError, connection, transaction
@@ -28,10 +28,13 @@ from django.test.utils import CaptureQueriesContext
 
 from .admin import (
     AuditedModelAdminMixin,
+    NetworkDeviceAddForm,
     NetworkDeviceAdmin,
+    NetworkDeviceChangeForm,
     NetworkDevicePortForm,
     NetworkDevicePortInline,
     NetworkDeviceTypeAdmin,
+    NetworkDeviceTypeForm,
     NetworkSwitchAddressInline,
     NetworkSwitchAdmin,
     NetworkSwitchPortForm,
@@ -2653,6 +2656,494 @@ class SlotOffsetAddressingTests(TestCase):
         device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
         device.delete()  # must not raise despite Control having an offset sibling
         self.assertFalse(NetworkDevicePort.objects.filter(device_id=device.pk).exists())
+
+
+class DeviceCompanionTests(TestCase):
+    """ADR 0018: ``NetworkDeviceType.companion_type`` /
+    ``NetworkDevice.host`` — existence and lifecycle only, never addressing
+    (``slot_offset``, ADR 0017, is explicitly out of scope here). Sized
+    like ``SlotOffsetAddressingTests`` above; covers the ADR's own
+    ``## Follow-up`` list plus the concrete cases the plan review named.
+    """
+
+    def setUp(self) -> None:
+        self.control_vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.dante_vlan = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=20)
+        self.rack2 = Rack.objects.create(name="Rack 2", slot_count=20)
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.control_vlan, address_range="10.200.1.0/27")
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.dante_vlan, address_range="10.201.1.0/27")
+        RackVlanRange.objects.create(rack=self.rack2, vlan=self.control_vlan, address_range="10.200.2.0/27")
+        RackVlanRange.objects.create(rack=self.rack2, vlan=self.dante_vlan, address_range="10.201.2.0/27")
+
+        # A DM7C-shaped pair: host has a Control port, companion has a
+        # Dante Primary port — different VLANs so nothing here accidentally
+        # exercises the same-VLAN materialization guard, which is ADR
+        # 0017's concern, not this one's.
+        self.companion_type = _make_device_type(
+            port_count=1,
+            vlan=self.dante_vlan,
+            manufacturer="Yamaha",
+            model="DM7C",
+            name="Device Control Interface",
+        )
+        self.host_type = _make_device_type(
+            port_count=1, vlan=self.control_vlan, manufacturer="Yamaha", model="DM7C", name="Default"
+        )
+        self.host_type.companion_type = self.companion_type
+        self.host_type.save()
+
+    def _make_host(self, *, rack=None, rack_slot=None, companion_rack_slot=None, hostname="host", **kwargs):
+        create_kwargs: dict = dict(device_type=self.host_type, hostname=hostname, **kwargs)
+        if rack is not None:
+            create_kwargs["rack"] = rack
+            create_kwargs["rack_slot"] = rack_slot
+            create_kwargs["companion_rack_slot"] = companion_rack_slot
+        return NetworkDevice.objects.create(**create_kwargs)
+
+    # -- Materialization, atomicity --------------------------------------------------
+
+    def test_host_materializes_companion_and_both_port_sets(self) -> None:
+        host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="dm7c-1")
+        companion = host.companion
+        self.assertEqual(companion.device_type, self.companion_type)
+        self.assertEqual(companion.rack, self.rack)
+        self.assertEqual(companion.rack_slot, 4)
+        self.assertEqual(companion.host_id, host.pk)
+        self.assertEqual(host.ports.count(), 1)
+        self.assertEqual(companion.ports.count(), 1)
+        self.assertIsNotNone(companion.ports.get().address)
+
+    def test_materialization_failure_rolls_back_whole_assembly(self) -> None:
+        blocker_type = _make_device_type(port_count=1, vlan=self.dante_vlan, name="Blocker")
+        NetworkDevice.objects.create(device_type=blocker_type, rack=self.rack, rack_slot=4)
+        with self.assertRaises(ValidationError):
+            self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="dm7c-2")
+        self.assertFalse(NetworkDevice.objects.filter(hostname="dm7c-2").exists())
+        self.assertFalse(NetworkDevicePort.objects.filter(device__hostname="dm7c-2").exists())
+
+    def test_every_device_type_without_companion_type_creates_as_before(self) -> None:
+        ordinary_type = _make_device_type(port_count=1, vlan=self.control_vlan, name="Ordinary")
+        device = NetworkDevice.objects.create(device_type=ordinary_type, hostname="plain")
+        self.assertIsNone(device.host_id)
+        with self.assertRaises(ObjectDoesNotExist):
+            _ = device.companion
+
+    # -- Type compatibility ------------------------------------------------------------
+
+    def test_companion_type_refused_via_objects_create(self) -> None:
+        with self.assertRaises(ValidationError):
+            NetworkDevice.objects.create(device_type=self.companion_type, hostname="orphan")
+
+    def test_companion_type_refused_on_bare_add_form(self) -> None:
+        form = NetworkDeviceAddForm()
+        self.assertNotIn(self.companion_type, form.fields["device_type"].queryset)  # type: ignore[attr-defined]
+
+    def test_companion_attached_to_wrong_typed_host_refused(self) -> None:
+        other_host_type = _make_device_type(port_count=1, vlan=self.control_vlan, name="Other Host")
+        other_host = NetworkDevice.objects.create(device_type=other_host_type, hostname="otherhost")
+        companion = NetworkDevice(device_type=self.companion_type, host=other_host, hostname="mismatched")
+        with self.assertRaises(ValidationError):
+            companion.full_clean()
+
+    def test_ordinary_type_refused_as_companion(self) -> None:
+        ordinary_type = _make_device_type(port_count=1, vlan=self.control_vlan, name="Ordinary")
+        host = self._make_host(hostname="host3")
+        bogus = NetworkDevice(device_type=ordinary_type, host=host, hostname="bogus")
+        with self.assertRaises(ValidationError):
+            bogus.full_clean()
+
+    # -- Deletion ------------------------------------------------------------------------
+
+    def test_deleting_host_via_delete_removes_both(self) -> None:
+        host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="hostA")
+        companion_pk = host.companion.pk
+        host.delete()
+        self.assertFalse(NetworkDevice.objects.filter(pk=host.pk).exists())
+        self.assertFalse(NetworkDevice.objects.filter(pk=companion_pk).exists())
+
+    def test_deleting_host_via_queryset_removes_both(self) -> None:
+        host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="hostB")
+        companion_pk = host.companion.pk
+        NetworkDevice.objects.filter(pk=host.pk).delete()
+        self.assertFalse(NetworkDevice.objects.filter(pk=host.pk).exists())
+        self.assertFalse(NetworkDevice.objects.filter(pk=companion_pk).exists())
+
+    def test_deleting_companion_alone_refused_via_delete(self) -> None:
+        host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="hostC")
+        companion = host.companion
+        with self.assertRaises(ValidationError):
+            companion.delete()
+        self.assertTrue(NetworkDevice.objects.filter(pk=companion.pk).exists())
+
+    def test_deleting_companion_alone_refused_via_queryset(self) -> None:
+        host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="hostD")
+        companion = host.companion
+        with self.assertRaises(ValidationError):
+            NetworkDevice.objects.filter(pk=companion.pk).delete()
+        self.assertTrue(NetworkDevice.objects.filter(pk=companion.pk).exists())
+
+    # -- Moves ---------------------------------------------------------------------------
+
+    def test_shift_down_move_parks_and_relocates_both(self) -> None:
+        # Companion below its host (DM7C-shaped): 5/4 -> 4/3. The host's
+        # new slot (4) is the companion's *current* slot — the collision
+        # review note 1/6 exist for.
+        host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="shiftdown")
+        companion = host.companion
+        host_addr = host.ports.get().address
+        companion_addr = companion.ports.get().address
+
+        host.rack_slot = 4
+        host.full_clean()
+        host.save()
+
+        host.refresh_from_db()
+        companion.refresh_from_db()
+        self.assertEqual(host.rack_slot, 4)
+        self.assertEqual(companion.rack_slot, 3)
+        self.assertEqual(host.ports.get().address, host_addr)
+        self.assertEqual(companion.ports.get().address, companion_addr)
+
+    def test_shift_up_move_parks_and_relocates_both(self) -> None:
+        # Companion above its host (DM3-shaped): 10/11 -> 11/12. The host's
+        # new slot (11) is the companion's *current* slot — same collision,
+        # mirrored direction.
+        host = self._make_host(rack=self.rack, rack_slot=10, companion_rack_slot=11, hostname="shiftup")
+        companion = host.companion
+        host_addr = host.ports.get().address
+        companion_addr = companion.ports.get().address
+
+        host.rack_slot = 11
+        host.full_clean()
+        host.save()
+
+        host.refresh_from_db()
+        companion.refresh_from_db()
+        self.assertEqual(host.rack_slot, 11)
+        self.assertEqual(companion.rack_slot, 12)
+        self.assertEqual(host.ports.get().address, host_addr)
+        self.assertEqual(companion.ports.get().address, companion_addr)
+
+    def test_non_colliding_move_relocates_both_without_park(self) -> None:
+        host = self._make_host(rack=self.rack, rack_slot=1, companion_rack_slot=2, hostname="nopark")
+        companion = host.companion
+        host_addr = host.ports.get().address
+        companion_addr = companion.ports.get().address
+
+        host.rack_slot = 6  # companion's target (7) doesn't overlap its old slot (2)
+        host.full_clean()
+        host.save()
+
+        host.refresh_from_db()
+        companion.refresh_from_db()
+        self.assertEqual(host.rack_slot, 6)
+        self.assertEqual(companion.rack_slot, 7)  # offset (+1) preserved
+        self.assertEqual(host.ports.get().address, host_addr)
+        self.assertEqual(companion.ports.get().address, companion_addr)
+
+    def test_cross_rack_move_relocates_both(self) -> None:
+        host = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=self.host_type,
+            rack=self.rack,
+            rack_slot=1,
+            companion_rack_slot=2,
+            hostname="crossrack",
+            port_addressing=PortAddressing.DHCP,
+        )
+        companion = host.companion
+
+        host.rack = self.rack2
+        host.rack_slot = 3
+        host.full_clean()
+        host.save()
+
+        host.refresh_from_db()
+        companion.refresh_from_db()
+        self.assertEqual(host.rack, self.rack2)
+        self.assertEqual(companion.rack, self.rack2)
+        self.assertEqual(companion.rack_slot, 4)  # offset (+1) preserved
+
+    def test_explicit_companion_slot_overrides_preserved_offset(self) -> None:
+        host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="explicit")
+        host.rack_slot = 8
+        host.companion_rack_slot = 10  # not the preserved offset (would be 7)
+        host.full_clean()  # caches host.companion (still at 4) via _check_companion_move_possible()
+        host.save()
+        # _finish_companion_move() writes the companion through its own
+        # freshly-fetched instance, not through host's cached reverse
+        # relation — ordinary Django caching, not an ADR 0018 guarantee
+        # (every other move test that checks host.companion after a save()
+        # refreshes first for the same reason).
+        host.refresh_from_db()
+        self.assertEqual(host.companion.rack_slot, 10)
+
+    def test_racking_spare_pool_assembly_requires_explicit_companion_slot(self) -> None:
+        host = self._make_host(hostname="spare")  # unracked — companion unracked too
+        self.assertIsNone(host.companion.rack_slot)
+        host.rack = self.rack
+        host.rack_slot = 6
+        with self.assertRaises(ValidationError):
+            host.full_clean()
+
+    def test_racking_spare_pool_assembly_with_explicit_slot_lands_both(self) -> None:
+        host = self._make_host(hostname="spare2")
+        host.rack = self.rack
+        host.rack_slot = 6
+        host.companion_rack_slot = 5
+        host.full_clean()
+        host.save()
+        host.refresh_from_db()
+        self.assertEqual(host.rack_slot, 6)
+        self.assertEqual(host.companion.rack_slot, 5)
+
+    def test_bare_save_moves_companion_and_validates_both_addresses(self) -> None:
+        host = self._make_host(rack=self.rack, rack_slot=1, companion_rack_slot=2, hostname="baresave")
+        companion = host.companion
+        host_addr = host.ports.get().address
+        companion_addr = companion.ports.get().address
+
+        host.rack_slot = 6  # no full_clean() — proves the move path lives in save(), not clean()
+        host.save()
+
+        companion.refresh_from_db()
+        self.assertEqual(companion.rack_slot, 7)
+        self.assertEqual(host.ports.get().address, host_addr)
+        self.assertEqual(companion.ports.get().address, companion_addr)
+
+    def test_update_fields_excluding_rack_fields_moves_nothing(self) -> None:
+        host = self._make_host(rack=self.rack, rack_slot=1, companion_rack_slot=2, hostname="updatefields")
+        companion = host.companion
+        host.rack_slot = 15  # dirty in-memory only — must not move anything
+        host.hostname = "updatefields-renamed"
+        host.save(update_fields=["hostname"])
+
+        host.refresh_from_db()
+        companion.refresh_from_db()
+        self.assertEqual(host.rack_slot, 1)
+        self.assertEqual(companion.rack_slot, 2)
+        self.assertEqual(host.hostname, "updatefields-renamed")
+
+    def test_independent_companion_move_refused(self) -> None:
+        host = self._make_host(rack=self.rack, rack_slot=1, companion_rack_slot=2, hostname="indep")
+        companion = host.companion
+        companion.rack_slot = 9
+        with self.assertRaises(ValidationError):
+            companion.full_clean()
+        with self.assertRaises(ValidationError):
+            companion.save()
+
+    def test_auditlog_entries_for_parked_move(self) -> None:
+        host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="auditparked")
+        companion = host.companion
+        LogEntry.objects.filter(object_pk=str(companion.pk)).delete()
+
+        host.rack_slot = 4  # collides with companion's current slot -> park then place
+        host.full_clean()
+        host.save()
+
+        entries = list(
+            LogEntry.objects.filter(object_pk=str(companion.pk), action=LogEntry.Action.UPDATE).order_by("pk")
+        )
+        self.assertEqual(len(entries), 2, [e.changes_dict for e in entries])
+        first, second = entries
+        # django-auditlog's ``changes_dict`` stores every value through
+        # ``smart_str()`` unless ``AUDITLOG_STORE_JSON_CHANGES`` is set
+        # (it isn't, project-wide, and this plan doesn't add it) — so the
+        # unracked side of the park is the literal string "None", not
+        # Python's ``None``.
+        self.assertEqual(first.changes_dict["rack_slot"], ["4", "None"])
+        self.assertEqual(second.changes_dict["rack_slot"], ["None", "3"])
+
+    def test_auditlog_entries_for_unparked_move(self) -> None:
+        host = self._make_host(rack=self.rack, rack_slot=1, companion_rack_slot=2, hostname="auditunparked")
+        companion = host.companion
+        LogEntry.objects.filter(object_pk=str(companion.pk)).delete()
+
+        host.rack_slot = 6  # no collision -> a single truthful move
+        host.full_clean()
+        host.save()
+
+        entries = list(
+            LogEntry.objects.filter(object_pk=str(companion.pk), action=LogEntry.Action.UPDATE).order_by("pk")
+        )
+        self.assertEqual(len(entries), 1, [e.changes_dict for e in entries])
+        self.assertEqual(entries[0].changes_dict["rack_slot"], ["2", "7"])
+
+    # -- Hostname fallback -----------------------------------------------------------
+
+    def test_blank_companion_hostname_copies_host(self) -> None:
+        host = self._make_host(hostname="copyme")
+        self.assertEqual(host.companion.hostname, "copyme")
+
+    def test_given_companion_hostname_wins(self) -> None:
+        host = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=self.host_type, hostname="host-with-given", companion_hostname="explicit-name"
+        )
+        self.assertEqual(host.companion.hostname, "explicit-name")
+
+    # -- Type-graph locking / chains ---------------------------------------------------
+
+    def test_companion_type_locked_once_instances_exist(self) -> None:
+        self._make_host(hostname="lockit")
+        other_type = _make_device_type(port_count=1, vlan=self.dante_vlan, name="Other Companion")
+        self.host_type.companion_type = other_type
+        with self.assertRaises(ValidationError):
+            self.host_type.save()
+
+    def test_companion_of_a_companion_refused(self) -> None:
+        grandchild = _make_device_type(port_count=1, vlan=self.dante_vlan, name="Grandchild")
+        self.companion_type.companion_type = grandchild
+        with self.assertRaises(ValidationError):
+            self.companion_type.save()
+
+    def test_self_referential_companion_refused(self) -> None:
+        loner = _make_device_type(port_count=1, vlan=self.dante_vlan, name="Loner")
+        loner.companion_type = loner
+        with self.assertRaises(ValidationError):
+            loner.save()
+
+    def test_type_declared_as_someone_elses_companion_cannot_declare_its_own(self) -> None:
+        # self.companion_type is already self.host_type's companion — it
+        # may not also become a host of some third type (chain upward).
+        third = _make_device_type(port_count=1, vlan=self.dante_vlan, name="Third")
+        self.companion_type.companion_type = third
+        with self.assertRaises(ValidationError):
+            self.companion_type.save()
+
+    # -- Admin: object-level ------------------------------------------------------------
+
+    def test_admin_readonly_fields_lock_host_and_placement_for_companion(self) -> None:
+        host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="readonly")
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        request = RequestFactory().get("/")
+        host_readonly = admin.get_readonly_fields(request, host)
+        self.assertIn("host", host_readonly)
+        self.assertNotIn("rack", host_readonly)
+        companion_readonly = admin.get_readonly_fields(request, host.companion)
+        self.assertIn("host", companion_readonly)
+        self.assertIn("rack", companion_readonly)
+        self.assertIn("rack_slot", companion_readonly)
+
+    def test_admin_add_and_change_forms_exclude_host(self) -> None:
+        # Instantiated, not class-level ``_meta.fields`` (which is None —
+        # these forms declare ``exclude``, not ``fields`` — so a
+        # class-level check would be a tautology regardless of whether
+        # host is actually excluded). ``.fields`` on a bound form is the
+        # real, computed field set.
+        self.assertNotIn("host", NetworkDeviceAddForm().fields)
+        self.assertIn("host", NetworkDeviceAddForm.Meta.exclude)
+        self.assertIn("host", NetworkDeviceChangeForm.Meta.exclude)
+
+    def test_admin_add_form_carries_companion_fields(self) -> None:
+        form = NetworkDeviceAddForm()
+        self.assertIn("companion_rack_slot", form.fields)
+        self.assertIn("companion_hostname", form.fields)
+
+    def test_admin_change_form_carries_companion_slot_only_with_companion(self) -> None:
+        host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="changeform")
+        plain_type = _make_device_type(port_count=1, vlan=self.control_vlan, name="Plain")
+        plain = NetworkDevice.objects.create(device_type=plain_type, hostname="plainform")
+
+        with_companion = NetworkDeviceChangeForm(instance=host)
+        self.assertIn("companion_rack_slot", with_companion.fields)
+        without_companion = NetworkDeviceChangeForm(instance=plain)
+        self.assertNotIn("companion_rack_slot", without_companion.fields)
+
+    def test_type_admin_companion_type_dropdown_excludes_chains_and_self(self) -> None:
+        third = _make_device_type(port_count=1, vlan=self.dante_vlan, name="Third Excluded Check")
+        form = NetworkDeviceTypeForm(instance=self.host_type)
+        queryset = form.fields["companion_type"].queryset  # type: ignore[attr-defined]
+        self.assertNotIn(self.host_type, queryset)  # excludes self
+        self.assertNotIn(self.companion_type, queryset)  # already someone's companion
+        self.assertIn(third, queryset)
+
+    # -- Admin: full HTTP ----------------------------------------------------------------
+
+    def _login_admin(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        user = User.objects.create_user("companionadmin", password="testpass123", is_staff=True)
+        user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="companionadmin", password="testpass123")
+
+    def test_admin_add_page_creates_assembly(self) -> None:
+        self._login_admin()
+        response = self.client.post(
+            "/admin/inventory/networkdevice/add/",
+            {
+                "device_type": str(self.host_type.pk),
+                "hostname": "http-add",
+                "port_addressing": PortAddressing.STATIC,
+                "rack": str(self.rack.pk),
+                "rack_slot": "5",
+                "companion_rack_slot": "4",
+                "companion_hostname": "",
+                "serial_number": "",
+                "ports-TOTAL_FORMS": "0",
+                "ports-INITIAL_FORMS": "0",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+            },
+        )
+        self.assertEqual(response.status_code, 302, getattr(response, "content", b"")[:2000])
+        # A blank companion_hostname copies the host's own (decision 3) —
+        # host and companion legitimately share "http-add" here, so the
+        # lookup must disambiguate by host__isnull rather than assume the
+        # hostname is unique.
+        host = NetworkDevice.objects.get(hostname="http-add", host__isnull=True)
+        self.assertEqual(host.companion.rack_slot, 4)
+
+    def test_admin_shift_down_move_via_change_form(self) -> None:
+        self._login_admin()
+        host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="http-move")
+        response = self.client.post(
+            f"/admin/inventory/networkdevice/{host.pk}/change/",
+            {
+                "device_type": str(self.host_type.pk),
+                "hostname": "http-move",
+                "rack": str(self.rack.pk),
+                "rack_slot": "4",
+                "companion_rack_slot": "",
+                "serial_number": "",
+                "ports-TOTAL_FORMS": "1",
+                "ports-INITIAL_FORMS": "1",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+                "ports-0-id": str(host.ports.get().pk),
+                "ports-0-is_dhcp": "",
+                "ports-0-address": host.ports.get().address,
+            },
+        )
+        self.assertEqual(response.status_code, 302, getattr(response, "content", b"")[:2000])
+        host.refresh_from_db()
+        self.assertEqual(host.rack_slot, 4)
+        self.assertEqual(host.companion.rack_slot, 3)
+
+    def test_admin_single_delete_of_companion_refused_with_message_not_500(self) -> None:
+        self._login_admin()
+        host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="http-del")
+        companion = host.companion
+        response = self.client.post(
+            f"/admin/inventory/networkdevice/{companion.pk}/delete/", {"post": "yes"}, follow=True
+        )
+        self.assertEqual(response.status_code, 200)
+        messages = [str(m) for m in get_messages(response.wsgi_request)]
+        self.assertTrue(any("Could not delete" in m for m in messages), messages)
+        self.assertTrue(NetworkDevice.objects.filter(pk=companion.pk).exists())
+
+    def test_admin_delete_selected_of_companion_refused_with_message_not_500(self) -> None:
+        self._login_admin()
+        host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="http-bulkdel")
+        companion = host.companion
+        response = self.client.post(
+            "/admin/inventory/networkdevice/",
+            {"action": "delete_selected_devices", "_selected_action": [str(companion.pk)], "post": "yes"},
+            follow=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        messages = [str(m) for m in get_messages(response.wsgi_request)]
+        self.assertTrue(any("Could not delete" in m for m in messages), messages)
+        self.assertTrue(NetworkDevice.objects.filter(pk=companion.pk).exists())
 
 
 class SwitchAddressMaterializationTests(TestCase):

@@ -414,3 +414,33 @@ established style — corrupt with `objects.filter(pk=...).update(host=None)`, a
   lives in ADR 0010 profile names, not in a companion link.
 - Guarding `QuerySet.update()` / `bulk_create()` against companion-lifecycle violations; see
   "Documented bypasses".
+
+## Implementation note (post-rev-2, landing the branch)
+
+Neither rev 2 nor the review caught one more gap in "Pair-aware occupancy": `Model.full_clean()`
+calls **both** `validate_unique()` and `validate_constraints()`. The pair-aware `validate_unique()`
+override above (review note 1's fix) only patches the former. `validate_constraints()` re-checks
+`Meta.constraints` — including `unique_device_rack_slot` — through each constraint's own
+`UniqueConstraint.validate()`, entirely independently, and that method excludes only `self.pk`,
+with no knowledge of a companion pair. A vacate-then-place move's target slot is briefly still
+occupied by the pair's other half at `clean()` time, so this raw constraint check tripped even
+after `validate_unique()`'s pair-aware version passed moments earlier — measured as
+`ValidationError: {'__all__': ['Network device with this Rack and Rack slot already exists.']}`
+on `host.full_clean()` for the shift-down/shift-up move tests and the parked-move auditlog test,
+indistinguishable by message text alone from `validate_unique()`'s own conflict re-check (both
+raise that exact string). Fixed with a `NetworkDevice.validate_constraints()` override that skips
+the `unique_device_rack_slot` constraint specifically (already re-checked, pair-aware, by
+`validate_unique()`) rather than excluding the `rack`/`rack_slot` *fields* — this model's two
+`CheckConstraint`s also reference those field names, and a field-based exclude would have
+silently stopped enforcing them too. See `NetworkDevice.validate_constraints()`'s docstring.
+
+Two other gaps surfaced only by running the suite, both fixed without any design change:
+`_finish_companion_move()` writes the companion through a freshly-fetched instance, not through
+the host's cached reverse `companion` relation, so a caller that read `host.companion` before a
+move and checks it again after — without an intervening `refresh_from_db()` — sees a stale
+object. Every other move test in the suite already refreshes first; the one that didn't
+(`test_explicit_companion_slot_overrides_preserved_offset`) was fixed to match, since this is
+ordinary Django relation-caching behaviour, not an ADR 0018 guarantee. And `test_admin_add_page_
+creates_assembly`'s `NetworkDevice.objects.get(hostname="http-add")` lookup didn't account for
+decision 3 (blank `companion_hostname` copies the host's) making the host and companion share a
+hostname by design — fixed to disambiguate with `host__isnull=True`, per the model, not weakened.
