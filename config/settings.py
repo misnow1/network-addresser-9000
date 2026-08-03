@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
 import os
+import re
 from pathlib import Path
 
 from django.core.exceptions import ImproperlyConfigured
@@ -110,6 +111,23 @@ DATABASES = {
         },
     }
 }
+
+# Give each git worktree its own test database.
+#
+# Worktrees share .env — it is symlinked from the main checkout via the
+# worktree.symlinkDirectories setting — so every worktree resolves to the same
+# DB_NAME. Without this, two test runs in parallel worktrees contend for the
+# same test_<DB_NAME>, and --noinput lets whichever starts second silently
+# destroy the first one's database mid-run.
+#
+# This is derived here rather than in the shell command deliberately: Claude
+# Code's permission matcher refuses to match an allow rule against any command
+# containing $(...) substitution, so a shell-derived name would prompt on every
+# single test run. Only TEST.NAME is touched, so the runtime database is
+# unaffected; the main checkout keeps Django's default test_<DB_NAME>.
+if ".claude/worktrees/" in BASE_DIR.as_posix():
+    _worktree_slug = re.sub(r"[^A-Za-z0-9]", "_", BASE_DIR.name)[:40]
+    DATABASES["default"]["TEST"] = {"NAME": f"test_na9k_wt_{_worktree_slug}"[:64]}
 
 
 # Password validation
