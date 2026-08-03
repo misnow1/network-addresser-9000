@@ -42,6 +42,36 @@ Guard rails so this stays useful instead of becoming noise:
   the orchestrating session should *stay* on Opus — folding review notes into a
   plan is planning work. Don't fire the reminder in that case.
 
+## Running tests
+
+**Nothing auto-loads `.env`** — not `manage.py`, not `config/settings.py`, not the
+`Dockerfile`, and not `direnv` (its hook lives in `~/.zshrc`, which the Bash tool's
+non-interactive shell never sources). A bare `python manage.py test inventory` dies
+with `ImproperlyConfigured: SECRET_KEY environment variable must be set`. Always:
+
+```bash
+set -a; source .env; set +a
+python manage.py test inventory
+```
+
+**In a worktree, override `DB_NAME` as well.** Worktrees get `.env` as a *symlink* to
+the main checkout's copy (via `worktree.symlinkDirectories`), so every worktree
+resolves to the same `DB_NAME` — and Django's test runner would have two parallel
+runs fighting over the same `test_<DB_NAME>` database, silently destroying each
+other's data with `--noinput`. Derive a unique name from the worktree directory:
+
+```bash
+set -a; source .env; set +a
+case "$PWD" in */.claude/worktrees/*)
+  export DB_NAME="na9k_wt_$(printf '%s' "${PWD##*/}" | tr -c '[:alnum:]' _ | cut -c1-40)" ;;
+esac
+python manage.py test inventory
+```
+
+The `case` guard matters: in the main checkout `DB_NAME` must stay whatever `.env`
+says, or you fork the dev database. Keep worktree names short — MariaDB caps
+identifiers at 64 characters and Django prepends `test_`.
+
 ## Plan-cycle automation
 
 `/plan-cycle` (`.claude/skills/plan-cycle/`) runs the whole ritual hands-off after
