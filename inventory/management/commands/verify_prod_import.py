@@ -523,6 +523,22 @@ def _check_companion_pairs(
                 f"{row.rack}/{row.slot} ({row.description}): companion.host is "
                 f"{companion.host_id!r}, expected host {host.pk!r} ({host.hostname!r}).",
             )
+        if host.host_id is not None:
+            # companion.host_id == host.pk alone doesn't rule out the link
+            # also running backwards (Codex review round 2, finding 6): a
+            # corrupted ``host.host_id = companion.pk`` is representable in
+            # the DB (host_id is a nullable OneToOne, so both rows pointing
+            # at each other doesn't violate anything at the schema level)
+            # and would pass the check above untouched, even though it
+            # means the row this command calls "host" is itself, per its
+            # own row, someone's companion. This command's whole point is
+            # independence from the importer (module docstring) — assert
+            # the direction outright rather than trusting the pairing.
+            findings.fail(
+                "companion_link",
+                f"{host_row.rack}/{host_row.slot} ({host_row.description}): expected to be a "
+                f"host, but has its own host_id={host.host_id!r} — the link runs the wrong way.",
+            )
 
         for description_row, device in ((row, companion), (host_row, host)):
             for function, sheet_value in (

@@ -2938,7 +2938,18 @@ class NetworkDeviceQuerySet(models.QuerySet):
 
     def delete(self):
         with transaction.atomic():
-            hosted = list(self.exclude(host__isnull=True).values("pk", "host__hostname"))
+            # Only a hosted row whose host is *not also* part of this same
+            # selection is "alone" (Codex review round 2, finding 5) — the
+            # original version flagged every hosted row unconditionally, so
+            # selecting both halves of a pair (or "select all") refused a
+            # deletion the host's own cascade would have carried out safely
+            # anyway. ``pks`` is evaluated once, up front, so the exclusion
+            # reads a stable snapshot of the selection rather than a
+            # subquery re-evaluated against a queryset that's mid-delete.
+            pks = set(self.values_list("pk", flat=True))
+            hosted = list(
+                self.exclude(host__isnull=True).exclude(host_id__in=pks).values("pk", "host__hostname")
+            )
             if hosted:
                 names = ", ".join(f"pk={row['pk']} (host {row['host__hostname']!r})" for row in hosted)
                 raise ValidationError(
@@ -3734,7 +3745,16 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         if persisted is None:
             return None
         old_rack_id, old_rack_slot = persisted["rack_id"], persisted["rack_slot"]
-        new_rack_id, new_rack_slot = self.rack_id, self.rack_slot
+        # Effective post-save values (Codex review round 2, finding 2), not
+        # blindly ``self.rack_id``/``self.rack_slot`` — when ``update_fields``
+        # names only one of the pair, ``super().save()`` below leaves the
+        # other field's DB value untouched no matter what ``self`` holds in
+        # memory. A caller that mutates both and then calls
+        # ``save(update_fields=["rack"])`` must plan the companion's move
+        # from the *persisted* old slot, not an unsaved dirty one that's
+        # never actually going to be written for this call.
+        new_rack_id = self.rack_id if normalized is None or "rack" in normalized else old_rack_id
+        new_rack_slot = self.rack_slot if normalized is None or "rack_slot" in normalized else old_rack_slot
         if new_rack_id == old_rack_id and new_rack_slot == old_rack_slot:
             return None
         companion_old_rack_id, companion_old_rack_slot = companion.rack_id, companion.rack_slot
@@ -3821,13 +3841,30 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         ``clean()``, so a bare ``host.save()`` (no ``full_clean()``) would
         otherwise silently leave a stale, now-out-of-range address on
         either row.
+
+        Runs ``companion.full_clean()`` before saving (Codex review round
+        2, finding 1) — the pair-vs-pair overlap is already pre-flighted
+        by ``_check_companion_move_possible()``/``_park_companion_if_
+        colliding()``, but nothing before this checked the companion's
+        *own* target against a third row: another device's or switch's
+        occupied range, or ``rack.slot_count``, neither backed by a DB
+        constraint. ``_host_managed_move`` is set **before** calling
+        ``full_clean()``, not just before ``save()`` — ``clean()`` is what
+        actually reads it (via ``_locked_fields()``), so setting it any
+        later would trip the very placement lock the flag exists to
+        bypass. ``full_clean()`` subsumes the explicit address-fit call
+        above (``RackSlotAssignmentMixin.clean()`` already runs it), and
+        its own ``validate_unique()``/``validate_constraints()`` overrides
+        correctly exclude this pair's own host via ``_companion_pair_
+        pks()`` — a genuine conflict here can only be against an unrelated
+        row.
         """
         self._validate_existing_addresses_still_fit()
         companion = NetworkDevice._default_manager.get(pk=pending_move["companion_pk"])
         companion.rack_id = pending_move["companion_new_rack_id"]
         companion.rack_slot = pending_move["companion_new_rack_slot"]
-        companion._validate_existing_addresses_still_fit()
         companion._host_managed_move = True
+        companion.full_clean()
         companion.save(update_fields=["rack", "rack_slot"])
 
 

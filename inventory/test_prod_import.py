@@ -575,6 +575,22 @@ class ImportProdDataTests(TestCase):
         with self.assertRaises(CommandError):
             call_command("verify_prod_import", data_dir=str(self.data_dir))
 
+    def test_verify_catches_a_reverse_companion_link(self) -> None:
+        # Codex review round 2, finding 6 — ``companion.host_id == host.pk``
+        # alone doesn't prove the link runs the right way. ``host`` here is
+        # a nullable OneToOneField, so nothing at the schema level stops a
+        # corrupted state where the row this test (and the fixture) calls
+        # the *host* also has its own ``host_id`` set, forming a two-way
+        # cycle the model would never produce but that a raw
+        # ``QuerySet.update()`` (same documented bypass as the test above)
+        # can still write. The verifier must assert the direction, not just
+        # the pairing.
+        dm7c_host = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=6)
+        dm7c_companion = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=5)
+        NetworkDevice.objects.filter(pk=dm7c_host.pk).update(host=dm7c_companion.pk)
+        with self.assertRaises(CommandError):
+            call_command("verify_prod_import", data_dir=str(self.data_dir))
+
     def test_verify_catches_a_wrong_address(self) -> None:
         port = NetworkDevicePort.objects.filter(
             device__rack__name="AVIO", device__rack_slot=1, address__isnull=False

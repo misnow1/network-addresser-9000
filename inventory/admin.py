@@ -6,7 +6,7 @@ from django.contrib import admin, messages
 from django.contrib.admin.actions import delete_selected as default_delete_selected
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError
-from django.db.models import QuerySet
+from django.db.models import Q, QuerySet
 from django.forms import BaseInlineFormSet, BaseModelFormSet
 from django.http import HttpRequest, HttpResponseRedirect
 from django.template.response import TemplateResponse
@@ -958,9 +958,25 @@ class NetworkDeviceTypeForm(forms.ModelForm):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        # ``companion_type`` is absent from ``self.fields`` entirely for a
+        # locked profile (Codex review round 2, finding 3) — Django's admin
+        # drops readonly fields from the generated ModelForm before this
+        # ``__init__`` ever runs, since ``get_readonly_fields()`` names it
+        # once the type has instances. Nothing to restrict on a form that
+        # doesn't carry the field at all.
+        if "companion_type" not in self.fields:
+            return
         companion_type_field = cast(forms.ModelChoiceField, self.fields["companion_type"])
         assert companion_type_field.queryset is not None  # ModelForm always sets this for an FK field
-        qs = companion_type_field.queryset.filter(companion_type__isnull=True, companion_of__isnull=True)
+        # The instance's *own current* companion_type is folded back in
+        # explicitly (Codex review round 2, finding 4) — it fails
+        # ``companion_of__isnull=True`` below precisely because it already
+        # is this instance's companion, so without this an unlocked type
+        # that already declares one would reject its own unchanged value as
+        # an invalid choice on every edit, before it ever gets any instances.
+        qs = companion_type_field.queryset.filter(
+            Q(companion_type__isnull=True, companion_of__isnull=True) | Q(pk=self.instance.companion_type_id)
+        )
         if self.instance.pk is not None:
             qs = qs.exclude(pk=self.instance.pk)
         companion_type_field.queryset = qs
