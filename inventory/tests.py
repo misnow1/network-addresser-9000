@@ -2938,6 +2938,57 @@ class DeviceCompanionTests(TestCase):
         self.assertEqual(host.rack_slot, 1)
         self.assertEqual(companion.rack_slot, 2)
 
+    def test_bare_save_pair_overlap_refused_with_multi_ordinal_host(self) -> None:
+        # Codex review round 3, finding 1 — with either type spanning more
+        # than one ordinal (a non-zero slot_offset type, ADR 0017), a bare
+        # save() could commit overlapping ranges with *different* starting
+        # slots: _check_companion_move_possible() only ever runs from
+        # clean(), the companion's own full_clean() in
+        # _finish_companion_move() structurally excludes its host from
+        # occupancy conflicts (pair-vs-pair overlap is this check's job,
+        # not that one's), and unique_device_rack_slot compares starting
+        # slots only — 5 and 6 never collide there.
+        spanning_type = NetworkDeviceType.objects.create(
+            manufacturer="Yamaha", model="DM7C", name="Spanning", port_count=2
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=spanning_type,
+            description="Control",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.control_vlan,
+            slot_offset=0,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=spanning_type,
+            description="Control2",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.control_vlan,
+            slot_offset=1,
+        )
+        spanning_type.companion_type = self.companion_type
+        spanning_type.save()
+
+        host = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=spanning_type,
+            hostname="spanhost",
+            rack=self.rack,
+            rack_slot=1,
+            companion_rack_slot=4,
+            port_addressing=PortAddressing.DHCP,
+        )
+        companion = host.companion
+        self.assertEqual(host.slot_span, 2)
+
+        host.rack_slot = 5  # host now spans 5-6
+        host.companion_rack_slot = 6  # explicit target lands on the host's own span
+        with self.assertRaises(ValidationError):
+            host.save()  # bare save — no full_clean()
+
+        host.refresh_from_db()
+        companion.refresh_from_db()
+        self.assertEqual(host.rack_slot, 1)
+        self.assertEqual(companion.rack_slot, 4)
+
     def test_explicit_companion_slot_overrides_preserved_offset(self) -> None:
         host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="explicit")
         host.rack_slot = 8
@@ -3040,6 +3091,44 @@ class DeviceCompanionTests(TestCase):
         self.assertEqual(host.ports.get().address, host_addr)
         self.assertEqual(companion.ports.get().address, companion_addr)
 
+    def test_update_fields_partial_rack_save_validates_host_address_against_effective_slot(self) -> None:
+        # Codex review round 3, finding 3 — round 2's fix to
+        # _plan_companion_move() only corrected the *move plan*;
+        # _validate_existing_addresses_still_fit() for the host's own row
+        # was still called directly on self, reading whatever
+        # self.rack/self.rack_slot happen to hold in memory.
+        # save(update_fields=["rack"]) with an in-memory rack_slot=None
+        # (excluded from update_fields, never persisted) makes
+        # _address_containment_error() silently skip its rack-range check
+        # whenever rack_slot is None — not a failure, just nothing
+        # checked — so a stale, now-invalid host address could survive
+        # the move uncaught.
+        third_rack = Rack.objects.create(name="Rack 3", slot_count=20)
+        RackVlanRange.objects.create(rack=third_rack, vlan=self.control_vlan, address_range="10.200.6.0/27")
+        # Same dante range as self.rack, verbatim — the companion's stale
+        # address stays valid post-move, isolating the host-side bug this
+        # finding is about (a failing companion address would trip the
+        # transaction for an unrelated reason and mask it).
+        RackVlanRange.objects.create(rack=third_rack, vlan=self.dante_vlan, address_range="10.201.1.0/27")
+
+        host = self._make_host(rack=self.rack, rack_slot=1, companion_rack_slot=2, hostname="dirtyslot")
+        companion = host.companion
+        host_addr = host.ports.get().address
+        companion_addr = companion.ports.get().address
+
+        host.rack = third_rack
+        host.rack_slot = None  # dirty in-memory only — excluded from update_fields, never persisted
+        with self.assertRaises(ValidationError):
+            host.save(update_fields=["rack"])
+
+        host.refresh_from_db()
+        companion.refresh_from_db()
+        self.assertEqual(host.rack, self.rack)
+        self.assertEqual(host.rack_slot, 1)
+        self.assertEqual(companion.rack, self.rack)
+        self.assertEqual(host.ports.get().address, host_addr)
+        self.assertEqual(companion.ports.get().address, companion_addr)
+
     def test_update_fields_excluding_rack_fields_moves_nothing(self) -> None:
         host = self._make_host(rack=self.rack, rack_slot=1, companion_rack_slot=2, hostname="updatefields")
         companion = host.companion
@@ -3081,6 +3170,47 @@ class DeviceCompanionTests(TestCase):
         self.assertEqual(host.rack_slot, 1)  # unchanged — "rack_slot" wasn't in update_fields
         self.assertEqual(companion.rack, self.rack2)
         self.assertEqual(companion.rack_slot, 2)  # offset (+1) from the real old slot 1, not the dirty 99
+
+    def test_second_move_on_reused_host_instance_uses_fresh_companion_slot(self) -> None:
+        # Codex review round 3, finding 2 — _plan_companion_move() read
+        # companion.rack_slot off _get_related()'s cached reverse relation,
+        # which _finish_companion_move() never updates (it writes through
+        # a *separately fetched* companion instance). Reusing the same
+        # host object for a second move — with no full_clean() and no
+        # manual refresh of anything, exactly what an ordinary caller
+        # would do — silently planned the second move from the companion's
+        # pre-*first*-move slot.
+        host = self._make_host(rack=self.rack, rack_slot=1, companion_rack_slot=2, hostname="reusedhost")
+        # Deliberately not touching host.companion here — the bug needs
+        # save() itself to be the first thing that populates the cache.
+
+        host.rack_slot = 6
+        host.full_clean()
+        host.save()  # first move: 1/2 -> 6/7
+
+        host.rack_slot = 8  # same host instance, no refresh_from_db() in between
+        host.full_clean()
+        host.save()  # second move: preserved offset (+1) should land the companion at 9
+
+        host.refresh_from_db()
+        self.assertEqual(host.rack_slot, 8)
+        self.assertEqual(host.companion.rack_slot, 9)
+
+    def test_move_plan_refuses_rack_set_with_slot_none(self) -> None:
+        # Hardening found while fixing finding 2 above, not itself one of
+        # the three named findings — mypy correctly flagged that
+        # new_rack_slot could still be None while new_rack_id isn't (an
+        # in-memory rack/rack_slot pair a caller left inconsistent), which
+        # would otherwise reach `new_rack_slot + (...)` and crash with a
+        # raw TypeError *before* super().save() ever gives the DB's own
+        # "rack and rack_slot together" CheckConstraint a chance to
+        # reject it. A bare save() reaches this directly, no update_fields
+        # trickery needed.
+        host = self._make_host(rack=self.rack, rack_slot=1, companion_rack_slot=2, hostname="inconsistent")
+        host.rack = self.rack2
+        host.rack_slot = None  # inconsistent: rack set, rack_slot not
+        with self.assertRaises(ValidationError):
+            host.save()
 
     def test_independent_companion_move_refused(self) -> None:
         host = self._make_host(rack=self.rack, rack_slot=1, companion_rack_slot=2, hostname="indep")

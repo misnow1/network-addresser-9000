@@ -3050,6 +3050,14 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                 if self.host_id is None:
                     pending_move = self._plan_companion_move(update_fields)
                     if pending_move is not None:
+                        # Unconditional, not just clean()'s pre-flight
+                        # (Codex review round 3, finding 1) — a bare
+                        # save() never calls clean(), and nothing else on
+                        # the save path checks the pair's ranges against
+                        # each other; see _check_pending_move_no_overlap()'s
+                        # docstring for why _finish_companion_move()'s own
+                        # full_clean() structurally can't catch this.
+                        self._check_pending_move_no_overlap(pending_move)
                         self._park_companion_if_colliding(pending_move)
             elif self.device_type_id is not None:
                 # Locks the type row so a concurrent edit to its port
@@ -3650,6 +3658,12 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         let a host and its companion land on top of each other. A no-op
         when this device has no companion, or when the move plan finds
         nothing actually changing.
+
+        This is the ``clean()``-path pre-flight (a nice admin form error) —
+        ``save()`` calls ``_check_pending_move_no_overlap()`` directly and
+        unconditionally for the same check on the *save* path, since a bare
+        ``save()`` never reaches this method at all (Codex review round 3,
+        finding 1).
         """
         companion = _get_related(self, "companion")
         if companion is None or companion.pk is None:
@@ -3657,10 +3671,38 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         pending_move = self._plan_companion_move(update_fields=None)
         if pending_move is None:
             return
+        self._check_pending_move_no_overlap(pending_move)
+
+    def _check_pending_move_no_overlap(self, pending_move: dict[str, Any]) -> None:
+        """The pair's own two *target* ranges, checked against each other —
+        shared by ``_check_companion_move_possible()`` (the ``clean()``-path
+        pre-flight, for a nice admin form error) and ``save()`` itself
+        (Codex review round 3, finding 1).
+
+        Before this, the only path that ran this check was ``clean()``,
+        which a bare ``save()`` never calls — and nothing on the save path
+        caught it either: the companion's own ``full_clean()`` in
+        ``_finish_companion_move()`` deliberately *excludes* its host from
+        occupancy conflicts (via ``_companion_pair_pks()``, review note 1),
+        precisely because pair-vs-pair overlap is this check's job, not
+        ``_check_rack_slot_not_occupied()``'s. And ``unique_device_rack_slot``
+        only compares *starting* slots, so a host spanning several ordinals
+        (a non-zero ``slot_offset`` type, ADR 0017) could commit an
+        overlapping companion at a *different* starting slot — 5–6 and 6,
+        say — through a bare ``host.save()`` with nothing to stop it.
+
+        Fetches the companion fresh rather than trusting any cached
+        relation on ``self`` — ``slot_span`` depends only on
+        ``device_type``, which never changes, so freshness doesn't matter
+        for *that*, but doing it here keeps this method usable standalone
+        without relying on a caller's possibly-stale ``_get_related()``
+        result.
+        """
         host_start = pending_move["host_new_rack_slot"]
         companion_start = pending_move["companion_new_rack_slot"]
         if host_start is None or companion_start is None:
             return  # unracking, or the companion ends up unracked — nothing can overlap
+        companion = NetworkDevice._default_manager.get(pk=pending_move["companion_pk"])
         host_end = host_start + self.slot_span - 1
         companion_end = companion_start + companion.slot_span - 1
         if host_start <= companion_end and companion_start <= host_end:
@@ -3757,7 +3799,35 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         new_rack_slot = self.rack_slot if normalized is None or "rack_slot" in normalized else old_rack_slot
         if new_rack_id == old_rack_id and new_rack_slot == old_rack_slot:
             return None
-        companion_old_rack_id, companion_old_rack_slot = companion.rack_id, companion.rack_slot
+        if new_rack_id is not None and new_rack_slot is None:
+            # An inconsistent in-memory state ("rack and rack_slot must
+            # both be set or both be empty" — RackSlotAssignmentMixin.clean(),
+            # backed by the networkdevice_rack_and_slot_together
+            # CheckConstraint) that a bare save() can still reach here,
+            # *before* the DB constraint would ever get a chance to reject
+            # it — this runs ahead of super().save(). Caught explicitly so
+            # the arithmetic below never has to add None to an int.
+            raise ValidationError(
+                "rack_slot is required when rack is set — cannot plan this device's companion "
+                "move from an inconsistent in-memory state (rack and rack_slot must both be set "
+                "or both be empty)."
+            )
+        # Read from the DB, not ``companion.rack_id``/``companion.rack_slot``
+        # (Codex review round 3, finding 2) — ``companion`` here is whatever
+        # ``_get_related()``'s reverse-relation cache holds, which
+        # ``_finish_companion_move()`` never updates: that method writes
+        # through a *separately fetched* instance
+        # (``NetworkDevice._default_manager.get(pk=...)``), so reusing the
+        # same host object for a second move reads the companion's
+        # pre-*first*-move slot, computing every offset from stale state —
+        # silently, no error, just a wrong target.
+        companion_persisted = (
+            NetworkDevice._default_manager.filter(pk=companion.pk).values("rack_id", "rack_slot").first()
+        )
+        if companion_persisted is None:
+            return None
+        companion_old_rack_id = companion_persisted["rack_id"]
+        companion_old_rack_slot = companion_persisted["rack_slot"]
         companion_new_rack_id: int | None
         companion_new_rack_slot: int | None
         if new_rack_id is None:
@@ -3768,6 +3838,7 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
             if self._companion_rack_slot is not None:
                 companion_new_rack_slot = self._companion_rack_slot
             elif companion_old_rack_slot is not None and old_rack_slot is not None:
+                assert new_rack_slot is not None  # guarded above: new_rack_id set implies new_rack_slot set
                 companion_new_rack_slot = new_rack_slot + (companion_old_rack_slot - old_rack_slot)
             else:
                 raise ValidationError(
@@ -3842,6 +3913,20 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         otherwise silently leave a stale, now-out-of-range address on
         either row.
 
+        Validates the **host's** addresses off a freshly re-fetched
+        instance, not ``self`` directly (Codex review round 3, finding 3)
+        — ``self.rack``/``self.rack_slot`` can hold a dirty in-memory value
+        that ``update_fields`` excluded from this very ``save()`` call
+        (e.g. ``save(update_fields=["rack"])`` after also mutating
+        ``rack_slot`` in memory), and ``_address_containment_error()``
+        silently skips its rack-range check whenever ``rack_slot`` is
+        ``None`` — not a failure, just nothing checked. By the time this
+        runs, ``super().save()`` has already written ``self``'s own row,
+        so re-fetching gets exactly what ``update_fields`` actually
+        persisted, the same effective-value fix ``_plan_companion_move()``
+        already applies to the move plan itself, applied here to the
+        address check that plan doesn't cover.
+
         Runs ``companion.full_clean()`` before saving (Codex review round
         2, finding 1) — the pair-vs-pair overlap is already pre-flighted
         by ``_check_companion_move_possible()``/``_park_companion_if_
@@ -3859,7 +3944,7 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         pks()`` — a genuine conflict here can only be against an unrelated
         row.
         """
-        self._validate_existing_addresses_still_fit()
+        NetworkDevice._default_manager.get(pk=self.pk)._validate_existing_addresses_still_fit()
         companion = NetworkDevice._default_manager.get(pk=pending_move["companion_pk"])
         companion.rack_id = pending_move["companion_new_rack_id"]
         companion.rack_slot = pending_move["companion_new_rack_slot"]
