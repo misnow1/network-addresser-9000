@@ -7,6 +7,7 @@ result into whatever handling makes sense for their model.
 """
 
 import ipaddress
+from collections.abc import Iterable
 
 
 def suggest_default_gateway(subnet: str) -> str | None:
@@ -83,6 +84,27 @@ def suggest_slot_address(range_cidr: str, slot: int) -> str:
     """Suggested address for ``slot`` within ``range_cidr``: base + slot."""
     network = ipaddress.IPv4Network(range_cidr, strict=True)
     return str(network.network_address + slot)
+
+
+def lowest_free_run(occupied: Iterable[tuple[int, int]], span: int, slot_count: int) -> int | None:
+    """Lowest 1-based start of ``span`` consecutive free ordinals in 1..slot_count.
+
+    ``None`` if ``span`` is non-positive, bigger than ``slot_count`` itself,
+    or every run that size is blocked by ``occupied``. Tolerates unsorted
+    and overlapping ``occupied`` input on purpose — a caller unioning two
+    equipment tables plus an in-flight candidate range should not have to
+    normalise first.
+    """
+    if span < 1 or slot_count < span:
+        return None
+    cursor = 1
+    for start, end in sorted(occupied):
+        if end < cursor:
+            continue  # already behind the cursor
+        if start - cursor >= span:
+            return cursor  # the gap before this range fits
+        cursor = max(cursor, end + 1)
+    return cursor if cursor + span - 1 <= slot_count else None
 
 
 def ranges_overlap(a: str, b: str) -> bool:

@@ -182,3 +182,27 @@ as a rack of spares is an ordinary Rack.
 - **Implementation is small**: a suggestion helper that finds the lowest free run of
   `slot_span` ordinals, wired into the admin add forms for `NetworkSwitch` and `NetworkDevice`
   as an initial value. No migration, no model change, no change to any stored address.
+
+## Follow-up
+
+**"As an initial value" (above) did not ship as written, and could not.** A literal
+Django `initial=` value is computed when the add page is *rendered* — before the operator has
+picked anything — so at that point there is no rack (nothing to search for occupancy) and no
+`device_type` (no `slot_span` to search for). What shipped instead is a submit-time fallback:
+`NetworkSwitchAddForm.clean()`/`NetworkDeviceAddForm.clean()` fill in a blank `rack_slot` (and,
+for a companion-declaring type, a blank `companion_rack_slot`) from `occupied_rack_slot_ranges()`
+and `lowest_free_run()` once the form is actually submitted, the same way `RackAddForm.clean()`
+already fills a blank `slot_count` from a chosen template. This corrects the prediction rather
+than silently departing from it — the convention ADR 0015 set on its own page, so that the gap
+between reading a diff and running the suite stays visible. Decisions 2 and 3 above are otherwise
+unaffected: the suggestion is still the lowest free run of `slot_span` consecutive ordinals, and
+it is still a default an operator may freely override, never a lock.
+
+**The suggester is ordinal-only, and that is a real, accepted boundary.** It answers "which
+ordinals are unoccupied," not "which addresses are free." ADR 0003 makes stored addresses
+editable, so equipment at ordinal 1 may hold the address ordinal 2's arithmetic would produce —
+a suggested-free ordinal can therefore still be refused by the cross-table address-uniqueness
+check (`_validate_static_address`). This is pinned by a test rather than fixed: closing it would
+mean checking materialized addresses across every VLAN the rack carries, a different and larger
+mechanism than the one decision 2 describes, and this ADR already frames the suggestion as "a
+default, not a constraint."

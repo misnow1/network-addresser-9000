@@ -27,7 +27,7 @@ otherwise seed-once/never-re-synced rule.
 """
 
 import ipaddress
-from typing import Any
+from typing import Any, cast
 
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
@@ -319,6 +319,42 @@ def _suggest_rack_slot_address(
         # guard (save() alone never enforces it) and overflows this range's
         # block — its own clean() would report that.
         return None
+
+
+def occupied_rack_slot_ranges(rack: "Rack") -> list[tuple[int, int]]:
+    """Every occupied ``(start, end)`` ordinal range in ``rack``, unioning
+    both equipment tables (ADR 0019). Public — unlike its ``_``-prefixed
+    neighbour above — because ``admin.py`` calls this to feed
+    ``suggestions.lowest_free_run()``.
+
+    Switches always span 1 (``RackSlotAssignmentMixin.slot_span``), so
+    they need no aggregate. Devices reuse the existing span annotation
+    verbatim rather than inventing a second one — the same
+    ``Coalesce(Max("device_type__type_ports__slot_offset"), 0) + 1`` used
+    by ``NetworkSwitch._check_rack_slot_not_occupied()`` and
+    ``NetworkDevice._check_rack_slot_not_occupied()`` — so an already-
+    stored spanning device contributes its whole range here too, not just
+    its starting ordinal.
+
+    ``rack_slot__isnull=False`` is filtered defensively even though
+    ``rack``/``rack_slot`` are all-or-neither (``RackSlotAssignmentMixin.
+    clean()``); two bounded queries, no aggregate per row.
+    """
+    switch_slots = NetworkSwitch.objects.filter(rack=rack, rack_slot__isnull=False).values_list(
+        "rack_slot", flat=True
+    )
+    # cast(int, ...): rack_slot/_end are guaranteed non-null by the
+    # isnull=False filter above, but the queryset's own typing can't
+    # express that.
+    switch_ranges = [(cast(int, slot), cast(int, slot)) for slot in switch_slots]
+    device_ranges = [
+        (cast(int, start), cast(int, end))
+        for start, end in NetworkDevice.objects.filter(rack=rack, rack_slot__isnull=False)
+        .annotate(_span=Coalesce(models.Max("device_type__type_ports__slot_offset"), 0) + 1)
+        .annotate(_end=models.F("rack_slot") + models.F("_span") - 1)
+        .values_list("rack_slot", "_end")
+    ]
+    return switch_ranges + device_ranges
 
 
 def _address_containment_error(
