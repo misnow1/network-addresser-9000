@@ -10,7 +10,7 @@ This repo contains a backend service and web-based frontend for tracking IP addr
 
 - **Backend**: Python, Django. Django's own migrations satisfy the "auto-generated schema upgrade/downgrade" requirement; its admin, auth, and audit-history ecosystem is why it was chosen over a bare SQLAlchemy/Alembic setup. See [ADR 0005](./docs/adr/0005-django-backend-framework.md).
 - **Database**: MariaDB. See [ADR 0006](./docs/adr/0006-mariadb-database-engine.md).
-- **Frontend**: Django admin (customized) for now, with a purpose-built UI deferred until real usage shows which views (rack layout, address-utilization dashboards, etc.) are worth building by hand.
+- **Frontend**: Django admin (customized) for **mutation**, and a purpose-built **read-only** UI at `/` for reading — rack elevations, the address map, device and spare-pool views, and the audit trail. The production import supplied the real usage this split was waiting on. Every mutation in the read-only UI is a deep link into the admin, so validation, removal confirmations and the audit actor keep exactly one home. See [ADR 0020](./docs/adr/0020-read-only-purpose-built-ui.md).
 - **Auth**: Django's built-in local accounts, not SSO — this may be revisited if the tool ever needs to integrate with an organizational identity provider.
 - Code should be written to be easily testable and understood by humans. Python code should have complete docstrings and type hints. Test units should be supplied for as much code as is practically possible.
 

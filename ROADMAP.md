@@ -2,7 +2,7 @@
 
 High-level phases only — day-to-day task tracking belongs in GitHub Issues once there's code to file issues against. This file exists so it's obvious what phase the project is in and what's next, even after a fresh start.
 
-**Current phase: 12 — done; phase 6 — done. Nothing currently in flight; see "Later / not yet designed" for candidates.**
+**Current phase: 14 and 15 — designed, not yet implemented. Phases 12, 13 and 6 done.**
 
 ## 1. Foundation — done
 
@@ -109,9 +109,38 @@ created both as unlinked devices because the model has no way to say one require
       `NetworkDevice.save()`, the delete guard and its queryset twin, host-managed companion
       placement in the admin, and the importer/verifier pairing pass; #42 stays open — see below
 
-## Later / not yet designed
+## 14. Rack is the address pool; the ordinal is suggested
 
-- Purpose-built frontend beyond Django admin (rack visualizations, address-utilization views)
+`docs/RACK-MUSINGS.md` asked whether arbitrary "address pools" should replace racks. They
+shouldn't — the misalignment that motivated the question comes from dense per-VLAN
+allocation, not from racks, and the existing ordinal already guarantees a device's addresses
+line up across every VLAN its rack carries.
+
+- [x] Design decided: no new grouping concept, no rename; suggest the ordinal instead of
+      requiring it typed, and reserve offset space with empty racks — see ADR 0019
+- [ ] Suggestion helper: lowest free run of `slot_span` consecutive ordinals in a rack
+- [ ] Wired into the `NetworkSwitch` and `NetworkDevice` admin add forms as an initial value
+      (a default, not a lock — ADR 0001, ADR 0003)
+- [ ] Tests: a plain device takes the lowest free ordinal; a spanning device (ADR 0017) skips
+      a run that would overlap; an operator-typed ordinal still wins
+
+No migration and no model change — nothing stored is altered.
+
+## 15. Read-only purpose-built UI
+
+The frontend `DESIGN.md` deferred until real usage showed which views were worth building.
+Read-only, mounted at `/`, with every mutation deep-linked into the admin — see ADR 0020.
+
+- [x] Design decided: strictly read-only v1, admin retains all mutation, Viewers leave the
+      admin — see ADR 0020
+- [ ] Prerequisites: `LOGIN_URL`/`LOGIN_REDIRECT_URL` (Django's default is unrouted),
+      `TEMPLATES["DIRS"]`, admin link gated on `is_staff`
+- [ ] The four shaped views: rack elevation, address map, device, spare pool
+- [ ] Read-parity: plain views for the remaining registered models and their inlines
+- [ ] Audit-trail view over `auditlog` — site-wide and per-object
+- [ ] Flip Viewer provisioning to `is_staff=False` (gated on parity + the audit view landing)
+
+## Later / not yet designed
 - Device-replacement workflow (swapping a spare into an already-addressed slot) — flagged in ADR 0003, design deferred
 - Addressing modeled per `(device, VLAN)` instead of per port — the actual fix for Switched Mode's bridged-jack limitation (ADR 0010, ADR 0013) — see #27
 - Two *independent* static addresses on one VLAN (a Yamaha console's "For Device Control" interface) — see #42. ADR 0018 covers the same hardware but solves a different problem (existence and lifecycle, not addressing) and leaves this open: if it ever lands, those consoles collapse to one device and their companion links fall away
@@ -127,14 +156,14 @@ created both as unlinked devices because the model has no way to say one require
 
   Also worth noting: this would make device types genuinely portable. `NetworkDeviceTypePort.vlan` is a `PROTECT` FK to a *specific* VLAN today, so "Martin Audio IK-42 — with Dante Card" is welded to this site's VLAN numbering; a role indirection would let a Type describe hardware rather than a site, which is what ADR 0010 says Types are for.
 - Rack *slot* occupancy has no DB-level overlap guarantee once a device spans several ordinals (ADR 0017's known gap). `RackSlotAssignmentMixin`'s docstring defers this to phase 3's "Overlap validation", but that item shipped covering rack-range-vs-range and DHCP overlap only — the deferral has no live home and the pointer is stale
-- **Aligned rack allocation** — allocate a rack's offset *once*, as the lowest offset free on every VLAN it is getting a range on, instead of running independent first-fit per `(rack, VLAN)`. Closes the cross-VLAN alignment gap in `PROD-DATA-ANALYSIS.md` §6.1 by removing the mechanism that causes divergence rather than policing the outcome. Tested against the production racks: reproduces all 19 automatically-allocated offsets, and — the point — **gives the same answer when the VLANs have different DHCP geometry**, which is precisely the case where today's per-VLAN first-fit diverges. Strictly more robust than what we have, not merely tidier.
+- **Aligned rack allocation** — allocate a rack's offset *once*, as the lowest offset free on every VLAN it is getting a range on, instead of running independent first-fit per `(rack, VLAN)`. (Unaffected by ADR 0019, and easy to conflate with it: this is about where a rack's *block* sits, whereas ADR 0019 is about the *ordinal inside* the block. The ordinal is already aligned across VLANs by construction; the block base is not.) Closes the cross-VLAN alignment gap in `PROD-DATA-ANALYSIS.md` §6.1 by removing the mechanism that causes divergence rather than policing the outcome. Tested against the production racks: reproduces all 19 automatically-allocated offsets, and — the point — **gives the same answer when the VLANs have different DHCP geometry**, which is precisely the case where today's per-VLAN first-fit diverges. Strictly more robust than what we have, not merely tidier.
   - **Suggest, don't enforce.** A hard constraint would be the first place this system forbids something an operator may legitimately need, cutting against ADR 0001's suggest-with-override and ADR 0003's stored-not-derived stance. Real cases exist: a VLAN whose subnet is too small for the aligned offset, a rack joining a VLAN whose aligned offset is already taken, or importing a site that is already misaligned. Aligned-by-default achieves the outcome; a constraint mainly produces a wall at the worst moment. If divergence should be *visible*, a report or admin column is far cheaper and strands nobody.
   - **The invariant is the offset from the VLAN's network address, not the third octet.** 16 of the 21 production racks don't start on a `/24` boundary. An offset-based rule survives a VLAN that isn't a `/21`; a third-octet rule doesn't (§6.1).
   - **Static addresses only.** DHCP interfaces are outside the guarantee — the only promises there are the VLAN subnet and the server's pool. A DHCP port stores no address at all, so this needs no special handling, but any misalignment report must ignore DHCP ports or it will flag every mixed device (§6.1).
   - **Department/group scoping declined for now.** It would need a VLAN grouping field, and: ADR 0014 decision 1 already declined the nearest thing deliberately; all 21 production racks carry only audio VLANs, so department-scoped and global alignment are identical on today's data; and the spreadsheet's own model is one offset per rack applied to *every* VLAN base, so scoping would depart from current practice rather than formalise it.
-- **Address regions** — named, declared partitions of the host-offset space that racks are allocated *from*, so that "amp racks live here, wireless lives there" is a property the system knows rather than something achieved by picking offsets by hand. Motivated by `PROD-DATA-ANALYSIS.md` §7.2: production's offset gaps are **mnemonic, not technical** — they exist so an address can be identified by eye in the field, the same instinct as VLAN-ID-in-the-second-octet, and they double as error detection. Two facts make this worth building rather than leaving as a convention:
-  - **Automation destroys the convention.** First-fit takes the lowest free offset, so the next rack created lands at offset 864 — inside the region reserved by eye for wireless. Aligned allocation doesn't change this. There is no "reserved but unallocated" concept, and today the only thing preventing it is that offsets are chosen manually.
-  - **Choosing offsets manually is itself error-prone**, and accidentally overlapping rack ranges is exactly what this tool exists to prevent. The convention and the automation are in direct tension; regions are what would let both hold.
+- **Address regions** — named, declared partitions of the host-offset space that racks are allocated *from*, so that "amp racks live here, wireless lives there" is a property the system knows rather than something achieved by picking offsets by hand. Motivated by `PROD-DATA-ANALYSIS.md` §7.2: production's offset gaps are **mnemonic, not technical** — they exist so an address can be identified by eye in the field, the same instinct as VLAN-ID-in-the-second-octet, and they double as error detection.
+  - **Downgraded by ADR 0019, not closed.** Reserving offset space no longer needs this feature: an empty Rack with hand-placed ranges holds a block against the first-fit suggester today, using machinery that already exists. What regions would still buy is (a) *automatic* enforcement — the suggester restricting its search to a window, so nobody has to remember to create the reservation racks first — and (b) one named region instead of a CIDR decomposition, since a region boundary need not be CIDR-aligned and a rack's range must be (offsets 864–1279 take three reservation racks: a `/27`, a `/25` and a `/24`). Both are real, and both are much smaller than "there is no way to reserve offset space", which is what this item used to claim.
+  - **Choosing offsets manually is itself error-prone**, and accidentally overlapping rack ranges is exactly what this tool exists to prevent. Reservation racks reduce this but don't remove it — they still have to be placed by hand.
   - **Declare regions once at site level, not per VLAN.** The obvious framing is "several declared address ranges per VLAN", but per-VLAN regions would have to be kept aligned across VLANs by hand — the original problem, one level up. A single site-level partition of the *offset* space, applied to every VLAN, composes correctly with aligned allocation and needs no per-VLAN bookkeeping.
   - **Likely additive, not a rewrite.** `RackVlanRange` is unchanged; a region is a new table (name + offset window, validated non-overlapping), a rack is created in a region, and the suggester restricts its search to that window. That is a constraint on which offsets are *considered*, not a change to how ranges are stored or validated — so the "this breaks the current model" concern is probably narrower than it looks. Worth confirming against a real design pass before relying on that.
   - Open: what happens when a VLAN's subnet is too small to contain every region, and whether a rack may ever sit outside all regions.
