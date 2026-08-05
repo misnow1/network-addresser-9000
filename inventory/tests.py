@@ -6430,15 +6430,36 @@ class RackSlotSuggestionTests(TestCase):
         self.assertEqual(form.instance.rack_slot, 1)
         self.assertEqual(form.instance.companion_rack_slot, 5)
 
+    def test_typed_companion_rack_slot_is_reserved_before_the_host_is_suggested(self) -> None:
+        # Codex review, commit 6a1af4c: the mirror of the case above — a
+        # typed *companion* ordinal must be visible to the *host* search
+        # too. Without this, an empty rack with companion_rack_slot typed
+        # at the lowest ordinal and rack_slot left blank would suggest the
+        # host onto that same ordinal, and _check_companion_creation_
+        # possible() would then correctly reject the resulting overlap —
+        # a submission that should have succeeded with the host placed
+        # elsewhere.
+        host_type = self._make_companion_pair()
+        form = NetworkDeviceAddForm(data=self._device_data(device_type=host_type, companion_rack_slot="1"))
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.companion_rack_slot, 1)
+        self.assertEqual(form.instance.rack_slot, 2)  # placed clear of the typed companion
+
     # -- 9: a companion type whose own slot_span > 1 gets a run that size -------------
 
     def test_companion_with_its_own_multi_slot_span_gets_a_run_that_size(self) -> None:
+        # A switch at 3 leaves a one-slot gap at 2 that's big enough for a
+        # span-1 search but not a span-2 one — on an otherwise-empty rack,
+        # a hard-coded span of 1 would land on 2 as well, so this wouldn't
+        # discriminate a real companion_type.slot_span lookup from one
+        # (Codex review, commit 6a1af4c).
+        NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=3, hostname="s1")
         companion_type = self._make_spanning_type(vlan=self.other_vlan, name="Spanning Companion")
         host_type = self._make_companion_pair(companion_type=companion_type)
         form = NetworkDeviceAddForm(data=self._device_data(device_type=host_type))
         self.assertTrue(form.is_valid(), form.errors)
         self.assertEqual(form.instance.rack_slot, 1)
-        self.assertEqual(form.instance.companion_rack_slot, 2)  # occupies 2-3, not just 2
+        self.assertEqual(form.instance.companion_rack_slot, 4)  # skips the gap at 2, occupies 4-5
 
     # -- 10: a full rack errors cleanly rather than raising ----------------------------
 
