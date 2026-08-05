@@ -2,7 +2,7 @@
 
 High-level phases only — day-to-day task tracking belongs in GitHub Issues once there's code to file issues against. This file exists so it's obvious what phase the project is in and what's next, even after a fresh start.
 
-**Current phase: 12 — done. Nothing currently in flight; see "Later / not yet designed" for candidates.**
+**Current phase: 12 — done; phase 6 — done. Nothing currently in flight; see "Later / not yet designed" for candidates.**
 
 ## 1. Foundation — done
 
@@ -36,11 +36,11 @@ High-level phases only — day-to-day task tracking belongs in GitHub Issues onc
 - [x] Dockerfile
 - [x] docker-compose (app + MariaDB)
 
-## 6. Process hardening
+## 6. Process hardening — done
 
 - [x] Pre-commit hooks (formatting/linting)
-- [ ] GitHub Actions CI (tests, lint)
-- [ ] Branch protection on `main` — require PRs, block direct pushes
+- [x] GitHub Actions CI (tests, lint)
+- [x] Branch protection on `main` — require PRs, block direct pushes
 
 ## 7. Container publishing
 

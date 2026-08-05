@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Cancel superseded PR runs to save minutes; never cancel a run on `main`,
+# since that's the record of what's actually green on the branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      # mysqlclient==2.2.8 has no Linux wheels on PyPI (Windows wheels + an
+      # sdist only), so it must build from source here too — the mypy
+      # pre-commit hook installs it via additional_dependencies.
+      - name: Install system build dependencies for mysqlclient
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config default-libmysqlclient-dev build-essential
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+          cache: pip
+          # setup-python's pip cache defaults to hashing **/requirements.txt
+          # only. requirements-dev.txt pins pre-commit/ruff/mypy/django-stubs
+          # — without listing it too, bumping a dev-only pin restores a
+          # stale cache under the same key and the refreshed set of
+          # packages can never displace it.
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Run pre-commit
+        run: pre-commit run --all-files --show-diff-on-failure
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      db:
+        image: mariadb:11.4.5
+        env:
+          MARIADB_ROOT_PASSWORD: na9000dev
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mariadb-admin ping -h 127.0.0.1 -u root -pna9000dev --silent"
+          --health-interval=5s --health-timeout=5s --health-retries=20 --health-start-period=30s
+    env:
+      DJANGO_DEBUG: "true"
+      DB_NAME: network_addresser_9000
+      DB_USER: root
+      DB_PASSWORD: na9000dev
+      DB_HOST: 127.0.0.1
+      DB_PORT: "3306"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install system build dependencies for mysqlclient
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config default-libmysqlclient-dev build-essential
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: .python-version
+          cache: pip
+          # See the matching comment in the `lint` job: requirements-dev.txt
+          # must be hashed too, or a dev-only pin bump can't invalidate the
+          # cache.
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Check for missing migrations
+        run: python manage.py makemigrations --check --dry-run
+
+      - name: Run tests
+        run: |
+          # `manage.py test` exits 0 if discovery finds zero tests, so a run
+          # that silently discovers nothing (e.g. a PR that renames/deletes
+          # the test package) would report green. Capture the run, always
+          # show it, then fail explicitly on either a genuine test failure
+          # or a discovery collapse.
+          #
+          # `min_tests` is a FLOOR, not the exact count: hardcoding today's
+          # 481 would turn every legitimate new test into a red build, which
+          # trains people to raise or ignore the number rather than trust
+          # it. 400 sits comfortably below 481 and exists only to catch
+          # "discovery found ~nothing" — it is not meant to track the exact
+          # count, and should not be "tightened" to one.
+          #
+          # No `shell: bash` override and no pipe-then-check-$? — this needs
+          # to work correctly under the default `bash -e {0}` runner shell,
+          # which lacks `pipefail`. The exit-status capture below uses an
+          # `if`/`else` (exempt from `-e`) instead of relying on pipefail
+          # semantics, so a real test failure still fails this step even
+          # under the default shell.
+          if python manage.py test inventory > test-output.log 2>&1; then
+            test_status=0
+          else
+            test_status=$?
+          fi
+          cat test-output.log
+
+          if [ "$test_status" -ne 0 ]; then
+            echo "Test suite failed (exit $test_status)."
+            exit "$test_status"
+          fi
+
+          found_count=$(grep -oE 'Found [0-9]+ test' test-output.log | grep -oE '[0-9]+' || true)
+          min_tests=400
+
+          if [ -z "$found_count" ] || [ "$found_count" -lt "$min_tests" ]; then
+            echo "Test discovery found only '${found_count:-0}' test(s), below the floor of $min_tests. Failing — this usually means discovery silently collapsed (e.g. a renamed/deleted test module), not that the suite passed cleanly."
+            exit 1
+          fi
+
+          echo "Discovered $found_count test(s) (floor: $min_tests) — OK."
