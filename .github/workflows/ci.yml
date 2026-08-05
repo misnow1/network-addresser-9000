@@ -33,6 +33,14 @@ jobs:
         with:
           python-version-file: .python-version
           cache: pip
+          # setup-python's pip cache defaults to hashing **/requirements.txt
+          # only. requirements-dev.txt pins pre-commit/ruff/mypy/django-stubs
+          # — without listing it too, bumping a dev-only pin restores a
+          # stale cache under the same key and the refreshed set of
+          # packages can never displace it.
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
       - name: Install dev dependencies
         run: pip install -r requirements-dev.txt
@@ -76,6 +84,12 @@ jobs:
         with:
           python-version-file: .python-version
           cache: pip
+          # See the matching comment in the `lint` job: requirements-dev.txt
+          # must be hashed too, or a dev-only pin bump can't invalidate the
+          # cache.
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
       - name: Install dev dependencies
         run: pip install -r requirements-dev.txt
@@ -84,4 +98,44 @@ jobs:
         run: python manage.py makemigrations --check --dry-run
 
       - name: Run tests
-        run: python manage.py test inventory
+        run: |
+          # `manage.py test` exits 0 if discovery finds zero tests, so a run
+          # that silently discovers nothing (e.g. a PR that renames/deletes
+          # the test package) would report green. Capture the run, always
+          # show it, then fail explicitly on either a genuine test failure
+          # or a discovery collapse.
+          #
+          # `min_tests` is a FLOOR, not the exact count: hardcoding today's
+          # 481 would turn every legitimate new test into a red build, which
+          # trains people to raise or ignore the number rather than trust
+          # it. 400 sits comfortably below 481 and exists only to catch
+          # "discovery found ~nothing" — it is not meant to track the exact
+          # count, and should not be "tightened" to one.
+          #
+          # No `shell: bash` override and no pipe-then-check-$? — this needs
+          # to work correctly under the default `bash -e {0}` runner shell,
+          # which lacks `pipefail`. The exit-status capture below uses an
+          # `if`/`else` (exempt from `-e`) instead of relying on pipefail
+          # semantics, so a real test failure still fails this step even
+          # under the default shell.
+          if python manage.py test inventory > test-output.log 2>&1; then
+            test_status=0
+          else
+            test_status=$?
+          fi
+          cat test-output.log
+
+          if [ "$test_status" -ne 0 ]; then
+            echo "Test suite failed (exit $test_status)."
+            exit "$test_status"
+          fi
+
+          found_count=$(grep -oE 'Found [0-9]+ test' test-output.log | grep -oE '[0-9]+' || true)
+          min_tests=400
+
+          if [ -z "$found_count" ] || [ "$found_count" -lt "$min_tests" ]; then
+            echo "Test discovery found only '${found_count:-0}' test(s), below the floor of $min_tests. Failing — this usually means discovery silently collapsed (e.g. a renamed/deleted test module), not that the suite passed cleanly."
+            exit 1
+          fi
+
+          echo "Discovered $found_count test(s) (floor: $min_tests) — OK."
