@@ -157,6 +157,19 @@ AVIO_IDENTITY_PATTERNS: tuple[tuple[re.Pattern[str], tuple[str, str, str]], ...]
 SD12_IDENTITY = ("DiGiCo", "SD12", "Default")
 DMI_DANTE_IDENTITY = ("DiGiCo", "DMI-DANTE", "Default")
 
+#: Case-insensitive hostname suffix identifying a companion device-control
+#: interface row (ADR 0018) — re-declared independently of
+#: ``import_prod_data.DEVICE_CONTROL_SUFFIX``, same convention.
+DEVICE_CONTROL_SUFFIX = "-device-control"
+
+#: Independently-declared expected host identity -> companion identity
+#: (ADR 0018), re-typed from the ADR rather than imported from
+#: ``import_prod_data.py``'s ``DeviceTypeSpec.companion_key``.
+EXPECTED_COMPANION_TYPES: dict[tuple[str, str, str], tuple[str, str, str]] = {
+    ("Yamaha", "DM7C", "Default"): ("Yamaha", "DM7C", "Device Control Interface"),
+    ("Yamaha", "DM3", "Default"): ("Yamaha", "DM3", "Device Control Interface"),
+}
+
 #: A plain 1GbE copper jack is the only device port type in this dataset
 #: (PROD-DATA-ANALYSIS.md §7.3) — re-declared as a literal here rather than
 #: importing ``inventory.models.PortType``, so this check owes the app's
@@ -402,6 +415,158 @@ def _check_rack_ranges(findings: _Findings, rack_offset_rows: list[Any], vlan_ro
     findings.count("rack_ranges_checked", checked)
 
 
+# -- Companion pairs (ADR 0018) -----------------------------------------------------
+
+
+def _check_companion_pairs(
+    findings: _Findings,
+    addressing_rows: list[AddressingRow],
+    consumed: set[tuple[str, int]],
+    actual_devices: dict[tuple[str, int], NetworkDevice],
+    vlan_id_by_function: dict[str, int],
+) -> int:
+    """Independent companion-pair check (ADR 0018) — mirrors the SD12
+    Control/Engine lookahead inside the main per-row loop below, but keyed
+    on the ``-device-control`` hostname suffix rather than slot adjacency
+    (a companion can sit either below or above its host — DM7C/DM3
+    respectively — which slot-adjacency can't express in both directions
+    at once), and re-declared independently of ``import_prod_data.py``'s
+    own companion pre-pass.
+
+    Runs as a genuine pre-pass over *every* row, not a lookahead triggered
+    while iterating — CSV order isn't reliable (the DM7C's companion row
+    precedes its host, the DM3's follows it), so this must find pairs
+    regardless of which row it meets first. Marks both rows' ``(rack,
+    slot)`` keys consumed so the main loop's ordinary per-row branch never
+    re-processes either one — mirroring how the SD12 branch consumes its
+    own pair inline.
+
+    Self-contained, same shape as the SD12 branch: verifies each row's own
+    hostname, type identity and static addresses at its own slot (nothing
+    is derived, ADR 0018 — the pair's address accounting still balances
+    exactly as an ordinary device's would), plus the one thing an ordinary
+    per-row check can't: that ``device.host`` actually links the two rows,
+    in the right direction (the companion's ``host`` is the console, never
+    the reverse).
+
+    Returns the number of byte-identical static addresses verified here,
+    so the caller can fold it into its own running total — this pass runs
+    *before* that total exists, so the two can't be accumulated any other
+    way, and ``total_placed``'s reconciliation at the end of that function
+    otherwise undercounts by exactly the addresses checked here.
+    """
+    byte_identical = 0
+    pairs_checked = 0
+    for row in addressing_rows:
+        key = (row.rack, row.slot)
+        if key in consumed or not row.description.lower().endswith(DEVICE_CONTROL_SUFFIX):
+            continue
+        stem = row.description[: -len(DEVICE_CONTROL_SUFFIX)]
+        host_row = next(
+            (
+                other
+                for other in addressing_rows
+                if other.rack == row.rack and other is not row and other.description.lower() == stem.lower()
+            ),
+            None,
+        )
+        if host_row is None:
+            findings.fail(
+                "companion_link", f"{row.rack} slot {row.slot}: no host row matching {stem!r} found."
+            )
+            consumed.add(key)
+            continue
+        host_key = (host_row.rack, host_row.slot)
+        consumed.add(key)
+        consumed.add(host_key)
+        pairs_checked += 1
+
+        companion = actual_devices.get(key)
+        host = actual_devices.get(host_key)
+        if companion is None:
+            findings.fail("devices", f"{row.rack} slot {row.slot}: expected companion device, none found.")
+        if host is None:
+            findings.fail(
+                "devices", f"{host_row.rack} slot {host_row.slot}: expected host device, none found."
+            )
+        if companion is None or host is None:
+            continue
+
+        if companion.hostname != row.description:
+            findings.fail(
+                "hostnames",
+                f"{row.rack} slot {row.slot}: hostname {companion.hostname!r} != {row.description!r}.",
+            )
+        if host.hostname != host_row.description:
+            findings.fail(
+                "hostnames",
+                f"{host_row.rack} slot {host_row.slot}: hostname {host.hostname!r} != "
+                f"{host_row.description!r}.",
+            )
+
+        host_identity = (host.device_type.manufacturer, host.device_type.model, host.device_type.name)
+        expected_companion_identity = EXPECTED_COMPANION_TYPES.get(host_identity)
+        if expected_companion_identity is None:
+            findings.fail(
+                "companion_link",
+                f"{host_row.rack}/{host_row.slot} ({host_row.description}): {host_identity} has no "
+                "expected companion type in EXPECTED_COMPANION_TYPES.",
+            )
+        else:
+            _check_device_type_identity(
+                findings, f"{row.rack}/{row.slot} ({row.description})", companion, expected_companion_identity
+            )
+
+        if companion.host_id != host.pk:
+            findings.fail(
+                "companion_link",
+                f"{row.rack}/{row.slot} ({row.description}): companion.host is "
+                f"{companion.host_id!r}, expected host {host.pk!r} ({host.hostname!r}).",
+            )
+        if host.host_id is not None:
+            # companion.host_id == host.pk alone doesn't rule out the link
+            # also running backwards (Codex review round 2, finding 6): a
+            # corrupted ``host.host_id = companion.pk`` is representable in
+            # the DB (host_id is a nullable OneToOne, so both rows pointing
+            # at each other doesn't violate anything at the schema level)
+            # and would pass the check above untouched, even though it
+            # means the row this command calls "host" is itself, per its
+            # own row, someone's companion. This command's whole point is
+            # independence from the importer (module docstring) — assert
+            # the direction outright rather than trusting the pairing.
+            findings.fail(
+                "companion_link",
+                f"{host_row.rack}/{host_row.slot} ({host_row.description}): expected to be a "
+                f"host, but has its own host_id={host.host_id!r} — the link runs the wrong way.",
+            )
+
+        for description_row, device in ((row, companion), (host_row, host)):
+            for function, sheet_value in (
+                (FN_CONTROL, description_row.control),
+                (FN_DANTE_PRIMARY, description_row.dante_primary),
+                (FN_DANTE_SECONDARY, description_row.dante_secondary),
+            ):
+                vlan_id = vlan_id_by_function[function]
+                actual_value = _device_address(device, vlan_id, offset=0)
+                if not sheet_value:
+                    if actual_value is not None:
+                        findings.fail(
+                            "address_diff",
+                            f"{description_row.rack}/{description_row.slot} {function}: unexpected "
+                            f"address {actual_value}.",
+                        )
+                    continue
+                byte_identical += _compare(
+                    findings,
+                    "address_diff",
+                    f"{description_row.rack}/{description_row.slot} {function}",
+                    sheet_value,
+                    actual_value,
+                )
+    findings.count("companion_pairs_checked", pairs_checked)
+    return byte_identical
+
+
 # -- Hostnames, type assignment, address manifest ----------------------------------
 
 
@@ -449,6 +614,15 @@ def _check_hostnames_and_types_and_addresses(
     differs_by_design = 0
     extra_verified = 0
     dmi_dante_rack_slot: dict[str, int] = {}
+
+    # ADR 0018 — companion pairs, verified (and their two (rack, slot)
+    # keys consumed) *before* the main per-row loop below, mirroring how
+    # the SD12 branch inside that loop self-contains its own pair. See
+    # _check_companion_pairs()'s own docstring for why this can't be a
+    # lookahead from inside the loop the way SD12's is.
+    byte_identical += _check_companion_pairs(
+        findings, addressing_rows, consumed, actual_devices, vlan_id_by_function
+    )
 
     for row in addressing_rows:
         key = (row.rack, row.slot)
@@ -825,9 +999,32 @@ def _check_device_type_ports(findings: _Findings, vlan_id_by_function: dict[str,
     on an upstream guarantee it never actually reads. A row-count match
     with a corrupted stored ``port_count`` is exactly the state that
     checking only ``len(actual_ports)`` sails past.
+
+    Also asserts ``companion_type`` against ``EXPECTED_COMPANION_TYPES``
+    (ADR 0018) — including the ``None`` case for every type with no
+    expected companion, so a stray link can't slip past unchecked the way
+    it would if this only asserted the positive cases.
     """
-    for device_type in NetworkDeviceType.objects.prefetch_related("type_ports__vlan"):
+    for device_type in NetworkDeviceType.objects.select_related("companion_type").prefetch_related(
+        "type_ports__vlan"
+    ):
         identity = (device_type.manufacturer, device_type.model, device_type.name)
+        expected_companion_identity = EXPECTED_COMPANION_TYPES.get(identity)
+        actual_companion_identity = None
+        if device_type.companion_type_id is not None:
+            companion_type = device_type.companion_type
+            assert companion_type is not None  # companion_type_id checked non-null above
+            actual_companion_identity = (
+                companion_type.manufacturer,
+                companion_type.model,
+                companion_type.name,
+            )
+        if actual_companion_identity != expected_companion_identity:
+            findings.fail(
+                "device_type_ports",
+                f"{device_type}: companion_type {actual_companion_identity} != "
+                f"{expected_companion_identity} (ADR 0018).",
+            )
         expected_ports = EXPECTED_DEVICE_TYPE_PORTS.get(identity)
         if expected_ports is None:
             findings.fail(

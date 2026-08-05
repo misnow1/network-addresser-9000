@@ -265,6 +265,50 @@ ADDRESSING_ROWS = [
         "",
         "",
     ),
+    # CONSOLES: a DM7C console + device-control interface pair, companion
+    # row BELOW its host (ADR 0018 — production has the DM7C's interface
+    # sitting one address below its console, e.g. 10.201.6.4 vs .5).
+    (
+        "dm7c-1-device-control",
+        "CONSOLES",
+        5,
+        "",
+        addr(FN_DANTE_PRIMARY, "CONSOLES", 5),
+        "",
+        "Only on Dante Primary for controlling snakes",
+    ),
+    (
+        "DM7C-1",
+        "CONSOLES",
+        6,
+        addr(FN_CONTROL, "CONSOLES", 6),
+        addr(FN_DANTE_PRIMARY, "CONSOLES", 6),
+        addr(FN_DANTE_SECONDARY, "CONSOLES", 6),
+        "",
+    ),
+    # CONSOLES: a DM3 console + device-control interface pair, companion
+    # row ABOVE its host (production has the DM3's interface one address
+    # above its console) — the opposite direction from the DM7C pair
+    # above, proving the importer's companion pre-pass isn't
+    # slot-adjacency/direction-specific (ADR 0018).
+    (
+        "bej-dm3-1",
+        "CONSOLES",
+        8,
+        addr(FN_CONTROL, "CONSOLES", 8),
+        addr(FN_DANTE_PRIMARY, "CONSOLES", 8),
+        addr(FN_DANTE_SECONDARY, "CONSOLES", 8),
+        "",
+    ),
+    (
+        "bej-dm3-1-device-control",
+        "CONSOLES",
+        9,
+        "",
+        addr(FN_DANTE_PRIMARY, "CONSOLES", 9),
+        "",
+        "",
+    ),
 ]
 
 
@@ -490,8 +534,62 @@ class ImportProdDataTests(TestCase):
             NetworkDevice.objects.get(rack__name="AVIO", rack_slot=1).hostname, "mps-avio-radial-tx"
         )
 
+    def test_dm7c_and_dm3_companion_pairs_linked(self) -> None:
+        # ADR 0018: the importer's companion pre-pass must pair each
+        # "-device-control" row with its host and materialize a real
+        # device.host link, in both directions — DM7C's companion sits
+        # below its host, DM3's sits above.
+        dm7c_host = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=6)
+        self.assertEqual(dm7c_host.hostname, "DM7C-1")
+        self.assertEqual(dm7c_host.device_type.name, "Default")
+        dm7c_companion = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=5)
+        self.assertEqual(dm7c_companion.hostname, "dm7c-1-device-control")
+        self.assertEqual(dm7c_companion.device_type.name, "Device Control Interface")
+        self.assertEqual(dm7c_companion.host_id, dm7c_host.pk)
+        self.assertEqual(dm7c_companion.ports.get().address, addr(FN_DANTE_PRIMARY, "CONSOLES", 5))
+
+        dm3_host = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=8)
+        self.assertEqual(dm3_host.hostname, "bej-dm3-1")
+        dm3_companion = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=9)
+        self.assertEqual(dm3_companion.hostname, "bej-dm3-1-device-control")
+        self.assertEqual(dm3_companion.host_id, dm3_host.pk)
+        self.assertEqual(dm3_companion.ports.get().address, addr(FN_DANTE_PRIMARY, "CONSOLES", 9))
+
+        # companion_type is linked on the type graph too (ADR 0018), not
+        # just the instance-level host FK.
+        self.assertEqual(dm7c_host.device_type.companion_type, dm7c_companion.device_type)
+        self.assertEqual(dm3_host.device_type.companion_type, dm3_companion.device_type)
+
     def test_verify_passes_against_a_correct_import(self) -> None:
         call_command("verify_prod_import", data_dir=str(self.data_dir))
+
+    def test_verify_catches_a_broken_companion_link(self) -> None:
+        # ADR 0018 — QuerySet.update() is a documented bypass of the
+        # model's own host lock (same shape as this file's other
+        # .update()-based corruption tests), so this reaches a state the
+        # ORM's own guards would otherwise refuse, and the verifier's
+        # independent companion-link check (_check_companion_pairs()) must
+        # catch it rather than silently pass.
+        companion = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=5)
+        NetworkDevice.objects.filter(pk=companion.pk).update(host=None)
+        with self.assertRaises(CommandError):
+            call_command("verify_prod_import", data_dir=str(self.data_dir))
+
+    def test_verify_catches_a_reverse_companion_link(self) -> None:
+        # Codex review round 2, finding 6 — ``companion.host_id == host.pk``
+        # alone doesn't prove the link runs the right way. ``host`` here is
+        # a nullable OneToOneField, so nothing at the schema level stops a
+        # corrupted state where the row this test (and the fixture) calls
+        # the *host* also has its own ``host_id`` set, forming a two-way
+        # cycle the model would never produce but that a raw
+        # ``QuerySet.update()`` (same documented bypass as the test above)
+        # can still write. The verifier must assert the direction, not just
+        # the pairing.
+        dm7c_host = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=6)
+        dm7c_companion = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=5)
+        NetworkDevice.objects.filter(pk=dm7c_host.pk).update(host=dm7c_companion.pk)
+        with self.assertRaises(CommandError):
+            call_command("verify_prod_import", data_dir=str(self.data_dir))
 
     def test_verify_catches_a_wrong_address(self) -> None:
         port = NetworkDevicePort.objects.filter(
@@ -584,6 +682,34 @@ class ImportProdDataMalformedDmiDanteTests(TestCase):
                 21,
                 addr(FN_CONTROL, "AMPRACK1", 21),
                 "",
+                "",
+                "",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_fixture_csvs(data_dir, addressing_source_rows=malformed_rows)
+            with self.assertRaises(CommandError):
+                call_command("import_prod_data", data_dir=str(data_dir))
+
+
+class ImportProdDataMalformedCompanionTests(TestCase):
+    """ADR 0018's importer pre-pass refuses rather than guesses when a
+    ``-device-control`` row's host can't be found — mirrors
+    ``ImportProdDataMalformedDmiDanteTests``'s shape: its own one-off
+    fixture, since it needs a deliberately-unpaired row the shared fixture
+    doesn't have.
+    """
+
+    def test_refuses_an_unmatched_companion_row(self) -> None:
+        malformed_rows = [
+            *ADDRESSING_ROWS,
+            (
+                "orphan-1-device-control",
+                "AMPRACK1",
+                20,
+                "",
+                addr(FN_DANTE_PRIMARY, "AMPRACK1", 20),
                 "",
                 "",
             ),

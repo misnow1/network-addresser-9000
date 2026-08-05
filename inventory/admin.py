@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, cast
 
 from auditlog.mixins import AuditlogHistoryAdminMixin
 from django import forms
@@ -6,7 +6,7 @@ from django.contrib import admin, messages
 from django.contrib.admin.actions import delete_selected as default_delete_selected
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError
-from django.db.models import QuerySet
+from django.db.models import Q, QuerySet
 from django.forms import BaseInlineFormSet, BaseModelFormSet
 from django.http import HttpRequest, HttpResponseRedirect
 from django.template.response import TemplateResponse
@@ -32,6 +32,7 @@ from .models import (
     RackVlanRange,
     SwitchAddressing,
     SwitchPortVlanProfile,
+    _get_related,
 )
 
 
@@ -69,6 +70,24 @@ class AuditedModelAdminMixin:
             return super().changeform_view(request, object_id, form_url, extra_context)  # type: ignore[misc]
         except (ValidationError, IntegrityError) as exc:
             messages.error(request, f"Could not save: {exc}")
+            return HttpResponseRedirect(request.path)
+
+    def delete_view(
+        self, request: HttpRequest, object_id: str, extra_context: dict[str, Any] | None = None
+    ) -> Any:
+        """Same reasoning as ``changeform_view`` above, for the delete
+        route: a ``ValidationError`` raised from inside ``Model.delete()``
+        (ADR 0018's companion-alone-delete refusal is the first one that
+        can happen through the admin's ordinary single-object delete flow)
+        would otherwise reach the admin unhandled and 500, since Django's
+        delete confirmation view has no built-in handling for it (only
+        ``ProtectedError``/``RestrictedError`` get the native "can't
+        delete" page).
+        """
+        try:
+            return super().delete_view(request, object_id, extra_context)  # type: ignore[misc]
+        except ValidationError as exc:
+            messages.error(request, f"Could not delete: {exc}")
             return HttpResponseRedirect(request.path)
 
     def save_model(self, request: HttpRequest, obj: AuditedModel, form: object, change: bool) -> None:
@@ -354,6 +373,15 @@ class NetworkDeviceAddForm(forms.ModelForm):
     alone. Used only for the add view (``NetworkDeviceAdmin.get_form()``);
     the choice has no effect after creation, so the change form omits it
     entirely rather than showing a field that does nothing.
+
+    Also carries the creation-time companion inputs (ADR 0018):
+    ``companion_rack_slot`` (required exactly when this device's type
+    declares a companion and it's being created racked — the model's own
+    ``_check_companion_creation_possible()`` is the real enforcement, this
+    is just the field) and ``companion_hostname`` (blank copies this
+    device's own hostname onto its companion, decision 3). ``host`` is
+    excluded outright — never operator-editable; a host materializes its
+    own companion, nothing sets this by hand (review note 3).
     """
 
     port_addressing = forms.ChoiceField(
@@ -365,10 +393,42 @@ class NetworkDeviceAddForm(forms.ModelForm):
             "a port on an L2-only VLAN (no subnet) — neither can carry a static address."
         ),
     )
+    companion_rack_slot = forms.IntegerField(
+        required=False,
+        min_value=1,
+        help_text=(
+            "Required only when this device's type declares a companion device (ADR 0018) and "
+            "this device is being created racked — the companion materializes alongside it and "
+            "needs its own rack slot. Ignored for a type with no companion, or an unracked device."
+        ),
+    )
+    companion_hostname = forms.CharField(
+        required=False,
+        help_text="Optional. Blank copies this device's own hostname onto its companion (ADR 0018).",
+    )
 
     class Meta:
         model = NetworkDevice
-        exclude: list[str] = []
+        # exclude, not fields — host must never appear on this form at
+        # all (ADR 0018 review note 3), including for any field added to
+        # NetworkDevice later; an explicit fields list would silently
+        # need updating every time, which is the failure mode this
+        # guards against. Deliberate departure from flake8-django's
+        # DJ006, which the project's own ruff config doesn't otherwise
+        # relax.
+        exclude = ["host"]  # noqa: DJ006
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # A companion-type instance can never be created directly through
+        # this form (ADR 0018) — the model already refuses it
+        # (NetworkDevice._check_companion_type_compatibility()), but
+        # filtering it out of the dropdown here keeps an operator from
+        # picking it and only then hitting that error. The model refusal
+        # remains the real enforcement.
+        device_type_field = cast(forms.ModelChoiceField, self.fields["device_type"])
+        assert device_type_field.queryset is not None  # ModelForm always sets this for an FK field
+        device_type_field.queryset = device_type_field.queryset.filter(companion_of__isnull=True)
 
     def _post_clean(self) -> None:
         # `or`, not `.get(..., default)` alone — required=False means an
@@ -378,6 +438,58 @@ class NetworkDeviceAddForm(forms.ModelForm):
         # does leave the key genuinely absent). Must run before
         # super()._post_clean(), which is what calls self.instance.full_clean().
         self.instance.port_addressing = self.cleaned_data.get("port_addressing") or PortAddressing.STATIC
+        self.instance.companion_rack_slot = self.cleaned_data.get("companion_rack_slot")
+        self.instance.companion_hostname = self.cleaned_data.get("companion_hostname")
+        super()._post_clean()  # type: ignore[misc]
+
+
+class NetworkDeviceChangeForm(forms.ModelForm):
+    """Excludes ``host`` (never operator-editable, ADR 0018 review note 3)
+    and, only when this device actually has a companion, carries the
+    move-time ``companion_rack_slot`` input: blank preserves the
+    companion's current relative offset from this device when it moves
+    (decision 1), a value given is an explicit absolute target slot. The
+    field is added conditionally in ``__init__`` (not declared at class
+    level, unlike ``NetworkDeviceAddForm``'s) because it's meaningless —
+    and would be actively misleading — on a device with no companion at
+    all.
+    """
+
+    class Meta:
+        model = NetworkDevice
+        # exclude, not fields — host must never appear on this form at
+        # all (ADR 0018 review note 3), including for any field added to
+        # NetworkDevice later; an explicit fields list would silently
+        # need updating every time, which is the failure mode this
+        # guards against. Deliberate departure from flake8-django's
+        # DJ006, which the project's own ruff config doesn't otherwise
+        # relax.
+        exclude = ["host"]  # noqa: DJ006
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        companion = _get_related(self.instance, "companion")
+        if companion is not None:
+            offset_note = ""
+            if self.instance.rack_slot is not None and companion.rack_slot is not None:
+                offset = companion.rack_slot - self.instance.rack_slot
+                offset_note = (
+                    f" Currently at rack_slot {companion.rack_slot} ({offset:+d} from this device's own)."
+                )
+            self.fields["companion_rack_slot"] = forms.IntegerField(
+                required=False,
+                min_value=1,
+                help_text=(
+                    "This device's companion (ADR 0018) moves with it. Leave blank to preserve "
+                    f"the current relative offset when moving this device.{offset_note}"
+                ),
+            )
+
+    def _post_clean(self) -> None:
+        # Absent entirely (no companion) means cleaned_data.get() returns
+        # None here, which is exactly companion_rack_slot's "preserve the
+        # offset" default anyway — safe to set unconditionally.
+        self.instance.companion_rack_slot = self.cleaned_data.get("companion_rack_slot")
         super()._post_clean()  # type: ignore[misc]
 
 
@@ -831,37 +943,115 @@ class NetworkSwitchAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
         return super().delete_view(request, object_id, extra_context)
 
 
+class NetworkDeviceTypeForm(forms.ModelForm):
+    """Restricts the ``companion_type`` dropdown to types that neither
+    declare a companion themselves nor are already someone else's, and
+    excludes this type itself (ADR 0018 decision 5 — chains, cycles and
+    self-reference are refused). ``NetworkDeviceType._validate_companion_
+    type()`` remains the real enforcement; this only keeps an operator
+    from picking an option that would just bounce back as a form error.
+    """
+
+    class Meta:
+        model = NetworkDeviceType
+        fields = ["manufacturer", "model", "name", "port_count", "companion_type"]
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # ``companion_type`` is absent from ``self.fields`` entirely for a
+        # locked profile (Codex review round 2, finding 3) — Django's admin
+        # drops readonly fields from the generated ModelForm before this
+        # ``__init__`` ever runs, since ``get_readonly_fields()`` names it
+        # once the type has instances. Nothing to restrict on a form that
+        # doesn't carry the field at all.
+        if "companion_type" not in self.fields:
+            return
+        companion_type_field = cast(forms.ModelChoiceField, self.fields["companion_type"])
+        assert companion_type_field.queryset is not None  # ModelForm always sets this for an FK field
+        # The instance's *own current* companion_type is folded back in
+        # explicitly (Codex review round 2, finding 4) — it fails
+        # ``companion_of__isnull=True`` below precisely because it already
+        # is this instance's companion, so without this an unlocked type
+        # that already declares one would reject its own unchanged value as
+        # an invalid choice on every edit, before it ever gets any instances.
+        qs = companion_type_field.queryset.filter(
+            Q(companion_type__isnull=True, companion_of__isnull=True) | Q(pk=self.instance.companion_type_id)
+        )
+        if self.instance.pk is not None:
+            qs = qs.exclude(pk=self.instance.pk)
+        companion_type_field.queryset = qs
+
+
 @admin.register(NetworkDeviceType)
 class NetworkDeviceTypeAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
-    list_display = ["manufacturer", "model", "name", "port_count"]
+    form = NetworkDeviceTypeForm
+    list_display = ["manufacturer", "model", "name", "port_count", "companion_type"]
     search_fields = ["manufacturer", "model", "name"]
     inlines = [NetworkDeviceTypePortInline]
     show_auditlog_history_link = True
 
     def get_readonly_fields(self, request: HttpRequest, obj: Any = None) -> list[str]:
+        # Same lock ADR 0010 already applies to manufacturer/model/name/
+        # port_count once the profile has instances — companion_type joins
+        # it (ADR 0018): NetworkDeviceType.save()/clean() lock it identically.
         if _profile_locked(obj, "devices"):
-            return ["manufacturer", "model", "name", "port_count"]
+            return ["manufacturer", "model", "name", "port_count", "companion_type"]
         return []
+
+
+@admin.action(permissions=["delete"], description="Delete selected network devices")
+def delete_selected_devices(
+    modeladmin: "NetworkDeviceAdmin", request: HttpRequest, queryset: QuerySet
+) -> Any:
+    """Shadows the site-wide ``delete_selected`` action — same reason as
+    the switch-side ``delete_selected`` above, but for a different failure
+    mode: Django's own action only catches ``ProtectedError``/
+    ``RestrictedError`` around the delete, not the ``ValidationError``
+    ``NetworkDeviceQuerySet.delete()`` raises when the selection includes
+    a companion on its own (ADR 0018 review note 8) — without this,
+    confirming that bulk delete 500s instead of showing a message. No
+    extra confirmation-page context is needed here the way
+    ``_connected_device_ports()`` is needed for switches — deleting a
+    *host* already lists its companion on Django's own delete-confirmation
+    page for free, since ``host`` is a real ``CASCADE`` (ADR 0018, "What
+    this asks of ADR 0007").
+    """
+    try:
+        return default_delete_selected(modeladmin, request, queryset)
+    except ValidationError as exc:
+        messages.error(request, f"Could not delete: {exc}")
+        return HttpResponseRedirect(request.path)
 
 
 @admin.register(NetworkDevice)
 class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
-    list_display = ["hostname", "device_type", "serial_number", "rack", "rack_slot"]
+    list_display = ["hostname", "device_type", "serial_number", "rack", "rack_slot", "host"]
     search_fields = ["hostname", "serial_number"]
     list_filter = ["rack", "device_type"]
     inlines = [NetworkDevicePortInline]
     show_auditlog_history_link = True
+    actions = [delete_selected_devices]
 
     def get_readonly_fields(self, request: HttpRequest, obj: Any = None) -> list[str]:
         # device_type is fixed at creation (ADR 0010) — editable on Add,
-        # locked on every subsequent Change.
-        if obj is not None:
-            return ["device_type"]
-        return []
+        # locked on every subsequent Change. host is never operator-
+        # editable once an object exists (ADR 0018) — a host materializes
+        # its own companion, nothing sets this by hand. rack/rack_slot are
+        # additionally locked whenever this device *is* a companion
+        # (obj.host_id is not None) — its placement is host-managed
+        # (NetworkDevice._locked_fields()); this is presentation only, the
+        # model-level lock is the real enforcement.
+        if obj is None:
+            return []
+        fields = ["device_type", "host"]
+        if obj.host_id is not None:
+            fields += ["rack", "rack_slot"]
+        return fields
 
     def get_form(self, request: HttpRequest, obj: Any = None, change: bool = False, **kwargs: Any) -> Any:
-        # port_addressing (ADR 0013) only makes sense at creation — the
-        # change form uses the default ModelForm, which has no such field.
-        if obj is None:
-            kwargs["form"] = NetworkDeviceAddForm
+        # port_addressing/companion inputs (ADR 0013/0018) only make sense
+        # at creation; the move-time companion_rack_slot input only makes
+        # sense once a companion exists. Two distinct forms, same shape as
+        # NetworkSwitchAddForm/the default ModelForm split elsewhere here.
+        kwargs["form"] = NetworkDeviceAddForm if obj is None else NetworkDeviceChangeForm
         return super().get_form(request, obj, change=change, **kwargs)
