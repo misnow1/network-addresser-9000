@@ -1,10 +1,12 @@
 # Network Addresser 9000
 
+[![CI](https://github.com/misnow1/network-addresser-9000/actions/workflows/ci.yml/badge.svg)](https://github.com/misnow1/network-addresser-9000/actions/workflows/ci.yml)
+
 A backend service and web frontend for tracking IP addresses assigned to network equipment: VLANs, IPv4 subnets, switches, network devices, and the racks they're grouped into.
 
 ## Status
 
-Django scaffolding, core domain logic (address suggestion, overlap validation, removal semantics), access/accountability (RBAC, mutation audit trail, removal confirmation), deployment (Docker / docker-compose), and port profiles (including reusable, live-referenced Switch Port VLAN Profiles — see ADR 0012) are in place; phase 6 (process hardening) is still open. See [`ROADMAP.md`](./ROADMAP.md) for what that covers. The domain model and key architectural decisions are settled; see the documentation below.
+Django scaffolding, core domain logic (address suggestion, overlap validation, removal semantics), access/accountability (RBAC, mutation audit trail, removal confirmation), deployment (Docker / docker-compose), and port profiles (including reusable, live-referenced Switch Port VLAN Profiles — see ADR 0012) are in place; process hardening (CI, branch protection) is done. See [`ROADMAP.md`](./ROADMAP.md) for what that covers. The domain model and key architectural decisions are settled; see the documentation below.
 
 ## Documentation
 
