@@ -2722,12 +2722,82 @@ class DeviceCompanionTests(TestCase):
         self.assertFalse(NetworkDevice.objects.filter(hostname="dm7c-2").exists())
         self.assertFalse(NetworkDevicePort.objects.filter(device__hostname="dm7c-2").exists())
 
+    def test_retry_same_instance_after_materialization_failure_creates_fully(self) -> None:
+        # Codex review round 5, finding 1 — the DB rollback after a failed
+        # _materialize_companion() doesn't undo super().save()'s in-memory
+        # side effects: self.pk stays set and self._state.adding stays
+        # False. Without restoring those, retrying the *same* instance
+        # after fixing whatever was wrong would compute is_new = False,
+        # take the update path, have its UPDATE affect zero rows (the row
+        # was rolled back), fall back to Django's own INSERT, and skip
+        # both materializers — a host with no ports and no companion.
+        blocker_type = _make_device_type(port_count=1, vlan=self.dante_vlan, name="Blocker2")
+        NetworkDevice.objects.create(device_type=blocker_type, rack=self.rack, rack_slot=4)
+        host = NetworkDevice(  # type: ignore[misc]
+            device_type=self.host_type,
+            hostname="retryhost",
+            rack=self.rack,
+            rack_slot=5,
+            companion_rack_slot=4,
+        )
+        host.port_addressing = PortAddressing.DHCP
+        with self.assertRaises(ValidationError):
+            host.save()
+        self.assertIsNone(host.pk)
+        self.assertTrue(host._state.adding)
+        self.assertFalse(NetworkDevice.objects.filter(hostname="retryhost").exists())
+
+        host.companion_rack_slot = 6  # fix the collision and retry the SAME instance
+        host.save()
+        self.assertIsNotNone(host.pk)
+        self.assertEqual(host.ports.count(), 1)
+        self.assertEqual(host.companion.rack_slot, 6)
+        self.assertEqual(host.companion.ports.count(), 1)
+
     def test_every_device_type_without_companion_type_creates_as_before(self) -> None:
         ordinary_type = _make_device_type(port_count=1, vlan=self.control_vlan, name="Ordinary")
         device = NetworkDevice.objects.create(device_type=ordinary_type, hostname="plain")
         self.assertIsNone(device.host_id)
         with self.assertRaises(ObjectDoesNotExist):
             _ = device.companion
+
+    def test_materialization_uses_freshly_locked_type_not_stale_cache(self) -> None:
+        # Codex review round 5, finding 2 — deterministic half: forces the
+        # exact stale-cache state a real concurrent transaction would
+        # produce (another connection changing host_type's companion_type
+        # and committing before this save() runs), without needing two
+        # real transactions. self.device_type on the host instance is
+        # left holding the object as it was *before* the change; save()
+        # locks host_type's row and then, before this fix, would have
+        # kept using that stale cached object for both the compatibility
+        # check and materialization — creating a companion of the *old*
+        # companion_type against a type row that (now, under the lock)
+        # declares a different one. What a genuine cross-connection race
+        # timing itself would look like remains unproven by this test —
+        # only the consequence of losing that race is exercised here.
+        other_companion_type = _make_device_type(port_count=1, vlan=self.dante_vlan, name="Other Companion")
+        host = NetworkDevice(  # type: ignore[misc]
+            device_type=self.host_type,
+            hostname="stalecache",
+            rack=self.rack,
+            rack_slot=5,
+            companion_rack_slot=4,
+        )
+        host.port_addressing = PortAddressing.DHCP
+        # "Concurrent" change, via a separately fetched object so host's
+        # own self.device_type stays exactly as stale as a real second
+        # connection's commit would leave it.
+        concurrent_edit = NetworkDeviceType.objects.get(pk=self.host_type.pk)
+        concurrent_edit.companion_type = other_companion_type
+        concurrent_edit.save()
+        self.assertEqual(host.device_type.companion_type_id, self.companion_type.pk)  # still stale
+
+        host.save()
+
+        self.assertEqual(host.companion.device_type_id, other_companion_type.pk)
+        persisted_companion_type_id = NetworkDeviceType.objects.get(pk=host.device_type_id).companion_type_id
+        self.assertEqual(persisted_companion_type_id, other_companion_type.pk)
+        self.assertEqual(host.companion.device_type_id, persisted_companion_type_id)
 
     # -- Type compatibility ------------------------------------------------------------
 
@@ -3042,6 +3112,72 @@ class DeviceCompanionTests(TestCase):
         self.assertEqual(host.rack_slot, 1)
         self.assertEqual(companion.rack_slot, 4)
 
+    def test_park_decision_uses_persisted_device_type_span(self) -> None:
+        # Audit finding while fixing Codex review round 5 — a third
+        # instance of round 4 finding 1's class, in
+        # _park_companion_if_colliding() rather than
+        # _check_pending_move_no_overlap(). unique_device_rack_slot only
+        # ever enforces exact (rack, rack_slot) equality, which doesn't
+        # depend on either row's span, so a dirty span here can't produce
+        # a wrong *final* placement — verified by hand that the pre-fix
+        # code still lands both rows correctly. What it *does* change is
+        # whether a park that genuinely should have happened (the host's
+        # real span-2 range momentarily overlapping the companion's
+        # current slot) actually does — observable in the audit trail:
+        # a real collision should log a parked pair (old→None, None→new,
+        # review round 2 finding 6), not a single direct move.
+        spanning_type = NetworkDeviceType.objects.create(
+            manufacturer="Yamaha", model="DM7C", name="Spanning3", port_count=2
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=spanning_type,
+            description="Control",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.control_vlan,
+            slot_offset=0,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=spanning_type,
+            description="Control2",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.control_vlan,
+            slot_offset=1,
+        )
+        spanning_type.companion_type = self.companion_type
+        spanning_type.save()
+        span1_type = _make_device_type(port_count=1, vlan=self.control_vlan, name="Compatible span-1b")
+
+        host = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=spanning_type,
+            hostname="parkdirtytype",
+            rack=self.rack,
+            rack_slot=1,
+            companion_rack_slot=6,
+            port_addressing=PortAddressing.DHCP,
+        )
+        companion = host.companion
+        LogEntry.objects.filter(object_pk=str(companion.pk)).delete()
+
+        # Real span 2 -> host would occupy 5-6, colliding with the
+        # companion's *current* slot (6) -> a park is genuinely needed.
+        # The dirty span-1 type would see host as occupying just {5},
+        # missing that collision.
+        host.rack_slot = 5
+        host.device_type = span1_type  # dirty in-memory only — never in update_fields
+        host.companion_rack_slot = 8  # move the companion out of the way too
+        host.save(update_fields=["rack_slot"])
+
+        host.refresh_from_db()
+        companion.refresh_from_db()
+        self.assertEqual(host.rack_slot, 5)
+        self.assertEqual(companion.rack_slot, 8)
+        entries = list(
+            LogEntry.objects.filter(object_pk=str(companion.pk), action=LogEntry.Action.UPDATE).order_by("pk")
+        )
+        self.assertEqual(len(entries), 2, [e.changes_dict for e in entries])
+        self.assertEqual(entries[0].changes_dict["rack_slot"], ["6", "None"])
+        self.assertEqual(entries[1].changes_dict["rack_slot"], ["None", "8"])
+
     def test_explicit_companion_only_relocation_with_host_stationary(self) -> None:
         # Codex review round 4, finding 2 — the most user-visible of the
         # five: submitting the host change form with the host's own slot
@@ -3097,6 +3233,32 @@ class DeviceCompanionTests(TestCase):
         host.refresh_from_db()
         self.assertEqual(host.rack_slot, 12)
         self.assertEqual(host.companion.rack_slot, 14)
+
+    def test_stale_companion_rack_slot_reset_after_noop_save(self) -> None:
+        # Codex review round 5, finding 4 — round 4's reset lived inside
+        # _finish_companion_move(), which never runs when the host and
+        # the companion's own explicit target both already match what's
+        # persisted (a true no-op: pair at 5/4, explicit
+        # companion_rack_slot=4 given again — host_unchanged and
+        # companion_unchanged are both true, so _plan_companion_move()
+        # returns None before _finish_companion_move() is ever called).
+        # Reusing the same instance afterward for a blank-preserving move
+        # must not still treat the no-op call's explicit 4 as a fresh
+        # target.
+        host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="noopthenreset")
+
+        host.rack_slot = 5  # unchanged
+        host.companion_rack_slot = 4  # explicit, but already the companion's current slot — a no-op
+        host.full_clean()
+        host.save()
+
+        host.rack_slot = 8  # same instance, companion_rack_slot untouched this time
+        host.full_clean()
+        host.save()
+
+        host.refresh_from_db()
+        self.assertEqual(host.rack_slot, 8)
+        self.assertEqual(host.companion.rack_slot, 7)  # offset (+1) preserved, not the stale 4
 
     def test_racking_spare_pool_assembly_requires_explicit_companion_slot(self) -> None:
         host = self._make_host(hostname="spare")  # unracked — companion unracked too
@@ -3336,6 +3498,40 @@ class DeviceCompanionTests(TestCase):
         # Must not have resurrected an orphan host — nothing back at all.
         self.assertFalse(NetworkDevice.objects.filter(pk=host_pk).exists())
         self.assertFalse(NetworkDevice.objects.filter(pk=companion_pk).exists())
+
+    def test_save_after_companion_vanished_raises_instead_of_resurrecting(self) -> None:
+        # Codex review round 5, finding 3 — the companion-side twin of the
+        # test above (round 4 finding 4 fixed the host's own lookup; this
+        # one, the companion's, was left returning None). Deterministic
+        # half only, same caveat as above: what's forced here is the host
+        # row genuinely still existing while the companion row is already
+        # gone — the state a real concurrent host deletion (host is
+        # CASCADE, so it takes the companion with it) would leave *if*
+        # this save()'s companion lookup loses its race against that
+        # commit while its host lookup a few lines earlier had already
+        # won its own. Which of the two lookups loses is itself a genuine
+        # race this single-connection suite can't reproduce; only the
+        # consequence of losing on the companion side is exercised here.
+        # The companion is detached first (the documented QuerySet.
+        # update() bypass, same shape test_prod_import.py's corruption
+        # tests use) so a plain delete doesn't trip the standalone-
+        # companion guard — this is simulating an already-cascaded state,
+        # not testing the cascade itself.
+        host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="companionvanish")
+        companion_pk = host.companion.pk
+        NetworkDevice.objects.filter(pk=companion_pk).update(host=None)
+        NetworkDevice.objects.filter(pk=companion_pk).delete()
+        self.assertTrue(NetworkDevice.objects.filter(pk=host.pk).exists())
+        self.assertFalse(NetworkDevice.objects.filter(pk=companion_pk).exists())
+
+        host.rack_slot = 6
+        with self.assertRaises(ValidationError):
+            host.save()
+
+        # Must not have silently "succeeded" at moving a host with no
+        # companion, nor resurrected anything.
+        host.refresh_from_db()
+        self.assertEqual(host.rack_slot, 5)
 
     def test_independent_companion_move_refused(self) -> None:
         host = self._make_host(rack=self.rack, rack_slot=1, companion_rack_slot=2, hostname="indep")

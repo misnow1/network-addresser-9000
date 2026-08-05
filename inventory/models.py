@@ -3049,6 +3049,20 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                 self._check_companion_type_compatibility()
                 if self.host_id is None:
                     pending_move = self._plan_companion_move(update_fields)
+                    # Reset once _plan_companion_move() has run for THIS
+                    # save() call, regardless of what it returned (Codex
+                    # review round 5, finding 4) — moved here from inside
+                    # _finish_companion_move(), which never runs when the
+                    # host and the companion's *explicit* target both
+                    # already match what's persisted (a true no-op, e.g.
+                    # pair at 5/4, explicit companion_rack_slot=4 given
+                    # again). The input was still consulted this call;
+                    # leaving it set would let a *later* save() on the
+                    # same instance misread it as a fresh explicit target
+                    # rather than a stale leftover. This is the single
+                    # site covering every exit from this branch, not a
+                    # per-branch patch.
+                    self._companion_rack_slot = None
                     if pending_move is not None:
                         # Lock order (Codex review round 4, finding 5) —
                         # both pair rows, sorted by pk, before either
@@ -3067,6 +3081,16 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                         # on every save() of a host-with-companion, so a
                         # hostname-only edit doesn't needlessly widen its
                         # lock window over a row it's never going to write.
+                        #
+                        # Note this still doesn't lock *before*
+                        # _plan_companion_move()'s own reads run (Codex
+                        # review round 5, finding 3) — that method also
+                        # runs unlocked from clean()'s pre-flight, so
+                        # locking ahead of it isn't free; see
+                        # _plan_companion_move()'s own handling of a
+                        # companion that's vanished by the time its
+                        # (unlocked) read runs, immediately below this
+                        # comment block's call.
                         _lock_type_rows(NetworkDevice, self.pk, pending_move["companion_pk"])
                         # Unconditional, not just clean()'s pre-flight
                         # (Codex review round 3, finding 1) — a bare
@@ -3081,15 +3105,53 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                 # Locks the type row so a concurrent edit to its port
                 # templates/count can't interleave with this materialization.
                 _lock_type_rows(NetworkDeviceType, self.device_type_id)
+                # Re-read from the DB, not the cached relation this
+                # instance loaded earlier (Codex review round 5,
+                # finding 2) — locking a row and then continuing to
+                # trust a stale in-memory copy of it defeats the point
+                # of the lock. Without this, a concurrent, already-
+                # committed edit to companion_type is invisible to both
+                # the compatibility check below and
+                # _materialize_companion() further down (both read via
+                # _get_related(self, "device_type"), i.e. off this same
+                # cached object) — a host could materialize a companion
+                # of the type's *old* companion_type while its own,
+                # now-locked type row says something else.
+                self.device_type = NetworkDeviceType._default_manager.get(pk=self.device_type_id)
                 self._check_companion_type_compatibility()
-            super().save(
-                force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
-            )
-            if is_new:
-                self._materialize_ports()
-                self._materialize_companion()
-            elif pending_move is not None:
-                self._finish_companion_move(pending_move)
+            try:
+                super().save(
+                    force_insert=force_insert,
+                    force_update=force_update,
+                    using=using,
+                    update_fields=update_fields,
+                )
+                if is_new:
+                    self._materialize_ports()
+                    self._materialize_companion()
+                elif pending_move is not None:
+                    self._finish_companion_move(pending_move)
+            except Exception:
+                if is_new and self._state.adding is False and self.pk is not None:
+                    # The atomic block below still rolls back the INSERT
+                    # above, but Django has already set self.pk and
+                    # cleared self._state.adding on this in-memory object
+                    # — a DB rollback doesn't undo those Python attributes
+                    # (Codex review round 5, finding 1). Left as-is, a
+                    # caller that catches this, fixes whatever was wrong
+                    # (e.g. an unavailable companion slot), and retries
+                    # the *same* instance would compute is_new = False on
+                    # the next call, take the update path, have its
+                    # UPDATE affect zero rows (the row was rolled back),
+                    # fall back to Django's own zero-row-UPDATE→INSERT
+                    # behavior, and skip both materializers — reproducing
+                    # this finding's own bug (a host with no ports and no
+                    # companion) by a different route than finding 3
+                    # below. Restored so a retry takes the creation path
+                    # again, in full, exactly as a fresh instance would.
+                    self.pk = None
+                    self._state.adding = True
+                raise
 
     def clean(self) -> None:
         super().clean()
@@ -3883,7 +3945,27 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
             NetworkDevice._default_manager.filter(pk=companion.pk).values("rack_id", "rack_slot").first()
         )
         if companion_persisted is None:
-            return None
+            # Not "nothing to move" (Codex review round 5, finding 3, the
+            # companion-side twin of round 4 finding 4's fix on the host's
+            # own lookup above) — ``host`` is ``CASCADE``, so this is the
+            # *more* likely branch to fire under a concurrent host
+            # deletion: whether the race lands here or on the host's own
+            # lookup above is decided by which of two unlocked reads a few
+            # lines apart loses to the other transaction's commit.
+            # Returning ``None`` here would let ``super().save()`` fall
+            # through to the same zero-row-``UPDATE``→``INSERT`` fallback
+            # that resurrects an orphan host with no ports and no
+            # companion. Raising here doesn't make these reads locked —
+            # they still run before ``save()``'s own
+            # ``_lock_type_rows(NetworkDevice, self.pk, ...)`` a few lines
+            # up its call site, since that call needs the companion's pk
+            # from this method's return value in the first place — it
+            # closes the silent-resurrection outcome, not the underlying
+            # race window itself.
+            raise ValidationError(
+                f"Cannot move {self}: its companion no longer exists in the database (deleted by "
+                "another operation) — reload it before making further changes."
+            )
         companion_old_rack_id = companion_persisted["rack_id"]
         companion_old_rack_slot = companion_persisted["rack_slot"]
         companion_new_rack_id: int | None
@@ -3954,7 +4036,19 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         ):
             return
         companion = NetworkDevice._default_manager.get(pk=pending_move["companion_pk"])
-        host_start, host_end = host_new_rack_slot, host_new_rack_slot + self.slot_span - 1
+        # Persisted, not self.slot_span (audit finding while fixing Codex
+        # review round 5 — a third instance of round 4 finding 1's class:
+        # self.slot_span reads through self.device_type, possibly dirty
+        # under a save(update_fields=[...]) that never touches
+        # device_type). The exact-tuple case unique_device_rack_slot
+        # actually enforces doesn't depend on either span — host_start and
+        # companion_start alone decide it, and neither reads slot_span —
+        # so a dirty span here can only ever make this *more* willing to
+        # skip a park the DB constraint wouldn't have needed anyway, never
+        # less. Fixed to match round 4 finding 1's site regardless, so
+        # nothing in this method depends on that argument staying true.
+        persisted_self = NetworkDevice._default_manager.get(pk=self.pk)
+        host_start, host_end = host_new_rack_slot, host_new_rack_slot + persisted_self.slot_span - 1
         companion_start = companion_old_rack_slot
         companion_end = companion_start + companion.slot_span - 1
         if not (host_start <= companion_end and companion_start <= host_end):
@@ -4016,17 +4110,14 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         companion._host_managed_move = True
         companion.full_clean()
         companion.save(update_fields=["rack", "rack_slot"])
-        # Consumed — reset once the move it drove has actually happened
-        # (Codex review round 4, finding 3), the same way
-        # ``_materialize_companion()`` already resets it after creation.
-        # Without this, an explicit target from *this* move keeps reading
-        # back as "explicit" on a *later* move performed on the same
-        # in-memory host instance (a form re-save, a script doing several
-        # moves in a row) — even a blank-preserving one, since
-        # ``_plan_companion_move()`` has no way to tell "still means what
-        # it said" from "stale leftover" once the field holds a value at
-        # all.
-        self._companion_rack_slot = None
+        # ``self._companion_rack_slot`` is reset by ``save()`` itself,
+        # right after ``_plan_companion_move()`` returns — not here (Codex
+        # review round 5, finding 4) — because this method never runs at
+        # all when the host and the companion's own explicit target both
+        # already match what's persisted (a true no-op), and the input
+        # was still consulted for that call. See ``save()``'s comment at
+        # that reset for the full reasoning; round 4 finding 3 originally
+        # placed the reset here, one exit path short.
 
 
 class NetworkDevicePortQuerySet(models.QuerySet):
