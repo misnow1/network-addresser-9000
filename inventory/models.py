@@ -3050,6 +3050,24 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                 if self.host_id is None:
                     pending_move = self._plan_companion_move(update_fields)
                     if pending_move is not None:
+                        # Lock order (Codex review round 4, finding 5) —
+                        # both pair rows, sorted by pk, before either
+                        # row's own UPDATE runs. _lock_type_rows() already
+                        # solves the identical problem for type rows
+                        # (:2650). Without this, a colliding move (which
+                        # parks the companion first — a real save() on the
+                        # companion row, i.e. UPDATE companion, then UPDATE
+                        # host below) and a non-colliding move (UPDATE
+                        # host below, then UPDATE companion in
+                        # _finish_companion_move()) acquire the pair in
+                        # opposite orders. Two such moves running
+                        # concurrently can each hold one row and wait on
+                        # the other — a real deadlock, not just contention.
+                        # Locked only when an actual move is planned, not
+                        # on every save() of a host-with-companion, so a
+                        # hostname-only edit doesn't needlessly widen its
+                        # lock window over a row it's never going to write.
+                        _lock_type_rows(NetworkDevice, self.pk, pending_move["companion_pk"])
                         # Unconditional, not just clean()'s pre-flight
                         # (Codex review round 3, finding 1) — a bare
                         # save() never calls clean(), and nothing else on
@@ -3703,7 +3721,18 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         if host_start is None or companion_start is None:
             return  # unracking, or the companion ends up unracked — nothing can overlap
         companion = NetworkDevice._default_manager.get(pk=pending_move["companion_pk"])
-        host_end = host_start + self.slot_span - 1
+        # ``self.slot_span`` reads through ``self.device_type`` — possibly
+        # dirty in memory (Codex review round 4, finding 1): ``device_type``
+        # is locked, but ``_check_locked_fields_unchanged()`` only checks
+        # fields named in ``update_fields``, so ``save(update_fields=
+        # ["rack_slot"])`` never even looks at it. A persisted span-2 host
+        # temporarily holding an in-memory, never-to-be-persisted span-1
+        # type would validate against the wrong span while the database
+        # keeps the real one. Fetched fresh, the same pattern ``companion``
+        # above already uses, since ``device_type`` never actually changes
+        # — only what ``self`` happens to hold in memory does.
+        persisted_self = NetworkDevice._default_manager.get(pk=self.pk)
+        host_end = host_start + persisted_self.slot_span - 1
         companion_end = companion_start + companion.slot_span - 1
         if host_start <= companion_end and companion_start <= host_end:
             raise ValidationError(
@@ -3767,12 +3796,19 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
 
         Returns ``None`` when there's nothing to move: no companion,
         ``update_fields`` excludes both rack fields (review note 5), or
-        the effective new values equal what's already persisted.
+        **neither row's** effective new values differ from what's already
+        persisted — checked for the host *and* the companion (Codex review
+        round 4, finding 2), not the host alone. An explicit
+        ``companion_rack_slot`` with the host otherwise stationary (the
+        change form's "host slot unchanged, companion slot edited" case)
+        is a real move that used to be discarded here before the
+        companion's own target was ever computed.
 
         A blank (``None``) ``companion_rack_slot`` preserves the current
         relative offset (decision 1); an explicit one is an absolute
-        target. Racking a previously-unracked assembly with no existing
-        offset to preserve requires an explicit ``companion_rack_slot``
+        target — this **implements** that decision rather than reopening
+        it. Racking a previously-unracked assembly with no existing offset
+        to preserve requires an explicit ``companion_rack_slot``
         (decision 6).
         """
         normalized = _normalize_update_fields(NetworkDevice, update_fields)
@@ -3785,7 +3821,25 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
             return None
         persisted = NetworkDevice._default_manager.filter(pk=self.pk).values("rack_id", "rack_slot").first()
         if persisted is None:
-            return None
+            # Not "nothing to move" (Codex review round 4, finding 4) —
+            # every caller of this method has already established
+            # ``self.pk`` is set and this isn't a new row, so a missing
+            # persisted row means something else deleted this host between
+            # it being loaded and this ``save()`` reaching here (READ
+            # COMMITTED — see ``django_mysql_read_committed`` in project
+            # memory — so a concurrent transaction's commit is visible
+            # mid-transaction). Returning ``None`` here would let
+            # ``super().save()`` fall through to Django's own "``UPDATE``
+            # affected 0 rows, so ``INSERT`` instead" fallback — and since
+            # ``is_new`` was already captured as ``False`` at the top of
+            # ``save()``, neither ``_materialize_ports()`` nor
+            # ``_materialize_companion()`` would run, resurrecting an
+            # invalid orphan host with no ports and no companion. Fail
+            # loudly instead of proceeding.
+            raise ValidationError(
+                f"Cannot save {self}: this device no longer exists in the database (deleted by "
+                "another operation) — reload it before making further changes."
+            )
         old_rack_id, old_rack_slot = persisted["rack_id"], persisted["rack_slot"]
         # Effective post-save values (Codex review round 2, finding 2), not
         # blindly ``self.rack_id``/``self.rack_slot`` — when ``update_fields``
@@ -3797,8 +3851,6 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         # never actually going to be written for this call.
         new_rack_id = self.rack_id if normalized is None or "rack" in normalized else old_rack_id
         new_rack_slot = self.rack_slot if normalized is None or "rack_slot" in normalized else old_rack_slot
-        if new_rack_id == old_rack_id and new_rack_slot == old_rack_slot:
-            return None
         if new_rack_id is not None and new_rack_slot is None:
             # An inconsistent in-memory state ("rack and rack_slot must
             # both be set or both be empty" — RackSlotAssignmentMixin.clean(),
@@ -3821,6 +3873,12 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         # same host object for a second move reads the companion's
         # pre-*first*-move slot, computing every offset from stale state —
         # silently, no error, just a wrong target.
+        #
+        # Fetched *before* the "nothing to move" decision (moved from where
+        # round 3 left it, right after this comment, to the very end of the
+        # function) — round 4 finding 2's fix needs the companion's own
+        # persisted position to decide whether *it* is moving, not just the
+        # host.
         companion_persisted = (
             NetworkDevice._default_manager.filter(pk=companion.pk).values("rack_id", "rack_slot").first()
         )
@@ -3846,6 +3904,13 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                     "to preserve (ADR 0018 decision 6) — the assembly was unracked, or the "
                     "companion had no rack_slot recorded."
                 )
+        host_unchanged = new_rack_id == old_rack_id and new_rack_slot == old_rack_slot
+        companion_unchanged = (
+            companion_new_rack_id == companion_old_rack_id
+            and companion_new_rack_slot == companion_old_rack_slot
+        )
+        if host_unchanged and companion_unchanged:
+            return None
         return {
             "companion_pk": companion.pk,
             "host_old_rack_id": old_rack_id,
@@ -3951,6 +4016,17 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         companion._host_managed_move = True
         companion.full_clean()
         companion.save(update_fields=["rack", "rack_slot"])
+        # Consumed — reset once the move it drove has actually happened
+        # (Codex review round 4, finding 3), the same way
+        # ``_materialize_companion()`` already resets it after creation.
+        # Without this, an explicit target from *this* move keeps reading
+        # back as "explicit" on a *later* move performed on the same
+        # in-memory host instance (a form re-save, a script doing several
+        # moves in a row) — even a blank-preserving one, since
+        # ``_plan_companion_move()`` has no way to tell "still means what
+        # it said" from "stale leftover" once the field holds a value at
+        # all.
+        self._companion_rack_slot = None
 
 
 class NetworkDevicePortQuerySet(models.QuerySet):

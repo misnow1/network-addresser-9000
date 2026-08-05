@@ -2989,6 +2989,77 @@ class DeviceCompanionTests(TestCase):
         self.assertEqual(host.rack_slot, 1)
         self.assertEqual(companion.rack_slot, 4)
 
+    def test_pending_move_overlap_uses_persisted_device_type_span(self) -> None:
+        # Codex review round 4, finding 1 — _check_pending_move_no_overlap()
+        # used self.slot_span, which reads through self.device_type. That
+        # field is locked, but _check_locked_fields_unchanged() only looks
+        # at fields named in update_fields, so save(update_fields=
+        # ["rack_slot"]) never even glances at a dirty in-memory
+        # device_type swapped to a *compatible*, smaller-span type. The
+        # persisted type (span 2, still in the database — device_type was
+        # never actually written) must govern the overlap check, not
+        # whatever self happens to hold in memory.
+        spanning_type = NetworkDeviceType.objects.create(
+            manufacturer="Yamaha", model="DM7C", name="Spanning2", port_count=2
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=spanning_type,
+            description="Control",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.control_vlan,
+            slot_offset=0,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=spanning_type,
+            description="Control2",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.control_vlan,
+            slot_offset=1,
+        )
+        spanning_type.companion_type = self.companion_type
+        spanning_type.save()
+        span1_type = _make_device_type(port_count=1, vlan=self.control_vlan, name="Compatible span-1")
+
+        host = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=spanning_type,
+            hostname="dirtytypehost",
+            rack=self.rack,
+            rack_slot=1,
+            companion_rack_slot=4,
+            port_addressing=PortAddressing.DHCP,
+        )
+        companion = host.companion
+
+        host.rack_slot = 5  # host really spans 5-6 (persisted type)
+        host.device_type = span1_type  # dirty in-memory only — never in update_fields
+        host.companion_rack_slot = 6  # would only look non-overlapping under the dirty span-1 type
+        with self.assertRaises(ValidationError):
+            host.save(update_fields=["rack_slot"])
+
+        host.refresh_from_db()
+        companion.refresh_from_db()
+        self.assertEqual(host.device_type, spanning_type)  # untouched — never in update_fields
+        self.assertEqual(host.rack_slot, 1)
+        self.assertEqual(companion.rack_slot, 4)
+
+    def test_explicit_companion_only_relocation_with_host_stationary(self) -> None:
+        # Codex review round 4, finding 2 — the most user-visible of the
+        # five: submitting the host change form with the host's own slot
+        # unchanged and only the companion's slot edited used to return
+        # None before self._companion_rack_slot was ever consulted,
+        # reporting success while leaving the companion untouched. This
+        # implements decision 1 ("a filled value is an explicit absolute
+        # slot") rather than reopening it.
+        host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="companiononly")
+        host.rack_slot = 5  # unchanged
+        host.companion_rack_slot = 3  # explicit, different from the companion's current slot (4)
+        host.full_clean()
+        host.save()
+
+        host.refresh_from_db()
+        self.assertEqual(host.rack_slot, 5)
+        self.assertEqual(host.companion.rack_slot, 3)
+
     def test_explicit_companion_slot_overrides_preserved_offset(self) -> None:
         host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="explicit")
         host.rack_slot = 8
@@ -3002,6 +3073,30 @@ class DeviceCompanionTests(TestCase):
         # refreshes first for the same reason).
         host.refresh_from_db()
         self.assertEqual(host.companion.rack_slot, 10)
+
+    def test_stale_companion_rack_slot_reset_after_move(self) -> None:
+        # Codex review round 4, finding 3 — _finish_companion_move() didn't
+        # reset self._companion_rack_slot after a successful move, unlike
+        # _materialize_companion(), which does. Move 5/4 -> 8/10 with an
+        # explicit target, then reuse the same host instance for a
+        # blank-preserving move to 12: without the reset, the leftover 10
+        # from the *first* move keeps reading back as "explicit" here too,
+        # instead of the new +2 offset (10 - 8) landing the companion at
+        # 14.
+        host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="staleslot")
+
+        host.rack_slot = 8
+        host.companion_rack_slot = 10  # explicit
+        host.full_clean()
+        host.save()
+
+        host.rack_slot = 12  # same instance, companion_rack_slot untouched this time
+        host.full_clean()
+        host.save()
+
+        host.refresh_from_db()
+        self.assertEqual(host.rack_slot, 12)
+        self.assertEqual(host.companion.rack_slot, 14)
 
     def test_racking_spare_pool_assembly_requires_explicit_companion_slot(self) -> None:
         host = self._make_host(hostname="spare")  # unracked — companion unracked too
@@ -3212,6 +3307,36 @@ class DeviceCompanionTests(TestCase):
         with self.assertRaises(ValidationError):
             host.save()
 
+    def test_save_after_host_row_vanished_raises_instead_of_resurrecting(self) -> None:
+        # Codex review round 4, finding 4 — deterministic half only: a
+        # genuine two-transaction race (another connection's DELETE
+        # committing between this instance being loaded and this save()
+        # reaching _plan_companion_move()'s persisted-row lookup) isn't
+        # something this single-connection TestCase can exercise. What's
+        # tested here is the exact downstream code path and consequence
+        # that race produces — the persisted-row lookup returning nothing
+        # for a pk this in-memory instance still believes is its own —
+        # forced directly by deleting the row out from under a stale
+        # instance rather than by two real concurrent transactions. Before
+        # the fix, save() would proceed to super().save(), whose UPDATE
+        # affects zero rows, falling back to Django's own INSERT — and
+        # since is_new was already captured as False, neither
+        # _materialize_ports() nor _materialize_companion() would run,
+        # resurrecting an orphan host with no ports and no companion.
+        host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="vanishing")
+        host_pk = host.pk
+        companion_pk = host.companion.pk
+        NetworkDevice.objects.filter(pk=host_pk).delete()  # real DELETE, cascades to the companion
+        self.assertFalse(NetworkDevice.objects.filter(pk=host_pk).exists())
+
+        host.rack_slot = 6  # stale in-memory instance still believes it's persisted
+        with self.assertRaises(ValidationError):
+            host.save()
+
+        # Must not have resurrected an orphan host — nothing back at all.
+        self.assertFalse(NetworkDevice.objects.filter(pk=host_pk).exists())
+        self.assertFalse(NetworkDevice.objects.filter(pk=companion_pk).exists())
+
     def test_independent_companion_move_refused(self) -> None:
         host = self._make_host(rack=self.rack, rack_slot=1, companion_rack_slot=2, hostname="indep")
         companion = host.companion
@@ -3257,6 +3382,73 @@ class DeviceCompanionTests(TestCase):
         )
         self.assertEqual(len(entries), 1, [e.changes_dict for e in entries])
         self.assertEqual(entries[0].changes_dict["rack_slot"], ["2", "7"])
+
+    # -- Lock ordering (Codex review round 4, finding 5) ------------------------------
+
+    def _first_pair_lock_query(self, queries: list[dict]) -> str | None:
+        for q in queries:
+            sql = q["sql"]
+            if "networkdevice" in sql.lower() and "FOR UPDATE" in sql.upper():
+                return sql
+        return None
+
+    def test_colliding_move_locks_pair_sorted_before_any_write(self) -> None:
+        # Codex review round 4, finding 5 — a colliding move parks the
+        # companion first (a real UPDATE on the companion row via
+        # _park_companion_if_colliding()'s companion.save()), while a
+        # non-colliding move writes the host first (super().save() below,
+        # before _finish_companion_move() ever touches the companion) —
+        # opposite acquisition orders, a deadlock risk under real
+        # concurrency. What's provable without two real transactions: the
+        # explicit _lock_type_rows() call now takes both pair rows,
+        # sorted, in a single SELECT ... FOR UPDATE, before either row's
+        # own UPDATE — so both the colliding and non-colliding paths
+        # converge on the identical acquisition point and order.
+        host = self._make_host(rack=self.rack, rack_slot=5, companion_rack_slot=4, hostname="lockcollide")
+        companion_pk = host.companion.pk
+        sorted_pks = sorted([host.pk, companion_pk])
+
+        host.rack_slot = 4  # collides with the companion's current slot -> park path
+        host.full_clean()
+        with CaptureQueriesContext(connection) as ctx:
+            host.save()
+
+        lock_sql = self._first_pair_lock_query(ctx.captured_queries)
+        self.assertIsNotNone(lock_sql, [q["sql"] for q in ctx.captured_queries])
+        assert lock_sql is not None  # for mypy — asserted above
+        self.assertIn(f"{sorted_pks[0]}, {sorted_pks[1]}", lock_sql)
+        lock_index = ctx.captured_queries.index(next(q for q in ctx.captured_queries if q["sql"] == lock_sql))
+        earlier_updates = [
+            q["sql"]
+            for q in ctx.captured_queries[:lock_index]
+            if "networkdevice" in q["sql"].lower() and q["sql"].strip().upper().startswith("UPDATE")
+        ]
+        self.assertEqual(earlier_updates, [], "the pair lock must be acquired before any write to either row")
+
+    def test_noncolliding_move_locks_pair_sorted_before_any_write(self) -> None:
+        # Same finding — the non-colliding path (no park, host writes
+        # first in the old code) must acquire the identical lock, in the
+        # identical order, before its own super().save() UPDATE.
+        host = self._make_host(rack=self.rack, rack_slot=1, companion_rack_slot=2, hostname="locknocollide")
+        companion_pk = host.companion.pk
+        sorted_pks = sorted([host.pk, companion_pk])
+
+        host.rack_slot = 6  # no collision — companion's target (7) doesn't overlap its old slot (2)
+        host.full_clean()
+        with CaptureQueriesContext(connection) as ctx:
+            host.save()
+
+        lock_sql = self._first_pair_lock_query(ctx.captured_queries)
+        self.assertIsNotNone(lock_sql, [q["sql"] for q in ctx.captured_queries])
+        assert lock_sql is not None  # for mypy — asserted above
+        self.assertIn(f"{sorted_pks[0]}, {sorted_pks[1]}", lock_sql)
+        lock_index = ctx.captured_queries.index(next(q for q in ctx.captured_queries if q["sql"] == lock_sql))
+        earlier_updates = [
+            q["sql"]
+            for q in ctx.captured_queries[:lock_index]
+            if "networkdevice" in q["sql"].lower() and q["sql"].strip().upper().startswith("UPDATE")
+        ]
+        self.assertEqual(earlier_updates, [], "the pair lock must be acquired before any write to either row")
 
     # -- Hostname fallback -----------------------------------------------------------
 
