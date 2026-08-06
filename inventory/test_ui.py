@@ -35,6 +35,7 @@ from auditlog.models import LogEntry
 from django.apps import apps
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
+from django.contrib.auth.models import User as DjangoUser
 from django.core.management import call_command
 from django.db import connection
 from django.test import TestCase
@@ -54,7 +55,7 @@ from .models import (
     RackVlanRange,
 )
 from .suggestions import suggest_slot_address
-from .views import resolve_slot_spans
+from .views import resolve_slot_spans, safe_slot_address
 
 User = get_user_model()
 
@@ -84,6 +85,30 @@ def _make_device_type(port_count: int = 0, vlan: VLAN | None = None, **kwargs) -
             device_type=device_type, description=f"Port {n}", port_type=PortType.GBE_RJ45, vlan=vlan
         )
     return device_type
+
+
+def _is_mutating_sql(sql: str) -> bool:
+    """Whether ``sql`` is a row-mutating DML statement (``INSERT``,
+    ``UPDATE``, ``DELETE``) — not a ``SELECT``, and not one of the
+    transaction-bookkeeping statements Django issues on every request
+    (``SAVEPOINT``, ``RELEASE SAVEPOINT``, ``ROLLBACK``, ``SET ...``),
+    none of which touch application data.
+
+    Exists because a row-count sweep alone can't distinguish "nothing
+    happened" from "every row was updated in place": an accidental
+    ``QuerySet.update()`` leaves every count identical *and* bypasses
+    ``Model.save()``, so it never reaches auditlog's signals either
+    (Codex review round 2, finding 3). Checking the actual SQL Django
+    sent is a check straight off the wire, not an inference from state
+    after the fact — the stronger of the two checks that finding offered,
+    kept alongside the row-count/``LogEntry`` check below rather than
+    replacing it, since the two catch different failure shapes (this one
+    catches an in-place mutation; the row-count check catches a create or
+    delete that happens to net out even but isn't purely SQL-shaped, e.g.
+    a signal handler with its own side effect).
+    """
+    first_word = sql.strip().split(None, 1)[0] if sql.strip() else ""
+    return first_word.upper() in {"INSERT", "UPDATE", "DELETE"}
 
 
 def _row_html(content: str, ordinal: int) -> str:
@@ -196,10 +221,110 @@ class UIAccessControlTests(TestCase):
         self.assertNotContains(self.client.get("/"), 'href="/admin/"')
 
 
+class PartialGrantAccessTests(TestCase):
+    """Each view's codename list is the exact set of models its template
+    actually reads, not one token model per view (Codex review round 2,
+    finding 2 — ``device_detail`` rendered the device's type, its rack,
+    full port rows, and the connected switch while declaring only
+    ``view_networkdevice``/``view_vlan``; the same gap existed, to a
+    smaller degree, on the other four views). A user missing even one
+    declared codename must be refused every one of them.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.switch_type = _make_switch_type(port_count=1)
+        self.device_type = _make_device_type(port_count=1, vlan=self.vlan)
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=10)
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.200.1.0/27")
+        self.switch = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=1)
+        self.device = NetworkDevice.objects.create(
+            device_type=self.device_type, rack=self.rack, rack_slot=2, hostname="dev1"
+        )
+
+    def _user_missing(self, codename: str) -> DjangoUser:
+        """A staff user holding every ``inventory.view_*`` permission
+        except ``codename`` — the minimal way to prove a view's codename
+        list is a real floor, not decoration: this user would pass any
+        *smaller* declared set but must be refused by the view that
+        actually declares ``codename``.
+        """
+        all_view_perms = Permission.objects.filter(
+            content_type__app_label="inventory", codename__startswith="view_"
+        )
+        user = User.objects.create_user(f"missing-{codename}", password="testpass123", is_staff=True)
+        user.user_permissions.set(all_view_perms.exclude(codename=codename))
+        return user
+
+    def _assert_403_when_missing_each(self, url: str, codenames: list[str]) -> None:
+        for codename in codenames:
+            user = self._user_missing(codename)
+            self.client.login(username=user.username, password="testpass123")
+            self.assertEqual(self.client.get(url).status_code, 403, f"{url} without {codename}")
+            self.client.logout()
+
+    def test_index_requires_every_declared_codename(self) -> None:
+        self._assert_403_when_missing_each(
+            "/", ["view_rack", "view_vlan", "view_networkswitch", "view_networkdevice"]
+        )
+
+    def test_rack_detail_requires_every_declared_codename(self) -> None:
+        self._assert_403_when_missing_each(
+            f"/racks/{self.rack.pk}/",
+            [
+                "view_rack",
+                "view_vlan",
+                "view_networkswitch",
+                "view_networkdevice",
+                "view_rackvlanrange",
+                "view_networkswitchaddress",
+                "view_networkdeviceport",
+            ],
+        )
+
+    def test_vlan_map_requires_every_declared_codename(self) -> None:
+        self._assert_403_when_missing_each(
+            f"/vlans/{self.vlan.pk}/",
+            [
+                "view_vlan",
+                "view_rack",
+                "view_networkswitch",
+                "view_networkdevice",
+                "view_rackvlanrange",
+                "view_networkswitchaddress",
+                "view_networkdeviceport",
+            ],
+        )
+
+    def test_device_detail_requires_every_declared_codename(self) -> None:
+        self._assert_403_when_missing_each(
+            f"/devices/{self.device.pk}/",
+            [
+                "view_networkdevice",
+                "view_vlan",
+                "view_networkdevicetype",
+                "view_rack",
+                "view_networkdeviceport",
+                "view_networkswitch",
+            ],
+        )
+
+    def test_spare_pool_requires_every_declared_codename(self) -> None:
+        self._assert_403_when_missing_each(
+            "/spares/",
+            ["view_networkswitch", "view_networkdevice", "view_networkswitchtype", "view_networkdevicetype"],
+        )
+
+
 class WritesNothingTests(TestCase):
     """ADR 0020's central claim, proved rather than asserted: a full GET
-    sweep of every route leaves every inventory model's row count, and
-    ``auditlog.LogEntry``'s, exactly as it found them.
+    sweep of every route executes no mutating SQL at all, *and* leaves
+    every inventory model's row count, and ``auditlog.LogEntry``'s,
+    exactly as it found them. Two independent checks (Codex review round
+    2, finding 3) — row counts alone can't tell an in-place ``UPDATE``
+    from nothing happening, since the count of rows is identical either
+    way and a raw ``QuerySet.update()`` bypasses auditlog's signals too.
     """
 
     def setUp(self) -> None:
@@ -219,7 +344,7 @@ class WritesNothingTests(TestCase):
         self.admin_user.groups.add(Group.objects.get(name="Admin"))
         self.client.login(username="adminrole", password="testpass123")
 
-    def test_get_sweep_changes_no_row_counts(self) -> None:
+    def test_get_sweep_executes_no_mutating_sql_and_changes_no_row_counts(self) -> None:
         routes = [
             "/",
             f"/racks/{self.rack.pk}/",
@@ -237,8 +362,14 @@ class WritesNothingTests(TestCase):
         before = {model: model._default_manager.count() for model in inventory_models}
         log_entries_before = LogEntry.objects.count()
 
-        for url in routes:
-            self.assertEqual(self.client.get(url).status_code, 200, url)
+        with CaptureQueriesContext(connection) as ctx:
+            for url in routes:
+                self.assertEqual(self.client.get(url).status_code, 200, url)
+
+        mutating_statements = [q["sql"] for q in ctx.captured_queries if _is_mutating_sql(q["sql"])]
+        self.assertEqual(
+            mutating_statements, [], "the read-only sweep executed mutating SQL — see the list above"
+        )
 
         for model in inventory_models:
             self.assertEqual(model._default_manager.count(), before[model], model.__name__)
@@ -382,10 +513,168 @@ class ElevationEncodingTests(TestCase):
             )
 
 
+class OccupancyConflictTests(TestCase):
+    """More than one occupant claiming an ordinal must be surfaced, not
+    silently resolved to whichever one the occupancy dict happened to
+    process last (Codex review round 2, finding 4). Reachable through a
+    direct ``objects.create()`` — which never calls ``full_clean()`` and
+    so never runs ``RackSlotAssignmentMixin.clean()``'s span-overlap
+    check — exactly the documented, un-closed gap ADR 0017 and
+    ``ROADMAP.md``'s "rack slot occupancy has no DB-level overlap
+    guarantee" item describe.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.vlan_a = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.rack = Rack.objects.create(name="Overlap", slot_count=10)
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan_a, address_range="10.200.1.0/27")
+
+        # A span-2 device (offset0 + offset1 on the same VLAN) at slot 5,
+        # occupying ordinals 5-6.
+        self.bracket_type = NetworkDeviceType.objects.create(
+            manufacturer="DiGiCo", model="SD12", name="Default", port_count=2
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=self.bracket_type,
+            description="Control",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_a,
+            slot_offset=0,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=self.bracket_type,
+            description="Engine",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_a,
+            slot_offset=1,
+        )
+        self.spanning_device = NetworkDevice.objects.create(
+            device_type=self.bracket_type, rack=self.rack, rack_slot=5, hostname="sd12-1"
+        )
+
+        # A second, ordinary device placed directly at ordinal 6 —
+        # objects.create() never calls full_clean(), so the span-overlap
+        # check in RackSlotAssignmentMixin.clean() never runs, and this
+        # succeeds despite colliding with the spanning device's
+        # continuation ordinal.
+        self.plain_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="Plain")
+        # DHCP addressing on the collider — it shares ordinal 6 with the
+        # spanning device's Engine port, and base+slot arithmetic would
+        # otherwise also collide on the *address* (a separate invariant,
+        # still enforced even when clean() is bypassed, since it's
+        # checked again at materialization time). Only the slot/span
+        # overlap is the gap this test targets.
+        self.colliding_device = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=self.plain_type,
+            rack=self.rack,
+            rack_slot=6,
+            hostname="collider",
+            port_addressing="dhcp",
+        )
+
+        self.admin_user = User.objects.create_user("adminrole", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="adminrole", password="testpass123")
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        self.assertEqual(response.status_code, 200)
+        self.content = response.content.decode()
+
+    def test_conflicting_ordinal_lists_both_occupants_not_just_one(self) -> None:
+        conflict_row = _row_html(self.content, 6)
+        self.assertIn("row-conflict", conflict_row)
+        # Both claimants must be named — an earlier revision kept only
+        # whichever entry the dict-overwrite happened to process last,
+        # silently dropping the other.
+        self.assertIn(str(self.spanning_device), conflict_row)
+        self.assertIn(str(self.colliding_device), conflict_row)
+
+    def test_non_conflicting_ordinals_are_unaffected(self) -> None:
+        start_row = _row_html(self.content, 5)
+        self.assertNotIn("row-conflict", start_row)
+        self.assertIn(str(self.spanning_device), start_row)
+
+
+class BannerHatchConsistencyTests(TestCase):
+    """The address map's next-free-block banner must never recommend
+    landing inside the region the same page hatches "unavailable by
+    convention" (Codex review round 2, finding 5) — the two encodings
+    have to agree, since a UI that visually asserts an unavailable region
+    and then recommends addressing inside it is contradicting itself.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.admin_user = User.objects.create_user("adminrole", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="adminrole", password="testpass123")
+
+    def test_next_block_banner_never_lands_inside_the_hatched_bottom_24(self) -> None:
+        vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        response = self.client.get(f"/vlans/{vlan.pk}/")
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode()
+        # The first /27 in the subnet (10.200.0.0/27) sits inside the
+        # hatched bottom /24 (10.200.0.0/24) and must not be offered;
+        # the first /27 clear of it (10.200.1.0/27) must be.
+        self.assertNotIn("10.200.0.0/27", content)
+        self.assertIn("10.200.1.0/27", content)
+
+
+class UnrackedCompanionTetherTests(TestCase):
+    """The companion tether (ADR 0018) must render for an unracked pair
+    too — the link is existence and lifecycle, not addressing, so it
+    doesn't come and go with placement (Codex review round 2, finding 6).
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.dante_vlan = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+        self.control_vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+
+        self.companion_type = _make_device_type(
+            port_count=1,
+            vlan=self.dante_vlan,
+            manufacturer="Yamaha",
+            model="DM7C",
+            name="Device Control Interface",
+        )
+        self.host_type = _make_device_type(
+            port_count=1, vlan=self.control_vlan, manufacturer="Yamaha", model="DM7C", name="Default"
+        )
+        self.host_type.companion_type = self.companion_type
+        self.host_type.save()
+
+        # Unracked — no rack/rack_slot on the host, so none on the
+        # materialized companion either (both spare-pool, per ADR 0018).
+        self.host = NetworkDevice.objects.create(device_type=self.host_type, hostname="unracked-dm7c-1")
+        self.companion = self.host.companion
+
+        self.admin_user = User.objects.create_user("adminrole", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="adminrole", password="testpass123")
+
+    def test_host_detail_shows_tether_to_unracked_companion(self) -> None:
+        response = self.client.get(f"/devices/{self.host.pk}/")
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode()
+        self.assertIn(f'data-tether-pk="{self.companion.pk}"', content)
+        self.assertIn("spare pool", content)
+
+    def test_companion_detail_shows_tether_to_unracked_host(self) -> None:
+        response = self.client.get(f"/devices/{self.companion.pk}/")
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode()
+        self.assertIn(f'data-tether-pk="{self.host.pk}"', content)
+        self.assertIn("spare pool", content)
+
+
 class RobustnessTests(TestCase):
     """Legal-but-awkward stored data must render 200, not 500 — data the
     write path already allows onto these tables via a bare ``save()``
-    that bypasses ``clean()`` (review note 3).
+    that bypasses ``clean()`` (review note 3) — and must not render a
+    *wrong* answer either (Codex review round 2, finding 1: an undersized
+    range doesn't raise, it just computes an address outside the block).
     """
 
     def setUp(self) -> None:
@@ -394,6 +683,30 @@ class RobustnessTests(TestCase):
         self.admin_user = User.objects.create_user("adminrole", password="testpass123", is_staff=True)
         self.admin_user.groups.add(Group.objects.get(name="Admin"))
         self.client.login(username="adminrole", password="testpass123")
+
+    def test_safe_slot_address_rejects_ordinal_outside_undersized_block(self) -> None:
+        # Unit-level: a /30 (10.200.1.0-10.200.1.3) has room for ordinal 1
+        # but not ordinal 9 — suggest_slot_address's raw arithmetic would
+        # happily compute 10.200.1.9 anyway, since it has no notion of the
+        # block's own boundary. safe_slot_address must reject the second.
+        self.assertEqual(safe_slot_address("10.200.1.0/30", 1), "10.200.1.1")
+        self.assertIsNone(safe_slot_address("10.200.1.0/30", 9))
+
+    def test_undersized_range_does_not_render_out_of_block_address(self) -> None:
+        rack = Rack.objects.create(name="Undersized", slot_count=10)
+        rack_range = RackVlanRange(rack=rack, vlan=self.vlan, address_range="10.200.1.0/30")
+        rack_range.save()  # bypasses clean() — a /30 could never pass it for a 10-slot rack
+
+        response = self.client.get(f"/racks/{rack.pk}/")
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode()
+        # Ordinal 1 genuinely lands inside the /30 and should show it...
+        self.assertIn("10.200.1.1", _row_html(content, 1))
+        # ...but ordinal 9 is four addresses past the block's own top
+        # (10.200.1.3) and must render blank, not that out-of-block value.
+        row_9 = _row_html(content, 9)
+        self.assertNotIn("10.200.1.9", row_9)
+        self.assertNotIn("would-be-address", row_9)
 
     def test_malformed_stored_range_renders_200_with_blank_cells(self) -> None:
         rack = Rack.objects.create(name="Malformed", slot_count=5)

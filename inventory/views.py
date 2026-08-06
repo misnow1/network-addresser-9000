@@ -65,29 +65,47 @@ def safe_slot_address(range_cidr: str, ordinal: int) -> str | None:
 
     Mirrors ``_suggest_rack_slot_address``'s existing validate-then-catch
     discipline (``models.py:289-320``): validate the CIDR text, then ask
-    ``suggest_slot_address`` for the address, and swallow the two ways that
-    can go wrong rather than letting either propagate into a 500.
+    ``suggest_slot_address`` for the address, and swallow the ways that
+    can go wrong rather than letting any of them propagate into a 500 —
+    or, just as important, into a wrong-but-plausible-looking address.
 
-    Both failure modes are real, not hypothetical, on data the *write*
+    Three failure modes are real, not hypothetical, on data the *write*
     path already allows onto this table: a ``RackVlanRange.address_range``
-    saved via a bare ``.save()`` bypasses ``clean()`` entirely and can hold
-    malformed text (``ValidationError`` from ``validate_ipv4_cidr``), and
+    saved via a bare ``.save()`` bypasses ``clean()`` entirely and can
+    hold malformed text (``ValidationError`` from ``validate_ipv4_cidr``);
     an ordinal far enough past a block's own top can push the arithmetic
     past the top of the whole IPv4 address space, which
     ``suggest_slot_address`` reports as a plain ``ValueError`` (the
-    ``ipaddress`` module's own overflow signal, not a domain-specific
-    exception). A read-only page must never 500 on data the write path
-    allowed — review note 3 of ``PLAN-read-only-ui.md`` — so both become
-    ``None`` here, which every caller renders as a blank cell.
+    ``ipaddress`` module's own overflow signal); and — the one an earlier
+    revision missed (Codex review) — a range that's syntactically valid
+    CIDR but *undersized* for the rack it's attached to (also only
+    reachable by a ``clean()``-bypassing ``save()``, since
+    ``Rack.clean()``/``RackVlanRange.clean()`` both enforce
+    ``required_block_size(rack.slot_count)`` against every stored range)
+    doesn't raise at all: ``network_address + ordinal`` is simple integer
+    arithmetic with no awareness of the block's own boundary, so a
+    ``/30`` on a 10-slot rack happily computes ``ordinal=9`` as an address
+    four addresses past the block's actual top. That's not a crash, but
+    it is a wrong answer confidently presented as the address a slot
+    would get, which is worse — so containment is checked explicitly
+    rather than left to ``suggest_slot_address``'s arithmetic to notice.
+    A read-only page must never 500 on data the write path allowed
+    (review note 3 of ``PLAN-read-only-ui.md``), and must not assert a
+    false one either; all three failure modes become ``None`` here, which
+    every caller renders as a blank cell.
     """
     try:
         validate_ipv4_cidr(range_cidr)
+        network = ipaddress.IPv4Network(range_cidr, strict=True)
     except ValidationError:
         return None
     try:
-        return suggest_slot_address(range_cidr, ordinal)
+        candidate = suggest_slot_address(range_cidr, ordinal)
     except ValueError:
         return None
+    if ipaddress.IPv4Address(candidate) not in network:
+        return None
+    return candidate
 
 
 def resolve_slot_spans(devices: Iterable[NetworkDevice]) -> dict[int, int]:
@@ -171,6 +189,11 @@ class ElevationCell:
       Renders nothing: it isn't absence (the device does use this VLAN)
       and it isn't an address (not at this row), so neither an em-dash
       nor a value would be honest here.
+    * ``"conflict"`` — more than one occupant claims this ordinal (see
+      ``ElevationRow.conflicts``). Carries no addresses of its own — with
+      two occupants disputing the slot, there is no way to say which
+      one's data belongs in this cell, so the cell says nothing rather
+      than guessing.
     """
 
     state: str
@@ -188,11 +211,19 @@ class TetherInfo:
     unbounded row distance. An in-page anchor link plus this pk is the
     encoding instead, and it is checkable exactly where a drawn line
     wouldn't be: by pk, not by pixel position.
+
+    ``ordinal`` is ``None`` when this half of the pair is unracked —
+    ADR 0018's companion link is an existence/lifecycle relationship, true
+    whether or not either half currently has a rack slot (a host and
+    companion materialize together, racked or not, and the spare pool is
+    an entirely legitimate state for both). A ``None`` ordinal means the
+    badge has no in-page row to anchor to (device-detail's spare-pool
+    case), not that the relationship itself is somehow absent.
     """
 
     pk: int
     label: str
-    ordinal: int
+    ordinal: int | None
 
 
 @dataclass(frozen=True)
@@ -214,11 +245,29 @@ class Occupant:
 
 
 @dataclass(frozen=True)
+class ConflictOccupant:
+    """One claimant in an ``ElevationRow.conflicts`` list — a minimal
+    label + admin link, not a full ``Occupant``: with the ordinal
+    genuinely disputed, there's no single span/tether/cell state that
+    could honestly describe "this" occupant of the row, so a conflict
+    entry carries only enough to identify and link to each claimant.
+    """
+
+    kind: str  # "switch" | "device"
+    label: str
+    admin_url: str
+
+
+@dataclass(frozen=True)
 class ElevationRow:
     ordinal: int
     occupant: Occupant | None
     cells: list[ElevationCell]
     add_url: str | None = None  # only set when occupant is None
+    # Non-empty only when more than one switch/device claims this ordinal
+    # — see _build_occupancy's docstring for how that becomes reachable
+    # despite the DB's own unique-slot constraints.
+    conflicts: list[ConflictOccupant] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -231,33 +280,67 @@ class _OccupancyEntry:
 
 def _build_occupancy(
     switches: Iterable[NetworkSwitch], devices: Iterable[NetworkDevice], spans: dict[int, int]
-) -> dict[int, _OccupancyEntry]:
-    """``{ordinal: _OccupancyEntry}`` covering every ordinal a switch or
-    device claims — not just each occupant's own ``rack_slot`` (review
-    note 1). A switch always claims exactly its own slot; a device claims
-    ``rack_slot .. rack_slot + span - 1`` where ``span`` comes from
-    ``spans`` (``resolve_slot_spans``'s output), never from a per-device
-    ``slot_span`` property access.
+) -> dict[int, list[_OccupancyEntry]]:
+    """``{ordinal: [_OccupancyEntry, ...]}`` covering every ordinal a
+    switch or device claims — not just each occupant's own ``rack_slot``
+    (review note 1). A switch always claims exactly its own slot; a
+    device claims ``rack_slot .. rack_slot + span - 1`` where ``span``
+    comes from ``spans`` (``resolve_slot_spans``'s output), never from a
+    per-device ``slot_span`` property access.
+
+    A **list** per ordinal, not a single entry (Codex review round 2,
+    finding 4) — the DB's ``unique(rack, rack_slot)`` constraint only
+    guarantees no two rows share a *starting* ordinal; it says nothing
+    about a spanning device's continuation ordinals (ADR 0017), whose
+    overlap is checked only in ``clean()``, not by the schema (see
+    ``RackSlotAssignmentMixin``'s own "Known gap" docstring and
+    ``ROADMAP.md``'s "rack slot occupancy has no DB-level overlap
+    guarantee" item). A direct ``objects.create()`` — which never calls
+    ``full_clean()`` — can therefore leave two occupants claiming one
+    ordinal. Overwriting one entry with the other in this dict would
+    silently drop an occupant from a page whose entire point is showing
+    what's actually racked; appending instead means ``_build_elevation_
+    rows`` can detect the collision and surface it rather than hide it.
     """
-    occupancy: dict[int, _OccupancyEntry] = {}
+    occupancy: dict[int, list[_OccupancyEntry]] = defaultdict(list)
     for switch in switches:
         if switch.rack_slot is None:
             continue
-        occupancy[switch.rack_slot] = _OccupancyEntry(
-            kind="switch", obj=switch, start=switch.rack_slot, row_kind="start"
+        occupancy[switch.rack_slot].append(
+            _OccupancyEntry(kind="switch", obj=switch, start=switch.rack_slot, row_kind="start")
         )
     for device in devices:
         if device.rack_slot is None:
             continue
         span = spans.get(device.device_type_id, 1)
         for offset in range(span):
-            occupancy[device.rack_slot + offset] = _OccupancyEntry(
-                kind="device",
-                obj=device,
-                start=device.rack_slot,
-                row_kind="start" if offset == 0 else "continuation",
+            occupancy[device.rack_slot + offset].append(
+                _OccupancyEntry(
+                    kind="device",
+                    obj=device,
+                    start=device.rack_slot,
+                    row_kind="start" if offset == 0 else "continuation",
+                )
             )
-    return occupancy
+    return dict(occupancy)
+
+
+def _conflict_occupant(entry: _OccupancyEntry) -> ConflictOccupant:
+    if entry.kind == "switch":
+        switch = entry.obj
+        assert isinstance(switch, NetworkSwitch)
+        return ConflictOccupant(
+            kind="switch",
+            label=str(switch),
+            admin_url=reverse("admin:inventory_networkswitch_change", args=[switch.pk]),
+        )
+    device = entry.obj
+    assert isinstance(device, NetworkDevice)
+    return ConflictOccupant(
+        kind="device",
+        label=str(device),
+        admin_url=reverse("admin:inventory_networkdevice_change", args=[device.pk]),
+    )
 
 
 def _device_port_index(
@@ -281,20 +364,29 @@ def _tether_for(device: NetworkDevice) -> TetherInfo | None:
     of one — the host (has a ``companion``) or the companion itself (has
     ``host_id`` set). ``None`` for a device with no companion relationship
     at all, which is the ordinary case for most types.
+
+    Rendered whenever either half of the pair *exists*, regardless of
+    whether it currently has a rack slot (Codex review round 2, finding
+    6) — ADR 0018's companion link is existence and lifecycle, not
+    addressing: a host materializes its companion in the same transaction
+    whether or not it's racked (``_materialize_companion()``), so an
+    unracked host in the spare pool has a real, existing companion just
+    as much as a racked one does. An earlier revision required
+    ``rack_slot is not None`` on the partner before returning anything,
+    which hid the relationship entirely for any unracked pair —
+    contradicting the ADR's own point that the link doesn't come and go
+    with placement. ``TetherInfo.ordinal`` is ``None`` in that case; it's
+    the caller's job to render "spare pool" instead of a slot number.
     """
     try:
         companion = device.companion
     except ObjectDoesNotExist:
         companion = None
     if companion is not None:
-        companion_slot = companion.rack_slot
-        if companion_slot is not None:
-            return TetherInfo(pk=companion.pk, label=str(companion), ordinal=companion_slot)
+        return TetherInfo(pk=companion.pk, label=str(companion), ordinal=companion.rack_slot)
     host = device.host
     if host is not None:
-        host_slot = host.rack_slot
-        if host_slot is not None:
-            return TetherInfo(pk=host.pk, label=str(host), ordinal=host_slot)
+        return TetherInfo(pk=host.pk, label=str(host), ordinal=host.rack_slot)
     return None
 
 
@@ -396,8 +488,8 @@ def _build_elevation_rows(
     occupancy = _build_occupancy(switches, devices, spans)
     rows = []
     for ordinal in range(1, rack.slot_count + 1):
-        entry = occupancy.get(ordinal)
-        if entry is None:
+        entries = occupancy.get(ordinal, [])
+        if not entries:
             cells = [_empty_cell(column, ordinal) for column in columns]
             add_url = (
                 f"{reverse('admin:inventory_networkdevice_add')}?"
@@ -406,6 +498,20 @@ def _build_elevation_rows(
             rows.append(ElevationRow(ordinal=ordinal, occupant=None, cells=cells, add_url=add_url))
             continue
 
+        if len(entries) > 1:
+            # More than one occupant claims this ordinal — a state the
+            # write path's clean()-time checks are supposed to prevent but
+            # can't guarantee at the DB level (see _build_occupancy).
+            # Surface every claimant rather than silently keeping only one
+            # (Codex review round 2, finding 4): no cell state here can
+            # honestly attribute an address to a disputed slot, so every
+            # column renders "conflict" and carries nothing.
+            conflicts = [_conflict_occupant(entry) for entry in entries]
+            cells = [ElevationCell(state="conflict") for _ in columns]
+            rows.append(ElevationRow(ordinal=ordinal, occupant=None, cells=cells, conflicts=conflicts))
+            continue
+
+        entry = entries[0]
         if entry.kind == "switch":
             switch = entry.obj
             assert isinstance(switch, NetworkSwitch)
@@ -423,10 +529,20 @@ def _build_elevation_rows(
 @require_GET
 @permission_required(
     [
+        # The four base models the elevation is built from...
         "inventory.view_rack",
         "inventory.view_vlan",
         "inventory.view_networkswitch",
         "inventory.view_networkdevice",
+        # ...plus the child rows whose own field values render into every
+        # cell, which an earlier revision omitted (Codex review round 2,
+        # finding 2 — "each view declares the full set of codenames it
+        # actually reads" was the plan's own rule, applied incompletely):
+        # RackVlanRange.address_range (the column headers), switch and
+        # device port addresses.
+        "inventory.view_rackvlanrange",
+        "inventory.view_networkswitchaddress",
+        "inventory.view_networkdeviceport",
     ],
     raise_exception=True,
 )
@@ -499,6 +615,24 @@ class AddressEntry:
     derived: bool
 
 
+def _conventional_dhcp_block(network: ipaddress.IPv4Network) -> str:
+    """The bottom /24 of ``network`` — DESIGN.md's "static rack allocation
+    is conventionally kept out of the bottom /24" convention — or the
+    whole subnet, when it's smaller than one /24 to begin with (matching
+    ``bottom_24_width_pct``'s own ``min(256, network.num_addresses)``).
+
+    Any network address for a prefix length <= 24 is automatically
+    24-bit-aligned: alignment for prefix length P requires the address be
+    a multiple of ``2**(32-P)``, and for P<=24 that exponent is >= 8, so
+    it's always also a multiple of ``2**8`` — a coarser alignment implies
+    every finer one down to /24. This always produces a syntactically
+    valid, properly-aligned CIDR block, never a ``strict=True`` failure.
+    """
+    if network.prefixlen <= 24:
+        return str(ipaddress.IPv4Network((network.network_address, 24)))
+    return str(network)
+
+
 def _vlan_addresses_in_use(vlan: VLAN) -> list[AddressEntry]:
     """Every static address on ``vlan`` — switch addresses and device
     ports alike — sorted numerically (not lexically: ``"10.200.9.0"`` >
@@ -551,6 +685,12 @@ def _vlan_addresses_in_use(vlan: VLAN) -> list[AddressEntry]:
         "inventory.view_rack",
         "inventory.view_networkswitch",
         "inventory.view_networkdevice",
+        # The colored-segment labels are RackVlanRange.address_range, and
+        # the "addresses in use" table below the map is switch/device
+        # port field values (see rack_detail's comment — same finding).
+        "inventory.view_rackvlanrange",
+        "inventory.view_networkswitchaddress",
+        "inventory.view_networkdeviceport",
     ],
     raise_exception=True,
 )
@@ -611,7 +751,23 @@ def vlan_map(request: HttpRequest, pk: int) -> HttpResponse:
     # 32) as the reference size — ADR 0019 made offset space reservable
     # with an empty Rack, so this suggestion is a backstop against nobody
     # having reserved a gap, not the only guard against landing in one.
-    next_block = suggest_rack_vlan_range(vlan.subnet, 1, used_ranges, dhcp_range)
+    #
+    # The conventional bottom /24 is added to the exclusion set below in
+    # addition to used_ranges/dhcp_range (Codex review round 2, finding
+    # 5) — an earlier revision let this banner recommend an address
+    # inside the exact region the map above hatches "unavailable by
+    # convention," which is the page contradicting itself. This is a
+    # display-only widening of what *this backstop banner* avoids;
+    # suggest_rack_vlan_range's real call site for an actual blank
+    # RackVlanRange — RackVlanRange.clean() — is untouched and still
+    # allocates against only the stored DHCP range and sibling ranges,
+    # exactly as ADR 0002/0019 specify. If this VLAN's real DHCP
+    # configuration doesn't occupy its bottom /24, the admin's own
+    # suggester may legitimately offer something this banner excludes —
+    # accepted as the cost of the banner staying honest about the
+    # convention this same page has already asserted by hatching it.
+    conventional_dhcp_block = _conventional_dhcp_block(network)
+    next_block = suggest_rack_vlan_range(vlan.subnet, 1, [*used_ranges, conventional_dhcp_block], dhcp_range)
 
     context = {
         "vlan": vlan,
@@ -631,7 +787,21 @@ def vlan_map(request: HttpRequest, pk: int) -> HttpResponse:
 
 @login_required
 @require_GET
-@permission_required(["inventory.view_networkdevice", "inventory.view_vlan"], raise_exception=True)
+@permission_required(
+    [
+        "inventory.view_networkdevice",
+        "inventory.view_vlan",
+        # This page renders the device's type name, its rack, every port
+        # row, and the connected switch — an earlier revision declared
+        # only the two codenames above despite reading all four of these
+        # (Codex review round 2, finding 2).
+        "inventory.view_networkdevicetype",
+        "inventory.view_rack",
+        "inventory.view_networkdeviceport",
+        "inventory.view_networkswitch",
+    ],
+    raise_exception=True,
+)
 def device_detail(request: HttpRequest, pk: int) -> HttpResponse:
     """Type, rack position (linked to the elevation), and the full port
     table — description, VLAN, port type, address or DHCP, a ``derived``
@@ -670,7 +840,18 @@ def device_detail(request: HttpRequest, pk: int) -> HttpResponse:
 
 @login_required
 @require_GET
-@permission_required(["inventory.view_networkswitch", "inventory.view_networkdevice"], raise_exception=True)
+@permission_required(
+    [
+        "inventory.view_networkswitch",
+        "inventory.view_networkdevice",
+        # The type column on both tables is NetworkSwitchType/
+        # NetworkDeviceType, not a field on the switch/device rows
+        # themselves (Codex review round 2, finding 2).
+        "inventory.view_networkswitchtype",
+        "inventory.view_networkdevicetype",
+    ],
+    raise_exception=True,
+)
 def spare_pool(request: HttpRequest) -> HttpResponse:
     """Unracked equipment (``rack__isnull=True``) — CONTEXT.md's Spare Pool
     entry is the framing: factory-DHCP equipment tracked by little more

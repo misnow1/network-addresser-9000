@@ -25,7 +25,8 @@
     {% if next_block %}
       <div class="vlan-map-banner">
         Next free block (backstop — ADR 0019 lets a reservation Rack hold offset space back
-        from this suggestion): {{ next_block }}
+        from this suggestion; also keeps clear of the hatched bottom /24 below, by convention,
+        not by anything this VLAN's own stored DHCP range says): {{ next_block }}
       </div>
     {% else %}
       <div class="vlan-map-banner">No free block sized for a /27-equivalent reservation remains on this subnet.</div>

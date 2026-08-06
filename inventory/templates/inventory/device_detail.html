@@ -10,7 +10,8 @@
   {% if tether %}
     <p>
       <span class="tether" data-tether-pk="{{ tether.pk }}">
-        &#8644; companion <a href="{% url 'inventory:device' tether.pk %}">{{ tether.label }}</a> (slot {{ tether.ordinal }})
+        &#8644; companion <a href="{% url 'inventory:device' tether.pk %}">{{ tether.label }}</a>
+        {% if tether.ordinal %}(slot {{ tether.ordinal }}){% else %}(spare pool — unracked){% endif %}
       </span>
     </p>
   {% endif %}

@@ -316,6 +316,32 @@ a {
   color: var(--text-muted);
 }
 
+/* Conflict — more than one occupant claims one ordinal (only reachable
+ * through a direct write that bypasses clean(); ADR 0017's documented
+ * known gap). Deliberately loud and distinct from every other encoding
+ * on this grid: this is a data problem the page is surfacing, not a
+ * normal occupancy state. */
+.row-conflict {
+  background: var(--derived-bg);
+}
+
+.badge--conflict {
+  border-color: var(--danger);
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.conflict-list {
+  margin: 0.2rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.78rem;
+}
+
+.cell-conflict {
+  background: var(--derived-bg);
+  border: 1px dashed var(--danger);
+}
+
 .cell {
   min-width: 8rem;
 }
