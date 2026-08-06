@@ -78,7 +78,7 @@
                   {% for address in cell.addresses %}
                     <div>
                       <span class="address-value{% if address.derived %} address-value--derived{% endif %}">{{ address.value }}</span>
-                      {% if address.derived %}<span class="tag-derived">derived</span>{% endif %}
+                      {% if address.derived %}<span class="tag-derived" title="The hardware works this address out from another of its own ports, and won't let it be changed.">derived</span>{% endif %}
                       <div class="tile__meta">{{ address.description }}</div>
                     </div>
                   {% endfor %}

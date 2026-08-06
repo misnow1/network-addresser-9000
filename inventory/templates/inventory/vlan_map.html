@@ -11,8 +11,11 @@
 
   {% if unavailable_reason == "l2_only" %}
     <div class="panel">
-      <p>L2-only — no tracked addressing. This VLAN has no subnet (ADR 0012), so it can never
-        have a gateway, DHCP range, rack range, or static address.</p>
+      {# An L2-only VLAN is one with no subnet — see ADR 0012. Kept out of the user-facing #}
+      {# wording below: "no subnet is set" is the fact an operator can act on, and the #}
+      {# decision record behind it isn't. #}
+      <p>No addressing is tracked for this VLAN, because it has no subnet set. Without one it
+        can't have a gateway, a DHCP range, a rack's reserved block, or a static address.</p>
     </div>
   {% elif unavailable_reason == "malformed" %}
     <div class="panel">
@@ -22,24 +25,21 @@
   {% else %}
     <p class="tile__meta">{{ vlan.subnet }}</p>
 
+    {# This figure is computed through the same call the admin's own "leave blank to #}
+    {# suggest" uses, so it always agrees with what creating a range here would actually #}
+    {# allocate. That equality is load-bearing and is pinned by BannerHatchConsistencyTests #}
+    {# — an earlier revision widened this banner's exclusion set to also skip the bottom #}
+    {# /24 (ADR 0002's retired convention, dropped by ADR 0011) and it began advertising a #}
+    {# block the allocator would not hand out. Don't reintroduce a display-only exclusion. #}
+    {# #}
+    {# It is a suggestion rather than a promise: an empty reservation Rack can hold offset #}
+    {# space back from it (ADR 0019). That nuance is deliberately not on screen — it only #}
+    {# matters when someone is deliberately reserving space, and they already know. #}
     {% if next_block %}
-      <div class="vlan-map-banner">
-        Next free block (backstop — ADR 0019 lets a reservation Rack hold offset space back
-        from this suggestion; computed the same way the admin's own "leave blank to suggest"
-        would for this VLAN, so this always agrees with what creating a range here actually
-        allocates): {{ next_block }}
-      </div>
+      <div class="vlan-map-banner">Next free block: {{ next_block }}</div>
     {% else %}
-      <div class="vlan-map-banner">No free block sized for a /27-equivalent reservation remains on this subnet.</div>
+      <div class="vlan-map-banner">No free block of the minimum size remains on this subnet.</div>
     {% endif %}
-
-    <p class="tile__meta">
-      By long-standing convention (ADR 0002), the bottom /24 of a VLAN's subnet was once
-      suggested as a DHCP range — that auto-suggestion was retired in ADR 0011, so nothing on
-      this page assumes it: the hatch below shows only the DHCP range actually recorded for
-      this VLAN, if any, and the banner above never avoids the bottom /24 unless that's where
-      the recorded range happens to be.
-    </p>
 
     <div class="panel">
       <h2 class="panel__heading">Shape of the subnet</h2>
@@ -55,16 +55,21 @@
                title="{{ segment.rack.name }} ({{ segment.address_range }})"></div>
         {% endfor %}
       </div>
+      {# The hatch shows only the DHCP range actually recorded on this VLAN. It deliberately #}
+      {# does not shade the bottom /24: that was ADR 0002's suggested convention, retired by #}
+      {# ADR 0011, and shading it would assert a rule the system no longer applies. The #}
+      {# legend says which range is hatched rather than explaining that history — an #}
+      {# operator needs to read the picture, not the reasoning behind it. #}
       <ul>
         {% if dhcp_segment %}
           <li>
-            <span class="badge">hatched</span> this VLAN's recorded DHCP range
-            ({{ dhcp_segment.start }}-{{ dhcp_segment.end }}) — allocated to nothing tracked here
+            <span class="badge">hatched</span> this VLAN's DHCP range
+            ({{ dhcp_segment.start }}-{{ dhcp_segment.end }}) — not available to racks
           </li>
         {% else %}
           <li><span class="badge">hatched</span> would show this VLAN's DHCP range — none is recorded</li>
         {% endif %}
-        <li><span class="badge">filled</span> a rack's reserved block — hatched and coloured are two different kinds of unavailable</li>
+        <li><span class="badge">filled</span> a block already reserved by a rack</li>
       </ul>
       <table class="plain">
         <thead>
@@ -94,7 +99,7 @@
             <tr>
               <td>
                 {{ entry.address }}
-                {% if entry.derived %}<span class="tag-derived">derived</span>{% endif %}
+                {% if entry.derived %}<span class="tag-derived" title="The hardware works this address out from another of its own ports, and won't let it be changed.">derived</span>{% endif %}
               </td>
               <td><a href="{{ entry.owner_url }}">{{ entry.owner_label }}</a></td>
             </tr>

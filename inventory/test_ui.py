@@ -830,7 +830,14 @@ class RobustnessTests(TestCase):
         l2_vlan = VLAN.objects.create(name="L2 Only", vlan_id=999)
         response = self.client.get(f"/vlans/{l2_vlan.pk}/")
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "no tracked addressing")
+        # Assert the *outcome* — no address map is built, and the page says
+        # why in terms of the missing subnet — rather than an exact sentence.
+        # This test previously pinned the phrase "no tracked addressing" and
+        # broke on a copy edit that changed nothing about behaviour; on-screen
+        # wording is product copy and will keep changing (see the template
+        # comments about keeping ADR references out of user-facing text).
+        self.assertNotContains(response, "Shape of the subnet")
+        self.assertContains(response, "no subnet")
 
     def test_ordinal_beyond_address_space_renders_blank_not_500(self) -> None:
         # A block near the top of the whole IPv4 address space — an

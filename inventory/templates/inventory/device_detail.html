@@ -47,7 +47,7 @@
           <tr>
             <td>
               {{ port.description }}
-              {% if port.slot_offset > 0 %}<span class="tag-derived">derived</span>{% endif %}
+              {% if port.slot_offset > 0 %}<span class="tag-derived" title="The hardware works this address out from another of its own ports, and won't let it be changed.">derived</span>{% endif %}
             </td>
             <td>
               <span class="vlan-chip" style="--vlan-hue: {{ port.vlan.vlan_id|vlan_hue }}">
