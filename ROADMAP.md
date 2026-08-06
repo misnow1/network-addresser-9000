@@ -133,9 +133,12 @@ Read-only, mounted at `/`, with every mutation deep-linked into the admin — se
 
 - [x] Design decided: strictly read-only v1, admin retains all mutation, Viewers leave the
       admin — see ADR 0020
-- [ ] Prerequisites: `LOGIN_URL`/`LOGIN_REDIRECT_URL` (Django's default is unrouted),
-      `TEMPLATES["DIRS"]`, admin link gated on `is_staff`
-- [ ] The four shaped views: rack elevation, address map, device, spare pool
+- [x] Prerequisites: `LOGIN_URL`/`LOGIN_REDIRECT_URL` (Django's default is unrouted),
+      `TEMPLATES["DIRS"]`, admin link gated on `is_staff` — the `TEMPLATES["DIRS"]` item is
+      closed by *not* doing it: `LOGOUT_REDIRECT_URL = "/"` sidesteps
+      `django.contrib.admin`'s `registration/logged_out.html` entirely rather than needing a
+      project-level dir to out-order it (`PLAN-read-only-ui.md` decision 6)
+- [x] The four shaped views: rack elevation, address map, device, spare pool
 - [ ] Read-parity: plain views for the remaining registered models and their inlines
 - [ ] Audit-trail view over `auditlog` — site-wide and per-object
 - [ ] Flip Viewer provisioning to `is_staff=False` (gated on parity + the audit view landing)

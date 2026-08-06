@@ -1,0 +1,66 @@
+{% extends "inventory/base.html" %}
+{% load inventory_extras %}
+
+{% block title %}Index — Network Addresser 9000{% endblock %}
+
+{% block content %}
+  <section class="panel">
+    <h2 class="panel__heading">Racks</h2>
+    <div class="tile-grid">
+      {% for rack in racks %}
+        <a class="tile" href="{% url 'inventory:rack' rack.pk %}">
+          <div class="tile__title">{{ rack.name }}</div>
+          <div class="tile__meta">
+            {{ rack.switch_count }} switch{{ rack.switch_count|pluralize:"es" }},
+            {{ rack.device_count }} device{{ rack.device_count|pluralize }}
+            / {{ rack.slot_count }} slot{{ rack.slot_count|pluralize }}
+          </div>
+        </a>
+      {% empty %}
+        <p>No racks yet.</p>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2 class="panel__heading">VLANs</h2>
+    <div class="tile-grid">
+      {% for vlan in vlans %}
+        {% if vlan.subnet %}
+          <a class="tile" href="{% url 'inventory:vlan_map' vlan.pk %}">
+            <div class="tile__title">
+              <span class="vlan-chip" style="--vlan-hue: {{ vlan.vlan_id|vlan_hue }}">VLAN {{ vlan.vlan_id }}</span>
+              {{ vlan.name }}
+            </div>
+            <div class="tile__meta">
+              {{ vlan.switch_address_count|add:vlan.device_address_count }} address{{ vlan.switch_address_count|add:vlan.device_address_count|pluralize }} in use
+            </div>
+          </a>
+        {% else %}
+          {# Subnet-less (L2-only, ADR 0012) VLANs get no map link — there's nothing #}
+          {# for the address map to show but its own "no tracked addressing" state. #}
+          <div class="tile tile--disabled">
+            <div class="tile__title">
+              <span class="vlan-chip" style="--vlan-hue: {{ vlan.vlan_id|vlan_hue }}">VLAN {{ vlan.vlan_id }}</span>
+              {{ vlan.name }}
+            </div>
+            <div class="tile__meta">L2-only — no tracked addressing</div>
+          </div>
+        {% endif %}
+      {% empty %}
+        <p>No VLANs yet.</p>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2 class="panel__heading">Spare Pool</h2>
+    <a class="tile" href="{% url 'inventory:spares' %}">
+      <div class="tile__title">Unracked equipment</div>
+      <div class="tile__meta">
+        {{ spare_switch_count }} switch{{ spare_switch_count|pluralize:"es" }},
+        {{ spare_device_count }} device{{ spare_device_count|pluralize }}
+      </div>
+    </a>
+  </section>
+{% endblock %}

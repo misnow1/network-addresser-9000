@@ -1,0 +1,113 @@
+{% extends "inventory/base.html" %}
+{% load inventory_extras %}
+
+{% block title %}VLAN {{ vlan.vlan_id }} — Network Addresser 9000{% endblock %}
+
+{% block content %}
+  <h1>
+    <span class="vlan-chip" style="--vlan-hue: {{ vlan.vlan_id|vlan_hue }}">VLAN {{ vlan.vlan_id }}</span>
+    {{ vlan.name }}
+  </h1>
+
+  {% if unavailable_reason == "l2_only" %}
+    <div class="panel">
+      {# An L2-only VLAN is one with no subnet — see ADR 0012. Kept out of the user-facing #}
+      {# wording below: "no subnet is set" is the fact an operator can act on, and the #}
+      {# decision record behind it isn't. #}
+      <p>No addressing is tracked for this VLAN, because it has no subnet set. Without one it
+        can't have a gateway, a DHCP range, a rack's reserved block, or a static address.</p>
+    </div>
+  {% elif unavailable_reason == "malformed" %}
+    <div class="panel">
+      <p>This VLAN's stored subnet isn't a valid IPv4 CIDR block, so no address map can be
+        built for it. Check its value in the admin.</p>
+    </div>
+  {% else %}
+    <p class="tile__meta">{{ vlan.subnet }}</p>
+
+    {# This figure is computed through the same call the admin's own "leave blank to #}
+    {# suggest" uses, so it always agrees with what creating a range here would actually #}
+    {# allocate. That equality is load-bearing and is pinned by BannerHatchConsistencyTests #}
+    {# — an earlier revision widened this banner's exclusion set to also skip the bottom #}
+    {# /24 (ADR 0002's retired convention, dropped by ADR 0011) and it began advertising a #}
+    {# block the allocator would not hand out. Don't reintroduce a display-only exclusion. #}
+    {# #}
+    {# It is a suggestion rather than a promise: an empty reservation Rack can hold offset #}
+    {# space back from it (ADR 0019). That nuance is deliberately not on screen — it only #}
+    {# matters when someone is deliberately reserving space, and they already know. #}
+    {% if next_block %}
+      <div class="vlan-map-banner">Next free block: {{ next_block }}</div>
+    {% else %}
+      <div class="vlan-map-banner">No free block of the minimum size remains on this subnet.</div>
+    {% endif %}
+
+    <div class="panel">
+      <h2 class="panel__heading">Shape of the subnet</h2>
+      <div class="vlan-map-track">
+        {% if dhcp_segment %}
+          <div class="vlan-map-segment vlan-map-segment--hatched"
+               style="left: {{ dhcp_segment.left_pct }}%; width: {{ dhcp_segment.width_pct }}%;"
+               title="Recorded DHCP range: {{ dhcp_segment.start }}-{{ dhcp_segment.end }}"></div>
+        {% endif %}
+        {% for segment in segments %}
+          <div class="vlan-map-segment vlan-map-segment--rack"
+               style="left: {{ segment.left_pct }}%; width: {{ segment.width_pct }}%;"
+               title="{{ segment.rack.name }} ({{ segment.address_range }})"></div>
+        {% endfor %}
+      </div>
+      {# The hatch shows only the DHCP range actually recorded on this VLAN. It deliberately #}
+      {# does not shade the bottom /24: that was ADR 0002's suggested convention, retired by #}
+      {# ADR 0011, and shading it would assert a rule the system no longer applies. The #}
+      {# legend says which range is hatched rather than explaining that history — an #}
+      {# operator needs to read the picture, not the reasoning behind it. #}
+      <ul>
+        {% if dhcp_segment %}
+          <li>
+            <span class="badge">hatched</span> this VLAN's DHCP range
+            ({{ dhcp_segment.start }}-{{ dhcp_segment.end }}) — not available to racks
+          </li>
+        {% else %}
+          <li><span class="badge">hatched</span> would show this VLAN's DHCP range — none is recorded</li>
+        {% endif %}
+        <li><span class="badge">filled</span> a block already reserved by a rack</li>
+      </ul>
+      <table class="plain">
+        <thead>
+          <tr><th>Rack</th><th>Block</th></tr>
+        </thead>
+        <tbody>
+          {% for segment in segments %}
+            <tr>
+              <td><a href="{% url 'inventory:rack' segment.rack.pk %}">{{ segment.rack.name }}</a></td>
+              <td>{{ segment.address_range }}</td>
+            </tr>
+          {% empty %}
+            <tr><td colspan="2">No rack holds a block on this VLAN yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <h2 class="panel__heading">Addresses in use</h2>
+      <table class="plain">
+        <thead>
+          <tr><th>Address</th><th>Owner</th></tr>
+        </thead>
+        <tbody>
+          {% for entry in addresses %}
+            <tr>
+              <td>
+                {{ entry.address }}
+                {% if entry.derived %}<span class="tag-derived" title="The hardware works this address out from another of its own ports, and won't let it be changed.">derived</span>{% endif %}
+              </td>
+              <td><a href="{{ entry.owner_url }}">{{ entry.owner_label }}</a></td>
+            </tr>
+          {% empty %}
+            <tr><td colspan="2">No addresses in use on this VLAN yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+{% endblock %}
