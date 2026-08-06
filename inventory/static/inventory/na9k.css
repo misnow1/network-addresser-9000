@@ -1,0 +1,469 @@
+/* Network Addresser 9000 — read-only UI stylesheet (phase 15, ADR 0020).
+ *
+ * One hand-written file, no build step, no framework — decision 2 of
+ * PLAN-read-only-ui.md. No JavaScript touches this page at all (decision
+ * 5), including no theme toggle: light/dark follows the browser's own
+ * `prefers-color-scheme` exclusively. The `:root[data-theme="dark"]` /
+ * `:root[data-theme="light"]` selectors below are written but never
+ * triggered by anything in this codebase today — they exist so that
+ * adding a toggle later is a `<script>` tag flipping an attribute, not a
+ * rewrite of every color in this file.
+ *
+ * Visual language: mono uppercase panel-label headings against a quiet
+ * system-sans body; an amber signal accent on a cool near-black ground in
+ * dark mode; VLAN identity is always a mono chip with a 2px hue
+ * underline, never a colored fill — so a VLAN's own hue is never
+ * competing with the accent color for the operator's attention.
+ */
+
+:root {
+  --bg: #f4f5f7;
+  --bg-elevated: #ffffff;
+  --panel-bg: #ffffff;
+  --text: #1b1d24;
+  --text-muted: #5b5f6e;
+  --border: #d7d9e0;
+  --accent: #b5710a;
+  --accent-contrast: #ffffff;
+  --absent: #9296a3;
+  --derived-bg: #fdf1d9;
+  --continuation-bg: #eef0f4;
+  --empty-would-be: #9296a3;
+  --link: #1a5fb4;
+  --danger: #a3323a;
+
+  --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161c;
+    --bg-elevated: #1a1d25;
+    --panel-bg: #1b1e27;
+    --text: #e7e8ee;
+    --text-muted: #9296a8;
+    --border: #2d303c;
+    --accent: #e8a33d;
+    --accent-contrast: #14161c;
+    --absent: #6b6f7f;
+    --derived-bg: #2c2413;
+    --continuation-bg: #21242e;
+    --empty-would-be: #565a6a;
+    --link: #7db8ff;
+    --danger: #e0707a;
+  }
+}
+
+/* Present but unexercised — nothing in this app sets data-theme (decision
+ * 5); a future toggle only needs to set this attribute on <html>. */
+:root[data-theme="dark"] {
+  --bg: #14161c;
+  --bg-elevated: #1a1d25;
+  --panel-bg: #1b1e27;
+  --text: #e7e8ee;
+  --text-muted: #9296a8;
+  --border: #2d303c;
+  --accent: #e8a33d;
+  --accent-contrast: #14161c;
+  --absent: #6b6f7f;
+  --derived-bg: #2c2413;
+  --continuation-bg: #21242e;
+  --empty-would-be: #565a6a;
+  --link: #7db8ff;
+  --danger: #e0707a;
+}
+
+:root[data-theme="light"] {
+  --bg: #f4f5f7;
+  --bg-elevated: #ffffff;
+  --panel-bg: #ffffff;
+  --text: #1b1d24;
+  --text-muted: #5b5f6e;
+  --border: #d7d9e0;
+  --accent: #b5710a;
+  --accent-contrast: #ffffff;
+  --absent: #9296a3;
+  --derived-bg: #fdf1d9;
+  --continuation-bg: #eef0f4;
+  --empty-would-be: #9296a3;
+  --link: #1a5fb4;
+  --danger: #a3323a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-body);
+  line-height: 1.45;
+}
+
+a {
+  color: var(--link);
+}
+
+.na9k-nav {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 0.75rem 1.25rem;
+  background: var(--panel-bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.na9k-nav__brand {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 700;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.na9k-nav__links {
+  display: flex;
+  gap: 1rem;
+  flex: 1;
+}
+
+.na9k-nav__links a {
+  text-decoration: none;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+
+.na9k-nav__links a:hover {
+  color: var(--text);
+}
+
+.na9k-nav__logout button {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  padding: 0.3rem 0.7rem;
+  border-radius: 3px;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.na9k-main {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 1.5rem 1.25rem 4rem;
+}
+
+.na9k-messages {
+  list-style: none;
+  margin: 0 0 1rem;
+  padding: 0;
+}
+
+.na9k-messages li {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  margin-bottom: 0.5rem;
+}
+
+/* -- Panels -------------------------------------------------------------- */
+
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1rem 1.25rem;
+  margin-bottom: 1.5rem;
+}
+
+.panel__heading {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.8rem;
+  color: var(--accent);
+  margin: 0 0 0.75rem;
+}
+
+/* -- VLAN chip ------------------------------------------------------------
+ * Identity is always a mono chip with a 2px hue underline — never a
+ * colored fill (decision 2's "so VLAN hues never compete with the accent
+ * color"). --vlan-hue is set inline per VLAN by the vlan_chip template
+ * filter/tag (see inventory_extras.py). */
+.vlan-chip {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  padding: 0.1rem 0.4rem;
+  border-bottom: 2px solid hsl(var(--vlan-hue, 200), 65%, 50%);
+  white-space: nowrap;
+  text-decoration: none;
+  color: var(--text);
+}
+
+/* -- Index tiles ----------------------------------------------------------*/
+
+.tile-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 0.75rem;
+}
+
+.tile {
+  display: block;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.75rem 0.9rem;
+  text-decoration: none;
+  color: var(--text);
+  background: var(--bg-elevated);
+}
+
+.tile:hover {
+  border-color: var(--accent);
+}
+
+.tile__title {
+  font-weight: 600;
+}
+
+.tile__meta {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.tile--disabled {
+  opacity: 0.6;
+}
+
+/* -- Rack elevation grid ---------------------------------------------------
+ * Scrolls inside its own container on narrow screens — the page body
+ * itself must never scroll horizontally. */
+
+.elevation-scroll {
+  overflow-x: auto;
+}
+
+.elevation {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.85rem;
+}
+
+.elevation th,
+.elevation td {
+  border: 1px solid var(--border);
+  padding: 0.35rem 0.5rem;
+  vertical-align: top;
+  text-align: left;
+}
+
+.elevation thead th {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  background: var(--panel-bg);
+}
+
+.ordinal-cell {
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  min-width: 9rem;
+}
+
+/* Solid bracket — an ADR 0017 span (a device whose type declares offset
+ * ports). Deliberately a *solid* border, unlike .tether's dashed one, so
+ * the two encodings can never be mistaken for each other. */
+.ordinal-cell--span-start {
+  border-top: 2px solid var(--accent);
+  border-left: 2px solid var(--accent);
+  border-right: 2px solid var(--accent);
+}
+
+.ordinal-cell--span-continuation {
+  border-left: 2px solid var(--accent);
+  border-right: 2px solid var(--accent);
+  background: var(--continuation-bg);
+}
+
+.ordinal-cell--span-end {
+  border-bottom: 2px solid var(--accent);
+}
+
+.occupant-link {
+  font-weight: 600;
+  text-decoration: none;
+}
+
+/* Dashed tether — an ADR 0018 companion pair. A badge, not a positional
+ * line: the pair's slots can be arbitrarily far apart, and this project
+ * draws no lines with no JavaScript to place them. Dashed border is the
+ * only thing this shares visually with .ordinal-cell--span-*, and
+ * deliberately so — the two must read as different encodings. */
+.tether {
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0 0.35rem;
+  border: 1px dashed var(--accent);
+  border-radius: 3px;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.cell {
+  min-width: 8rem;
+}
+
+.cell-empty .would-be-address {
+  color: var(--empty-would-be);
+  font-family: var(--font-mono);
+}
+
+.cell-absent {
+  color: var(--absent);
+  text-align: center;
+}
+
+.cell-absent::before {
+  content: "\2014"; /* em dash — no port on this VLAN */
+}
+
+.cell-occupied .address-value {
+  font-family: var(--font-mono);
+}
+
+.cell-occupied .address-value--derived {
+  background: var(--derived-bg);
+  padding: 0 0.2rem;
+  border-radius: 2px;
+}
+
+.tag-derived {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-left: 0.25rem;
+}
+
+.add-slot-link {
+  font-size: 0.8rem;
+  text-decoration: none;
+}
+
+/* -- Address map ------------------------------------------------------- */
+
+.vlan-map-track {
+  position: relative;
+  height: 2.5rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 0.75rem;
+}
+
+.vlan-map-segment {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-right: 1px solid var(--border);
+}
+
+.vlan-map-segment--hatched {
+  background-image: repeating-linear-gradient(
+    45deg,
+    var(--border),
+    var(--border) 4px,
+    transparent 4px,
+    transparent 10px
+  );
+}
+
+.vlan-map-segment--rack {
+  background: var(--derived-bg);
+}
+
+.vlan-map-segment__label {
+  position: absolute;
+  bottom: -1.4rem;
+  left: 0;
+  font-size: 0.7rem;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+
+.vlan-map-banner {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  border: 1px dashed var(--accent);
+  border-radius: 3px;
+  padding: 0.5rem 0.75rem;
+  margin-bottom: 1rem;
+}
+
+/* -- Tables generally ---------------------------------------------------- */
+
+table.plain {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+table.plain th,
+table.plain td {
+  border-bottom: 1px solid var(--border);
+  padding: 0.4rem 0.5rem;
+  text-align: left;
+  font-size: 0.9rem;
+}
+
+table.plain thead th {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  font-size: 0.72rem;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.badge {
+  display: inline-block;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  padding: 0.05rem 0.35rem;
+  border-radius: 2px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+
+/* -- Login form ------------------------------------------------------- */
+
+.login-form {
+  max-width: 320px;
+  margin: 4rem auto;
+}
+
+.login-form input {
+  display: block;
+  width: 100%;
+  padding: 0.5rem;
+  margin-bottom: 0.75rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 3px;
+}
+
+.login-form button {
+  background: var(--accent);
+  color: var(--accent-contrast);
+  border: none;
+  padding: 0.5rem 1rem;
+  border-radius: 3px;
+  cursor: pointer;
+  font-weight: 600;
+}

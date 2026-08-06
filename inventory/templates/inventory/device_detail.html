@@ -1,0 +1,75 @@
+{% extends "inventory/base.html" %}
+{% load inventory_extras %}
+
+{% block title %}{{ device }} — Network Addresser 9000{% endblock %}
+
+{% block content %}
+  <h1>{{ device }}</h1>
+  <p class="tile__meta">{{ device.device_type }}</p>
+
+  {% if tether %}
+    <p>
+      <span class="tether" data-tether-pk="{{ tether.pk }}">
+        &#8644; companion <a href="{% url 'inventory:device' tether.pk %}">{{ tether.label }}</a> (slot {{ tether.ordinal }})
+      </span>
+    </p>
+  {% endif %}
+
+  <div class="panel">
+    <h2 class="panel__heading">Placement</h2>
+    {% if rack_url %}
+      <p>
+        <a href="{{ rack_url }}">{{ device.rack.name }}</a>, slot {{ device.rack_slot }}
+      </p>
+    {% else %}
+      <p>Spare pool — not racked.</p>
+    {% endif %}
+    <p class="tile__meta">Serial: {{ device.serial_number|default:"—" }}</p>
+    <p><a href="{{ admin_change_url }}">Edit in admin</a></p>
+  </div>
+
+  <div class="panel">
+    <h2 class="panel__heading">Ports</h2>
+    <table class="plain">
+      <thead>
+        <tr>
+          <th>Description</th>
+          <th>VLAN</th>
+          <th>Type</th>
+          <th>Address</th>
+          <th>Gateway</th>
+          <th>Switch</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for port in ports %}
+          <tr>
+            <td>
+              {{ port.description }}
+              {% if port.slot_offset > 0 %}<span class="tag-derived">derived</span>{% endif %}
+            </td>
+            <td>
+              <span class="vlan-chip" style="--vlan-hue: {{ port.vlan.vlan_id|vlan_hue }}">
+                VLAN {{ port.vlan.vlan_id }}
+              </span>
+            </td>
+            <td>{{ port.get_port_type_display }}</td>
+            <td>{% if port.is_dhcp %}DHCP{% else %}{{ port.address }}{% endif %}</td>
+            <td>{{ port.default_gateway|default:"—" }}</td>
+            <td>
+              {% if port.switch and port.switch.rack_id %}
+                <a href="{% url 'inventory:rack' port.switch.rack_id %}">{{ port.switch }}</a>
+              {% elif port.switch %}
+                {{ port.switch }}
+              {% else %}
+                —
+              {% endif %}
+            </td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="6">No ports.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endblock %}

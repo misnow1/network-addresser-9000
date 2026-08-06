@@ -1,0 +1,21 @@
+{% extends "inventory/base.html" %}
+
+{% block title %}Sign in — Network Addresser 9000{% endblock %}
+
+{% block content %}
+  <div class="panel login-form">
+    <h1 class="panel__heading">Sign in</h1>
+    {% if form.errors %}
+      <p>Your username and password didn't match. Please try again.</p>
+    {% endif %}
+    <form method="post" action="{% url 'login' %}">
+      {% csrf_token %}
+      <label for="id_username">Username</label>
+      {{ form.username }}
+      <label for="id_password">Password</label>
+      {{ form.password }}
+      <input type="hidden" name="next" value="{{ next }}">
+      <button type="submit">Sign in</button>
+    </form>
+  </div>
+{% endblock %}

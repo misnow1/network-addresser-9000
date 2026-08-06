@@ -1,0 +1,78 @@
+{% extends "inventory/base.html" %}
+{% load inventory_extras %}
+
+{% block title %}{{ rack.name }} — Network Addresser 9000{% endblock %}
+
+{% block content %}
+  <h1>{{ rack.name }}</h1>
+  <p class="tile__meta">{{ rack.slot_count }} slot{{ rack.slot_count|pluralize }}</p>
+
+  <div class="panel elevation-scroll">
+    <table class="elevation">
+      <thead>
+        <tr>
+          <th class="ordinal-cell">Slot</th>
+          {% for column in columns %}
+            <th>
+              <span class="vlan-chip" style="--vlan-hue: {{ column.vlan.vlan_id|vlan_hue }}">
+                VLAN {{ column.vlan.vlan_id }}
+              </span>
+              <div>{{ column.vlan.name }}</div>
+              <div class="tile__meta">{{ column.address_range }}</div>
+            </th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+          <tr id="slot-{{ row.ordinal }}" data-ordinal="{{ row.ordinal }}">
+            <th class="ordinal-cell
+              {% if row.occupant.bracketed %}
+                {% if row.occupant.row_kind == 'start' %}ordinal-cell--span-start{% else %}ordinal-cell--span-continuation{% endif %}
+                {% if row.occupant.is_span_end %}ordinal-cell--span-end{% endif %}
+              {% endif %}"
+              data-occupant-kind="{% if row.occupant %}{{ row.occupant.row_kind }}{% else %}empty{% endif %}">
+              {{ row.ordinal }}
+              {% if row.occupant %}
+                {% if row.occupant.detail_url %}
+                  <a class="occupant-link" href="{{ row.occupant.detail_url }}">{{ row.occupant.label }}</a>
+                {% else %}
+                  <a class="occupant-link" href="{{ row.occupant.admin_url }}">{{ row.occupant.label }}</a>
+                {% endif %}
+                {% if row.occupant.row_kind == 'continuation' %}
+                  <span class="badge">cont'd</span>
+                {% endif %}
+                {% if row.occupant.tether %}
+                  <span class="tether" data-tether-pk="{{ row.occupant.tether.pk }}">
+                    &#8644; companion
+                    <a href="#slot-{{ row.occupant.tether.ordinal }}">{{ row.occupant.tether.label }}</a>
+                    (slot {{ row.occupant.tether.ordinal }})
+                  </span>
+                {% endif %}
+              {% else %}
+                <a class="add-slot-link" href="{{ row.add_url }}">+ add device</a>
+              {% endif %}
+            </th>
+            {% for cell in row.cells %}
+              <td class="cell cell-{{ cell.state }}">
+                {% if cell.state == "empty" %}
+                  {% if cell.would_be_address %}
+                    <span class="would-be-address">{{ cell.would_be_address }}</span>
+                  {% endif %}
+                {% elif cell.state == "occupied" %}
+                  {% for address in cell.addresses %}
+                    <div>
+                      <span class="address-value{% if address.derived %} address-value--derived{% endif %}">{{ address.value }}</span>
+                      {% if address.derived %}<span class="tag-derived">derived</span>{% endif %}
+                      <div class="tile__meta">{{ address.description }}</div>
+                    </div>
+                  {% endfor %}
+                {% endif %}
+              </td>
+            {% endfor %}
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endblock %}

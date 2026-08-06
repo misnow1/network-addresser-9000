@@ -1,0 +1,37 @@
+{% load static %}<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Network Addresser 9000{% endblock %}</title>
+  <link rel="stylesheet" href="{% static 'inventory/na9k.css' %}">
+</head>
+<body>
+  <nav class="na9k-nav">
+    <a class="na9k-nav__brand" href="{% url 'inventory:index' %}">NA9000</a>
+    {% if request.user.is_authenticated %}
+      <div class="na9k-nav__links">
+        <a href="{% url 'inventory:index' %}">Index</a>
+        <a href="{% url 'inventory:spares' %}">Spare Pool</a>
+        {% if request.user.is_staff %}
+          {# The admin link renders only for is_staff — a Viewer, per ADR 0020 decision 8, #}
+          {# is never offered a door that will refuse them. #}
+          <a href="{% url 'admin:index' %}">Admin</a>
+        {% endif %}
+      </div>
+      <form class="na9k-nav__logout" method="post" action="{% url 'logout' %}">
+        {% csrf_token %}
+        <button type="submit">Sign out</button>
+      </form>
+    {% endif %}
+  </nav>
+  <main class="na9k-main">
+    {% if messages %}
+      <ul class="na9k-messages">
+        {% for message in messages %}<li>{{ message }}</li>{% endfor %}
+      </ul>
+    {% endif %}
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

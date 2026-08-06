@@ -85,6 +85,23 @@ TEMPLATES = [
 WSGI_APPLICATION = "config.wsgi.application"
 
 
+# Read-only UI (phase 15, ADR 0020) — Django's own defaults for these three
+# are all wrong for this project. LOGIN_URL defaults to "/accounts/login/",
+# which nothing routes without this; a bare @login_required view would send
+# a logged-out visitor to a 404 rather than a login form. LOGIN_REDIRECT_URL
+# defaults to "/accounts/profile/", equally unrouted. LOGOUT_REDIRECT_URL
+# defaults to None, which would render Django's own "logged out" template —
+# django.contrib.admin ships a registration/logged_out.html that would win
+# over any override of ours (admin precedes inventory in INSTALLED_APPS), so
+# pointing this at "/" instead sidesteps that template entirely rather than
+# needing a project-level TEMPLATES["DIRS"] to shadow it (ADR 0020's plan,
+# revision 2, decision 6 — one of the ADR's stated prerequisites is closed
+# by not doing it).
+LOGIN_URL = "/accounts/login/"
+LOGIN_REDIRECT_URL = "/"
+LOGOUT_REDIRECT_URL = "/"
+
+
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 

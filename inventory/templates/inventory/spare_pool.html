@@ -1,0 +1,51 @@
+{% extends "inventory/base.html" %}
+
+{% block title %}Spare Pool — Network Addresser 9000{% endblock %}
+
+{% block content %}
+  <h1>Spare Pool</h1>
+  <p class="tile__meta">
+    Equipment with no rack (CONTEXT.md) — factory-DHCP, tracked by serial number and hostname
+    until it's racked and statically addressed.
+  </p>
+
+  <div class="panel">
+    <h2 class="panel__heading">Switches</h2>
+    <table class="plain">
+      <thead>
+        <tr><th>Hostname</th><th>Type</th><th>Serial</th></tr>
+      </thead>
+      <tbody>
+        {% for switch in spare_switches %}
+          <tr>
+            <td><a href="{% url 'admin:inventory_networkswitch_change' switch.pk %}">{{ switch }}</a></td>
+            <td>{{ switch.switch_type }}</td>
+            <td>{{ switch.serial_number|default:"—" }}</td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="3">No spare switches.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2 class="panel__heading">Devices</h2>
+    <table class="plain">
+      <thead>
+        <tr><th>Hostname</th><th>Type</th><th>Serial</th></tr>
+      </thead>
+      <tbody>
+        {% for device in spare_devices %}
+          <tr>
+            <td><a href="{% url 'inventory:device' device.pk %}">{{ device }}</a></td>
+            <td>{{ device.device_type }}</td>
+            <td>{{ device.serial_number|default:"—" }}</td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="3">No spare devices.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endblock %}
