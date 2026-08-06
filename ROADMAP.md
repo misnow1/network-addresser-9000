@@ -118,10 +118,10 @@ line up across every VLAN its rack carries.
 
 - [x] Design decided: no new grouping concept, no rename; suggest the ordinal instead of
       requiring it typed, and reserve offset space with empty racks — see ADR 0019
-- [ ] Suggestion helper: lowest free run of `slot_span` consecutive ordinals in a rack
-- [ ] Wired into the `NetworkSwitch` and `NetworkDevice` admin add forms as an initial value
+- [x] Suggestion helper: lowest free run of `slot_span` consecutive ordinals in a rack
+- [x] Wired into the `NetworkSwitch` and `NetworkDevice` admin add forms as an initial value
       (a default, not a lock — ADR 0001, ADR 0003)
-- [ ] Tests: a plain device takes the lowest free ordinal; a spanning device (ADR 0017) skips
+- [x] Tests: a plain device takes the lowest free ordinal; a spanning device (ADR 0017) skips
       a run that would overlap; an operator-typed ordinal still wins
 
 No migration and no model change — nothing stored is altered.

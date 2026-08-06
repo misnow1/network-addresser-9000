@@ -10,6 +10,7 @@ inside ``save()`` itself, can guard those paths.
 
 import io
 import ipaddress
+from typing import Any
 
 from auditlog.models import LogEntry
 from django.contrib.admin.sites import AdminSite
@@ -35,6 +36,7 @@ from .admin import (
     NetworkDevicePortInline,
     NetworkDeviceTypeAdmin,
     NetworkDeviceTypeForm,
+    NetworkSwitchAddForm,
     NetworkSwitchAddressInline,
     NetworkSwitchAdmin,
     NetworkSwitchPortForm,
@@ -76,6 +78,7 @@ from .models import (
 )
 from .suggestions import (
     dhcp_range_overlaps_cidr,
+    lowest_free_run,
     prefix_length_for_capacity,
     required_block_size,
     suggest_default_gateway,
@@ -622,6 +625,37 @@ class SuggestionFunctionTests(TestCase):
     def test_suggest_slot_address(self) -> None:
         self.assertEqual(suggest_slot_address("10.200.1.0/27", 1), "10.200.1.1")
         self.assertEqual(suggest_slot_address("10.200.1.0/27", 5), "10.200.1.5")
+
+    # -- lowest_free_run (ADR 0019) ------------------------------------------------------
+
+    def test_lowest_free_run_empty_rack(self) -> None:
+        self.assertEqual(lowest_free_run([], 1, 4), 1)
+
+    def test_lowest_free_run_skips_a_gap_too_small(self) -> None:
+        # A single free slot at 3 can't fit a span of 2 — the next fit is 5.
+        self.assertEqual(lowest_free_run([(1, 2), (4, 4)], 2, 6), 5)
+
+    def test_lowest_free_run_unsorted_and_overlapping_input_matches_normalised(self) -> None:
+        normalised = lowest_free_run([(1, 2), (4, 4)], 2, 6)
+        # Same occupancy, given unsorted and with a redundant overlapping
+        # duplicate thrown in — callers union two tables and shouldn't have
+        # to normalise first.
+        unsorted_overlapping = lowest_free_run([(4, 4), (1, 2), (1, 1)], 2, 6)
+        self.assertEqual(unsorted_overlapping, normalised)
+
+    def test_lowest_free_run_span_larger_than_slot_count_is_none(self) -> None:
+        self.assertIsNone(lowest_free_run([], 5, 4))
+
+    def test_lowest_free_run_none_when_run_would_overrun_the_end(self) -> None:
+        # slot_count=4, span=2: only a run starting at 3 would fit the end
+        # (3-4); occupying 3 leaves no room for a span of 2 anywhere.
+        self.assertIsNone(lowest_free_run([(1, 1), (3, 3)], 2, 4))
+
+    def test_lowest_free_run_exact_terminal_fit(self) -> None:
+        # occupied=[(1,2)], span=2, slot_count=4: the only fit is exactly
+        # 3-4, ending exactly at slot_count — the case that distinguishes
+        # `<` from `<=` at the boundary.
+        self.assertEqual(lowest_free_run([(1, 2)], 2, 4), 3)
 
 
 class VLANSuggestionTests(TestCase):
@@ -6224,3 +6258,325 @@ class RackAddressingProductionReplayTests(TestCase):
         # either gap.
         _rack, twentieth = self._create_rack("Twentieth Rack", 3)
         self.assertEqual(twentieth.address_range, "10.200.3.96/27")
+
+
+class RackSlotSuggestionTests(TestCase):
+    """PLAN-adr-0019.md's verification list (ADR 0019) — items 2-13. Item 1
+    (``lowest_free_run`` itself) joins ``SuggestionFunctionTests`` above,
+    and item 14 needs the admin add URL over the test client — see
+    ``RackSlotSuggestionAdminViewTests`` below. Uses the ``Form(data=
+    {...})`` style ``RackAddForm``'s own tests use (``RackTemplateAdminTests``
+    above), not admin HTTP calls — ``clean()`` runs identically either way
+    and this is more direct.
+    """
+
+    def setUp(self) -> None:
+        self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.other_vlan = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=6)
+        self.tiny_rack = Rack.objects.create(name="Tiny Rack", slot_count=1)
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.200.1.0/27")
+        self.switch_type = _make_switch_type()
+        self.device_type = _make_device_type(port_count=1, vlan=self.vlan, name="Plain")  # span 1
+
+    def _make_spanning_type(self, vlan: VLAN | None = None, **kwargs) -> NetworkDeviceType:
+        """A span-2 type: an offset-0 and an offset-1 port on the same VLAN
+        (ADR 0017's SD12-shaped example — see ``SlotOffsetAddressingTests``).
+        """
+        vlan = vlan or self.vlan
+        kwargs.setdefault("manufacturer", "DiGiCo")
+        kwargs.setdefault("model", "SD12")
+        device_type = NetworkDeviceType.objects.create(port_count=2, **kwargs)
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type,
+            description="Control",
+            port_type=PortType.GBE_RJ45,
+            vlan=vlan,
+            slot_offset=0,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type,
+            description="Engine",
+            port_type=PortType.GBE_RJ45,
+            vlan=vlan,
+            slot_offset=1,
+        )
+        return device_type
+
+    def _make_companion_pair(self, companion_type: NetworkDeviceType | None = None) -> NetworkDeviceType:
+        companion_type = companion_type or _make_device_type(
+            port_count=1, vlan=self.other_vlan, manufacturer="Yamaha", model="DM7C", name="Companion"
+        )
+        host_type = _make_device_type(
+            port_count=1, vlan=self.vlan, manufacturer="Yamaha", model="DM7C", name="Host"
+        )
+        host_type.companion_type = companion_type
+        host_type.save()
+        return host_type
+
+    def _switch_data(self, **overrides: Any) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "switch_type": str(self.switch_type.pk),
+            "hostname": "sw",
+            "rack": str(self.rack.pk),
+            "rack_slot": "",
+            "address_materialization": "manual",
+        }
+        data.update(overrides)
+        return data
+
+    def _device_data(self, device_type: NetworkDeviceType | None = None, **overrides: Any) -> dict[str, Any]:
+        device_type = device_type or self.device_type
+        data: dict[str, Any] = {
+            "device_type": str(device_type.pk),
+            "hostname": "dev",
+            "rack": str(self.rack.pk),
+            "rack_slot": "",
+            "port_addressing": "dhcp",
+            "companion_rack_slot": "",
+            "companion_hostname": "",
+        }
+        data.update(overrides)
+        return data
+
+    # -- 2/3: a plain device/switch takes the lowest free ordinal, and the
+    # suggested value actually reaches the instance -----------------------------------
+
+    def test_plain_device_gets_lowest_free_ordinal_on_the_instance(self) -> None:
+        form = NetworkDeviceAddForm(data=self._device_data())
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.rack_slot, 1)
+
+    def test_plain_switch_gets_lowest_free_ordinal_on_the_instance(self) -> None:
+        form = NetworkSwitchAddForm(data=self._switch_data())
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.rack_slot, 1)
+
+    # -- 4: a spanning device (ADR 0017) skips a run that would overlap ----------------
+
+    def test_spanning_device_skips_a_run_that_would_overlap(self) -> None:
+        NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=1, hostname="d1")
+        NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=3, hostname="s1")
+        spanning_type = self._make_spanning_type(name="Spanner")
+        form = NetworkDeviceAddForm(data=self._device_data(device_type=spanning_type))
+        self.assertTrue(form.is_valid(), form.errors)
+        # The gap at 2 is only 1 slot wide (3 is taken) — too small for a
+        # span of 2, so the first fit is 4, not 2.
+        self.assertEqual(form.instance.rack_slot, 4)
+
+    # -- 5: an already-stored span-2 device contributes its whole range ----------------
+
+    def test_stored_spanning_device_contributes_its_whole_range(self) -> None:
+        spanning_type = self._make_spanning_type(name="Spanner2")
+        NetworkDevice.objects.create(device_type=spanning_type, rack=self.rack, rack_slot=1, hostname="span1")
+        form = NetworkSwitchAddForm(data=self._switch_data())
+        self.assertTrue(form.is_valid(), form.errors)
+        # The span-2 device at 1 occupies 1-2 — an implementation treating
+        # it as span 1 would offer 2, not 3.
+        self.assertEqual(form.instance.rack_slot, 3)
+
+    # -- 6: an operator-typed ordinal still wins ---------------------------------------
+
+    def test_typed_device_rack_slot_is_not_overwritten(self) -> None:
+        form = NetworkDeviceAddForm(data=self._device_data(rack_slot="5"))
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.rack_slot, 5)
+
+    def test_typed_switch_rack_slot_is_not_overwritten(self) -> None:
+        form = NetworkSwitchAddForm(data=self._switch_data(rack_slot="5"))
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.rack_slot, 5)
+
+    # -- 7: cross-table — a switch blocks a device's suggestion and vice versa --------
+
+    def test_switch_blocks_a_devices_suggestion(self) -> None:
+        NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=1, hostname="s1")
+        form = NetworkDeviceAddForm(data=self._device_data())
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.rack_slot, 2)
+
+    def test_device_blocks_a_switchs_suggestion(self) -> None:
+        NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=1, hostname="d1")
+        form = NetworkSwitchAddForm(data=self._switch_data())
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.rack_slot, 2)
+
+    # -- 8: companion gets the next free run after the host's, both suggested and typed;
+    # a typed companion_rack_slot is preserved -----------------------------------------
+
+    def test_companion_gets_next_free_run_after_a_suggested_host(self) -> None:
+        host_type = self._make_companion_pair()
+        form = NetworkDeviceAddForm(data=self._device_data(device_type=host_type))
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.rack_slot, 1)
+        self.assertEqual(form.instance.companion_rack_slot, 2)
+
+    def test_companion_gets_next_free_run_after_a_typed_host(self) -> None:
+        host_type = self._make_companion_pair()
+        # Typed to 1 (rather than left blank) deliberately — nothing can
+        # sit before ordinal 1, so this exercises the "host was typed"
+        # branch without the ambiguity of a mid-rack typed value, where
+        # lowest_free_run() would legitimately offer a slot *before* the
+        # host (it has no notion of "after", only "does not overlap").
+        form = NetworkDeviceAddForm(data=self._device_data(device_type=host_type, rack_slot="1"))
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.rack_slot, 1)
+        self.assertEqual(form.instance.companion_rack_slot, 2)
+
+    def test_typed_companion_rack_slot_is_preserved(self) -> None:
+        host_type = self._make_companion_pair()
+        form = NetworkDeviceAddForm(data=self._device_data(device_type=host_type, companion_rack_slot="5"))
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.rack_slot, 1)
+        self.assertEqual(form.instance.companion_rack_slot, 5)
+
+    def test_typed_companion_rack_slot_is_reserved_before_the_host_is_suggested(self) -> None:
+        # Codex review, commit 6a1af4c: the mirror of the case above — a
+        # typed *companion* ordinal must be visible to the *host* search
+        # too. Without this, an empty rack with companion_rack_slot typed
+        # at the lowest ordinal and rack_slot left blank would suggest the
+        # host onto that same ordinal, and _check_companion_creation_
+        # possible() would then correctly reject the resulting overlap —
+        # a submission that should have succeeded with the host placed
+        # elsewhere.
+        host_type = self._make_companion_pair()
+        form = NetworkDeviceAddForm(data=self._device_data(device_type=host_type, companion_rack_slot="1"))
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.companion_rack_slot, 1)
+        self.assertEqual(form.instance.rack_slot, 2)  # placed clear of the typed companion
+
+    # -- 9: a companion type whose own slot_span > 1 gets a run that size -------------
+
+    def test_companion_with_its_own_multi_slot_span_gets_a_run_that_size(self) -> None:
+        # A switch at 3 leaves a one-slot gap at 2 that's big enough for a
+        # span-1 search but not a span-2 one — on an otherwise-empty rack,
+        # a hard-coded span of 1 would land on 2 as well, so this wouldn't
+        # discriminate a real companion_type.slot_span lookup from one
+        # (Codex review, commit 6a1af4c).
+        NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=3, hostname="s1")
+        companion_type = self._make_spanning_type(vlan=self.other_vlan, name="Spanning Companion")
+        host_type = self._make_companion_pair(companion_type=companion_type)
+        form = NetworkDeviceAddForm(data=self._device_data(device_type=host_type))
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.rack_slot, 1)
+        self.assertEqual(form.instance.companion_rack_slot, 4)  # skips the gap at 2, occupies 4-5
+
+    # -- 10: a full rack errors cleanly rather than raising ----------------------------
+
+    def test_full_rack_blocks_host_and_skips_companion_entirely(self) -> None:
+        # Occupies the tiny rack's only slot with an unrelated device
+        # before the companion-declaring type is even submitted. DHCP —
+        # tiny_rack carries no RackVlanRange, so a static device couldn't
+        # materialize here at all, which isn't what this test is about.
+        blocker = NetworkDevice(
+            device_type=self.device_type, rack=self.tiny_rack, rack_slot=1, hostname="blocker"
+        )
+        blocker.port_addressing = PortAddressing.DHCP
+        blocker.save()
+        host_type = self._make_companion_pair()
+        data = self._device_data(device_type=host_type, rack=str(self.tiny_rack.pk))
+        form = NetworkDeviceAddForm(data=data)
+        self.assertFalse(form.is_valid())
+        self.assertIn("rack_slot", form.errors)
+        self.assertIn("1", form.errors["rack_slot"][0])  # names the span
+        # The companion step must not have been attempted at all (review
+        # note 1) — building a range from an unresolved host would raise,
+        # not merely add a second error.
+        self.assertNotIn("companion_rack_slot", form.errors)
+        self.assertIsNone(form.instance.rack_slot)
+
+    def test_full_rack_leaves_room_for_host_but_not_companion(self) -> None:
+        host_type = self._make_companion_pair()
+        data = self._device_data(device_type=host_type, rack=str(self.tiny_rack.pk))
+        form = NetworkDeviceAddForm(data=data)
+        self.assertFalse(form.is_valid())
+        self.assertIn("companion_rack_slot", form.errors)
+        # The host's own suggestion succeeded — review note 2: a secondary
+        # model-level (__all__) error is expected here too (the model
+        # re-derives "companion_rack_slot is required" once the field-level
+        # error above deletes it from cleaned_data), so only the specific
+        # field error is asserted, not the absence of others.
+        self.assertNotIn("rack_slot", form.errors)
+        self.assertEqual(form.instance.rack_slot, 1)
+
+    # -- 11: rack left blank suggests nothing; still valid (spare pool) ---------------
+
+    def test_blank_rack_suggests_nothing_for_a_device(self) -> None:
+        form = NetworkDeviceAddForm(data=self._device_data(rack="", rack_slot=""))
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertIsNone(form.instance.rack)
+        self.assertIsNone(form.instance.rack_slot)
+
+    def test_blank_rack_suggests_nothing_for_a_switch(self) -> None:
+        form = NetworkSwitchAddForm(data=self._switch_data(rack="", rack_slot=""))
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertIsNone(form.instance.rack)
+        self.assertIsNone(form.instance.rack_slot)
+
+    # -- 12: the ordinal-only boundary (decision 5) — a suggested-free ordinal can
+    # still be rejected by _validate_static_address ------------------------------------
+
+    def test_ordinal_only_boundary_a_free_ordinal_can_still_be_address_rejected(self) -> None:
+        device_a = NetworkDevice.objects.create(
+            device_type=self.device_type, rack=self.rack, rack_slot=1, hostname="deviceA"
+        )
+        port_a = device_a.ports.get()
+        # Edit ordinal 1's own stored address to what ordinal 2's
+        # arithmetic would produce (ADR 0003 makes addresses editable).
+        port_a.address = "10.200.1.2"
+        port_a.full_clean()
+        port_a.save()
+
+        form = NetworkDeviceAddForm(data=self._device_data(hostname="deviceB", port_addressing="static"))
+        self.assertFalse(form.is_valid())
+        # The suggestion itself succeeded — ordinal 2 is unoccupied — and
+        # landed on the instance; the rejection comes from address
+        # uniqueness, a different and later check, not from rack_slot.
+        self.assertNotIn("rack_slot", form.errors)
+        self.assertEqual(form.instance.rack_slot, 2)
+        self.assertIn("already assigned to", str(form.errors))
+
+    # -- 13: the change form is unaffected — moving equipment auto-suggests nothing --
+
+    def test_change_form_does_not_auto_suggest_on_blank_rack_slot(self) -> None:
+        rack2 = Rack.objects.create(name="Rack 2", slot_count=6)
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, rack=self.rack, rack_slot=1, hostname="mover"
+        )
+        form = NetworkDeviceChangeForm(
+            instance=device,
+            data={
+                "device_type": str(device.device_type_id),
+                "hostname": device.hostname,
+                "serial_number": device.serial_number,
+                "rack": str(rack2.pk),
+                "rack_slot": "",
+            },
+        )
+        self.assertFalse(form.is_valid())
+        self.assertIn("rack and rack_slot must both be set", str(form.errors))
+
+
+class RackSlotSuggestionAdminViewTests(TestCase):
+    """Verification 14 (ADR 0019/ADR 0020 decision 3): a deep link's query
+    parameters prefill both ``rack`` and ``rack_slot`` on the real admin add
+    view. This is plain ``ModelAdmin.get_changeform_initial_data()``
+    behaviour — nothing this plan adds — pinned here before phase 15 builds
+    a deep link on top of it. The only test in this ADR that needs the
+    admin add URL over the test client rather than ``Form(data={...})``:
+    there is no submission here to reach a bare form's ``clean()`` with.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.admin_user = User.objects.create_user("adr19admin", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="adr19admin", password="testpass123")
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=6)
+
+    def test_get_query_params_prefill_rack_and_rack_slot(self) -> None:
+        response = self.client.get(f"/admin/inventory/networkdevice/add/?rack={self.rack.pk}&rack_slot=6")
+        self.assertEqual(response.status_code, 200)
+        initial = response.context["adminform"].form.initial
+        self.assertEqual(initial.get("rack"), str(self.rack.pk))
+        self.assertEqual(initial.get("rack_slot"), "6")

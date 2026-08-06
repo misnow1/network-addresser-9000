@@ -33,7 +33,9 @@ from .models import (
     SwitchAddressing,
     SwitchPortVlanProfile,
     _get_related,
+    occupied_rack_slot_ranges,
 )
+from .suggestions import lowest_free_run
 
 
 class AuditedModelAdminMixin:
@@ -430,6 +432,70 @@ class NetworkDeviceAddForm(forms.ModelForm):
         assert device_type_field.queryset is not None  # ModelForm always sets this for an FK field
         device_type_field.queryset = device_type_field.queryset.filter(companion_of__isnull=True)
 
+    def clean(self) -> dict[str, Any]:
+        """Blank ``rack_slot``/``companion_rack_slot`` are filled in with the
+        lowest free ordinal (ADR 0019) — never overwriting a typed value.
+
+        Bails outright unless both ``rack`` and ``device_type`` cleaned: a
+        field error on either means the span needed for the search is
+        unknowable, so the ordinary field error is left to surface on its
+        own. ``companion_type_id`` is checked before ``companion_type`` so
+        an ordinary (non-companion-declaring) type costs no extra query.
+
+        A *typed* ``companion_rack_slot`` is reserved before the host is
+        searched (Codex review, commit 6a1af4c) — the mirror of how a typed
+        host ordinal is fed into the companion search below. Without this,
+        an operator who types ``companion_rack_slot`` and leaves
+        ``rack_slot`` blank could have the host suggested straight onto the
+        ordinal they just typed for the companion, which
+        ``_check_companion_creation_possible()`` would then correctly
+        reject as an overlap — a submission that should have succeeded
+        with the host placed elsewhere. The companion *search* (when it
+        runs at all) still only sees ``occupied`` plus the host's own
+        range, not this reservation too — the two are never both blank at
+        once, so there is nothing to double up.
+        """
+        cleaned_data = super().clean() or {}
+        rack = cleaned_data.get("rack")
+        device_type = cleaned_data.get("device_type")
+        if rack is None or device_type is None:
+            return cleaned_data
+        occupied = occupied_rack_slot_ranges(rack)
+        companion_type = device_type.companion_type if device_type.companion_type_id is not None else None
+        typed_companion_slot = cleaned_data.get("companion_rack_slot")
+        host_occupied = occupied
+        if companion_type is not None and typed_companion_slot is not None:
+            typed_companion_range = (
+                typed_companion_slot,
+                typed_companion_slot + companion_type.slot_span - 1,
+            )
+            host_occupied = [*occupied, typed_companion_range]
+        host_slot = cleaned_data.get("rack_slot")
+        if host_slot is None:
+            host_slot = lowest_free_run(host_occupied, device_type.slot_span, rack.slot_count)
+            if host_slot is None:
+                self.add_error(
+                    "rack_slot",
+                    f"No free rack slot for a span of {device_type.slot_span} in {rack} "
+                    f"(slot_count {rack.slot_count}).",
+                )
+                return cleaned_data  # no host range to build the companion search from
+            cleaned_data["rack_slot"] = host_slot
+        if companion_type is not None and typed_companion_slot is None:
+            host_range = (host_slot, host_slot + device_type.slot_span - 1)
+            companion_slot = lowest_free_run(
+                [*occupied, host_range], companion_type.slot_span, rack.slot_count
+            )
+            if companion_slot is None:
+                self.add_error(
+                    "companion_rack_slot",
+                    f"No free rack slot for {companion_type}'s span of {companion_type.slot_span} "
+                    f"in {rack} (slot_count {rack.slot_count}).",
+                )
+            else:
+                cleaned_data["companion_rack_slot"] = companion_slot
+        return cleaned_data
+
     def _post_clean(self) -> None:
         # `or`, not `.get(..., default)` alone — required=False means an
         # omitted/blank submission cleans to "" (present in cleaned_data, not
@@ -500,6 +566,11 @@ class NetworkSwitchAddForm(forms.ModelForm):
     (``NetworkSwitchAdmin.get_form()``); the choice has no effect after
     creation, so the change form omits it entirely rather than showing a
     field that does nothing. See ``NetworkDeviceAddForm`` — same shape.
+
+    A blank ``rack_slot`` with a chosen ``rack`` is filled in with the
+    lowest free ordinal (ADR 0019) — a switch always spans 1. This is
+    add-only, same reasoning as ``NetworkDeviceAddForm``'s: on the change
+    form, blank has no such meaning.
     """
 
     address_materialization = forms.ChoiceField(
@@ -515,6 +586,20 @@ class NetworkSwitchAddForm(forms.ModelForm):
     class Meta:
         model = NetworkSwitch
         exclude: list[str] = []
+
+    def clean(self) -> dict[str, Any]:
+        cleaned_data = super().clean() or {}
+        rack = cleaned_data.get("rack")
+        if rack is not None and cleaned_data.get("rack_slot") is None:
+            slot = lowest_free_run(occupied_rack_slot_ranges(rack), 1, rack.slot_count)
+            if slot is None:
+                self.add_error(
+                    "rack_slot",
+                    f"No free rack slot for a span of 1 in {rack} (slot_count {rack.slot_count}).",
+                )
+            else:
+                cleaned_data["rack_slot"] = slot
+        return cleaned_data
 
     def _post_clean(self) -> None:
         # `or`, not `.get(..., default)` alone — see NetworkDeviceAddForm's
