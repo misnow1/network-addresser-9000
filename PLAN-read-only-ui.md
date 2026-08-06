@@ -585,12 +585,25 @@ load-bearing:
 @registry_permission_required("detail")
 ```
 
-`list_permissions` is the spec's own `view_` codename. `detail_permissions` is that **plus
-every inline's `permissions`** plus the view codename of any model reachable through a
-`relation`/`m2m` field on the page — the same partial-privilege gap review note 5 raised for
-Stage A, which is why `relation` degrades to plain text rather than linking when the codename
-is absent. Enumerate both sets explicitly per entry; do not compute them from the field specs
-at import time, because a computed set is invisible in review.
+**Both sets follow the same rule: declare every codename the page actually reads.**
+`list_permissions` is the spec's own `view_` codename **plus the view codename of every model
+reachable through a `relation` or `m2m` column in `list_columns`** — the profile list prints
+native-VLAN and allowed-VLAN values, so it reads `VLAN` and must say so. `detail_permissions`
+is the same rule over `detail_fields`, plus every inline's `permissions`. Enumerate both sets
+explicitly per entry; do not compute them from the field specs at import time, because a
+computed set is invisible in review.
+
+`relation`'s degradation to unlinked text is about **linking, not disclosure** — the value is
+still printed either way, so it is not a substitute for holding the target's codename. It
+exists so that a page whose *own* permissions are satisfied does not emit a link the user
+would only be refused at. This mirrors what Stage A settled at `views.py:867-878`, where the
+device page's codename list was widened for exactly this reason.
+
+*(Revision 3 correction, made during the code review: this section originally read
+"`list_permissions` is the spec's own `view_` codename", which contradicts the rule stated
+everywhere else in this plan and would have let a user without `view_vlan` read VLAN names
+off the profile list. The implementation declares the wider set and is correct; this text
+was wrong.)*
 
 The audit panel is **not** in `detail_permissions`. It renders inside
 `{% if perms.auditlog.view_logentry %}`, so a user without it loses the panel rather than the
