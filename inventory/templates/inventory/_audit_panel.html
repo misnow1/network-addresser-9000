@@ -1,0 +1,36 @@
+{# Per-object audit history — shared by the rack elevation, the switch     #}
+{# parity detail page, and the device detail page (ADR 0020 decision 6).  #}
+{# Expects `audit_entries` (a list, or None when the viewer lacks the     #}
+{# permission — the view avoids the query entirely in that case) and     #}
+{# `audit_content_type_pk` in context.                                    #}
+{#                                                                        #}
+{# Gated here too, not only by the view skipping the query when absent:  #}
+{# a missing audit grant must lose only this panel, never the whole page #}
+{# it's included on (Stage B) — folding it into a page's required        #}
+{# permission set would turn a missing audit grant into a 403 on, say,   #}
+{# the rack elevation, which would be a regression against Stage A.      #}
+{% if perms.auditlog.view_logentry and audit_entries is not None %}
+  <div class="panel elevation-scroll">
+    <h2 class="panel__heading">Audit history</h2>
+    <table class="plain">
+      <thead>
+        <tr><th>Timestamp</th><th>Actor</th><th>Action</th><th>Changes</th></tr>
+      </thead>
+      <tbody>
+        {% for entry in audit_entries %}
+          <tr data-logentry-pk="{{ entry.pk }}">
+            <td>{{ entry.timestamp }}</td>
+            <td>{{ entry.actor_label }}</td>
+            <td>{{ entry.action_label }}</td>
+            <td>{% include "inventory/_changes.html" with changes=entry.changes %}</td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="4">No audit history recorded.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if audit_content_type_pk %}
+      <p><a href="{% url 'inventory:audit' %}?content_type={{ audit_content_type_pk }}">View all entries for this model</a></p>
+    {% endif %}
+  </div>
+{% endif %}

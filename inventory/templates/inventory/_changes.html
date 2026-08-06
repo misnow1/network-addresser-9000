@@ -1,0 +1,11 @@
+{# Renders one LogEntry's already-computed change rows (views.render_log_entry_changes). #}
+{# Never LogEntry.changes_display_dict() — see that function's docstring for why.        #}
+{% if changes %}
+  <ul class="audit-changes">
+    {% for change in changes %}
+      <li><span class="audit-changes__field">{{ change.field }}</span>: {{ change.text }}</li>
+    {% endfor %}
+  </ul>
+{% else %}
+  No field changes recorded.
+{% endif %}

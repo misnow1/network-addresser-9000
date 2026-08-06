@@ -1,3 +1,8 @@
+> **Revision 3** — Stage A is implemented and merged (`f70790b`, #51). This revision
+> specifies **Stage B** to the same depth, incorporating review notes from
+> `REVIEW-1-PLAN-read-only-ui-stage-b.md`. See "Review response — revision 3" for the
+> mapping. Stage A's sections are left as built, except for two corrected citations.
+>
 > **Revision 2** — incorporates review notes from `REVIEW-1-PLAN-read-only-ui.md`.
 > See "Review response" for the mapping.
 
@@ -74,6 +79,23 @@ Added in revision 2:
 12. **Every view is `@require_GET`**, and the test suite proves the UI writes nothing rather
     than asserting it in prose.
 
+Added in revision 3 (Stage B):
+
+13. **The shaped views are canonical for Rack and NetworkDevice; their generic parity URLs
+    redirect there.** The alternative — a second, complete generic detail page alongside the
+    shaped one — would make two pages the source of truth for the same object. Instead the
+    shaped page absorbs the fields it was missing. See "Canonical detail".
+14. **A runtime permission decorator, not `@permission_required`.** One view serves eight
+    models, and Stage A's decorator captures its codename list at import time. See "Access
+    control on the generic views".
+15. **The audit view renders `LogEntry.changes` and nothing else** — no object snapshots, no
+    applying today's tracking config to yesterday's rows, and its own renderer rather than
+    `changes_display_dict()`. See "Audit view".
+16. **Standard `Paginator`, page size 50, cost accepted.** Keyset pagination is the better
+    shape for an unbounded append-only table, but this is a 21-rack installation and the `no
+    JavaScript` constraint makes prev/next links the interaction either way. Recorded as a
+    deliberate trade, with the escape hatch named.
+
 ## Review response
 
 Findings from `REVIEW-1-PLAN-read-only-ui.md` (codex, `gpt-5.6`, reasoning effort high).
@@ -91,6 +113,25 @@ No P0 findings. All ten folded in; none rejected.
 | 8 [P2] Verification not executable from a fresh DB; examples use labels where routes take int pks | **Folded in.** Verification now runs `import_prod_data` first (it refuses a DB that already has a Rack) and resolves pks rather than hard-coding labels | Verification |
 | 9 [P2] Deep-link test only proves the URL resolves | **Folded in.** Test now GETs the admin add page and asserts the bound form's initial values | Tests |
 | 10 [P3] Two citations wrong — no-JS is `admin.py:539-543` not `:429-432`; audit perm is `sync_roles.py:40-45` not `:44-47` | **Folded in.** Both corrected in place (decision 5 above, Stage B audit section) | Decisions, Stage B |
+
+## Review response — revision 3 (Stage B)
+
+Findings from `REVIEW-1-PLAN-read-only-ui-stage-b.md` (codex, `gpt-5.6`, reasoning effort
+high), reviewing **Stage B only** against the merged Stage A. No P0 findings; five P1, two
+P2. All eight folded in; none rejected. Every citation was re-checked against the code
+before folding — all eight were accurate, including the `changes_display_dict()` crash,
+which was confirmed by reading the installed package.
+
+| Note | Resolution | Section |
+|---|---|---|
+| 1 [P1] Registry contract too vague — accessors, formatting, canonical URLs, query loading, pagination and permission derivation all undecided | **Folded in.** The registry is now specified as three frozen dataclasses (`FieldSpec`, `InlineSpec`, `ModelSpec`) with every key named, plus the render vocabulary, the null/choice/m2m rules, and the 404 behaviour | Stage B → The registry |
+| 2 [P1] Parity inventory doesn't match the admin — there are six inlines, not the five listed; "allowed VLANs" is a form field not an inline; RackTemplate's VLAN m2m is omitted entirely; four computed columns unaccounted for | **Folded in.** Verified every citation: `admin.py:166/691/716/738/815` are the six inlines, `:252` and `:322` are the two `ModelMultipleChoiceField`s, and `allowed_vlans_display` (`:881`), `vlans_display` (`:918`), `profile_summary` (`:766`) and `default_gateway` (`models.py:4640`) are all real. The registry now enumerates all six inlines, both m2m memberships and all four computed values explicitly | Stage B → Parity inventory |
+| 3 [P1] "Links across" to the shaped Rack/Device pages breaks parity — the device page omits port number, slot offset and the switch-port relation that the admin shows | **Folded in**, taking the recommended option as decision 13. Verified against `device_detail.html:37-64`: the port table has Description / VLAN / Type / Address / Gateway / Switch and no port number or numeric offset. The shaped page absorbs the missing fields and becomes canonical; the generic URL 301s to it | Decisions, Stage B → Canonical detail |
+| 4 [P1] A runtime per-slug permission set cannot be expressed with Stage A's `@permission_required([...])` — the list is captured at import time | **Folded in** as decision 14. Verified at `views.py:548-572`: the decorator takes a literal list. A `registry_permission_required("list"\|"detail")` decorator is now specified, innermost, with `@login_required` still outermost | Stage B → Access control on the generic views |
+| 5 [P1] Audit design neither honest nor robust — 16 tracked entries not 8, mixed `include_fields`/`exclude_fields`/`m2m_fields`, and `changes_display_dict()` crashes on a stale content type | **Folded in** as decision 15. Confirmed by reading the installed `django-auditlog` 3.4.1: `changes_display_dict` does `model = self.content_type.model_class()` then `model._meta.model` with no null guard, so it raises `AttributeError` for an uninstalled model *despite its own docstring claiming it handles that*. Scalar-vs-m2m shapes, the `SET_NULL` actor, `actor_email` and the field-scoping disclosure are all now specified | Stage B → Audit view |
+| 6 [P2] "Paginated, filterable" leaves page size, ordering, filter params, invalid-value behaviour and query loading open | **Folded in** as decision 16. Standard `Paginator` at 50/page with the `COUNT(*)` cost accepted and keyset named as the escape hatch; ordering, the three filters, invalid-value handling and `select_related` all pinned | Stage B → Audit view |
+| 7 [P1] Tests and verification insufficient for Stage B | **Folded in.** The test section is rewritten against distinctive-fixture assertions, per-codename 403s, the six audit edge cases, pagination boundaries and query budgets; `## Verification` gains a Stage B block that requires *running* the suite and reporting counts rather than inferring them — the `ADR 0015` Follow-up lesson | Stage B → Tests, Verification |
+| 8 [P2] Stage B omits navigation and its own roadmap update; spare-pool switch links still point into the admin | **Folded in.** Verified `base.html:13-20` (Index / Spare Pool / Admin only) and `spare_pool.html:21` (switch links go to `admin:inventory_networkswitch_change`). Nav gains a conditional Audit link, the index gains an "All records" panel, and the switch link is retargeted | Stage B → Navigation |
 
 ## Sequencing
 
@@ -295,9 +336,12 @@ and never reaches the suggester. The index does not offer a map link for them at
 
 Type, rack + ordinal (linked to the elevation), and the port table: description, VLAN chip,
 port type, address or `DHCP`, `derived` tag where `slot_offset > 0`, `default_gateway` (the
-read-only property at `models.py:4604` — do not recompute), and the connected switch port via
-`NetworkDevicePort.switch` (`models.py:4599`). Companion tether rendered if either side of the
+read-only property at `models.py:4640` — do not recompute), and the connected switch port via
+`NetworkDevicePort.switch` (`models.py:4634`). Companion tether rendered if either side of the
 pair is set. Deep link to `admin:inventory_networkdevice_change`.
+
+*(Revision 3 citation fix — both line numbers were off by roughly 35. Stage B extends this
+table further; see "Canonical detail".)*
 
 ### Spare pool — `spare_pool`
 
@@ -370,43 +414,356 @@ ADR 0020 decision 5 and the "Viewers leave the admin" section: a Viewer who cann
 admin and cannot see, say, switch port VLAN profiles in the new UI has lost access to data
 CONTEXT.md promises them. Parity is what keeps "Can see all data" true.
 
-## Parity, declaratively
+**Parity is measured against the admin, not against the models.** The gap the review found is
+that `admin.py` shows several values that are not fields — computed columns, two m2m
+memberships rendered as form widgets rather than inlines — and a registry built by walking
+`_meta.fields` would silently drop every one of them. The inventory below is the checklist.
 
-A module-level registry in `views.py` — model → `{list columns, detail fields, inlines,
-detail-view name}` — driven by two generic views:
+## Files
+
+| File | Change |
+|---|---|
+| `inventory/urls.py` | three routes: `model_list`, `model_detail`, `audit` |
+| `inventory/views.py` | the registry dataclasses, the registry itself, `registry_permission_required`, the two generic views, the audit view, the audit-panel helper |
+| `inventory/templates/inventory/model_list.html` | **new** |
+| `inventory/templates/inventory/model_detail.html` | **new** |
+| `inventory/templates/inventory/audit.html` | **new** |
+| `inventory/templates/inventory/_audit_panel.html` | **new** — the per-object include |
+| `inventory/templates/inventory/_changes.html` | **new** — renders one `LogEntry.changes` |
+| `inventory/templates/inventory/base.html` | nav gains a conditional Audit link |
+| `inventory/templates/inventory/index.html` | gains the "All records" panel |
+| `inventory/templates/inventory/spare_pool.html` | switch link retargeted off the admin |
+| `inventory/templates/inventory/device_detail.html` | the three missing port columns; audit panel |
+| `inventory/templates/inventory/rack_detail.html` | audit panel |
+| `inventory/static/inventory/na9k.css` | styles for the new pages, same token set |
+| `inventory/test_ui.py` | extended |
+| `ROADMAP.md` | phase 15 checkboxes at lines 142-143 |
+
+No model changes, no migration, no new dependency — same as Stage A.
+
+## Routes
 
 ```
 /models/<slug>/           inventory:model_list
 /models/<slug>/<int:pk>/  inventory:model_detail
+/audit/                   inventory:audit
 ```
 
-Eight entries: `VLAN`, `SwitchPortVlanProfile`, `RackTemplate`, `Rack`, `NetworkSwitchType`,
-`NetworkSwitch`, `NetworkDeviceType`, `NetworkDevice`, with their inlines (rack VLAN ranges,
-type ports, instance ports, switch addresses, allowed VLANs). Each entry declares **every**
-codename its page reads — including the inlines' models, which is the same partial-privilege
-gap review note 5 raised for Stage A. Two templates total.
+`<slug>` is a `str` converter matched against the registry; anything not in it is a 404, not a
+500. Detail pks stay integers (decision 9).
 
-Where a model already has a shaped view (Rack, NetworkDevice), the parity detail page links
-across to it rather than duplicating it.
+## The registry
+
+Module-level in `views.py` (decision 7 — no package split), built from three frozen
+dataclasses. This is the whole contract; nothing about a model's page is decided in a
+template.
+
+```python
+@dataclass(frozen=True)
+class FieldSpec:
+    label: str
+    accessor: str | Callable[[Any], Any]   # dotted path ("profile.native_vlan.vlan_id")
+                                           # or a pure function of the object
+    render: Literal["text", "choice", "boolean", "relation", "m2m"] = "text"
+
+@dataclass(frozen=True)
+class InlineSpec:
+    label: str                             # panel heading, e.g. "Ports"
+    accessor: str                          # reverse relation name on the parent
+    columns: tuple[FieldSpec, ...]
+    ordering: tuple[str, ...]
+    permissions: tuple[str, ...]           # the inline model's own view_ codename(s)
+
+@dataclass(frozen=True)
+class ModelSpec:
+    slug: str
+    model: type[Model]
+    label: str
+    label_plural: str
+    list_columns: tuple[FieldSpec, ...]
+    detail_fields: tuple[FieldSpec, ...]
+    inlines: tuple[InlineSpec, ...] = ()
+    canonical_detail_view: str | None = None    # e.g. "inventory:rack"
+    ordering: tuple[str, ...] = ()
+    list_select_related: tuple[str, ...] = ()
+    list_prefetch_related: tuple[str, ...] = ()
+    detail_select_related: tuple[str, ...] = ()
+    detail_prefetch_related: tuple[str, ...] = ()
+    list_permissions: tuple[str, ...] = ()
+    detail_permissions: tuple[str, ...] = ()
+```
+
+`REGISTRY: dict[str, ModelSpec]` keyed by slug, plus a derived
+`_SPEC_BY_MODEL: dict[type[Model], ModelSpec]` so a `relation` value can find the target's
+canonical URL. Build the second from the first at import time — do not hand-maintain two maps.
+
+**Render vocabulary**, fixed so templates hold no per-model logic:
+
+| `render` | Behaviour |
+|---|---|
+| `text` | `str(value)`; `None` or `""` renders `—` |
+| `choice` | the model's `get_<field>_display()`; `—` when unset |
+| `boolean` | `Yes` / `No` — never a bare `True`/`False`, and never a blank for `False` |
+| `relation` | link to the target's canonical detail URL if its model is in the registry *and* the user holds that model's view codename; otherwise plain `str(value)`. `None` renders `—` |
+| `m2m` | the related objects sorted by their natural ordering, each rendered as `relation` would, comma-joined; empty renders `—` |
+
+`accessor` resolution walks dotted attributes and returns `None` the moment any hop is
+`None` — the same defensive posture as `safe_slot_address` (Stage A): a read-only page must
+never 500 on data the write path allowed. A callable accessor is called with the object and
+must not touch the database beyond what the spec's `select_related`/`prefetch_related`
+declares.
+
+`canonical_detail_view` is the name of a shaped view; see "Canonical detail".
+
+### Parity inventory — what each entry must reproduce
+
+Checked against `admin.py` (review note 2). **Six** inlines exist, not five, and two m2m
+memberships are rendered as `ModelMultipleChoiceField`s rather than inlines, so a naive
+"inlines" sweep misses both.
+
+| Registry entry | Must include |
+|---|---|
+| `VLAN` | its own fields; `subnet` blank is legitimate (L2-only), render `—` not a crash |
+| `SwitchPortVlanProfile` | `port_mode` as `choice`; `native_vlan` as `relation`; `all_vlans_allowed` as `boolean`; **`allowed_vlans` as `m2m`** — the admin shows this via `allowed_vlans_display` (`admin.py:881`) fed by a form field at `admin.py:252`, *not* an inline |
+| `RackTemplate` | `slot_count`; **`vlans` as `m2m`** — `vlans_display` (`admin.py:918`), form field at `admin.py:322`. The revision-2 text omitted this entirely |
+| `Rack` | inline **Rack VLAN ranges** (`admin.py:166`): vlan, `address_range`. `canonical_detail_view = "inventory:rack"` |
+| `NetworkSwitchType` | inline **Type ports** (`admin.py:691`), columns exactly `port_number`, `description`, `port_type`, `profile` (`:694`) |
+| `NetworkSwitch` | inline **Addresses** (`admin.py:172`); inline **Ports** (`admin.py:738`) with columns `port_number`, `port_type`, `description`, `profile`, and **`profile_summary`** — the computed "mode, native VLAN, allowed VLANs" string at `admin.py:766`. Reuse the admin's method or extract it; do not reimplement the formatting twice |
+| `NetworkDeviceType` | inline **Type ports** (`admin.py:716`), columns exactly `port_number`, `description`, `port_type`, `vlan`, `slot_offset` (`:720`) |
+| `NetworkDevice` | inline **Ports** (`admin.py:815`) with the full declared column list at `:828` including `slot_offset` and **`default_gateway`** (`models.py:4640`). `canonical_detail_view = "inventory:device"` |
+
+`profile_summary` reads `profile.native_vlan` and `profile.allowed_vlans` per row; the admin
+guards that with `select_related("profile__native_vlan").prefetch_related(
+"profile__allowed_vlans")` (`admin.py:752-765`). The spec's `detail_prefetch_related` must
+carry the same hints or the switch detail page is an N+1 per port.
+
+### Canonical detail
+
+Decision 13. Rack and NetworkDevice already have shaped pages, and revision 2's "the parity
+detail page links across to it" left it ambiguous whether the generic page also renders the
+full field set. It must not — two pages claiming to be the record of one object is exactly
+the duplication decision 5 exists to avoid.
+
+So: when a spec declares `canonical_detail_view`, `model_detail` issues a permanent redirect
+to `reverse(canonical_detail_view, args=[pk])` before rendering anything. A redirect is still
+a read; `@require_GET` is unaffected.
+
+That makes the shaped page responsible for parity, and `device_detail.html` currently is not
+(review note 3, verified against `device_detail.html:37-64`). Its port table shows
+Description / VLAN / Type / Address / Gateway / Switch. Add:
+
+- **Port number** — `port.port_number`.
+- **Offset** — the numeric `slot_offset`. The existing `derived` badge says *that* an address
+  is derived; the admin shows *by how much*, and under ADR 0017 the offset is the whole
+  content of the derivation.
+- **Switch port**, not just the switch — the admin's inline exposes the specific
+  `NetworkDevicePort.switch_port`; the shaped page collapses it to `port.switch`
+  (`device_detail.html:60-68`). Show the port, keeping the existing rack link.
+
+The rack elevation is already at parity with `RackAdmin` (`list_display = ["name",
+"slot_count"]` plus the VLAN-range inline, all of which the elevation renders), so it needs
+no field additions — only the audit panel.
+
+### Access control on the generic views
+
+Decision 14. Stage A's pattern cannot work here: `@permission_required([...])` at
+`views.py:548-572` binds a literal list at import time, and one view now serves eight
+different permission sets. Specify a decorator:
+
+```python
+def registry_permission_required(which: Literal["list", "detail"]):
+    """Innermost decorator. Resolves <slug> to its ModelSpec, 404s an unknown
+    slug, then checks the spec's own codename set with has_perms()."""
+```
+
+raising `PermissionDenied` (→ 403) on failure. Stacking order is unchanged and still
+load-bearing:
+
+```python
+@login_required                       # outermost — logged-out gets the login redirect
+@require_GET
+@registry_permission_required("detail")
+```
+
+**Both sets follow the same rule: declare every codename the page actually reads.**
+`list_permissions` is the spec's own `view_` codename **plus the view codename of every model
+reachable through a `relation` or `m2m` column in `list_columns`** — the profile list prints
+native-VLAN and allowed-VLAN values, so it reads `VLAN` and must say so. `detail_permissions`
+is the same rule over `detail_fields`, plus every inline's `permissions`. Enumerate both sets
+explicitly per entry; do not compute them from the field specs at import time, because a
+computed set is invisible in review.
+
+`relation`'s degradation to unlinked text is about **linking, not disclosure** — the value is
+still printed either way, so it is not a substitute for holding the target's codename. It
+exists so that a page whose *own* permissions are satisfied does not emit a link the user
+would only be refused at. This mirrors what Stage A settled at `views.py:867-878`, where the
+device page's codename list was widened for exactly this reason.
+
+*(Revision 3 correction, made during the code review: this section originally read
+"`list_permissions` is the spec's own `view_` codename", which contradicts the rule stated
+everywhere else in this plan and would have let a user without `view_vlan` read VLAN names
+off the profile list. The implementation declares the wider set and is correct; this text
+was wrong.)*
+
+The audit panel is **not** in `detail_permissions`. It renders inside
+`{% if perms.auditlog.view_logentry %}`, so a user without it loses the panel rather than the
+page — folding it into the page's required set would turn a missing audit grant into a 403 on
+the rack elevation, which is a regression against Stage A.
 
 ## Audit view
 
-`/audit/` — `auditlog.LogEntry`, newest first, paginated, filterable by actor, action and
-content type. Gated on `auditlog.view_logentry`, which `sync_roles.py` already grants Viewers
-deliberately (`sync_roles.py:40-45` — "who-changed-what is part of" seeing all data).
+`/audit/` over `auditlog.LogEntry`, gated on `auditlog.view_logentry` — granted to Viewers
+deliberately at `sync_roles.py:40-45` ("who-changed-what is part of" seeing all data).
 
-Per-object history is the same query narrowed by content type + object id, included as a panel
-on the rack, switch and device pages (ADR 0020 decision 6).
+**Render `LogEntry.changes` and nothing else** (decision 15). Do not reconstruct an object
+state, and do not apply today's `AUDITLOG_INCLUDE_TRACKING_MODELS` to an old row — tracking
+config changes over time and a row records what was tracked *then*.
 
-Read `AUDITLOG_INCLUDE_TRACKING_MODELS` in `settings.py` before writing this — tracking is
-scoped per model, so some models log only a few fields and the view must not imply it is
-showing more than was recorded.
+`AUDITLOG_INCLUDE_TRACKING_MODELS` (`settings.py:263`) has **16 entries, not 8**, mixing four
+shapes: whole-model, `include_fields`, `exclude_fields`, and `m2m_fields`. The page must
+therefore carry an explicit note that field coverage is per-model and that a field's absence
+from an entry means *not tracked*, not *unchanged*. That sentence is the difference between an
+honest audit view and a misleading one.
+
+**Do not call `LogEntry.changes_display_dict()`.** Verified against the installed
+`django-auditlog` 3.4.1: it does `model = self.content_type.model_class()` and then
+`auditlog.contains(model._meta.model)` with no null check, so it raises `AttributeError` for a
+content type whose model is no longer installed — despite the comment directly above it
+claiming to "gracefully handle the case where the model no longer exists". Write a small
+renderer over `changes_dict` instead:
+
+- **scalar** — `{field: [old, new]}` → `old → new`, with `—` for `None`/`""`.
+- **m2m** — `{field: {"type": "m2m", "operation": ..., "objects": [...]}}` (`models.py:122-127`
+  in the package) → `<operation>: a, b, c`. A renderer that assumes a two-element list
+  crashes or renders garbage on every profile/template VLAN change.
+- **empty or null `changes`** — "No field changes recorded", not a blank cell.
+
+**Actor**, in order: `actor` if set → `actor_email` if set → "system or deleted actor".
+`actor` is `on_delete=SET_NULL` in the package, so a deleted user leaves rows behind and
+`actor_email` is the retained fallback — a blank column would read as "nobody did this".
+
+**Query and pagination** (decision 16): ordering `("-timestamp", "-pk")` — `-timestamp` alone
+is not a total order and pages would duplicate or skip rows across a tie. `select_related(
+"actor", "content_type")`. Django's `Paginator`, 50 per page, `COUNT(*)` cost accepted for an
+installation this size; if it ever hurts, keyset prev/next over `(timestamp, pk)` is the
+replacement and needs no template change. Budget: **a fixed number of queries per page,
+independent of page size** — the same equal-count assertion Stage A uses.
+
+**Filters**, all optional query parameters: `actor` (user pk), `action` (the `LogEntry.Action`
+integer), `content_type` (pk). A value that does not parse is ignored and the page renders a
+visible "filter ignored" note; a value that parses but matches nothing renders an empty
+result, which is a different and true statement. Populate the content-type dropdown from
+`LogEntry.objects.values_list("content_type", flat=True).distinct()` rather than from the
+registry, so a content type for a model that no longer exists stays selectable and its rows
+stay reachable.
+
+**Per-object history** is the same queryset narrowed by content type + object id
+(`LogEntry.objects.get_for_object(obj)`), rendered by the shared `_audit_panel.html` include
+on the rack elevation, the switch parity detail page and the device detail page (ADR 0020
+decision 6). Same renderer, same actor fallback, capped at the most recent 20 with a link
+through to `/audit/` filtered to that content type.
+
+## Navigation
+
+Review note 8, verified: `base.html:13-20` offers only Index, Spare Pool and Admin, and
+`spare_pool.html:21` still links switches into `admin:inventory_networkswitch_change` — which
+a Stage C Viewer cannot open.
+
+- Nav gains **Audit**, inside `{% if perms.auditlog.view_logentry %}`.
+- `index.html` gains an **All records** panel listing the eight model lists, each link shown
+  only if the user holds that spec's `list_permissions`. This is the discovery surface for
+  `/models/<slug>/`; it avoids a ninth route and keeps the nav bar short.
+- `spare_pool.html`'s switch link retargets to `inventory:model_detail` for
+  `networkswitch`. The device link already goes to `inventory:device` and stays.
 
 ## Tests
 
-Every registry entry's list and detail return 200 for a Viewer and 403 without the codename;
-each inline renders; the audit view shows a known mutation and its actor; per-object history
-filters correctly. `@require_GET` and the writes-nothing sweep extend to the new routes.
+Extending `inventory/test_ui.py` (decision 9).
+
+**Parity, with distinctive fixtures** (review note 7) — every assertion names a value that
+could only come from the right place, never merely `assertContains(response, "VLAN")`:
+
+- Each of the eight list pages renders every declared `list_column` for a fixture row.
+- Each of the six detail pages renders every declared `detail_field` and every inline column.
+- The two m2m memberships specifically: a `SwitchPortVlanProfile` with two allowed VLANs, and
+  a `RackTemplate` with two VLANs, each rendering both — these are the values a `_meta.fields`
+  walk would have dropped.
+- `profile_summary` renders mode, native VLAN and allowed VLANs for a switch port, and matches
+  what `NetworkSwitchPortInline.profile_summary` returns for the same object.
+- `default_gateway` renders on a device port, and renders `—` for a DHCP port.
+- Rack and NetworkDevice `model_detail` URLs **redirect** to their shaped views (assert the
+  redirect target, not just a 3xx).
+- The shaped device page renders port number, numeric `slot_offset` and the connected switch
+  *port* — the three fields review note 3 found missing.
+- A `relation` to a model the user lacks the codename for renders as text with no `<a href>`.
+
+**Access:**
+
+- Every new route: 200 for Viewer, Editor, Admin; redirect to `/accounts/login/` when logged
+  out (the decorator-order test); 403 for an authenticated user in no group.
+- **Per codename**: for each spec, a user granted every codename in `detail_permissions`
+  *except one* gets 403 on that detail page. This is the test that proves the sets are real
+  rather than decorative.
+- A user without `auditlog.view_logentry` gets 403 on `/audit/` but **200** on the rack
+  elevation, with no audit panel rendered — the regression guard for the decision above.
+- Unknown slug → 404. Unknown pk → 404. Neither is a 500.
+- POST/PUT/PATCH/DELETE to every new route → 405.
+- The Stage A **writes-nothing sweep is extended to every new route**: row counts of every
+  inventory model *and* `auditlog.LogEntry` unchanged across a full GET sweep as an Admin.
+
+**Audit edge cases** — one test each, because each is a live crash path:
+
+- a scalar change; an m2m change; a `LogEntry` with `changes` null/empty;
+- an entry whose `actor` was deleted (assert the `actor_email` fallback, then the "system or
+  deleted actor" string when both are absent);
+- an entry whose `content_type` points at a model not in the registry — construct it directly
+  and assert 200, which is the `changes_display_dict()` crash this view exists to avoid;
+- a field-scoped model (`NetworkSwitch`, `include_fields`) shows only its tracked fields and
+  the page carries the coverage note.
+
+**Pagination and filters:**
+
+- 51 entries across two pages: no row appears twice and none is missing, asserted by pk set
+  union — this is what the `-pk` tiebreak is for.
+- Each filter narrows correctly; an unparseable `action=banana` renders 200 with the note.
+- Per-object history returns only that object's entries, with a decoy object of the same
+  content type carrying its own entries.
+
+**Query budgets:** equal query counts for a 2-row and a 50-row list page, for each of the
+eight; equal counts for a detail page whose inline has 2 rows versus 50; equal counts for the
+audit page at 10 versus 50 entries.
+
+## Verification (Stage B)
+
+Run the commands in the shared `## Verification` section below (it follows Stage C), then — as
+an authenticated Editor in the admin —
+**make a real mutation** (rename a rack, add a VLAN to a rack template) and confirm it appears
+both in `/audit/` and in the per-object panel on that object's page, with the right actor.
+Nothing else proves the audit trail is wired to the thing it claims to record.
+
+Then walk all eight `/models/<slug>/` lists and one detail page each against the corresponding
+admin changelist open in another tab. The two must not disagree. Check specifically:
+
+- the `SwitchPortVlanProfile` list's allowed-VLAN column against `allowed_vlans_display`;
+- a switch's port inline against the admin's `profile_summary` column;
+- `/models/rack/1/` and `/models/networkdevice/1/` land on the shaped pages.
+
+**Report the actual numbers.** Run the suite and lint and report what they printed; do not
+predict them from the diff. `docs/adr/0015-minimum-rack-block-size.md:107` keeps a wrong
+five-failing-test prediction on the page permanently, on purpose, as the record of what that
+mistake costs.
+
+## Definition of done (Stage B)
+
+- Full suite green against the recorded baseline; `pre-commit run --all-files` clean.
+- All six inlines, both m2m memberships and all four computed values from the parity
+  inventory rendered and asserted.
+- The per-codename 403 tests, the audit edge-case tests and the query budgets present and
+  passing.
+- `ROADMAP.md:142-143` ticked — read-parity and the audit view. **Line 144 (the Viewer flip)
+  stays open**; it is Stage C's, and ticking it here would claim the phase is finished.
+- The PR body names decision 13 (shaped pages made canonical, generic detail redirects) as a
+  change to how Stage A's device page renders, so it is not discovered in review.
 
 ---
 

@@ -32,13 +32,16 @@ import io
 import ipaddress
 import re
 
+from auditlog.context import set_actor
 from auditlog.models import LogEntry
 from django.apps import apps
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.contrib.auth.models import User as DjangoUser
+from django.contrib.contenttypes.models import ContentType
 from django.core.management import call_command
 from django.db import connection
+from django.db.models import Q
 from django.test import TestCase
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
@@ -51,12 +54,22 @@ from .models import (
     NetworkSwitch,
     NetworkSwitchType,
     NetworkSwitchTypePort,
+    PortMode,
     PortType,
     Rack,
+    RackTemplate,
     RackVlanRange,
+    SwitchPortVlanProfile,
+    switch_port_profile_summary,
 )
 from .suggestions import suggest_rack_vlan_range, suggest_slot_address
-from .views import resolve_slot_spans, safe_slot_address
+from .views import (
+    REGISTRY,
+    _content_type_for_model_no_create,
+    _object_audit_panel_context,
+    resolve_slot_spans,
+    safe_slot_address,
+)
 
 User = get_user_model()
 
@@ -147,6 +160,239 @@ def _cell_states(row_html: str) -> list[str]:
     an encoding, not just that the encoding appears somewhere in the row.
     """
     return re.findall(r'<td class="cell cell-(\w+)"', row_html)
+
+
+def _clean_text(raw_html: str) -> str:
+    """Inner text of an HTML fragment — tags stripped, whitespace
+    collapsed — so a rendered value can be compared exactly whether the
+    template wrapped it in ``<a>`` or not.
+    """
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", raw_html)).strip()
+
+
+def _detail_field_text(content: str, label: str) -> str:
+    """The rendered value for one ``model_detail.html`` "Fields" row, keyed
+    by its ``<th>`` label — coordinates, not presence (review note 7):
+    proves *which* field rendered *what*, so a column silently dropped
+    from ``ModelSpec.detail_fields`` fails loudly here instead of a
+    presence check elsewhere passing by accident. Raises if no such field
+    row exists, which is itself the failure a dropped column should
+    produce.
+    """
+    match = re.search(rf"<th>{re.escape(label)}</th>\s*<td>(.*?)</td>", content, re.DOTALL)
+    if match is None:
+        raise AssertionError(f"no detail field row found for label {label!r}")
+    return _clean_text(match.group(1))
+
+
+def _list_row_cells(content: str, row_marker: str) -> list[str]:
+    """Every ``<td>`` in the ``model_list.html`` row containing
+    ``row_marker`` (a value unique to that row), stripped and in column
+    order — the trailing "Details" link cell is *not* stripped off here;
+    callers compare against ``column_labels`` plus one.
+    """
+    for row in re.findall(r"<tr>(.*?)</tr>", content, re.DOTALL):
+        if row_marker in row:
+            return [_clean_text(cell) for cell in re.findall(r"<td>(.*?)</td>", row, re.DOTALL)]
+    raise AssertionError(f"no list row found containing {row_marker!r}")
+
+
+def _inline_row_cells(content: str, panel_heading: str, row_marker: str) -> list[str]:
+    """Every ``<td>`` in the row containing ``row_marker``, scoped to the
+    ``model_detail.html`` inline panel titled ``panel_heading`` — scoped
+    so two inlines with similarly-shaped rows (e.g. both an "Addresses"
+    and a "Ports" panel showing a VLAN column) can't be confused for one
+    another.
+    """
+    panel_match = re.search(
+        rf'<h2 class="panel__heading">{re.escape(panel_heading)}</h2>(.*?)</table>', content, re.DOTALL
+    )
+    if panel_match is None:
+        raise AssertionError(f"no inline panel found for heading {panel_heading!r}")
+    for row in re.findall(r"<tr>(.*?)</tr>", panel_match.group(1), re.DOTALL):
+        if row_marker in row:
+            return [_clean_text(cell) for cell in re.findall(r"<td>(.*?)</td>", row, re.DOTALL)]
+    raise AssertionError(f"no row found in inline panel {panel_heading!r} containing {row_marker!r}")
+
+
+def _audit_row_cells(content: str, row_marker: str) -> list[str]:
+    """Cells of one ``audit.html``/``_audit_panel.html`` row, the row
+    containing ``row_marker`` — like ``_list_row_cells``, but matching
+    ``<tr data-logentry-pk="...">`` (every audit row carries that
+    attribute; ``_list_row_cells``'s bare ``<tr>`` wouldn't match it).
+    Column order: Timestamp, Actor, Action, Model, Object, Changes.
+    """
+    for row in re.findall(r"<tr[^>]*>(.*?)</tr>", content, re.DOTALL):
+        if row_marker in row:
+            return [_clean_text(cell) for cell in re.findall(r"<td>(.*?)</td>", row, re.DOTALL)]
+    raise AssertionError(f"no audit row found containing {row_marker!r}")
+
+
+def _permission_for(codename: str) -> Permission:
+    """``codename`` is an ``"app_label.codename"`` string, exactly the
+    shape every ``ModelSpec.list_permissions``/``detail_permissions``
+    entry is written in — the same lookup ``registry_permission_required``
+    itself performs via ``has_perms()``.
+    """
+    app_label, name = codename.split(".", 1)
+    return Permission.objects.get(codename=name, content_type__app_label=app_label)
+
+
+def _user_missing_codename(codename: str) -> DjangoUser:
+    """A staff user holding every ``inventory.view_*`` codename plus
+    ``auditlog.view_logentry``, except ``codename`` — the minimal way to
+    prove a page's declared codename set is a real floor (Stage A's
+    ``PartialGrantAccessTests._user_missing`` does the same for the four
+    shaped views; this is its Stage B counterpart, generalised over both
+    apps' view codenames since the registry's ``detail_permissions`` sets
+    span both).
+    Idempotent by ``codename`` — several registry entries share the same
+    required codename (``view_vlan`` alone appears in five of them), and
+    ``test_detail_requires_every_declared_codename`` calls this once per
+    (spec, codename) pair, so a second call for the same codename reuses
+    rather than re-creates the user (which is also the *correct* fixture:
+    the same missing-exactly-this-codename grant must 403 every spec that
+    declares it).
+    """
+    all_view_perms = Permission.objects.filter(
+        Q(content_type__app_label="inventory", codename__startswith="view_")
+        | Q(content_type__app_label="auditlog", codename="view_logentry")
+    )
+    missing = _permission_for(codename)
+    user, _ = User.objects.get_or_create(username=f"missing-{missing.codename}", defaults={"is_staff": True})
+    user.set_password("testpass123")
+    user.save()
+    user.user_permissions.set(all_view_perms.exclude(pk=missing.pk))
+    return user
+
+
+class ParityFixtureMixin:
+    """One of everything the Stage B registry covers, with distinctive
+    values throughout (review note 7 — every assertion below names a
+    value that could only come from the right place, never a bare
+    ``assertContains(response, "VLAN")``). Shared by every Stage B test
+    class below rather than rebuilt per class, following Stage A's own
+    per-class ``setUp`` pattern but factored out since Stage B's fixture
+    is large and used by five different test classes.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()  # type: ignore[misc]
+        call_command("sync_roles", stdout=io.StringIO())
+
+        # vlan_id/port_number/rack_slot values are deliberately chosen so
+        # none of them is a substring of any other rendered value on the
+        # same page (review note 7, sharpened by Codex review's "presence-
+        # only" finding) — e.g. vlan_id 4077 shares no digits with subnet
+        # "10.210.0.0/21" or default_gateway "10.210.0.1", so a test can
+        # assert the VLAN ID column specifically rendered rather than
+        # merely that *a* string containing similar digits appears.
+        self.vlan_native = VLAN.objects.create(
+            name="StageB Native",
+            vlan_id=4077,
+            subnet="10.210.0.0/21",
+            default_gateway="10.210.0.1",
+            dhcp_range_start="10.210.0.50",
+            dhcp_range_end="10.210.0.99",
+        )
+        self.vlan_allowed_1 = VLAN.objects.create(
+            name="StageB Allowed One", vlan_id=4078, subnet="10.211.0.0/21"
+        )
+        self.vlan_allowed_2 = VLAN.objects.create(
+            name="StageB Allowed Two", vlan_id=4079, subnet="10.212.0.0/21"
+        )
+
+        self.profile = SwitchPortVlanProfile.objects.create(
+            name="StageB Profile", port_mode=PortMode.TRUNK, native_vlan=self.vlan_native
+        )
+        self.profile.allowed_vlans.set([self.vlan_allowed_1, self.vlan_allowed_2])
+
+        self.rack_template = RackTemplate.objects.create(name="StageB Template", slot_count=12)
+        self.rack_template.vlans.set([self.vlan_allowed_1, self.vlan_allowed_2])
+
+        self.rack = Rack.objects.create(name="StageB Rack", slot_count=10)
+        self.rack_vlan_range = RackVlanRange.objects.create(
+            rack=self.rack, vlan=self.vlan_native, address_range="10.210.1.0/27"
+        )
+
+        self.switch_type = NetworkSwitchType.objects.create(
+            manufacturer="StageB Switch Mfr", model="SBSwitchModel", name="StageB Switch Type", port_count=1
+        )
+        NetworkSwitchTypePort.objects.create(
+            switch_type=self.switch_type,
+            # port_number must be a contiguous 1..port_count sequence
+            # (_validate_switch_type_port_profile) — unlike device type
+            # ports, this can't be an arbitrary distinctive number, so
+            # the description carries the distinctiveness instead.
+            port_number=1,
+            description="StageB Switch Port Desc",
+            port_type=PortType.GBE_RJ45,
+            profile=self.profile,
+        )
+        self.switch = NetworkSwitch.objects.create(
+            switch_type=self.switch_type,
+            rack=self.rack,
+            rack_slot=3,
+            hostname="stageb-switch1",
+            serial_number="SBSW001",
+            dhcp_server_enabled=True,
+        )
+        self.switch_port = self.switch.ports.get()
+        self.switch_address = self.switch.addresses.get()
+
+        self.device_type = NetworkDeviceType.objects.create(
+            manufacturer="StageB Device Mfr", model="SBDeviceModel", name="StageB Device Type", port_count=1
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=self.device_type,
+            port_number=7,
+            description="StageB Device Port",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_native,
+            slot_offset=0,
+        )
+        self.device = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=5,
+            hostname="stageb-device1",
+            serial_number="SBDEV001",
+        )
+        self.device_port = self.device.ports.get()
+        self.device_port.switch_port = self.switch_port
+        self.device_port.save()
+
+        # Unracked — materializes DHCP (ADR 0013), for the "default_gateway
+        # renders — for a DHCP port" assertion.
+        self.dhcp_device = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname="stageb-dhcp-device"
+        )
+        self.dhcp_device_port = self.dhcp_device.ports.get()
+
+        self.admin_user = User.objects.create_user("stageb-admin", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.viewer = User.objects.create_user("stageb-viewer", password="testpass123", is_staff=True)
+        self.viewer.groups.add(Group.objects.get(name="Viewer"))
+        self.editor = User.objects.create_user("stageb-editor", password="testpass123", is_staff=True)
+        self.editor.groups.add(Group.objects.get(name="Editor"))
+        self.no_group = User.objects.create_user("stageb-nogroup", password="testpass123", is_staff=False)
+
+        self.pk_by_slug = {
+            "vlan": self.vlan_native.pk,
+            "switchportvlanprofile": self.profile.pk,
+            "racktemplate": self.rack_template.pk,
+            "rack": self.rack.pk,
+            "networkswitchtype": self.switch_type.pk,
+            "networkswitch": self.switch.pk,
+            "networkdevicetype": self.device_type.pk,
+            "networkdevice": self.device.pk,
+        }
+
+    def _list_url(self, slug: str) -> str:
+        return reverse("inventory:model_list", args=[slug])
+
+    def _detail_url(self, slug: str) -> str:
+        return reverse("inventory:model_detail", args=[slug, self.pk_by_slug[slug]])
 
 
 class UIAccessControlTests(TestCase):
@@ -324,6 +570,9 @@ class PartialGrantAccessTests(TestCase):
                 "view_rack",
                 "view_networkdeviceport",
                 "view_networkswitch",
+                # Stage B's port table renders the connected switch port,
+                # not just the switch (Codex review, Stage B pass).
+                "view_networkswitchport",
             ],
         )
 
@@ -374,6 +623,13 @@ class WritesNothingTests(TestCase):
         )
         self.spare_device = NetworkDevice.objects.create(device_type=self.device_type, hostname="spare1")
 
+        # Stage B fixtures — one of every other registered model, so the
+        # sweep below actually exercises all eight /models/<slug>/ list
+        # pages and the six non-redirecting detail pages, not just the
+        # four models Stage A already had fixtures for.
+        self.profile = SwitchPortVlanProfile.objects.create(name="WN Profile", native_vlan=self.vlan)
+        self.rack_template = RackTemplate.objects.create(name="WN Template", slot_count=5)
+
         self.admin_user = User.objects.create_user("adminrole", password="testpass123", is_staff=True)
         self.admin_user.groups.add(Group.objects.get(name="Admin"))
         self.client.login(username="adminrole", password="testpass123")
@@ -386,6 +642,24 @@ class WritesNothingTests(TestCase):
             f"/devices/{self.device.pk}/",
             f"/devices/{self.spare_device.pk}/",
             "/spares/",
+            "/audit/",
+            "/audit/?actor=&action=&content_type=",
+            "/models/vlan/",
+            f"/models/vlan/{self.vlan.pk}/",
+            "/models/switchportvlanprofile/",
+            f"/models/switchportvlanprofile/{self.profile.pk}/",
+            "/models/racktemplate/",
+            f"/models/racktemplate/{self.rack_template.pk}/",
+            "/models/rack/",
+            f"/models/rack/{self.rack.pk}/",  # redirects — still a GET, still no write
+            "/models/networkswitchtype/",
+            f"/models/networkswitchtype/{self.switch_type.pk}/",
+            "/models/networkswitch/",
+            f"/models/networkswitch/{self.switch.pk}/",
+            "/models/networkdevicetype/",
+            f"/models/networkdevicetype/{self.device_type.pk}/",
+            "/models/networkdevice/",
+            f"/models/networkdevice/{self.device.pk}/",  # redirects too
         ]
         # ``_default_manager``, not ``.objects`` — every model in this app
         # defines the latter, but iterating over apps.get_models()' generic
@@ -395,10 +669,25 @@ class WritesNothingTests(TestCase):
         inventory_models = list(apps.get_app_config("inventory").get_models())
         before = {model: model._default_manager.count() for model in inventory_models}
         log_entries_before = LogEntry.objects.count()
+        # ContentType and Permission are Django's own create-on-read
+        # tables — ContentType.objects.get_for_model() (and, transitively,
+        # auditlog's LogEntry.objects.get_for_object(), which the Stage B
+        # audit panel used to call) is documented to create the row on a
+        # cache miss. A row-count sweep over just the eight inventory
+        # models and LogEntry — the original shape of this test — could
+        # not have caught that: every registered model's ContentType row
+        # already exists by the time any test runs (Django's post_migrate
+        # signal creates one per model), so the create-on-miss branch
+        # never actually fired here, and the hole went unnoticed until an
+        # independent review found it by reading the library's own
+        # docstring rather than by running this suite (Codex review).
+        # These two counts are what closes that gap for good.
+        content_types_before = ContentType.objects.count()
+        permissions_before = Permission.objects.count()
 
         with CaptureQueriesContext(connection) as ctx:
             for url in routes:
-                self.assertEqual(self.client.get(url).status_code, 200, url)
+                self.assertIn(self.client.get(url).status_code, (200, 301), url)
 
         disallowed_statements = [
             q["sql"] for q in ctx.captured_queries if not _is_allowed_readonly_sql(q["sql"])
@@ -412,6 +701,12 @@ class WritesNothingTests(TestCase):
         for model in inventory_models:
             self.assertEqual(model._default_manager.count(), before[model], model.__name__)
         self.assertEqual(LogEntry.objects.count(), log_entries_before)
+        self.assertEqual(
+            ContentType.objects.count(), content_types_before, "sweep must not create ContentType rows"
+        )
+        self.assertEqual(
+            Permission.objects.count(), permissions_before, "sweep must not create Permission rows"
+        )
 
 
 class ElevationEncodingTests(TestCase):
@@ -923,6 +1218,115 @@ class QueryBudgetTests(TestCase):
         self.assertEqual(big_response.status_code, 200)
         self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
 
+    def test_model_list_query_count_independent_of_row_count(self) -> None:
+        """Stage B: every one of the eight ``/models/<slug>/`` list pages
+        must cost the same number of queries whether it lists 2 rows or
+        50 — proof the declared ``list_select_related``/
+        ``list_prefetch_related`` hints actually eliminate the N+1 a naive
+        per-row relation/m2m render would otherwise be (review note 2's
+        equal-count discipline, applied to the parity registry). Each
+        slug is measured in isolation (its own small/big object sets),
+        since REGISTRY entries are independent models.
+        """
+        native_vlan = VLAN.objects.create(name="QB Native VLAN", vlan_id=290, subnet="10.290.0.0/24")
+        switch_type = NetworkSwitchType.objects.create(
+            manufacturer="QB", model="M", name="QB Switch Type", port_count=0
+        )
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="QB", model="M", name="QB Device Type", port_count=0
+        )
+
+        factories = {
+            "vlan": lambda i: VLAN.objects.create(name=f"QB VLAN {i}", vlan_id=2000 + i),
+            "switchportvlanprofile": lambda i: SwitchPortVlanProfile.objects.create(
+                name=f"QB Profile {i}", native_vlan=native_vlan
+            ),
+            "racktemplate": lambda i: RackTemplate.objects.create(name=f"QB Template {i}"),
+            "rack": lambda i: Rack.objects.create(name=f"QB Rack {i}", slot_count=1),
+            "networkswitchtype": lambda i: NetworkSwitchType.objects.create(
+                manufacturer="QB", model="M", name=f"QB SwitchType {i}", port_count=0
+            ),
+            "networkswitch": lambda i: NetworkSwitch.objects.create(
+                switch_type=switch_type, hostname=f"qb-switch-{i}"
+            ),
+            "networkdevicetype": lambda i: NetworkDeviceType.objects.create(
+                manufacturer="QB", model="M", name=f"QB DeviceType {i}", port_count=0
+            ),
+            "networkdevice": lambda i: NetworkDevice.objects.create(
+                device_type=device_type, hostname=f"qb-device-{i}"
+            ),
+        }
+        self.assertEqual(set(factories), set(REGISTRY), "every registry slug needs a query-budget factory")
+
+        for slug, make in factories.items():
+            for i in range(2):
+                make(i)
+            with CaptureQueriesContext(connection) as small_ctx:
+                small_response = self.client.get(f"/models/{slug}/")
+            for i in range(2, 50):
+                make(i)
+            with CaptureQueriesContext(connection) as big_ctx:
+                big_response = self.client.get(f"/models/{slug}/")
+
+            self.assertEqual(small_response.status_code, 200, slug)
+            self.assertEqual(big_response.status_code, 200, slug)
+            self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries), slug)
+
+    def test_networkswitchtype_detail_query_count_independent_of_inline_row_count(self) -> None:
+        """Stage B: the inline row count on a parity detail page must not
+        change the query count either — the same discipline as the
+        elevation/vlan-map tests above, now for
+        ``ModelSpec.detail_prefetch_related``.
+        """
+        small_type = NetworkSwitchType.objects.create(
+            manufacturer="QB", model="M", name="QB Small Switch Type", port_count=2
+        )
+        for n in range(1, 3):
+            NetworkSwitchTypePort.objects.create(
+                switch_type=small_type, port_number=n, port_type=PortType.GBE_RJ45
+            )
+
+        big_type = NetworkSwitchType.objects.create(
+            manufacturer="QB", model="M", name="QB Big Switch Type", port_count=60
+        )
+        for n in range(1, 61):
+            NetworkSwitchTypePort.objects.create(
+                switch_type=big_type, port_number=n, port_type=PortType.GBE_RJ45
+            )
+
+        with CaptureQueriesContext(connection) as small_ctx:
+            small_response = self.client.get(f"/models/networkswitchtype/{small_type.pk}/")
+        with CaptureQueriesContext(connection) as big_ctx:
+            big_response = self.client.get(f"/models/networkswitchtype/{big_type.pk}/")
+
+        self.assertEqual(small_response.status_code, 200)
+        self.assertEqual(big_response.status_code, 200)
+        self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
+
+    def test_audit_query_count_independent_of_total_entry_count(self) -> None:
+        """Stage B decision 16: a fixed number of queries per audit page,
+        independent of how many total ``LogEntry`` rows exist — the
+        ``Paginator``'s own ``COUNT(*)`` cost scales with row count in
+        runtime, not in query *count*, which is what this locks in.
+        """
+        vlan = VLAN.objects.create(name="QB Audit VLAN", vlan_id=291, subnet="10.291.0.0/24")
+        for i in range(10):
+            vlan.name = f"QB Audit VLAN rename {i}"
+            vlan.save()
+
+        with CaptureQueriesContext(connection) as small_ctx:
+            small_response = self.client.get("/audit/")
+        self.assertEqual(small_response.status_code, 200)
+
+        for i in range(10, 60):
+            vlan.name = f"QB Audit VLAN rename {i}"
+            vlan.save()
+
+        with CaptureQueriesContext(connection) as big_ctx:
+            big_response = self.client.get("/audit/")
+        self.assertEqual(big_response.status_code, 200)
+        self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
+
 
 class DeepLinkTests(TestCase):
     """A deep link's target form is actually prefilled, not merely
@@ -946,3 +1350,593 @@ class DeepLinkTests(TestCase):
         initial = response.context["adminform"].form.initial
         self.assertEqual(str(initial.get("rack")), str(self.rack.pk))
         self.assertEqual(str(initial.get("rack_slot")), "6")
+
+
+# ---------------------------------------------------------------------------
+# Stage B — read-parity and the audit trail
+# ---------------------------------------------------------------------------
+
+
+class ParityAccessTests(ParityFixtureMixin, TestCase):
+    """The same access-control discipline Stage A proved for the four
+    shaped views — ``login_required`` outermost (a logged-out visitor
+    redirects, doesn't 403), ``require_GET`` (every write verb refused),
+    and a real permission floor — now for the three Stage B routes.
+    """
+
+    def _routes(self) -> list[str]:
+        routes = ["/audit/"]
+        for slug in REGISTRY:
+            routes.append(self._list_url(slug))
+            routes.append(self._detail_url(slug))
+        return routes
+
+    def test_every_route_200_or_redirect_for_all_three_roles(self) -> None:
+        canonical_slugs = {slug for slug, spec in REGISTRY.items() if spec.canonical_detail_view}
+        for username in ["stageb-viewer", "stageb-editor", "stageb-admin"]:
+            self.client.login(username=username, password="testpass123")
+            for slug in REGISTRY:
+                self.assertEqual(
+                    self.client.get(self._list_url(slug)).status_code, 200, f"{username} {slug} list"
+                )
+                expected = 301 if slug in canonical_slugs else 200
+                self.assertEqual(
+                    self.client.get(self._detail_url(slug)).status_code, expected, f"{username} {slug} detail"
+                )
+            self.assertEqual(self.client.get("/audit/").status_code, 200, f"{username} audit")
+            self.client.logout()
+
+    def test_unprivileged_user_gets_403(self) -> None:
+        self.client.login(username="stageb-nogroup", password="testpass123")
+        for url in self._routes():
+            self.assertEqual(self.client.get(url).status_code, 403, url)
+
+    def test_logged_out_redirects_to_login(self) -> None:
+        for url in self._routes():
+            response = self.client.get(url)
+            self.assertEqual(response.status_code, 302, url)
+            self.assertTrue(response["Location"].startswith("/accounts/login/"), response["Location"])
+
+    def test_post_put_patch_delete_return_405_for_every_route(self) -> None:
+        self.client.login(username="stageb-admin", password="testpass123")
+        for url in self._routes():
+            self.assertEqual(self.client.post(url).status_code, 405, f"POST {url}")
+            self.assertEqual(self.client.put(url).status_code, 405, f"PUT {url}")
+            self.assertEqual(self.client.patch(url).status_code, 405, f"PATCH {url}")
+            self.assertEqual(self.client.delete(url).status_code, 405, f"DELETE {url}")
+
+    def test_unknown_slug_is_404_not_500(self) -> None:
+        self.client.login(username="stageb-admin", password="testpass123")
+        self.assertEqual(self.client.get("/models/nonexistent/").status_code, 404)
+        self.assertEqual(self.client.get("/models/nonexistent/1/").status_code, 404)
+
+    def test_unknown_pk_is_404_not_500(self) -> None:
+        self.client.login(username="stageb-admin", password="testpass123")
+        for slug in REGISTRY:
+            self.assertEqual(self.client.get(f"/models/{slug}/999999/").status_code, 404, slug)
+
+    def test_rack_and_networkdevice_model_detail_redirect_to_shaped_view(self) -> None:
+        # Decision 13 — assert the *target*, not merely a 3xx (review note 3).
+        self.client.login(username="stageb-admin", password="testpass123")
+        rack_response = self.client.get(self._detail_url("rack"))
+        self.assertEqual(rack_response.status_code, 301)
+        self.assertEqual(rack_response["Location"], reverse("inventory:rack", args=[self.rack.pk]))
+
+        device_response = self.client.get(self._detail_url("networkdevice"))
+        self.assertEqual(device_response.status_code, 301)
+        self.assertEqual(device_response["Location"], reverse("inventory:device", args=[self.device.pk]))
+
+    def test_audit_nav_link_present_only_with_permission(self) -> None:
+        self.client.login(username="stageb-viewer", password="testpass123")
+        self.assertContains(self.client.get("/"), 'href="/audit/"')
+        self.client.logout()
+
+        no_audit_user = _user_missing_codename("auditlog.view_logentry")
+        self.client.login(username=no_audit_user.username, password="testpass123")
+        self.assertNotContains(self.client.get("/"), 'href="/audit/"')
+
+    def test_missing_audit_permission_403s_audit_but_not_rack_elevation(self) -> None:
+        # The regression guard review note 8 exists for: a missing audit
+        # grant must lose only the panel, never the whole page it's
+        # included on.
+        no_audit_user = _user_missing_codename("auditlog.view_logentry")
+        self.client.login(username=no_audit_user.username, password="testpass123")
+        self.assertEqual(self.client.get("/audit/").status_code, 403)
+        rack_response = self.client.get(f"/racks/{self.rack.pk}/")
+        self.assertEqual(rack_response.status_code, 200)
+        self.assertNotContains(rack_response, "Audit history")
+
+    def test_content_type_lookup_never_creates_a_missing_row(self) -> None:
+        """Codex review: ``ContentType.objects.get_for_model()`` — and,
+        transitively, ``LogEntry.objects.get_for_object()``, which the
+        audit panel used to call — creates the row on a cache miss. Every
+        registered model's row already exists by the time any test runs
+        (``post_migrate`` creates one per model), so the writes-nothing
+        sweep's row-count check never actually exercised that branch —
+        this test forces the miss directly.
+
+        Deliberately a direct call, not a hit against a live page: a
+        page's own model's ``ContentType`` row backs that model's
+        ``Permission`` rows too (``Permission.content_type`` is
+        ``on_delete=CASCADE``), so deleting Rack's row to force the miss
+        would also delete ``view_rack`` and 403 the request for an
+        unrelated reason — masking exactly the behaviour this test exists
+        to check.
+        """
+        content_type_pk = ContentType.objects.get_for_model(Rack).pk
+        ContentType.objects.filter(pk=content_type_pk).delete()
+        ContentType.objects.clear_cache()
+        before = ContentType.objects.count()
+
+        self.assertIsNone(_content_type_for_model_no_create(Rack))
+        self.assertEqual(ContentType.objects.count(), before, "a pure lookup must never create a row")
+
+        entries, resolved_content_type_pk = _object_audit_panel_context(self.rack, self.admin_user)
+        self.assertEqual(entries, [])
+        self.assertIsNone(resolved_content_type_pk)
+        self.assertEqual(
+            ContentType.objects.count(), before, "the panel context builder must not create a row"
+        )
+
+
+class PartialGrantParityAccessTests(ParityFixtureMixin, TestCase):
+    """For every registry entry, a user granted every codename in
+    ``detail_permissions`` except one is refused that entry's detail page
+    — the test that proves the declared sets are real, not decorative
+    (Stage A's ``PartialGrantAccessTests`` does the same for the four
+    shaped views).
+    """
+
+    def test_detail_requires_every_declared_codename(self) -> None:
+        for slug, spec in REGISTRY.items():
+            for codename in spec.detail_permissions:
+                user = _user_missing_codename(codename)
+                self.client.login(username=user.username, password="testpass123")
+                response = self.client.get(self._detail_url(slug))
+                self.assertEqual(response.status_code, 403, f"{slug} without {codename}")
+                self.client.logout()
+
+
+class ParityContentTests(ParityFixtureMixin, TestCase):
+    """Read-parity content, asserted with distinctive fixture values
+    (review note 7) — never a bare ``assertContains(response, "VLAN")``.
+
+    Every test below checks the *exact* rendered cell/field sequence for
+    one row, via ``_list_row_cells``/``_detail_field_text``/
+    ``_inline_row_cells``, rather than merely that some expected substring
+    appears anywhere on the page. That distinction is load-bearing (Codex
+    review): a presence-only check can't tell "this column rendered its
+    real value" from "this column was silently dropped and something else
+    on the page happens to contain a similar string" — booleans especially
+    (a missing boolean column and a ``False`` one read identically under
+    ``assertContains``).
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.client.login(username="stageb-admin", password="testpass123")
+
+    def test_vlan_list_renders_every_declared_column(self) -> None:
+        response = self.client.get(self._list_url("vlan"))
+        cells = _list_row_cells(response.content.decode(), "StageB Native")
+        self.assertEqual(
+            cells,
+            ["StageB Native", "4077", "10.210.0.0/21", "10.210.0.1", "10.210.0.50", "10.210.0.99", "Details"],
+        )
+
+    def test_vlan_detail_renders_every_declared_field(self) -> None:
+        response = self.client.get(self._detail_url("vlan"))
+        content = response.content.decode()
+        self.assertEqual(_detail_field_text(content, "Name"), "StageB Native")
+        self.assertEqual(_detail_field_text(content, "VLAN ID"), "4077")
+        self.assertEqual(_detail_field_text(content, "Subnet"), "10.210.0.0/21")
+        self.assertEqual(_detail_field_text(content, "Default gateway"), "10.210.0.1")
+        self.assertEqual(_detail_field_text(content, "DHCP start"), "10.210.0.50")
+        self.assertEqual(_detail_field_text(content, "DHCP end"), "10.210.0.99")
+
+    def test_switchportvlanprofile_renders_every_declared_column(self) -> None:
+        # The value a naive `_meta.fields` walk would have dropped
+        # entirely — allowed_vlans is a form field in the admin, not a
+        # model field or an inline (review note 2) — and the two booleans
+        # Codex flagged as under-tested (a missing boolean column and a
+        # False one look identical under a presence check).
+        allowed_text = "StageB Allowed One (VLAN 4078), StageB Allowed Two (VLAN 4079)"
+        list_response = self.client.get(self._list_url("switchportvlanprofile"))
+        self.assertEqual(
+            _list_row_cells(list_response.content.decode(), "StageB Profile"),
+            ["StageB Profile", "Trunk", "StageB Native (VLAN 4077)", "No", allowed_text, "No", "Details"],
+        )
+
+        detail_response = self.client.get(self._detail_url("switchportvlanprofile"))
+        content = detail_response.content.decode()
+        self.assertEqual(_detail_field_text(content, "Name"), "StageB Profile")
+        self.assertEqual(_detail_field_text(content, "Port mode"), "Trunk")
+        self.assertEqual(_detail_field_text(content, "Native VLAN"), "StageB Native (VLAN 4077)")
+        self.assertEqual(_detail_field_text(content, "All VLANs allowed"), "No")
+        self.assertEqual(_detail_field_text(content, "Allowed VLANs"), allowed_text)
+        self.assertEqual(_detail_field_text(content, "System profile"), "No")
+
+    def test_racktemplate_renders_every_declared_column(self) -> None:
+        vlans_text = "StageB Allowed One (VLAN 4078), StageB Allowed Two (VLAN 4079)"
+        list_response = self.client.get(self._list_url("racktemplate"))
+        self.assertEqual(
+            _list_row_cells(list_response.content.decode(), "StageB Template"),
+            ["StageB Template", "12", vlans_text, "Details"],
+        )
+
+        detail_response = self.client.get(self._detail_url("racktemplate"))
+        content = detail_response.content.decode()
+        self.assertEqual(_detail_field_text(content, "Name"), "StageB Template")
+        self.assertEqual(_detail_field_text(content, "Slot count"), "12")
+        self.assertEqual(_detail_field_text(content, "VLANs"), vlans_text)
+
+    def test_rack_list_renders_every_declared_column_and_detail_redirects(self) -> None:
+        list_response = self.client.get(self._list_url("rack"))
+        self.assertEqual(
+            _list_row_cells(list_response.content.decode(), "StageB Rack"),
+            ["StageB Rack", "10", "Details"],
+        )
+        detail_response = self.client.get(self._detail_url("rack"))
+        self.assertEqual(detail_response.status_code, 301)
+
+    def test_networkswitchtype_renders_every_declared_column_and_inline(self) -> None:
+        list_response = self.client.get(self._list_url("networkswitchtype"))
+        self.assertEqual(
+            _list_row_cells(list_response.content.decode(), "StageB Switch Type"),
+            ["StageB Switch Mfr", "SBSwitchModel", "StageB Switch Type", "1", "Details"],
+        )
+
+        detail_response = self.client.get(self._detail_url("networkswitchtype"))
+        content = detail_response.content.decode()
+        self.assertEqual(_detail_field_text(content, "Manufacturer"), "StageB Switch Mfr")
+        self.assertEqual(_detail_field_text(content, "Model"), "SBSwitchModel")
+        self.assertEqual(_detail_field_text(content, "Name"), "StageB Switch Type")
+        self.assertEqual(_detail_field_text(content, "Port count"), "1")
+        self.assertEqual(
+            _inline_row_cells(content, "Type ports", "StageB Switch Port Desc"),
+            ["1", "StageB Switch Port Desc", "1GbE RJ45 (copper)", "StageB Profile"],
+        )
+
+    def test_networkswitch_renders_every_declared_column_and_both_inlines(self) -> None:
+        switch_type_text = "StageB Switch Mfr SBSwitchModel — StageB Switch Type"
+        list_response = self.client.get(self._list_url("networkswitch"))
+        self.assertEqual(
+            _list_row_cells(list_response.content.decode(), "stageb-switch1"),
+            ["stageb-switch1", switch_type_text, "SBSW001", "StageB Rack", "3", "Yes", "Details"],
+        )
+
+        detail_response = self.client.get(self._detail_url("networkswitch"))
+        content = detail_response.content.decode()
+        self.assertEqual(_detail_field_text(content, "Hostname"), "stageb-switch1")
+        self.assertEqual(_detail_field_text(content, "Type"), switch_type_text)
+        self.assertEqual(_detail_field_text(content, "Serial number"), "SBSW001")
+        self.assertEqual(_detail_field_text(content, "Rack"), "StageB Rack")
+        self.assertEqual(_detail_field_text(content, "Rack slot"), "3")
+        self.assertEqual(_detail_field_text(content, "DHCP server"), "Yes")
+
+        # Addresses inline — the switch's materialized static address on the racked VLAN.
+        assert self.switch_address.address is not None  # materialized (rack + RackVlanRange), never DHCP
+        self.assertEqual(
+            _inline_row_cells(content, "Addresses", self.switch_address.address),
+            ["StageB Native (VLAN 4077)", self.switch_address.address],
+        )
+        # Ports inline — profile_summary must match switch_port_profile_summary()
+        # exactly (review note 2's "reuse, do not reimplement the formatting twice").
+        expected_summary = switch_port_profile_summary(self.switch_port)
+        self.assertEqual(
+            _inline_row_cells(content, "Ports", "StageB Switch Port Desc"),
+            ["1", "1GbE RJ45 (copper)", "StageB Switch Port Desc", "StageB Profile", expected_summary],
+        )
+
+    def test_networkdevicetype_renders_every_declared_column_and_inline(self) -> None:
+        list_response = self.client.get(self._list_url("networkdevicetype"))
+        self.assertEqual(
+            _list_row_cells(list_response.content.decode(), "StageB Device Type"),
+            ["StageB Device Mfr", "SBDeviceModel", "StageB Device Type", "1", "—", "Details"],
+        )
+
+        detail_response = self.client.get(self._detail_url("networkdevicetype"))
+        content = detail_response.content.decode()
+        self.assertEqual(_detail_field_text(content, "Manufacturer"), "StageB Device Mfr")
+        self.assertEqual(_detail_field_text(content, "Model"), "SBDeviceModel")
+        self.assertEqual(_detail_field_text(content, "Name"), "StageB Device Type")
+        self.assertEqual(_detail_field_text(content, "Port count"), "1")
+        self.assertEqual(_detail_field_text(content, "Companion type"), "—")  # no companion declared
+        self.assertEqual(
+            _inline_row_cells(content, "Type ports", "StageB Device Port"),
+            ["7", "StageB Device Port", "1GbE RJ45 (copper)", "StageB Native (VLAN 4077)", "0"],
+        )
+
+    def test_networkdevice_list_renders_every_declared_column_and_detail_redirects(self) -> None:
+        device_type_text = "StageB Device Mfr SBDeviceModel — StageB Device Type"
+        list_response = self.client.get(self._list_url("networkdevice"))
+        self.assertEqual(
+            _list_row_cells(list_response.content.decode(), "stageb-device1"),
+            ["stageb-device1", device_type_text, "SBDEV001", "StageB Rack", "5", "—", "Details"],
+        )
+        detail_response = self.client.get(self._detail_url("networkdevice"))
+        self.assertEqual(detail_response.status_code, 301)
+
+    def test_device_shaped_page_renders_every_port_column(self) -> None:
+        # The three columns review note 3 found missing from Stage A's
+        # device page — port number, the numeric slot_offset, and the
+        # connected switch *port*, not just the switch — checked here by
+        # exact cell value, not merely that the column header exists.
+        response = self.client.get(f"/devices/{self.device.pk}/")
+        self.device_port.refresh_from_db()
+        cells = _list_row_cells(response.content.decode(), "StageB Device Port")
+        self.assertEqual(
+            cells,
+            [
+                "StageB Device Port",
+                "7",
+                "VLAN 4077",
+                "1GbE RJ45 (copper)",
+                "0",
+                self.device_port.address,
+                "10.210.0.1",
+                str(self.switch_port),
+            ],
+        )
+
+    def test_default_gateway_renders_and_dash_for_dhcp(self) -> None:
+        racked_response = self.client.get(f"/devices/{self.device.pk}/")
+        racked_cells = _list_row_cells(racked_response.content.decode(), "StageB Device Port")
+        self.assertEqual(racked_cells[5], self.device_port.address)  # Address column
+        self.assertEqual(racked_cells[6], "10.210.0.1")  # Gateway column
+
+        dhcp_response = self.client.get(f"/devices/{self.dhcp_device.pk}/")
+        self.assertTrue(self.dhcp_device_port.is_dhcp)
+        dhcp_cells = _list_row_cells(dhcp_response.content.decode(), "StageB Device Port")
+        self.assertEqual(dhcp_cells[5], "DHCP")  # Address column — DHCP-configured
+        self.assertEqual(dhcp_cells[6], "—")  # Gateway column — None while DHCP
+
+    def test_relation_without_codename_renders_as_text_not_link(self) -> None:
+        # Every registry list/detail page requires the codename of every
+        # relation it renders (so a user who can reach the page always
+        # has permission to link from it) — the one place the "degrade to
+        # plain text" branch is actually reachable is the audit trail,
+        # whose own required permission (auditlog.view_logentry) is
+        # independent of any inventory model's view_ codename.
+        self.vlan_native.name = "StageB Native Renamed"
+        self.vlan_native.save()
+        user = _user_missing_codename("inventory.view_vlan")
+        self.client.login(username=user.username, password="testpass123")
+        response = self.client.get("/audit/")
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode()
+        self.assertIn("StageB Native Renamed", content)
+        self.assertNotIn(f'href="/models/vlan/{self.vlan_native.pk}/"', content)
+
+    def test_spare_pool_switch_link_targets_model_detail(self) -> None:
+        spare_switch = NetworkSwitch.objects.create(
+            switch_type=self.switch_type, hostname="stageb-spare-switch"
+        )
+        response = self.client.get("/spares/")
+        self.assertContains(response, f'href="/models/networkswitch/{spare_switch.pk}/"')
+
+
+class AuditTrailTests(TestCase):
+    """One test per live crash path (decision 15) — each of these is a
+    real ``django-auditlog`` shape this view must survive without a 500.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.admin_user = User.objects.create_user("audit-admin", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="audit-admin", password="testpass123")
+
+    def test_scalar_change_renders_old_arrow_new(self) -> None:
+        vlan = VLAN.objects.create(name="Audit Original Name", vlan_id=220, subnet="10.220.0.0/24")
+        vlan.name = "Audit Renamed"
+        vlan.save()
+        response = self.client.get("/audit/")
+        self.assertContains(response, "Audit Original Name → Audit Renamed")
+
+    def test_m2m_change_renders_operation_and_objects(self) -> None:
+        vlan_a = VLAN.objects.create(name="Audit M2M A", vlan_id=221, subnet="10.221.0.0/24")
+        template = RackTemplate.objects.create(name="Audit Template")
+        template.vlans.add(vlan_a)
+        response = self.client.get("/audit/")
+        # One combined, exact string — "add" and str(vlan_a) checked
+        # separately would each pass even if the m2m renderer only ever
+        # produced one of the two ("add" is also common English word risk
+        # on a page with an "All" filter option).
+        self.assertContains(response, f"add: {vlan_a}")
+
+    def test_null_or_empty_changes_renders_no_field_changes_recorded(self) -> None:
+        content_type = ContentType.objects.get_for_model(VLAN)
+        LogEntry.objects.create(
+            content_type=content_type,
+            object_pk="1",
+            object_id=1,
+            object_repr="Audit Empty Changes",
+            action=LogEntry.Action.ACCESS,
+            changes=None,
+        )
+        response = self.client.get("/audit/")
+        self.assertContains(response, "No field changes recorded")
+
+    def test_deleted_actor_falls_back_to_actor_email_then_system(self) -> None:
+        actor = User.objects.create_user("audit-actor-to-delete", password="testpass123")
+        content_type = ContentType.objects.get_for_model(VLAN)
+        entry_with_email = LogEntry.objects.create(
+            content_type=content_type,
+            object_pk="2",
+            object_id=2,
+            object_repr="Audit Deleted Actor With Email",
+            action=LogEntry.Action.UPDATE,
+            actor=actor,
+            actor_email="deleted-actor@example.com",
+        )
+        entry_without_email = LogEntry.objects.create(
+            content_type=content_type,
+            object_pk="3",
+            object_id=3,
+            object_repr="Audit Deleted Actor No Email",
+            action=LogEntry.Action.UPDATE,
+            actor=actor,
+        )
+        actor.delete()  # actor is SET_NULL — both rows survive with actor_id now NULL
+        entry_with_email.refresh_from_db()
+        entry_without_email.refresh_from_db()
+        self.assertIsNone(entry_with_email.actor_id)
+
+        response = self.client.get("/audit/")
+        content = response.content.decode()
+        # Tied to each row specifically (not just "somewhere on the
+        # page") — a renderer that always fell back to one of the two
+        # strings regardless of which row it was rendering would still
+        # pass a bare assertContains of both strings.
+        self.assertEqual(
+            _audit_row_cells(content, "Audit Deleted Actor With Email")[1], "deleted-actor@example.com"
+        )
+        self.assertEqual(
+            _audit_row_cells(content, "Audit Deleted Actor No Email")[1], "system or deleted actor"
+        )
+
+    def test_unregistered_content_type_renders_200_not_the_changes_display_dict_crash(self) -> None:
+        # LogEntry.changes_display_dict() would raise AttributeError here
+        # (model_class() is None, then .content_type.model_class()._meta
+        # fails) — this view's own renderer must not.
+        ghost_content_type = ContentType.objects.create(app_label="inventory", model="ghostmodel")
+        LogEntry.objects.create(
+            content_type=ghost_content_type,
+            object_pk="4",
+            object_id=4,
+            object_repr="A Ghost Object",
+            action=LogEntry.Action.CREATE,
+            changes={"name": ["old", "new"]},
+        )
+        response = self.client.get("/audit/")
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "A Ghost Object")
+
+    def test_field_scoped_model_shows_only_tracked_fields_and_coverage_note(self) -> None:
+        # NetworkSwitch is tracked with include_fields=["rack", "rack_slot",
+        # "created_at"] (settings.py:263) — hostname/serial_number changes
+        # are simply not tracked at all, which the page must say plainly.
+        switch_type = _make_switch_type(port_count=0)
+        switch = NetworkSwitch.objects.create(switch_type=switch_type, hostname="Audit Switch Original")
+        switch_content_type = ContentType.objects.get_for_model(NetworkSwitch)
+        count_after_create = LogEntry.objects.filter(
+            content_type=switch_content_type, object_id=switch.pk
+        ).count()
+
+        switch.hostname = "Audit Switch Renamed"
+        switch.save()
+
+        # hostname isn't in NetworkSwitch's include_fields, so this rename
+        # produces no *new* LogEntry at all (auditlog only writes an
+        # UPDATE row when a tracked field actually changed) — the coverage
+        # note on the page is what keeps that silence from reading as
+        # "nothing changed" rather than "this field isn't tracked".
+        count_after_rename = LogEntry.objects.filter(
+            content_type=switch_content_type, object_id=switch.pk
+        ).count()
+        self.assertEqual(count_after_create, count_after_rename)
+
+        response = self.client.get("/audit/")
+        self.assertContains(response, "Tracked fields differ by model")
+
+
+class AuditPaginationFilterTests(TestCase):
+    """Pagination boundaries (decision 16's ``-pk`` tiebreak), the three
+    filters, and per-object history's own narrowing.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.admin_user = User.objects.create_user("audit-pg-admin", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="audit-pg-admin", password="testpass123")
+
+    def test_51_entries_across_two_pages_no_duplicate_no_missing(self) -> None:
+        vlan = VLAN.objects.create(name="Pagination VLAN", vlan_id=230, subnet="10.230.0.0/24")
+        for i in range(51):
+            vlan.name = f"Pagination VLAN rename {i}"
+            vlan.save()
+        all_entries = list(
+            LogEntry.objects.filter(content_type=ContentType.objects.get_for_model(VLAN), object_id=vlan.pk)
+        )
+        self.assertEqual(len(all_entries), 52)  # the create + 51 renames
+
+        page1 = self.client.get("/audit/")
+        page2 = self.client.get("/audit/?page=2")
+        self.assertEqual(page1.status_code, 200)
+        self.assertEqual(page2.status_code, 200)
+        pks_1 = set(re.findall(r"data-logentry-pk=\"(\d+)\"", page1.content.decode()))
+        pks_2 = set(re.findall(r"data-logentry-pk=\"(\d+)\"", page2.content.decode()))
+        self.assertEqual(pks_1 & pks_2, set())
+        self.assertEqual(len(pks_1), 50)
+        self.assertGreaterEqual(len(pks_2), 2)
+
+    def test_each_filter_narrows_correctly(self) -> None:
+        # A negative control per filter (Codex review — the previous
+        # version of this test only ever checked that the wanted entry was
+        # present, which the *unfiltered* page would satisfy too; removing
+        # the filter entirely would have kept it green): a second actor,
+        # and a different content type, each of which must disappear when
+        # filtered against.
+        other_user = User.objects.create_user("audit-pg-other", password="testpass123", is_staff=True)
+
+        vlan_a = VLAN.objects.create(name="Filter VLAN A", vlan_id=231, subnet="10.231.0.0/24")
+        VLAN.objects.create(name="Filter VLAN B", vlan_id=232, subnet="10.232.0.0/24")
+        # auditlog only attaches an actor via its middleware, which reads
+        # the current request's user — a plain save() outside a request
+        # cycle has no request to read, so the actor filter needs
+        # set_actor() to get a non-null actor onto this LogEntry at all.
+        with set_actor(actor=self.admin_user):
+            vlan_a.name = "Filter VLAN Renamed By Admin"
+            vlan_a.save()
+        with set_actor(actor=other_user):
+            vlan_a.name = "Filter VLAN Renamed By Other"
+            vlan_a.save()
+        Rack.objects.create(name="Filter Rack Decoy", slot_count=3)  # a different content type entirely
+
+        actor_response = self.client.get(f"/audit/?actor={self.admin_user.pk}")
+        self.assertContains(actor_response, "Filter VLAN Renamed By Admin")
+        self.assertNotContains(actor_response, "Filter VLAN Renamed By Other")  # a different actor
+
+        action_response = self.client.get(f"/audit/?action={LogEntry.Action.CREATE}")
+        self.assertContains(action_response, "Filter VLAN B")
+        self.assertNotContains(action_response, "Filter VLAN Renamed By Admin")  # an UPDATE, not a CREATE
+        self.assertNotContains(action_response, "Filter VLAN Renamed By Other")
+
+        content_type_pk = ContentType.objects.get_for_model(VLAN).pk
+        content_type_response = self.client.get(f"/audit/?content_type={content_type_pk}")
+        self.assertContains(content_type_response, "Filter VLAN Renamed By Admin")
+        self.assertContains(content_type_response, "Filter VLAN B")
+        self.assertNotContains(content_type_response, "Filter Rack Decoy")  # a different content type
+
+    def test_unparseable_filter_value_renders_200_with_note(self) -> None:
+        response = self.client.get("/audit/?action=banana")
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Ignored unrecognised filter value")
+
+    def test_per_object_history_returns_only_that_objects_entries(self) -> None:
+        switch_type = _make_switch_type(port_count=1)
+        rack = Rack.objects.create(name="Panel Rack", slot_count=5)
+        switch = NetworkSwitch.objects.create(
+            switch_type=switch_type, rack=rack, rack_slot=1, hostname="panel-switch"
+        )
+        decoy = NetworkSwitch.objects.create(
+            switch_type=switch_type, rack=rack, rack_slot=2, hostname="panel-decoy"
+        )
+        switch.rack_slot = 1  # touch a tracked field so a fresh UPDATE LogEntry exists
+        switch.dhcp_server_enabled = True
+        switch.save()
+        decoy.dhcp_server_enabled = True
+        decoy.save()
+
+        response = self.client.get(f"/models/networkswitch/{switch.pk}/")
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode()
+        self.assertIn("panel-switch", content)
+        # The panel is per-object — the decoy's own LogEntry pk must not
+        # leak onto this page even though it shares the same content type.
+        decoy_entry = LogEntry.objects.filter(
+            content_type=ContentType.objects.get_for_model(NetworkSwitch), object_id=decoy.pk
+        ).latest("timestamp")
+        self.assertNotIn(f'data-logentry-pk="{decoy_entry.pk}"', content)

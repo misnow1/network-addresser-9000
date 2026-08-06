@@ -34,6 +34,7 @@ from .models import (
     SwitchPortVlanProfile,
     _get_related,
     occupied_rack_slot_ranges,
+    switch_port_profile_summary,
 )
 from .suggestions import lowest_free_run
 
@@ -765,13 +766,9 @@ class NetworkSwitchPortInline(admin.TabularInline):
 
     @admin.display(description="Profile config")
     def profile_summary(self, obj: NetworkSwitchPort) -> str:
-        profile = obj.profile
-        mode = profile.get_port_mode_display()
-        if profile.all_vlans_allowed:
-            return f"{mode}, all VLANs allowed"
-        allowed = ", ".join(str(vlan.vlan_id) for vlan in profile.allowed_vlans.all())
-        summary = f"{mode}, native {profile.native_vlan.vlan_id}"
-        return f"{summary}, allowed {allowed}" if allowed else summary
+        # Shared with the read-only UI's generic parity page (phase 15
+        # Stage B) — see switch_port_profile_summary()'s docstring.
+        return switch_port_profile_summary(obj)
 
     def has_add_permission(self, request: HttpRequest, obj: Any = None) -> bool:
         return False

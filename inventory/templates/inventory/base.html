@@ -13,6 +13,9 @@
       <div class="na9k-nav__links">
         <a href="{% url 'inventory:index' %}">Index</a>
         <a href="{% url 'inventory:spares' %}">Spare Pool</a>
+        {% if perms.auditlog.view_logentry %}
+          <a href="{% url 'inventory:audit' %}">Audit</a>
+        {% endif %}
         {% if request.user.is_staff %}
           {# The admin link renders only for is_staff — a Viewer, per ADR 0020 decision 8, #}
           {# is never offered a door that will refuse them. #}

@@ -1,0 +1,89 @@
+{% extends "inventory/base.html" %}
+
+{% block title %}Audit trail — Network Addresser 9000{% endblock %}
+
+{% block content %}
+  <h1>Audit trail</h1>
+
+  <div class="panel">
+    {# Stage B decision 15: field coverage is per-model (AUDITLOG_INCLUDE_TRACKING_MODELS #}
+    {# mixes whole-model, include_fields, exclude_fields, and m2m_fields shapes), so a     #}
+    {# field's absence from an entry means it wasn't tracked, not that it was unchanged.   #}
+    <p>Tracked fields differ by model — a field missing from a row below was not tracked
+      at the time, not left unchanged.</p>
+  </div>
+
+  <form method="get" class="panel audit-filters">
+    <label>
+      Actor
+      <select name="actor">
+        <option value="">All</option>
+        {% for choice in actor_choices %}
+          <option value="{{ choice.pk }}"{% if actor_param == choice.pk|stringformat:"s" %} selected{% endif %}>{{ choice.username }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      Action
+      <select name="action">
+        <option value="">All</option>
+        {% for value, label in action_choices %}
+          <option value="{{ value }}"{% if action_param == value|stringformat:"s" %} selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      Model
+      <select name="content_type">
+        <option value="">All</option>
+        {% for choice in content_type_choices %}
+          <option value="{{ choice.pk }}"{% if content_type_param == choice.pk|stringformat:"s" %} selected{% endif %}>{{ choice }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <button type="submit">Filter</button>
+  </form>
+
+  {% if ignored_filters %}
+    <div class="panel">
+      <p>Ignored unrecognised filter value{{ ignored_filters|length|pluralize }} for:
+        {{ ignored_filters|join:", " }}.</p>
+    </div>
+  {% endif %}
+
+  <div class="panel elevation-scroll">
+    <table class="plain">
+      <thead>
+        <tr><th>Timestamp</th><th>Actor</th><th>Action</th><th>Model</th><th>Object</th><th>Changes</th></tr>
+      </thead>
+      <tbody>
+        {% for entry in entries %}
+          <tr data-logentry-pk="{{ entry.pk }}">
+            <td>{{ entry.timestamp }}</td>
+            <td>{{ entry.actor_label }}</td>
+            <td>{{ entry.action_label }}</td>
+            <td>{{ entry.content_type_label }}</td>
+            <td>
+              {% if entry.object_url %}<a href="{{ entry.object_url }}">{{ entry.object_label }}</a>{% else %}{{ entry.object_label }}{% endif %}
+            </td>
+            <td>{% include "inventory/_changes.html" with changes=entry.changes %}</td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="6">No audit entries match this filter.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if page_obj.has_other_pages %}
+    <nav class="pagination">
+      {% if page_obj.has_previous %}
+        <a href="?{{ querystring_prefix }}page={{ page_obj.previous_page_number }}">Previous</a>
+      {% endif %}
+      <span class="tile__meta">Page {{ page_obj.number }} of {{ page_obj.paginator.num_pages }}</span>
+      {% if page_obj.has_next %}
+        <a href="?{{ querystring_prefix }}page={{ page_obj.next_page_number }}">Next</a>
+      {% endif %}
+    </nav>
+  {% endif %}
+{% endblock %}

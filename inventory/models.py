@@ -2642,6 +2642,29 @@ class NetworkSwitchPort(AuditedModel):
         return NetworkDevicePort.objects.filter(switch_port_id=self.pk).exists()
 
 
+def switch_port_profile_summary(port: "NetworkSwitchPort") -> str:
+    """The "Profile config" computed column — mode, native VLAN, and (for a
+    trunk) the allowed VLANs — read off ``port.profile``.
+
+    Module-level and not a method on either caller, so the admin's
+    ``NetworkSwitchPortInline.profile_summary`` and the read-only UI's
+    generic parity page (``inventory/views.py``, phase 15 Stage B) share one
+    implementation rather than risking two independently-drifting copies of
+    the same formatting rule (``PLAN-read-only-ui.md`` Stage B: "do not
+    reimplement the formatting twice"). Callers are responsible for their
+    own query shaping — this reads ``port.profile``,
+    ``profile.native_vlan``, and ``profile.allowed_vlans`` and does not
+    prefetch anything itself.
+    """
+    profile = port.profile
+    mode = profile.get_port_mode_display()
+    if profile.all_vlans_allowed:
+        return f"{mode}, all VLANs allowed"
+    allowed = ", ".join(str(vlan.vlan_id) for vlan in profile.allowed_vlans.all())
+    summary = f"{mode}, native {profile.native_vlan.vlan_id}"
+    return f"{summary}, allowed {allowed}" if allowed else summary
+
+
 class NetworkDeviceType(AuditedModel):
     """A device make/model *profile* (ADR 0010) — see ``NetworkSwitchType``
     for what "profile" means here. E.g. "Martin Audio IK-42 — with Dante

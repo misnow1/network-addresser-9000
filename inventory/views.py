@@ -34,15 +34,21 @@ with partial grants must not see data it lacks the codename for.
 
 import ipaddress
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from functools import wraps
+from typing import Any, Literal
 from urllib.parse import urlencode
 
+from auditlog.models import LogEntry
+from django.contrib.auth import get_user_model
 from django.contrib.auth.decorators import login_required, permission_required
-from django.core.exceptions import ObjectDoesNotExist, ValidationError
-from django.db.models import Count, Max, Prefetch, Q
-from django.http import HttpRequest, HttpResponse
-from django.shortcuts import get_object_or_404, render
+from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ObjectDoesNotExist, PermissionDenied, ValidationError
+from django.core.paginator import Paginator
+from django.db.models import Count, Max, Model, Prefetch, Q
+from django.http import Http404, HttpRequest, HttpResponse
+from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.views.decorators.http import require_GET
 
@@ -50,14 +56,22 @@ from .models import (
     VLAN,
     NetworkDevice,
     NetworkDevicePort,
+    NetworkDeviceType,
     NetworkDeviceTypePort,
     NetworkSwitch,
     NetworkSwitchAddress,
+    NetworkSwitchPort,
+    NetworkSwitchType,
     Rack,
+    RackTemplate,
     RackVlanRange,
+    SwitchPortVlanProfile,
+    switch_port_profile_summary,
 )
 from .suggestions import suggest_rack_vlan_range, suggest_slot_address
 from .validators import validate_ipv4_cidr
+
+User = get_user_model()
 
 
 def safe_slot_address(range_cidr: str, ordinal: int) -> str | None:
@@ -593,6 +607,14 @@ def rack_detail(request: HttpRequest, pk: int) -> HttpResponse:
     count independent of how many switches/devices the rack holds, which
     ``test_ui.py`` locks in by asserting equal counts for a 2-device and a
     50-device rack.
+
+    This is already the canonical ``Rack`` page (Stage B decision 13): the
+    generic parity route for ``Rack`` redirects here rather than rendering
+    a second field list — ``RackAdmin``'s own ``list_display``
+    (``name``/``slot_count``) plus its VLAN-range inline are both already
+    on screen, so nothing needed adding except the audit-history panel
+    (Stage B), which renders at the bottom when the viewer holds
+    ``auditlog.view_logentry``.
     """
     vlan_range_qs = RackVlanRange.objects.select_related("vlan").order_by("vlan__vlan_id")
     switch_qs = NetworkSwitch.objects.select_related("switch_type").prefetch_related(
@@ -615,7 +637,15 @@ def rack_detail(request: HttpRequest, pk: int) -> HttpResponse:
     devices = list(rack.devices.all())
     spans = resolve_slot_spans(devices)
     rows = _build_elevation_rows(rack, columns, switches, devices, spans)
-    return render(request, "inventory/rack_detail.html", {"rack": rack, "columns": columns, "rows": rows})
+    audit_entries, audit_content_type_pk = _object_audit_panel_context(rack, request.user)
+    context = {
+        "rack": rack,
+        "columns": columns,
+        "rows": rows,
+        "audit_entries": audit_entries,
+        "audit_content_type_pk": audit_content_type_pk,
+    }
+    return render(request, "inventory/rack_detail.html", context)
 
 
 # ---------------------------------------------------------------------------
@@ -847,17 +877,32 @@ def vlan_map(request: HttpRequest, pk: int) -> HttpResponse:
         "inventory.view_rack",
         "inventory.view_networkdeviceport",
         "inventory.view_networkswitch",
+        # Stage B's port table renders the specific connected switch
+        # *port* (``port.switch_port``), not just the switch it belongs
+        # to — the same class of gap the comment above already names once:
+        # a field this page reads that its own codename list didn't yet
+        # declare (Codex review, Stage B pass).
+        "inventory.view_networkswitchport",
     ],
     raise_exception=True,
 )
 def device_detail(request: HttpRequest, pk: int) -> HttpResponse:
     """Type, rack position (linked to the elevation), and the full port
-    table — description, VLAN, port type, address or DHCP, a ``derived``
-    tag where ``slot_offset > 0`` (ADR 0017), ``default_gateway`` (read
-    live off the port's VLAN, ``models.py:4604`` — never recomputed here),
-    and the connected switch via ``NetworkDevicePort.switch``
-    (``models.py:4599``). The companion tether (ADR 0018) renders if
-    either half of the pair is set.
+    table — port number, description, VLAN, port type, the numeric
+    ``slot_offset`` (Stage B — the admin's inline shows *by how much* an
+    address is derived, ADR 0017, not just *that* it is), address or DHCP,
+    a ``derived`` tag where ``slot_offset > 0``, ``default_gateway`` (read
+    live off the port's VLAN, ``models.py:4640`` — never recomputed here),
+    and the connected switch **port** (Stage B — not just the switch, per
+    ``NetworkDevicePort.switch_port``) via ``switch_port__switch``. The
+    companion tether (ADR 0018) renders if either half of the pair is set.
+
+    This is the *canonical* device page (Stage B decision 13): the generic
+    parity route for ``NetworkDevice`` redirects here rather than rendering
+    a second, competing field list, so any field the admin shows that this
+    page doesn't render yet is a real gap, not a duplicate source of truth.
+    An audit-history panel (Stage B) renders at the bottom when the viewer
+    holds ``auditlog.view_logentry``.
     """
     device = get_object_or_404(
         NetworkDevice.objects.select_related("device_type", "rack", "host").prefetch_related(
@@ -871,12 +916,15 @@ def device_detail(request: HttpRequest, pk: int) -> HttpResponse:
         ),
         pk=pk,
     )
+    audit_entries, audit_content_type_pk = _object_audit_panel_context(device, request.user)
     context = {
         "device": device,
         "ports": list(device.ports.all()),
         "tether": _tether_for(device),
         "admin_change_url": reverse("admin:inventory_networkdevice_change", args=[device.pk]),
         "rack_url": reverse("inventory:rack", args=[device.rack_id]) if device.rack_id else None,
+        "audit_entries": audit_entries,
+        "audit_content_type_pk": audit_content_type_pk,
     }
     return render(request, "inventory/device_detail.html", context)
 
@@ -937,6 +985,14 @@ def index(request: HttpRequest) -> HttpResponse:
     counts — every tile links into one of the four shaped views, except a
     subnet-less VLAN (L2-only, ADR 0012), which is listed with no map link
     since its map route has nothing to show but the L2-only state anyway.
+
+    Also the discovery surface for the Stage B parity pages (review note
+    8): an "All records" panel lists all eight ``/models/<slug>/`` lists,
+    each shown only if the viewer holds that entry's own
+    ``list_permissions`` — a partial-privilege user simply sees fewer
+    tiles, the same floor-not-narrowing posture every other view here
+    takes. This keeps the nav bar itself short (one more static link,
+    "Audit", is all it gains) rather than growing it by eight.
     """
     racks = Rack.objects.annotate(
         switch_count=Count("switches", distinct=True),
@@ -948,10 +1004,963 @@ def index(request: HttpRequest) -> HttpResponse:
             "device_ports", filter=Q(device_ports__address__isnull=False), distinct=True
         ),
     ).order_by("vlan_id")
+    all_records = [spec for spec in REGISTRY.values() if request.user.has_perms(spec.list_permissions)]
     context = {
         "racks": racks,
         "vlans": vlans,
         "spare_switch_count": NetworkSwitch.objects.filter(rack__isnull=True).count(),
         "spare_device_count": NetworkDevice.objects.filter(rack__isnull=True).count(),
+        "all_records": all_records,
     }
     return render(request, "inventory/index.html", context)
+
+
+# ---------------------------------------------------------------------------
+# Read-parity — the registry (phase 15, ADR 0020, Stage B)
+# ---------------------------------------------------------------------------
+#
+# ADR 0020 decision 5: a Viewer who cannot reach the admin and cannot see,
+# say, a switch port's VLAN profile in this UI has lost access to data
+# CONTEXT.md promises them ("Can see all data"). Parity is measured against
+# the admin's own changelists/forms, not against a bare `_meta.fields` walk
+# — the admin shows several values that are not fields at all (computed
+# columns like `profile_summary`/`default_gateway`) and two M2M
+# memberships as form widgets rather than inlines
+# (`SwitchPortVlanProfile.allowed_vlans`, `RackTemplate.vlans`), both of
+# which a naive walk would silently drop. The parity inventory in
+# `PLAN-read-only-ui.md`'s Stage B section is the checklist this registry
+# was built against, entry by entry.
+#
+# Two generic views (`model_list`/`model_detail`) driven by this registry,
+# not sixteen hand-written ones (decision 8) — this is the whole contract
+# for what a model's page shows; nothing about it is decided in a
+# template. Templates only know the five `render` kinds below, never a
+# model name.
+
+
+@dataclass(frozen=True)
+class FieldSpec:
+    """One column (on a list page) or one field row (on a detail page).
+
+    ``accessor`` is either a dotted attribute path resolved against the
+    row object (``"native_vlan.vlan_id"`` — the first ``None`` hop short-
+    circuits to ``None``, the same defensive posture as ``safe_slot_
+    address``: a read-only page must never 500 on data the write path
+    allowed), or a plain function of the object for a value that isn't an
+    attribute at all (``switch_port_profile_summary`` — a computed column,
+    not a field). A callable accessor must not touch the database beyond
+    what the owning ``ModelSpec``'s ``select_related``/``prefetch_related``
+    already declares — it runs once per row, so anything it queries itself
+    is an N+1.
+    """
+
+    label: str
+    accessor: str | Callable[[Any], Any]
+    render: Literal["text", "choice", "boolean", "relation", "m2m"] = "text"
+
+
+@dataclass(frozen=True)
+class InlineSpec:
+    """One admin inline, reproduced as a sub-table on the parity detail
+    page — e.g. ``NetworkSwitchPortInline`` becomes the "Ports" panel on
+    ``/models/networkswitch/<pk>/``.
+    """
+
+    label: str  # panel heading, e.g. "Ports"
+    accessor: str  # reverse relation name on the parent, e.g. "ports"
+    columns: tuple[FieldSpec, ...]
+    ordering: tuple[str, ...]
+    permissions: tuple[str, ...]  # the inline model's own view_ codename(s)
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    """One registered model's whole read-only-UI page contract."""
+
+    slug: str
+    model: type[Model]
+    label: str
+    label_plural: str
+    list_columns: tuple[FieldSpec, ...]
+    detail_fields: tuple[FieldSpec, ...]
+    inlines: tuple[InlineSpec, ...] = ()
+    #: The name of a Stage A shaped view (e.g. ``"inventory:rack"``) that
+    #: is canonical for this model — set only for Rack and NetworkDevice
+    #: (decision 13). When set, `model_detail` redirects there rather than
+    #: rendering `detail_fields`/`inlines`, so there is never a second page
+    #: claiming to be the record of the same object.
+    canonical_detail_view: str | None = None
+    ordering: tuple[str, ...] = ()
+    list_select_related: tuple[str, ...] = ()
+    list_prefetch_related: tuple[str, ...] = ()
+    detail_select_related: tuple[str, ...] = ()
+    detail_prefetch_related: tuple[str, ...] = ()
+    list_permissions: tuple[str, ...] = ()
+    detail_permissions: tuple[str, ...] = ()
+
+
+def _switch_port_profile_summary_accessor(port: NetworkSwitchPort) -> str:
+    # A tiny wrapper, not switch_port_profile_summary itself, so the
+    # FieldSpec's callable-accessor type (Callable[[Any], Any]) doesn't
+    # have to widen to accept the model's own more specific signature.
+    return switch_port_profile_summary(port)
+
+
+REGISTRY: dict[str, ModelSpec] = {
+    "vlan": ModelSpec(
+        slug="vlan",
+        model=VLAN,
+        label="VLAN",
+        label_plural="VLANs",
+        list_columns=(
+            FieldSpec("Name", "name"),
+            FieldSpec("VLAN ID", "vlan_id"),
+            FieldSpec("Subnet", "subnet"),
+            FieldSpec("Default gateway", "default_gateway"),
+            FieldSpec("DHCP start", "dhcp_range_start"),
+            FieldSpec("DHCP end", "dhcp_range_end"),
+        ),
+        detail_fields=(
+            FieldSpec("Name", "name"),
+            FieldSpec("VLAN ID", "vlan_id"),
+            FieldSpec("Subnet", "subnet"),
+            FieldSpec("Default gateway", "default_gateway"),
+            FieldSpec("DHCP start", "dhcp_range_start"),
+            FieldSpec("DHCP end", "dhcp_range_end"),
+        ),
+        ordering=("vlan_id",),
+        list_permissions=("inventory.view_vlan",),
+        detail_permissions=("inventory.view_vlan",),
+    ),
+    "switchportvlanprofile": ModelSpec(
+        slug="switchportvlanprofile",
+        model=SwitchPortVlanProfile,
+        label="Switch Port VLAN Profile",
+        label_plural="Switch Port VLAN Profiles",
+        list_columns=(
+            FieldSpec("Name", "name"),
+            FieldSpec("Port mode", "port_mode", render="choice"),
+            FieldSpec("Native VLAN", "native_vlan", render="relation"),
+            FieldSpec("All VLANs allowed", "all_vlans_allowed", render="boolean"),
+            FieldSpec("Allowed VLANs", "allowed_vlans", render="m2m"),
+            FieldSpec("System profile", "is_system", render="boolean"),
+        ),
+        detail_fields=(
+            FieldSpec("Name", "name"),
+            FieldSpec("Port mode", "port_mode", render="choice"),
+            FieldSpec("Native VLAN", "native_vlan", render="relation"),
+            FieldSpec("All VLANs allowed", "all_vlans_allowed", render="boolean"),
+            FieldSpec("Allowed VLANs", "allowed_vlans", render="m2m"),
+            FieldSpec("System profile", "is_system", render="boolean"),
+        ),
+        ordering=("name",),
+        list_select_related=("native_vlan",),
+        list_prefetch_related=("allowed_vlans",),
+        detail_select_related=("native_vlan",),
+        detail_prefetch_related=("allowed_vlans",),
+        list_permissions=("inventory.view_switchportvlanprofile", "inventory.view_vlan"),
+        detail_permissions=("inventory.view_switchportvlanprofile", "inventory.view_vlan"),
+    ),
+    "racktemplate": ModelSpec(
+        slug="racktemplate",
+        model=RackTemplate,
+        label="Rack Template",
+        label_plural="Rack Templates",
+        list_columns=(
+            FieldSpec("Name", "name"),
+            FieldSpec("Slot count", "slot_count"),
+            FieldSpec("VLANs", "vlans", render="m2m"),
+        ),
+        detail_fields=(
+            FieldSpec("Name", "name"),
+            FieldSpec("Slot count", "slot_count"),
+            FieldSpec("VLANs", "vlans", render="m2m"),
+        ),
+        ordering=("name",),
+        list_prefetch_related=("vlans",),
+        detail_prefetch_related=("vlans",),
+        list_permissions=("inventory.view_racktemplate", "inventory.view_vlan"),
+        detail_permissions=("inventory.view_racktemplate", "inventory.view_vlan"),
+    ),
+    "rack": ModelSpec(
+        slug="rack",
+        model=Rack,
+        label="Rack",
+        label_plural="Racks",
+        list_columns=(
+            FieldSpec("Name", "name"),
+            FieldSpec("Slot count", "slot_count"),
+        ),
+        # Never actually rendered — canonical_detail_view redirects before
+        # detail_fields/inlines are consulted (decision 13) — declared
+        # anyway so this entry documents everything RackAdmin shows, per
+        # the parity inventory.
+        detail_fields=(
+            FieldSpec("Name", "name"),
+            FieldSpec("Slot count", "slot_count"),
+        ),
+        inlines=(
+            InlineSpec(
+                label="VLAN ranges",
+                accessor="vlan_ranges",
+                columns=(
+                    FieldSpec("VLAN", "vlan", render="relation"),
+                    FieldSpec("Address range", "address_range"),
+                ),
+                ordering=("vlan__vlan_id",),
+                permissions=("inventory.view_rackvlanrange",),
+            ),
+        ),
+        canonical_detail_view="inventory:rack",
+        ordering=("name",),
+        list_permissions=("inventory.view_rack",),
+        # Minimal on purpose: model_detail redirects to rack_detail before
+        # rendering anything, and rack_detail declares its own — larger —
+        # codename set. Requiring that larger set here too would 403 the
+        # redirect itself for a user rack_detail would otherwise happily
+        # serve, and would report the wrong codename in a 403.
+        detail_permissions=("inventory.view_rack",),
+    ),
+    "networkswitchtype": ModelSpec(
+        slug="networkswitchtype",
+        model=NetworkSwitchType,
+        label="Network Switch Type",
+        label_plural="Network Switch Types",
+        list_columns=(
+            FieldSpec("Manufacturer", "manufacturer"),
+            FieldSpec("Model", "model"),
+            FieldSpec("Name", "name"),
+            FieldSpec("Port count", "port_count"),
+        ),
+        detail_fields=(
+            FieldSpec("Manufacturer", "manufacturer"),
+            FieldSpec("Model", "model"),
+            FieldSpec("Name", "name"),
+            FieldSpec("Port count", "port_count"),
+        ),
+        inlines=(
+            InlineSpec(
+                label="Type ports",
+                accessor="type_ports",
+                columns=(
+                    FieldSpec("Port number", "port_number"),
+                    FieldSpec("Description", "description"),
+                    FieldSpec("Port type", "port_type", render="choice"),
+                    FieldSpec("Profile", "profile", render="relation"),
+                ),
+                ordering=("port_number",),
+                permissions=("inventory.view_networkswitchtypeport",),
+            ),
+        ),
+        ordering=("manufacturer", "model", "name"),
+        list_permissions=("inventory.view_networkswitchtype",),
+        detail_permissions=(
+            "inventory.view_networkswitchtype",
+            "inventory.view_networkswitchtypeport",
+            "inventory.view_switchportvlanprofile",
+        ),
+        detail_prefetch_related=("type_ports__profile",),
+    ),
+    "networkswitch": ModelSpec(
+        slug="networkswitch",
+        model=NetworkSwitch,
+        label="Network Switch",
+        label_plural="Network Switches",
+        list_columns=(
+            FieldSpec("Hostname", "hostname"),
+            FieldSpec("Type", "switch_type", render="relation"),
+            FieldSpec("Serial number", "serial_number"),
+            FieldSpec("Rack", "rack", render="relation"),
+            FieldSpec("Rack slot", "rack_slot"),
+            FieldSpec("DHCP server", "dhcp_server_enabled", render="boolean"),
+        ),
+        detail_fields=(
+            FieldSpec("Hostname", "hostname"),
+            FieldSpec("Type", "switch_type", render="relation"),
+            FieldSpec("Serial number", "serial_number"),
+            FieldSpec("Rack", "rack", render="relation"),
+            FieldSpec("Rack slot", "rack_slot"),
+            FieldSpec("DHCP server", "dhcp_server_enabled", render="boolean"),
+        ),
+        # NetworkSwitch has no shaped page of its own yet — this is the
+        # first genuinely generic detail page in the registry.
+        inlines=(
+            InlineSpec(
+                label="Addresses",
+                accessor="addresses",
+                columns=(
+                    FieldSpec("VLAN", "vlan", render="relation"),
+                    FieldSpec("Address", "address"),
+                ),
+                ordering=("vlan__vlan_id",),
+                permissions=("inventory.view_networkswitchaddress",),
+            ),
+            InlineSpec(
+                label="Ports",
+                accessor="ports",
+                columns=(
+                    FieldSpec("Port number", "port_number"),
+                    FieldSpec("Port type", "port_type", render="choice"),
+                    FieldSpec("Description", "description"),
+                    FieldSpec("Profile", "profile", render="relation"),
+                    # Computed, not a field — admin.py:766's
+                    # profile_summary(), reused verbatim rather than
+                    # reimplemented (see switch_port_profile_summary()).
+                    FieldSpec("Profile config", _switch_port_profile_summary_accessor),
+                ),
+                ordering=("port_number",),
+                permissions=("inventory.view_networkswitchport",),
+            ),
+        ),
+        ordering=("hostname",),
+        list_select_related=("switch_type", "rack"),
+        detail_select_related=("switch_type", "rack"),
+        # profile_summary() reads profile.native_vlan and
+        # profile.allowed_vlans per port — without these, an N+1 across a
+        # switch's ports (admin.py:752-765 carries the identical hint for
+        # the same reason).
+        detail_prefetch_related=(
+            "addresses__vlan",
+            "ports__profile__native_vlan",
+            "ports__profile__allowed_vlans",
+        ),
+        list_permissions=(
+            "inventory.view_networkswitch",
+            "inventory.view_networkswitchtype",
+            "inventory.view_rack",
+        ),
+        detail_permissions=(
+            "inventory.view_networkswitch",
+            "inventory.view_networkswitchtype",
+            "inventory.view_rack",
+            "inventory.view_networkswitchaddress",
+            "inventory.view_vlan",
+            "inventory.view_networkswitchport",
+            "inventory.view_switchportvlanprofile",
+        ),
+    ),
+    "networkdevicetype": ModelSpec(
+        slug="networkdevicetype",
+        model=NetworkDeviceType,
+        label="Network Device Type",
+        label_plural="Network Device Types",
+        list_columns=(
+            FieldSpec("Manufacturer", "manufacturer"),
+            FieldSpec("Model", "model"),
+            FieldSpec("Name", "name"),
+            FieldSpec("Port count", "port_count"),
+            FieldSpec("Companion type", "companion_type", render="relation"),
+        ),
+        detail_fields=(
+            FieldSpec("Manufacturer", "manufacturer"),
+            FieldSpec("Model", "model"),
+            FieldSpec("Name", "name"),
+            FieldSpec("Port count", "port_count"),
+            FieldSpec("Companion type", "companion_type", render="relation"),
+        ),
+        inlines=(
+            InlineSpec(
+                label="Type ports",
+                accessor="type_ports",
+                columns=(
+                    FieldSpec("Port number", "port_number"),
+                    FieldSpec("Description", "description"),
+                    FieldSpec("Port type", "port_type", render="choice"),
+                    FieldSpec("VLAN", "vlan", render="relation"),
+                    FieldSpec("Slot offset", "slot_offset"),
+                ),
+                ordering=("ordinal",),
+                permissions=("inventory.view_networkdevicetypeport",),
+            ),
+        ),
+        ordering=("manufacturer", "model", "name"),
+        list_select_related=("companion_type",),
+        detail_select_related=("companion_type",),
+        detail_prefetch_related=("type_ports__vlan",),
+        list_permissions=("inventory.view_networkdevicetype",),
+        detail_permissions=(
+            "inventory.view_networkdevicetype",
+            "inventory.view_networkdevicetypeport",
+            "inventory.view_vlan",
+        ),
+    ),
+    "networkdevice": ModelSpec(
+        slug="networkdevice",
+        model=NetworkDevice,
+        label="Network Device",
+        label_plural="Network Devices",
+        list_columns=(
+            FieldSpec("Hostname", "hostname"),
+            FieldSpec("Type", "device_type", render="relation"),
+            FieldSpec("Serial number", "serial_number"),
+            FieldSpec("Rack", "rack", render="relation"),
+            FieldSpec("Rack slot", "rack_slot"),
+            FieldSpec("Host", "host", render="relation"),
+        ),
+        # Never actually rendered — see the Rack entry's identical note.
+        detail_fields=(
+            FieldSpec("Hostname", "hostname"),
+            FieldSpec("Type", "device_type", render="relation"),
+            FieldSpec("Serial number", "serial_number"),
+            FieldSpec("Rack", "rack", render="relation"),
+            FieldSpec("Rack slot", "rack_slot"),
+            FieldSpec("Host", "host", render="relation"),
+        ),
+        inlines=(
+            InlineSpec(
+                label="Ports",
+                accessor="ports",
+                columns=(
+                    FieldSpec("Description", "description"),
+                    FieldSpec("Port number", "port_number"),
+                    FieldSpec("Port type", "port_type", render="choice"),
+                    FieldSpec("VLAN", "vlan", render="relation"),
+                    FieldSpec("Slot offset", "slot_offset"),
+                    FieldSpec("DHCP", "is_dhcp", render="boolean"),
+                    FieldSpec("Address", "address"),
+                    FieldSpec("Default gateway", "default_gateway"),
+                    FieldSpec("Switch port", "switch_port", render="relation"),
+                ),
+                ordering=("ordinal",),
+                permissions=("inventory.view_networkdeviceport",),
+            ),
+        ),
+        canonical_detail_view="inventory:device",
+        ordering=("hostname",),
+        list_select_related=("device_type", "rack", "host"),
+        list_permissions=(
+            "inventory.view_networkdevice",
+            "inventory.view_networkdevicetype",
+            "inventory.view_rack",
+        ),
+        # Minimal — see the Rack entry's identical note; device_detail
+        # declares its own larger codename set once the redirect lands.
+        detail_permissions=("inventory.view_networkdevice",),
+    ),
+}
+
+_SPEC_BY_MODEL: dict[type[Model], ModelSpec] = {spec.model: spec for spec in REGISTRY.values()}
+
+
+def _resolve_dotted(obj: Any, accessor: str) -> Any:
+    """Walks a dotted attribute path against ``obj``, returning ``None`` the
+    moment any hop is ``None`` — the same defensive posture as
+    ``safe_slot_address``: a read-only page must never 500 on data the
+    write path allowed.
+    """
+    value = obj
+    for part in accessor.split("."):
+        if value is None:
+            return None
+        value = getattr(value, part, None)
+    return value
+
+
+def _resolve_field_value(obj: Any, field_spec: FieldSpec) -> Any:
+    if callable(field_spec.accessor):
+        return field_spec.accessor(obj)
+    return _resolve_dotted(obj, field_spec.accessor)
+
+
+def _resolve_choice_display(obj: Any, accessor: str) -> Any:
+    """``get_<field>_display()`` for a (possibly dotted) choice field —
+    resolved against the accessor's *parent* object, since the display
+    method lives on whichever model actually declares the field.
+    """
+    if "." in accessor:
+        parent_path, field_name = accessor.rsplit(".", 1)
+        parent = _resolve_dotted(obj, parent_path)
+    else:
+        parent = obj
+        field_name = accessor
+    if parent is None:
+        return None
+    display = getattr(parent, f"get_{field_name}_display", None)
+    return display() if display is not None else None
+
+
+def _text_or_dash(value: Any) -> str:
+    if value is None or value == "":
+        return "—"
+    return str(value)
+
+
+@dataclass(frozen=True)
+class LinkedText:
+    """One rendered value — plain text, or text with a link — the smallest
+    unit every render kind below decomposes into. A ``relation``/``m2m``
+    field is one or more of these; every other kind is exactly one.
+    Templates render this uniformly (``<a>`` if ``url`` else plain text),
+    which is what keeps "nothing about a model's page is decided in a
+    template" true even for links.
+    """
+
+    text: str
+    url: str | None = None
+
+
+def _linked_text_for(value: Model, user: Any) -> LinkedText:
+    """A single related object, rendered as ``relation`` would: linked to
+    its own canonical detail URL if its model is in the registry *and* the
+    viewer holds that model's own ``view_`` codename — otherwise plain
+    text (the same partial-privilege posture Stage A's views already take:
+    a missing codename degrades the page rather than 403ing it wholesale).
+    """
+    text = str(value)
+    spec = _SPEC_BY_MODEL.get(type(value))
+    if spec is None:
+        return LinkedText(text)
+    codename = f"{value._meta.app_label}.view_{value._meta.model_name}"
+    if not user.has_perm(codename):
+        return LinkedText(text)
+    return LinkedText(text, reverse("inventory:model_detail", args=[spec.slug, value.pk]))
+
+
+def _render_cell(obj: Any, field_spec: FieldSpec, user: Any) -> tuple[LinkedText, ...]:
+    """The fixed render vocabulary (Stage B): every ``FieldSpec`` renders to
+    one or more ``LinkedText`` items via exactly one of these five kinds —
+    the whole reason a template never needs to know which model it's
+    looking at.
+    """
+    if field_spec.render == "choice":
+        display = _resolve_choice_display(obj, field_spec.accessor)  # type: ignore[arg-type]
+        return (LinkedText(_text_or_dash(display)),)
+    value = _resolve_field_value(obj, field_spec)
+    if field_spec.render == "text":
+        return (LinkedText(_text_or_dash(value)),)
+    if field_spec.render == "boolean":
+        return (LinkedText("Yes" if value else "No"),)
+    if field_spec.render == "relation":
+        if value is None:
+            return (LinkedText("—"),)
+        return (_linked_text_for(value, user),)
+    if field_spec.render == "m2m":
+        items = [_linked_text_for(item, user) for item in value.all()] if value is not None else []
+        return tuple(items) if items else (LinkedText("—"),)
+    raise AssertionError(f"unknown render kind {field_spec.render!r}")  # pragma: no cover
+
+
+@dataclass(frozen=True)
+class RenderedField:
+    label: str
+    items: tuple[LinkedText, ...]
+
+
+@dataclass(frozen=True)
+class RenderedInline:
+    label: str
+    column_labels: tuple[str, ...]
+    rows: list[tuple[tuple[LinkedText, ...], ...]]
+
+
+@dataclass(frozen=True)
+class ModelListRow:
+    pk: int
+    cells: tuple[tuple[LinkedText, ...], ...]
+
+
+def _sorted_by_ordering(rows: list[Any], ordering: tuple[str, ...]) -> list[Any]:
+    """Sorts already-fetched rows in Python by an ORM-style ordering tuple
+    (``"vlan__vlan_id"``, ``"port_number"`` — all ascending; nothing in
+    this registry needs a descending inline order).
+
+    Deliberately *not* ``queryset.order_by(*ordering)``: ``obj``'s query
+    already carries ``detail_prefetch_related``, and calling
+    ``.order_by()`` on a prefetched related manager's ``.all()`` returns a
+    *new* queryset that can no longer see the prefetch cache — Django then
+    re-fetches from the database, once per row, the moment any field
+    reached through that fresh queryset needs a relation the prefetch was
+    supposed to have already loaded. That's an N+1 that query-count tests
+    alone would only catch by accident; sorting the already-prefetched
+    Python objects instead costs nothing extra. A stable sort applied
+    field-by-field in reverse order is the standard trick for a correct
+    multi-key sort.
+    """
+    for ordering_field in reversed(ordering):
+
+        def _key(row: Any, ordering_field: str = ordering_field) -> Any:
+            return _resolve_dotted(row, ordering_field.replace("__", "."))
+
+        rows = sorted(rows, key=_key)
+    return rows
+
+
+def _render_inline(obj: Model, inline_spec: InlineSpec, user: Any) -> RenderedInline:
+    rows_qs = list(getattr(obj, inline_spec.accessor).all())
+    if inline_spec.ordering:
+        rows_qs = _sorted_by_ordering(rows_qs, inline_spec.ordering)
+    rows = [tuple(_render_cell(row, column, user) for column in inline_spec.columns) for row in rows_qs]
+    return RenderedInline(
+        label=inline_spec.label,
+        column_labels=tuple(column.label for column in inline_spec.columns),
+        rows=rows,
+    )
+
+
+def registry_permission_required(which: Literal["list", "detail"]) -> Callable[[Callable], Callable]:
+    """Innermost decorator (stacking order unchanged from Stage A —
+    ``login_required`` outermost, then ``require_GET``, then this):
+    resolves ``slug`` (a URL kwarg) to its ``ModelSpec``, 404s an unknown
+    slug, then checks the spec's own ``list_permissions``/
+    ``detail_permissions`` with ``has_perms()``.
+
+    Exists because Stage A's ``@permission_required([...])`` binds a
+    literal codename list at import time (``views.py`` — see
+    ``rack_detail``'s decorator), and one generic view here serves eight
+    different permission sets, one per slug, resolved only once the
+    request names which model it wants.
+    """
+
+    def decorator(view_func: Callable) -> Callable:
+        @wraps(view_func)
+        def wrapped(request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponse:
+            slug = kwargs.get("slug")
+            spec = REGISTRY.get(slug) if slug is not None else None
+            if spec is None:
+                raise Http404(f"No such model {slug!r}")
+            codenames = spec.list_permissions if which == "list" else spec.detail_permissions
+            if not request.user.has_perms(codenames):
+                raise PermissionDenied
+            return view_func(request, *args, **kwargs)
+
+        return wrapped
+
+    return decorator
+
+
+@login_required
+@require_GET
+@registry_permission_required("list")
+def model_list(request: HttpRequest, slug: str) -> HttpResponse:
+    """The read-parity list page for one registered model — every
+    ``list_column`` from its ``ModelSpec``, rendered through the fixed
+    render vocabulary and nothing else. Not paginated: every model this
+    registry covers is small (the largest, ``NetworkDevice``, is in the
+    low hundreds even at full production scale) and Stage B reserves
+    pagination for the one table that's genuinely unbounded — the audit
+    trail (decision 16).
+    """
+    spec = REGISTRY[slug]
+    queryset = spec.model._default_manager.all()
+    if spec.ordering:
+        queryset = queryset.order_by(*spec.ordering)
+    if spec.list_select_related:
+        queryset = queryset.select_related(*spec.list_select_related)
+    if spec.list_prefetch_related:
+        queryset = queryset.prefetch_related(*spec.list_prefetch_related)
+    rows = [
+        ModelListRow(
+            pk=obj.pk, cells=tuple(_render_cell(obj, column, request.user) for column in spec.list_columns)
+        )
+        for obj in queryset
+    ]
+    context = {
+        "spec": spec,
+        "column_labels": tuple(column.label for column in spec.list_columns),
+        "rows": rows,
+    }
+    return render(request, "inventory/model_list.html", context)
+
+
+@login_required
+@require_GET
+@registry_permission_required("detail")
+def model_detail(request: HttpRequest, slug: str, pk: int) -> HttpResponse:
+    """The read-parity detail page for one registered model — every
+    ``detail_field`` and every inline from its ``ModelSpec``.
+
+    When the spec declares ``canonical_detail_view`` (Rack, NetworkDevice
+    — decision 13), this issues a permanent redirect to that shaped view
+    instead of rendering anything: the shaped page absorbed the fields it
+    was missing (see ``rack_detail``/``device_detail``'s docstrings), so
+    two pages never compete to be the record of the same object. A
+    redirect is still a read — ``@require_GET`` is unaffected.
+    """
+    spec = REGISTRY[slug]
+    if spec.canonical_detail_view:
+        get_object_or_404(spec.model, pk=pk)
+        return redirect(spec.canonical_detail_view, pk, permanent=True)
+
+    queryset = spec.model._default_manager.all()
+    if spec.detail_select_related:
+        queryset = queryset.select_related(*spec.detail_select_related)
+    if spec.detail_prefetch_related:
+        queryset = queryset.prefetch_related(*spec.detail_prefetch_related)
+    obj = get_object_or_404(queryset, pk=pk)
+
+    fields = [
+        RenderedField(label=column.label, items=_render_cell(obj, column, request.user))
+        for column in spec.detail_fields
+    ]
+    inlines = [_render_inline(obj, inline_spec, request.user) for inline_spec in spec.inlines]
+
+    # The audit panel renders only for the one generic page ADR 0020
+    # decision 6 names outright (rack/switch/device) — Rack and
+    # NetworkDevice get theirs on their shaped pages instead (see
+    # rack_detail/device_detail), so NetworkSwitch's generic page is the
+    # only model_detail render that needs one at all.
+    audit_entries: list[AuditRow] | None = None
+    audit_content_type_pk: int | None = None
+    if slug == "networkswitch":
+        audit_entries, audit_content_type_pk = _object_audit_panel_context(obj, request.user)
+
+    context = {
+        "spec": spec,
+        "object": obj,
+        "fields": fields,
+        "inlines": inlines,
+        "admin_change_url": reverse(f"admin:inventory_{spec.model._meta.model_name}_change", args=[obj.pk]),
+        "audit_entries": audit_entries,
+        "audit_content_type_pk": audit_content_type_pk,
+    }
+    return render(request, "inventory/model_detail.html", context)
+
+
+# ---------------------------------------------------------------------------
+# Audit trail (phase 15, ADR 0020, Stage B)
+# ---------------------------------------------------------------------------
+#
+# Gated on auditlog.view_logentry — granted to Viewers deliberately
+# (sync_roles.py:40-45, "who-changed-what is part of" seeing all data).
+# Renders LogEntry.changes and nothing else (decision 15): no object-state
+# reconstruction, and no applying today's AUDITLOG_INCLUDE_TRACKING_MODELS
+# (settings.py:263, 16 entries mixing whole-model/include_fields/
+# exclude_fields/m2m_fields shapes) to an old row — tracking config
+# changes over time, and a row records what was tracked *then*.
+
+
+@dataclass(frozen=True)
+class ChangeRow:
+    field: str
+    text: str
+
+
+@dataclass(frozen=True)
+class AuditRow:
+    pk: int
+    timestamp: Any
+    actor_label: str
+    action_label: str
+    content_type_label: str
+    object_label: str
+    object_url: str | None
+    changes: list[ChangeRow]
+
+
+def render_log_entry_changes(entry: LogEntry) -> list[ChangeRow]:
+    """``LogEntry.changes_dict`` rendered field by field — deliberately
+    **not** ``LogEntry.changes_display_dict()``: verified against the
+    installed django-auditlog 3.4.1, that property does ``model =
+    self.content_type.model_class()`` and then ``auditlog.contains(model
+    ._meta.model)`` with no null guard, raising ``AttributeError`` for a
+    content type whose model is no longer installed — despite the comment
+    directly above it claiming to "gracefully handle" exactly that case.
+
+    Two shapes, both real: a scalar change is ``{field: [old, new]}``; an
+    m2m change (``models.py:122-127`` in the installed package) is
+    ``{field: {"type": "m2m", "operation": ..., "objects": [...]}}`` — a
+    renderer that assumes every value is a two-element list crashes or
+    renders garbage on every profile/template VLAN change, which is
+    exactly the shape ``SwitchPortVlanProfile.allowed_vlans``/
+    ``RackTemplate.vlans`` produce.
+    """
+    changes = entry.changes_dict  # {} for a null/empty `changes` column
+    rows = []
+    for field_name, value in changes.items():
+        if isinstance(value, dict) and value.get("type") == "m2m":
+            operation = value.get("operation", "")
+            objects = value.get("objects", [])
+            text = f"{operation}: {', '.join(str(o) for o in objects)}" if objects else str(operation)
+        else:
+            try:
+                old, new = value
+            except (TypeError, ValueError):
+                text = str(value)  # a shape neither renderer above recognises; show it raw rather than 500
+            else:
+                text = f"{_text_or_dash(old)} → {_text_or_dash(new)}"
+        rows.append(ChangeRow(field=field_name, text=text))
+    return rows
+
+
+def _actor_label(entry: LogEntry) -> str:
+    """``actor`` if set, else the retained ``actor_email`` fallback, else
+    "system or deleted actor" — ``actor`` is ``on_delete=SET_NULL`` in the
+    installed package, so a deleted user leaves rows behind with
+    ``actor_email`` as the only remaining record of who it was. A blank
+    actor column would read as "nobody did this", which is never true.
+    """
+    if entry.actor_id is not None and entry.actor is not None:
+        return str(entry.actor)
+    if entry.actor_email:
+        return entry.actor_email
+    return "system or deleted actor"
+
+
+def _render_log_entry(entry: LogEntry, user: Any) -> AuditRow:
+    """Shared by the site-wide ``/audit/`` list and every per-object panel
+    (``_object_audit_panel_context``) — one renderer, one actor fallback,
+    so the two can never show a different answer for the same row.
+    """
+    model = entry.content_type.model_class()
+    object_url = None
+    if model is not None and entry.object_id is not None:
+        spec = _SPEC_BY_MODEL.get(model)
+        if spec is not None:
+            codename = f"{model._meta.app_label}.view_{model._meta.model_name}"
+            if user.has_perm(codename):
+                object_url = reverse("inventory:model_detail", args=[spec.slug, entry.object_id])
+    return AuditRow(
+        pk=entry.pk,
+        timestamp=entry.timestamp,
+        actor_label=_actor_label(entry),
+        action_label=entry.get_action_display(),
+        content_type_label=str(entry.content_type),
+        object_label=entry.object_repr,
+        object_url=object_url,
+        changes=render_log_entry_changes(entry),
+    )
+
+
+def _content_type_for_model_no_create(model: type[Model]) -> ContentType | None:
+    """A pure, never-creating lookup for ``model``'s ``ContentType`` row.
+
+    ``ContentType.objects.get_for_model()`` — and, transitively,
+    ``auditlog``'s own ``LogEntry.objects.get_for_object()``, which calls
+    it internally — is documented to create the row on a cache miss
+    (``django/contrib/contenttypes/models.py``: "creating the ContentType
+    if necessary"). That makes loading an audit panel on an otherwise
+    plain ``GET`` request capable of an ``INSERT`` — exactly the write
+    this stage's central claim says never happens (Codex review). In
+    practice every registered model's row already exists (Django's
+    ``post_migrate`` signal creates one per model at migration time), so
+    this only changes behaviour on the should-never-happen miss: render no
+    history rather than silently create a row to answer a read.
+    """
+    try:
+        return ContentType.objects.get(app_label=model._meta.app_label, model=model._meta.model_name)
+    except ContentType.DoesNotExist:
+        return None
+
+
+def _object_audit_panel_context(obj: Model, user: Any) -> tuple[list[AuditRow] | None, int | None]:
+    """The most recent 20 ``LogEntry`` rows for ``obj``, rendered the same
+    way as the site-wide list — shared by the rack elevation, the switch
+    parity page and the device page (ADR 0020 decision 6). Returns
+    ``(None, None)`` when the viewer lacks ``auditlog.view_logentry``,
+    which is the query-avoiding half of the belt-and-suspenders posture:
+    the template *also* gates the panel on ``perms.auditlog.view_logentry``
+    (Stage B: the panel must never turn a missing audit grant into a 403
+    on an otherwise-permitted page), but there is no reason to pay for the
+    query at all when the answer is already known here.
+
+    Built directly against ``LogEntry`` with a non-creating content-type
+    lookup rather than ``LogEntry.objects.get_for_object()`` — see
+    ``_content_type_for_model_no_create``'s docstring. ``object_id`` (not
+    ``object_pk``) is the right column here, mirroring ``get_for_object``'s
+    own branch for an integer pk, which every model this stage covers has.
+    """
+    if not user.has_perm("auditlog.view_logentry"):
+        return None, None
+    content_type = _content_type_for_model_no_create(type(obj))
+    if content_type is None:
+        return [], None  # no ContentType row at all means no LogEntry can reference this model either
+    entries = (
+        LogEntry.objects.filter(content_type=content_type, object_id=obj.pk)
+        .select_related("actor", "content_type")
+        .order_by("-timestamp", "-pk")[:20]
+    )
+    return [_render_log_entry(entry, user) for entry in entries], content_type.pk
+
+
+def _parse_filter_int(value: str) -> tuple[int | None, bool]:
+    """``(parsed_value, ignored)`` for one audit filter's raw query-string
+    value. A value that doesn't parse is *ignored*, not a 500 or a silent
+    no-op — the page renders a visible note (decision 16) so "this filter
+    did nothing because it was garbage" and "this filter matched nothing"
+    stay two different, both-true statements.
+    """
+    try:
+        return int(value), False
+    except ValueError:
+        return None, True
+
+
+def _tracked_actors() -> list[Any]:
+    actor_ids = LogEntry.objects.exclude(actor_id__isnull=True).values_list("actor_id", flat=True).distinct()
+    return list(User.objects.filter(pk__in=actor_ids).order_by("username"))
+
+
+def _tracked_content_types() -> list[ContentType]:
+    """Every ``ContentType`` that actually has audit rows — sourced from
+    ``LogEntry`` itself, not from ``REGISTRY``, so a content type for a
+    model that's since been removed from the registry (or the codebase
+    entirely) stays a selectable filter and its rows stay reachable.
+    """
+    content_type_ids = LogEntry.objects.values_list("content_type_id", flat=True).distinct()
+    return list(ContentType.objects.filter(pk__in=content_type_ids).order_by("app_label", "model"))
+
+
+@login_required
+@require_GET
+@permission_required(["auditlog.view_logentry"], raise_exception=True)
+def audit(request: HttpRequest) -> HttpResponse:
+    """Site-wide audit history — ordered ``(-timestamp, -pk)`` (decision
+    16: ``-timestamp`` alone is not a total order, so ties would duplicate
+    or skip rows across a page boundary), paginated at 50/page with
+    Django's standard ``Paginator`` (the ``COUNT(*)`` cost is accepted for
+    an installation this size; keyset pagination over ``(timestamp, pk)``
+    is the named escape hatch if it ever hurts, and needs no template
+    change).
+
+    Three optional filters — ``actor`` (user pk), ``action`` (the
+    ``LogEntry.Action`` integer), ``content_type`` (pk) — each either
+    narrows the queryset or, if its value doesn't parse, is ignored with a
+    visible note rather than a 500 or a silent no-op.
+    """
+    queryset = LogEntry.objects.select_related("actor", "content_type").order_by("-timestamp", "-pk")
+    ignored_filters: list[str] = []
+
+    actor_param = request.GET.get("actor", "")
+    if actor_param:
+        actor_id, ignored = _parse_filter_int(actor_param)
+        if ignored:
+            ignored_filters.append("actor")
+        else:
+            queryset = queryset.filter(actor_id=actor_id)
+
+    action_param = request.GET.get("action", "")
+    if action_param:
+        action_value, ignored = _parse_filter_int(action_param)
+        if ignored:
+            ignored_filters.append("action")
+        else:
+            queryset = queryset.filter(action=action_value)
+
+    content_type_param = request.GET.get("content_type", "")
+    if content_type_param:
+        content_type_id, ignored = _parse_filter_int(content_type_param)
+        if ignored:
+            ignored_filters.append("content_type")
+        else:
+            queryset = queryset.filter(content_type_id=content_type_id)
+
+    paginator = Paginator(queryset, 50)
+    page_obj = paginator.get_page(request.GET.get("page"))
+    entries = [_render_log_entry(entry, request.user) for entry in page_obj.object_list]
+
+    preserved_params = {key: value for key, value in request.GET.items() if key != "page"}
+    querystring_prefix = f"{urlencode(preserved_params)}&" if preserved_params else ""
+
+    context = {
+        "entries": entries,
+        "page_obj": page_obj,
+        "querystring_prefix": querystring_prefix,
+        "ignored_filters": ignored_filters,
+        "actor_choices": _tracked_actors(),
+        "action_choices": LogEntry.Action.choices,
+        "content_type_choices": _tracked_content_types(),
+        "actor_param": actor_param,
+        "action_param": action_param,
+        "content_type_param": content_type_param,
+    }
+    return render(request, "inventory/audit.html", context)
