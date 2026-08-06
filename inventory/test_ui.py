@@ -29,6 +29,7 @@ Four groups of tests, matching the plan's own structure:
 """
 
 import io
+import ipaddress
 import re
 
 from auditlog.models import LogEntry
@@ -54,7 +55,7 @@ from .models import (
     Rack,
     RackVlanRange,
 )
-from .suggestions import suggest_slot_address
+from .suggestions import suggest_rack_vlan_range, suggest_slot_address
 from .views import resolve_slot_spans, safe_slot_address
 
 User = get_user_model()
@@ -87,12 +88,26 @@ def _make_device_type(port_count: int = 0, vlan: VLAN | None = None, **kwargs) -
     return device_type
 
 
-def _is_mutating_sql(sql: str) -> bool:
-    """Whether ``sql`` is a row-mutating DML statement (``INSERT``,
-    ``UPDATE``, ``DELETE``) — not a ``SELECT``, and not one of the
-    transaction-bookkeeping statements Django issues on every request
-    (``SAVEPOINT``, ``RELEASE SAVEPOINT``, ``ROLLBACK``, ``SET ...``),
-    none of which touch application data.
+_ALLOWED_READONLY_SQL_VERBS = frozenset({"SELECT", "SAVEPOINT", "ROLLBACK", "SET"})
+
+
+def _is_allowed_readonly_sql(sql: str) -> bool:
+    """Whether ``sql`` is one of the statements a read-only GET request
+    cycle may legitimately issue: a ``SELECT``, or one of Django's own
+    transaction-bookkeeping statements (``SAVEPOINT``/``RELEASE
+    SAVEPOINT``/``ROLLBACK``/``SET ...``) — never a data-mutating one.
+
+    An **allowlist**, not a blocklist of mutating verbs (Codex review
+    round 3, finding 1 — the previous revision's blocklist of
+    ``INSERT``/``UPDATE``/``DELETE`` had false negatives: MariaDB's
+    ``REPLACE ...`` mutates rows under a verb the list never named, and a
+    comment-prefixed statement like ``/* tag */ UPDATE ...`` doesn't
+    start with any of them either, so both would have silently passed a
+    blocklist check while genuinely mutating data). A blocklist is always
+    one dialect quirk behind; this fails closed instead — deny by
+    default, name only the specific, known-safe shapes a read-only page's
+    request cycle can produce, and require an exact match after stripping
+    leading whitespace and any leading ``/* ... */`` comment.
 
     Exists because a row-count sweep alone can't distinguish "nothing
     happened" from "every row was updated in place": an accidental
@@ -100,15 +115,16 @@ def _is_mutating_sql(sql: str) -> bool:
     ``Model.save()``, so it never reaches auditlog's signals either
     (Codex review round 2, finding 3). Checking the actual SQL Django
     sent is a check straight off the wire, not an inference from state
-    after the fact — the stronger of the two checks that finding offered,
-    kept alongside the row-count/``LogEntry`` check below rather than
-    replacing it, since the two catch different failure shapes (this one
-    catches an in-place mutation; the row-count check catches a create or
-    delete that happens to net out even but isn't purely SQL-shaped, e.g.
-    a signal handler with its own side effect).
+    after the fact.
     """
-    first_word = sql.strip().split(None, 1)[0] if sql.strip() else ""
-    return first_word.upper() in {"INSERT", "UPDATE", "DELETE"}
+    stripped = sql.strip()
+    stripped = re.sub(r"^(?:/\*.*?\*/\s*)+", "", stripped, flags=re.DOTALL).strip()
+    if not stripped:
+        return True  # nothing to check; an empty capture can't mutate anything
+    first_word = stripped.split(None, 1)[0].upper()
+    if first_word in _ALLOWED_READONLY_SQL_VERBS:
+        return True
+    return stripped.upper().startswith("RELEASE SAVEPOINT")
 
 
 def _row_html(content: str, ordinal: int) -> str:
@@ -280,6 +296,7 @@ class PartialGrantAccessTests(TestCase):
                 "view_rackvlanrange",
                 "view_networkswitchaddress",
                 "view_networkdeviceport",
+                "view_networkdevicetypeport",
             ],
         )
 
@@ -327,6 +344,23 @@ class WritesNothingTests(TestCase):
     way and a raw ``QuerySet.update()`` bypasses auditlog's signals too.
     """
 
+    def test_allowlist_rejects_replace_and_comment_prefixed_update(self) -> None:
+        # The two shapes that defeated the old blocklist (Codex review
+        # round 3, finding 1): a verb the list never named (MariaDB's
+        # REPLACE), and a statement that doesn't start with any verb at
+        # all because a comment precedes it.
+        self.assertFalse(_is_allowed_readonly_sql("REPLACE INTO inventory_vlan (...) VALUES (...)"))
+        self.assertFalse(_is_allowed_readonly_sql("/* tag */ UPDATE inventory_vlan SET name = 'x'"))
+        self.assertFalse(_is_allowed_readonly_sql("UPDATE inventory_vlan SET name = 'x'"))
+        self.assertFalse(_is_allowed_readonly_sql("INSERT INTO inventory_vlan (...) VALUES (...)"))
+        self.assertFalse(_is_allowed_readonly_sql("DELETE FROM inventory_vlan"))
+        self.assertTrue(_is_allowed_readonly_sql("SELECT * FROM inventory_vlan"))
+        self.assertTrue(_is_allowed_readonly_sql("/* tag */ SELECT * FROM inventory_vlan"))
+        self.assertTrue(_is_allowed_readonly_sql("SAVEPOINT s1"))
+        self.assertTrue(_is_allowed_readonly_sql("RELEASE SAVEPOINT s1"))
+        self.assertTrue(_is_allowed_readonly_sql("ROLLBACK TO SAVEPOINT s1"))
+        self.assertTrue(_is_allowed_readonly_sql("SET autocommit=0"))
+
     def setUp(self) -> None:
         call_command("sync_roles", stdout=io.StringIO())
         self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
@@ -366,9 +400,13 @@ class WritesNothingTests(TestCase):
             for url in routes:
                 self.assertEqual(self.client.get(url).status_code, 200, url)
 
-        mutating_statements = [q["sql"] for q in ctx.captured_queries if _is_mutating_sql(q["sql"])]
+        disallowed_statements = [
+            q["sql"] for q in ctx.captured_queries if not _is_allowed_readonly_sql(q["sql"])
+        ]
         self.assertEqual(
-            mutating_statements, [], "the read-only sweep executed mutating SQL — see the list above"
+            disallowed_statements,
+            [],
+            "the read-only sweep executed SQL outside the read-only allowlist — see the list above",
         )
 
         for model in inventory_models:
@@ -596,11 +634,26 @@ class OccupancyConflictTests(TestCase):
 
 
 class BannerHatchConsistencyTests(TestCase):
-    """The address map's next-free-block banner must never recommend
-    landing inside the region the same page hatches "unavailable by
-    convention" (Codex review round 2, finding 5) — the two encodings
-    have to agree, since a UI that visually asserts an unavailable region
-    and then recommends addressing inside it is contradicting itself.
+    """The address map's next-free-block banner and its hatched region
+    must both be driven by *stored* data and must agree with the admin's
+    own allocator — not with each other via an invented, unrecorded
+    convention (Codex review round 3, finding 4, reversing round 2's
+    fix).
+
+    ADR 0002's "bottom /24 is DHCP" sizing-time suggestion was explicitly
+    retired by ADR 0011: ``dhcp_range`` stopped being a CIDR block, and
+    "no replacement convention was wanted" (ADR 0011's own words) — no
+    auto-suggestion of any kind replaced it. Round 2's fix hatched the
+    bottom /24 unconditionally (asserting a convention the domain no
+    longer tracks as data) and then widened the banner's exclusions to
+    agree with that hatch, which made the *banner* diverge from what
+    ``RackVlanRange.clean()`` would actually allocate for a blank range
+    on this VLAN — a worse problem, since a wrong "next free block" is
+    believed. The correct fix removes the false assertion instead of
+    building a second one to agree with it: the hatch now shows only a
+    VLAN's own recorded ``dhcp_range_start``/``dhcp_range_end`` (nothing,
+    if neither is set), and the banner reaches ``suggest_rack_vlan_range``
+    with exactly the same inputs the admin's own suggestion would use.
     """
 
     def setUp(self) -> None:
@@ -609,16 +662,51 @@ class BannerHatchConsistencyTests(TestCase):
         self.admin_user.groups.add(Group.objects.get(name="Admin"))
         self.client.login(username="adminrole", password="testpass123")
 
-    def test_next_block_banner_never_lands_inside_the_hatched_bottom_24(self) -> None:
+    def test_no_hatch_and_banner_matches_allocator_with_no_stored_dhcp_range(self) -> None:
         vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
         response = self.client.get(f"/vlans/{vlan.pk}/")
         self.assertEqual(response.status_code, 200)
         content = response.content.decode()
-        # The first /27 in the subnet (10.200.0.0/27) sits inside the
-        # hatched bottom /24 (10.200.0.0/24) and must not be offered;
-        # the first /27 clear of it (10.200.1.0/27) must be.
-        self.assertNotIn("10.200.0.0/27", content)
-        self.assertIn("10.200.1.0/27", content)
+        # Nothing is recorded, so nothing is hatched — the bottom /24 is
+        # not assumed unavailable.
+        self.assertNotIn("vlan-map-segment--hatched", content)
+        # The banner must show exactly what suggest_rack_vlan_range
+        # itself computes for this VLAN — the same call
+        # RackVlanRange.clean() would make for a blank range here.
+        expected = suggest_rack_vlan_range(vlan.subnet, 1, [], None)
+        assert expected is not None
+        self.assertIn(expected, content)
+        self.assertIn("10.200.0.0/27", content)  # the honest first-fit answer with nothing excluded
+
+    def test_hatch_reflects_stored_dhcp_range_and_banner_avoids_it(self) -> None:
+        vlan = VLAN.objects.create(
+            name="Control",
+            vlan_id=200,
+            subnet="10.200.0.0/21",
+            dhcp_range_start="10.200.0.10",
+            dhcp_range_end="10.200.0.200",
+        )
+        response = self.client.get(f"/vlans/{vlan.pk}/")
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode()
+        self.assertIn("vlan-map-segment--hatched", content)
+        self.assertIn("10.200.0.10-10.200.0.200", content)
+        # The banner must still agree exactly with the allocator, now
+        # that a real DHCP range is stored — computed independently here
+        # via the same function/inputs RackVlanRange.clean() would use.
+        assert vlan.dhcp_range_start is not None
+        assert vlan.dhcp_range_end is not None
+        expected = suggest_rack_vlan_range(vlan.subnet, 1, [], (vlan.dhcp_range_start, vlan.dhcp_range_end))
+        assert expected is not None
+        self.assertIn(expected, content)
+        # And the allocator's own answer must not itself land inside the
+        # recorded DHCP range — otherwise the test fixture, not the code
+        # under test, would be the thing that's wrong.
+        expected_network = ipaddress.IPv4Network(expected)
+        self.assertFalse(
+            ipaddress.IPv4Address("10.200.0.10") in expected_network
+            or ipaddress.IPv4Address("10.200.0.200") in expected_network
+        )
 
 
 class UnrackedCompanionTetherTests(TestCase):
@@ -692,6 +780,20 @@ class RobustnessTests(TestCase):
         self.assertEqual(safe_slot_address("10.200.1.0/30", 1), "10.200.1.1")
         self.assertIsNone(safe_slot_address("10.200.1.0/30", 9))
 
+    def test_safe_slot_address_rejects_the_blocks_own_reserved_addresses(self) -> None:
+        # Codex review round 3, finding 3: containment alone still admits
+        # the block's own reserved addresses. required_block_size()'s
+        # docstring is explicit that index 0 (the network address) and
+        # index size-1 (the top/broadcast address) are both reserved —
+        # for this /30 (indices 0-3), only ordinals 1 and 2 are honest
+        # slot addresses; ordinal 3 lands exactly on the reserved top
+        # index (10.200.1.3, the block's broadcast address) and ordinal 0
+        # lands on the reserved base (10.200.1.0), the network address.
+        self.assertEqual(safe_slot_address("10.200.1.0/30", 1), "10.200.1.1")
+        self.assertEqual(safe_slot_address("10.200.1.0/30", 2), "10.200.1.2")
+        self.assertIsNone(safe_slot_address("10.200.1.0/30", 3))
+        self.assertIsNone(safe_slot_address("10.200.1.0/30", 0))
+
     def test_undersized_range_does_not_render_out_of_block_address(self) -> None:
         rack = Rack.objects.create(name="Undersized", slot_count=10)
         rack_range = RackVlanRange(rack=rack, vlan=self.vlan, address_range="10.200.1.0/30")
@@ -700,10 +802,16 @@ class RobustnessTests(TestCase):
         response = self.client.get(f"/racks/{rack.pk}/")
         self.assertEqual(response.status_code, 200)
         content = response.content.decode()
-        # Ordinal 1 genuinely lands inside the /30 and should show it...
+        # Ordinal 1 genuinely lands inside the /30, on a non-reserved
+        # address, and should show it...
         self.assertIn("10.200.1.1", _row_html(content, 1))
-        # ...but ordinal 9 is four addresses past the block's own top
-        # (10.200.1.3) and must render blank, not that out-of-block value.
+        # ...but ordinal 3 lands exactly on the block's reserved top
+        # address (10.200.1.3, the /30's broadcast address) and must
+        # render blank, not that reserved value.
+        row_3 = _row_html(content, 3)
+        self.assertNotIn("10.200.1.3", row_3)
+        self.assertNotIn("would-be-address", row_3)
+        # ...and ordinal 9 is well outside the block entirely.
         row_9 = _row_html(content, 9)
         self.assertNotIn("10.200.1.9", row_9)
         self.assertNotIn("would-be-address", row_9)

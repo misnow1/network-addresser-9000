@@ -25,18 +25,30 @@
     {% if next_block %}
       <div class="vlan-map-banner">
         Next free block (backstop — ADR 0019 lets a reservation Rack hold offset space back
-        from this suggestion; also keeps clear of the hatched bottom /24 below, by convention,
-        not by anything this VLAN's own stored DHCP range says): {{ next_block }}
+        from this suggestion; computed the same way the admin's own "leave blank to suggest"
+        would for this VLAN, so this always agrees with what creating a range here actually
+        allocates): {{ next_block }}
       </div>
     {% else %}
       <div class="vlan-map-banner">No free block sized for a /27-equivalent reservation remains on this subnet.</div>
     {% endif %}
 
+    <p class="tile__meta">
+      By long-standing convention (ADR 0002), the bottom /24 of a VLAN's subnet was once
+      suggested as a DHCP range — that auto-suggestion was retired in ADR 0011, so nothing on
+      this page assumes it: the hatch below shows only the DHCP range actually recorded for
+      this VLAN, if any, and the banner above never avoids the bottom /24 unless that's where
+      the recorded range happens to be.
+    </p>
+
     <div class="panel">
       <h2 class="panel__heading">Shape of the subnet</h2>
       <div class="vlan-map-track">
-        <div class="vlan-map-segment vlan-map-segment--hatched" style="left: 0%; width: {{ bottom_24_width_pct }}%;"
-             title="Bottom /24 — DHCP convention, allocated to nothing"></div>
+        {% if dhcp_segment %}
+          <div class="vlan-map-segment vlan-map-segment--hatched"
+               style="left: {{ dhcp_segment.left_pct }}%; width: {{ dhcp_segment.width_pct }}%;"
+               title="Recorded DHCP range: {{ dhcp_segment.start }}-{{ dhcp_segment.end }}"></div>
+        {% endif %}
         {% for segment in segments %}
           <div class="vlan-map-segment vlan-map-segment--rack"
                style="left: {{ segment.left_pct }}%; width: {{ segment.width_pct }}%;"
@@ -44,7 +56,14 @@
         {% endfor %}
       </div>
       <ul>
-        <li><span class="badge">hatched</span> bottom /24 — DHCP convention, allocated to nothing</li>
+        {% if dhcp_segment %}
+          <li>
+            <span class="badge">hatched</span> this VLAN's recorded DHCP range
+            ({{ dhcp_segment.start }}-{{ dhcp_segment.end }}) — allocated to nothing tracked here
+          </li>
+        {% else %}
+          <li><span class="badge">hatched</span> would show this VLAN's DHCP range — none is recorded</li>
+        {% endif %}
         <li><span class="badge">filled</span> a rack's reserved block — hatched and coloured are two different kinds of unavailable</li>
       </ul>
       <table class="plain">

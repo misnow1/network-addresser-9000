@@ -77,8 +77,8 @@ def safe_slot_address(range_cidr: str, ordinal: int) -> str | None:
     past the top of the whole IPv4 address space, which
     ``suggest_slot_address`` reports as a plain ``ValueError`` (the
     ``ipaddress`` module's own overflow signal); and — the one an earlier
-    revision missed (Codex review) — a range that's syntactically valid
-    CIDR but *undersized* for the rack it's attached to (also only
+    revision missed (Codex review round 2) — a range that's syntactically
+    valid CIDR but *undersized* for the rack it's attached to (also only
     reachable by a ``clean()``-bypassing ``save()``, since
     ``Rack.clean()``/``RackVlanRange.clean()`` both enforce
     ``required_block_size(rack.slot_count)`` against every stored range)
@@ -89,10 +89,25 @@ def safe_slot_address(range_cidr: str, ordinal: int) -> str | None:
     it is a wrong answer confidently presented as the address a slot
     would get, which is worse — so containment is checked explicitly
     rather than left to ``suggest_slot_address``'s arithmetic to notice.
+
+    Containment alone still isn't the whole rule, though (Codex review
+    round 3, finding 3): ``required_block_size``'s own docstring is
+    explicit that "the block's own network address (index 0) and its top
+    address (index size-1) are both left unassigned" — reserved, not
+    available to any slot. An in-range-but-reserved ordinal (``ordinal=3``
+    on that same undersized ``/30``, whose top index *is* 3) would pass a
+    bare containment check while still being an address no slot is
+    actually entitled to. Rather than re-deriving that same reservation
+    arithmetic a second way and risking it drifting from
+    ``required_block_size``'s, the candidate is checked directly against
+    the two addresses the docstring names: the network's own base address
+    and its ``broadcast_address`` (which, for any ``IPv4Network``, *is*
+    the top index).
+
     A read-only page must never 500 on data the write path allowed
     (review note 3 of ``PLAN-read-only-ui.md``), and must not assert a
-    false one either; all three failure modes become ``None`` here, which
-    every caller renders as a blank cell.
+    false one either; every failure mode above becomes ``None`` here,
+    which every caller renders as a blank cell.
     """
     try:
         validate_ipv4_cidr(range_cidr)
@@ -103,7 +118,10 @@ def safe_slot_address(range_cidr: str, ordinal: int) -> str | None:
         candidate = suggest_slot_address(range_cidr, ordinal)
     except ValueError:
         return None
-    if ipaddress.IPv4Address(candidate) not in network:
+    candidate_address = ipaddress.IPv4Address(candidate)
+    if candidate_address not in network:
+        return None
+    if candidate_address in (network.network_address, network.broadcast_address):
         return None
     return candidate
 
@@ -543,6 +561,12 @@ def _build_elevation_rows(
         "inventory.view_rackvlanrange",
         "inventory.view_networkswitchaddress",
         "inventory.view_networkdeviceport",
+        # ...and NetworkDeviceTypePort, read directly by
+        # resolve_slot_spans() (its slot_offset column drives both the
+        # bracket span and every cell's occupancy) rather than merely
+        # implied by view_networkdevice — an earlier revision missed this
+        # one too (Codex review round 3, finding 2).
+        "inventory.view_networkdevicetypeport",
     ],
     raise_exception=True,
 )
@@ -615,22 +639,25 @@ class AddressEntry:
     derived: bool
 
 
-def _conventional_dhcp_block(network: ipaddress.IPv4Network) -> str:
-    """The bottom /24 of ``network`` — DESIGN.md's "static rack allocation
-    is conventionally kept out of the bottom /24" convention — or the
-    whole subnet, when it's smaller than one /24 to begin with (matching
-    ``bottom_24_width_pct``'s own ``min(256, network.num_addresses)``).
+@dataclass(frozen=True)
+class DhcpMapSegment:
+    """The hatched region of the address map — this VLAN's own *stored*
+    ``dhcp_range_start``/``dhcp_range_end``, not an assumed convention.
 
-    Any network address for a prefix length <= 24 is automatically
-    24-bit-aligned: alignment for prefix length P requires the address be
-    a multiple of ``2**(32-P)``, and for P<=24 that exponent is >= 8, so
-    it's always also a multiple of ``2**8`` — a coarser alignment implies
-    every finer one down to /24. This always produces a syntactically
-    valid, properly-aligned CIDR block, never a ``strict=True`` failure.
+    ADR 0002's "bottom /24 is DHCP" is a sizing-time suggestion that ADR
+    0011 explicitly retired: ``dhcp_range`` stopped being a CIDR block,
+    stopped being auto-suggested, and "no replacement convention was
+    wanted" (ADR 0011's own words). Hatching the bottom /24 regardless of
+    what's actually stored — an earlier revision's behaviour — asserts a
+    convention the domain deliberately stopped enforcing three ADRs ago
+    (Codex review round 3, finding 4). ``None`` (no segment at all) for a
+    VLAN with no stored DHCP range, which is a legitimate, common state.
     """
-    if network.prefixlen <= 24:
-        return str(ipaddress.IPv4Network((network.network_address, 24)))
-    return str(network)
+
+    start: str
+    end: str
+    left_pct: float
+    width_pct: float
 
 
 def _vlan_addresses_in_use(vlan: VLAN) -> list[AddressEntry]:
@@ -704,6 +731,21 @@ def vlan_map(request: HttpRequest, pk: int) -> HttpResponse:
     raises (review note 3). A malformed non-blank ``subnet`` — reachable
     only by a ``clean()``-bypassing write — gets the same treatment for the
     same reason, one level up.
+
+    The hatched region is this VLAN's own stored ``dhcp_range_start``/
+    ``dhcp_range_end`` — nothing at all if neither is set — not an
+    assumed bottom /24 (Codex review round 3, finding 4; see
+    ``DhcpMapSegment``). The next-free-block banner reaches
+    ``suggest_rack_vlan_range`` with exactly the same inputs
+    ``RackVlanRange.clean()`` itself would use for a blank range on this
+    VLAN — sibling ranges and the stored DHCP range, nothing synthesized
+    — so this banner and the admin's own allocator can never disagree.
+    An earlier revision widened the banner's exclusions to agree with an
+    assumed-convention hatch instead; that made the *banner* wrong
+    (recommending a block the real allocator wouldn't give you) to paper
+    over a hatch that was asserting a convention ADR 0011 already retired
+    the auto-suggestion for. Fixing the hatch made that widening
+    unnecessary, so it's reverted here too.
     """
     vlan = get_object_or_404(VLAN, pk=pk)
     if not vlan.subnet:
@@ -735,45 +777,51 @@ def vlan_map(request: HttpRequest, pk: int) -> HttpResponse:
         used_ranges.append(rack_range.address_range)
     segments.sort(key=lambda segment: segment.left_pct)
 
-    bottom_24_width_pct = min(256, network.num_addresses) / network.num_addresses * 100
-
     dhcp_range = None
+    dhcp_segment = None
     if vlan.dhcp_range_start and vlan.dhcp_range_end:
         try:
-            ipaddress.IPv4Address(vlan.dhcp_range_start)
-            ipaddress.IPv4Address(vlan.dhcp_range_end)
+            start_address = ipaddress.IPv4Address(vlan.dhcp_range_start)
+            end_address = ipaddress.IPv4Address(vlan.dhcp_range_end)
         except ValueError:
             pass  # VLAN's own malformed range; its own admin page reports that
         else:
-            dhcp_range = (vlan.dhcp_range_start, vlan.dhcp_range_end)
+            # Normalized the same way dhcp_range_overlaps_cidr() is —
+            # VLAN.clean() enforces start < end on an ordinary write, but
+            # that's not a DB-level guarantee, so a clean()-bypassing
+            # write could leave the pair reversed.
+            if start_address > end_address:
+                start_address, end_address = end_address, start_address
+            dhcp_range = (str(start_address), str(end_address))
+            if start_address in network and end_address in network:
+                offset = int(start_address) - int(network.network_address)
+                width = int(end_address) - int(start_address) + 1
+                dhcp_segment = DhcpMapSegment(
+                    start=str(start_address),
+                    end=str(end_address),
+                    left_pct=offset / network.num_addresses * 100,
+                    width_pct=width / network.num_addresses * 100,
+                )
+            # else: stored range no longer fits this VLAN's subnet (an
+            # edited subnet, reached via a clean()-bypassing write) —
+            # nothing sensible to place on the map; VLAN.clean() would
+            # ordinarily catch this on save, so it's not re-reported here.
 
     # slot_count=1 forces ADR 0015's /27 floor (required_block_size(1) ==
     # 32) as the reference size — ADR 0019 made offset space reservable
     # with an empty Rack, so this suggestion is a backstop against nobody
     # having reserved a gap, not the only guard against landing in one.
-    #
-    # The conventional bottom /24 is added to the exclusion set below in
-    # addition to used_ranges/dhcp_range (Codex review round 2, finding
-    # 5) — an earlier revision let this banner recommend an address
-    # inside the exact region the map above hatches "unavailable by
-    # convention," which is the page contradicting itself. This is a
-    # display-only widening of what *this backstop banner* avoids;
-    # suggest_rack_vlan_range's real call site for an actual blank
-    # RackVlanRange — RackVlanRange.clean() — is untouched and still
-    # allocates against only the stored DHCP range and sibling ranges,
-    # exactly as ADR 0002/0019 specify. If this VLAN's real DHCP
-    # configuration doesn't occupy its bottom /24, the admin's own
-    # suggester may legitimately offer something this banner excludes —
-    # accepted as the cost of the banner staying honest about the
-    # convention this same page has already asserted by hatching it.
-    conventional_dhcp_block = _conventional_dhcp_block(network)
-    next_block = suggest_rack_vlan_range(vlan.subnet, 1, [*used_ranges, conventional_dhcp_block], dhcp_range)
+    # Exactly the same inputs RackVlanRange.clean() itself would use for
+    # a blank range on this VLAN (sibling ranges, stored DHCP range) —
+    # nothing synthesized — so this banner can never recommend something
+    # the real allocator wouldn't actually give you.
+    next_block = suggest_rack_vlan_range(vlan.subnet, 1, used_ranges, dhcp_range)
 
     context = {
         "vlan": vlan,
         "network": network,
         "segments": segments,
-        "bottom_24_width_pct": bottom_24_width_pct,
+        "dhcp_segment": dhcp_segment,
         "next_block": next_block,
         "addresses": _vlan_addresses_in_use(vlan),
     }
