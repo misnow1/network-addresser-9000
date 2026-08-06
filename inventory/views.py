@@ -877,6 +877,12 @@ def vlan_map(request: HttpRequest, pk: int) -> HttpResponse:
         "inventory.view_rack",
         "inventory.view_networkdeviceport",
         "inventory.view_networkswitch",
+        # Stage B's port table renders the specific connected switch
+        # *port* (``port.switch_port``), not just the switch it belongs
+        # to — the same class of gap the comment above already names once:
+        # a field this page reads that its own codename list didn't yet
+        # declare (Codex review, Stage B pass).
+        "inventory.view_networkswitchport",
     ],
     raise_exception=True,
 )
@@ -1815,6 +1821,27 @@ def _render_log_entry(entry: LogEntry, user: Any) -> AuditRow:
     )
 
 
+def _content_type_for_model_no_create(model: type[Model]) -> ContentType | None:
+    """A pure, never-creating lookup for ``model``'s ``ContentType`` row.
+
+    ``ContentType.objects.get_for_model()`` — and, transitively,
+    ``auditlog``'s own ``LogEntry.objects.get_for_object()``, which calls
+    it internally — is documented to create the row on a cache miss
+    (``django/contrib/contenttypes/models.py``: "creating the ContentType
+    if necessary"). That makes loading an audit panel on an otherwise
+    plain ``GET`` request capable of an ``INSERT`` — exactly the write
+    this stage's central claim says never happens (Codex review). In
+    practice every registered model's row already exists (Django's
+    ``post_migrate`` signal creates one per model at migration time), so
+    this only changes behaviour on the should-never-happen miss: render no
+    history rather than silently create a row to answer a read.
+    """
+    try:
+        return ContentType.objects.get(app_label=model._meta.app_label, model=model._meta.model_name)
+    except ContentType.DoesNotExist:
+        return None
+
+
 def _object_audit_panel_context(obj: Model, user: Any) -> tuple[list[AuditRow] | None, int | None]:
     """The most recent 20 ``LogEntry`` rows for ``obj``, rendered the same
     way as the site-wide list — shared by the rack elevation, the switch
@@ -1825,12 +1852,20 @@ def _object_audit_panel_context(obj: Model, user: Any) -> tuple[list[AuditRow] |
     (Stage B: the panel must never turn a missing audit grant into a 403
     on an otherwise-permitted page), but there is no reason to pay for the
     query at all when the answer is already known here.
+
+    Built directly against ``LogEntry`` with a non-creating content-type
+    lookup rather than ``LogEntry.objects.get_for_object()`` — see
+    ``_content_type_for_model_no_create``'s docstring. ``object_id`` (not
+    ``object_pk``) is the right column here, mirroring ``get_for_object``'s
+    own branch for an integer pk, which every model this stage covers has.
     """
     if not user.has_perm("auditlog.view_logentry"):
         return None, None
-    content_type = ContentType.objects.get_for_model(type(obj))
+    content_type = _content_type_for_model_no_create(type(obj))
+    if content_type is None:
+        return [], None  # no ContentType row at all means no LogEntry can reference this model either
     entries = (
-        LogEntry.objects.get_for_object(obj)
+        LogEntry.objects.filter(content_type=content_type, object_id=obj.pk)
         .select_related("actor", "content_type")
         .order_by("-timestamp", "-pk")[:20]
     )
