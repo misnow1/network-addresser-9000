@@ -18,7 +18,10 @@
       <tbody>
         {% for switch in spare_switches %}
           <tr>
-            <td><a href="{% url 'admin:inventory_networkswitch_change' switch.pk %}">{{ switch }}</a></td>
+            {# Stage B — retargeted off the admin: NetworkSwitch has no shaped page of #}
+            {# its own, but it does have a read-parity one now (Stage C's Viewer can't  #}
+            {# reach admin:inventory_networkswitch_change at all). #}
+            <td><a href="{% url 'inventory:model_detail' 'networkswitch' switch.pk %}">{{ switch }}</a></td>
             <td>{{ switch.switch_type }}</td>
             <td>{{ switch.serial_number|default:"—" }}</td>
           </tr>

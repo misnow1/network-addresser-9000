@@ -63,4 +63,20 @@
       </div>
     </a>
   </section>
+
+  <section class="panel">
+    {# Stage B — the discovery surface for /models/<slug>/; each tile is shown only if #}
+    {# the viewer holds that entry's own list_permissions (a partial-privilege user    #}
+    {# simply sees fewer tiles, same floor-not-narrowing posture as everywhere else).  #}
+    <h2 class="panel__heading">All records</h2>
+    <div class="tile-grid">
+      {% for spec in all_records %}
+        <a class="tile" href="{% url 'inventory:model_list' spec.slug %}">
+          <div class="tile__title">{{ spec.label_plural }}</div>
+        </a>
+      {% empty %}
+        <p>No records visible.</p>
+      {% endfor %}
+    </div>
+  </section>
 {% endblock %}

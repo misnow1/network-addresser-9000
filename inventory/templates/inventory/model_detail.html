@@ -1,0 +1,55 @@
+{% extends "inventory/base.html" %}
+
+{% block title %}{{ object }} — Network Addresser 9000{% endblock %}
+
+{% block content %}
+  <h1>{{ object }}</h1>
+  <p class="tile__meta">{{ spec.label }}</p>
+
+  <div class="panel">
+    <h2 class="panel__heading">Fields</h2>
+    <table class="plain">
+      <tbody>
+        {% for field in fields %}
+          <tr>
+            <th>{{ field.label }}</th>
+            <td>
+              {% for item in field.items %}
+                {% if item.url %}<a href="{{ item.url }}">{{ item.text }}</a>{% else %}{{ item.text }}{% endif %}{% if not forloop.last %}, {% endif %}
+              {% endfor %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p><a href="{{ admin_change_url }}">Edit in admin</a></p>
+  </div>
+
+  {% for inline in inlines %}
+    <div class="panel elevation-scroll">
+      <h2 class="panel__heading">{{ inline.label }}</h2>
+      <table class="plain">
+        <thead>
+          <tr>{% for label in inline.column_labels %}<th>{{ label }}</th>{% endfor %}</tr>
+        </thead>
+        <tbody>
+          {% for row in inline.rows %}
+            <tr>
+              {% for cell in row %}
+                <td>
+                  {% for item in cell %}
+                    {% if item.url %}<a href="{{ item.url }}">{{ item.text }}</a>{% else %}{{ item.text }}{% endif %}{% if not forloop.last %}, {% endif %}
+                  {% endfor %}
+                </td>
+              {% endfor %}
+            </tr>
+          {% empty %}
+            <tr><td colspan="{{ inline.column_labels|length }}">None.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endfor %}
+
+  {% include "inventory/_audit_panel.html" %}
+{% endblock %}
