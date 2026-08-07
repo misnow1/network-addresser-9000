@@ -60,4 +60,9 @@ access.
 
 **Admin**:
 Can view, add, and remove objects. Remove implies add — there is no role that can remove but
-not add. Provisioned `is_staff=True`, for the same reason as Editor.
+not add. Provisioned `is_staff=True`, for the same reason as Editor. **"Admin" here is the name
+of this group, not Django's own superuser flag** — `sync_roles.py` only ever grants permissions
+on this app's own models (plus one `auditlog` codename), never `auth.change_user` or any other
+permission on Django's own `User`/`Group` models, so a member of this group cannot manage
+other users' accounts (e.g. change another user's password) unless they are separately made a
+Django superuser. See README.md's "Setting up accounts".
