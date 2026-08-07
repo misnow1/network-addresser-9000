@@ -49,10 +49,15 @@ _Avoid_: assuming a profile is snapshot-copied onto a port the way a Type Port i
 ## Roles
 
 **Viewer**:
-Can see all data, cannot add or remove anything.
+Can see all data, cannot add or remove anything. Provisioned `is_staff=False` and reads
+through the purpose-built UI at `/` — never the Django admin, which refuses non-staff users
+entirely. See ADR 0020.
 
 **Editor**:
-Can view and add objects, cannot remove them.
+Can view and add objects, cannot remove them. Provisioned `is_staff=True`, because every
+mutation is a deep link into the Django admin (ADR 0020) and reaching one requires admin
+access.
 
 **Admin**:
-Can view, add, and remove objects. Remove implies add — there is no role that can remove but not add.
+Can view, add, and remove objects. Remove implies add — there is no role that can remove but
+not add. Provisioned `is_staff=True`, for the same reason as Editor.
