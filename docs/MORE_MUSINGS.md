@@ -24,8 +24,8 @@ VLANs should have a Department name. It may make sense to tag other entities - r
 * Lighting (VLANs 100-101)
 * Video (VLANs 220-221)
 
-> *→ `ROADMAP.md` phase 16.* An FK'd table, not an enum — no code branches on the value, and a
-> new department must not need a migration and a redeploy. Optional `PROTECT` FK from VLAN,
+> *→ `ROADMAP.md` phase 16, ADR 0021.* An FK'd table, not an enum — no code branches on the value,
+> and a new department must not need a migration and a redeploy. Optional `PROTECT` FK from VLAN,
 > descriptive only. Your instinct to leave racks and devices untagged held; the one place the
 > pass went further was pinning **role** (Control / Dante Primary / Dante Secondary) in the same
 > ADR, scoped per-department, because departments are what give role its correct uniqueness

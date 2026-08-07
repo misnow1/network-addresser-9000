@@ -54,6 +54,7 @@ from django.views.decorators.http import require_GET
 
 from .models import (
     VLAN,
+    Department,
     NetworkDevice,
     NetworkDevicePort,
     NetworkDeviceType,
@@ -748,6 +749,11 @@ def _vlan_addresses_in_use(vlan: VLAN) -> list[AddressEntry]:
         "inventory.view_rackvlanrange",
         "inventory.view_networkswitchaddress",
         "inventory.view_networkdeviceport",
+        # The header now names this VLAN's department (ADR 0021) —
+        # _linked_text_for only links it with this codename held, but the
+        # name itself renders regardless, so this is required for the same
+        # reason as the other entries above: it's data the page shows.
+        "inventory.view_department",
     ],
     raise_exception=True,
 )
@@ -777,7 +783,7 @@ def vlan_map(request: HttpRequest, pk: int) -> HttpResponse:
     the auto-suggestion for. Fixing the hatch made that widening
     unnecessary, so it's reverted here too.
     """
-    vlan = get_object_or_404(VLAN, pk=pk)
+    vlan = get_object_or_404(VLAN.objects.select_related("department"), pk=pk)
     if not vlan.subnet:
         return render(request, "inventory/vlan_map.html", {"vlan": vlan, "unavailable_reason": "l2_only"})
     try:
@@ -987,12 +993,12 @@ def index(request: HttpRequest) -> HttpResponse:
     since its map route has nothing to show but the L2-only state anyway.
 
     Also the discovery surface for the Stage B parity pages (review note
-    8): an "All records" panel lists all eight ``/models/<slug>/`` lists,
+    8): an "All records" panel lists all nine ``/models/<slug>/`` lists,
     each shown only if the viewer holds that entry's own
     ``list_permissions`` — a partial-privilege user simply sees fewer
     tiles, the same floor-not-narrowing posture every other view here
     takes. This keeps the nav bar itself short (one more static link,
-    "Audit", is all it gains) rather than growing it by eight.
+    "Audit", is all it gains) rather than growing it by nine.
     """
     racks = Rack.objects.annotate(
         switch_count=Count("switches", distinct=True),
@@ -1032,7 +1038,7 @@ def index(request: HttpRequest) -> HttpResponse:
 # was built against, entry by entry.
 #
 # Two generic views (`model_list`/`model_detail`) driven by this registry,
-# not sixteen hand-written ones (decision 8) — this is the whole contract
+# not eighteen hand-written ones (decision 8) — this is the whole contract
 # for what a model's page shows; nothing about it is decided in a
 # template. Templates only know the five `render` kinds below, never a
 # model name.
@@ -1119,6 +1125,7 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Default gateway", "default_gateway"),
             FieldSpec("DHCP start", "dhcp_range_start"),
             FieldSpec("DHCP end", "dhcp_range_end"),
+            FieldSpec("Department", "department", render="relation"),
         ),
         detail_fields=(
             FieldSpec("Name", "name"),
@@ -1127,10 +1134,45 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Default gateway", "default_gateway"),
             FieldSpec("DHCP start", "dhcp_range_start"),
             FieldSpec("DHCP end", "dhcp_range_end"),
+            FieldSpec("Department", "department", render="relation"),
         ),
         ordering=("vlan_id",),
-        list_permissions=("inventory.view_vlan",),
-        detail_permissions=("inventory.view_vlan",),
+        list_select_related=("department",),
+        detail_select_related=("department",),
+        list_permissions=("inventory.view_vlan", "inventory.view_department"),
+        detail_permissions=("inventory.view_vlan", "inventory.view_department"),
+    ),
+    "department": ModelSpec(
+        slug="department",
+        model=Department,
+        label="Department",
+        label_plural="Departments",
+        list_columns=(FieldSpec("Name", "name"), FieldSpec("Description", "description")),
+        detail_fields=(FieldSpec("Name", "name"), FieldSpec("Description", "description")),
+        inlines=(
+            InlineSpec(
+                label="VLANs",
+                accessor="vlans",
+                columns=(
+                    FieldSpec("Name", "name"),
+                    FieldSpec("VLAN ID", "vlan_id"),
+                    FieldSpec("Subnet", "subnet"),
+                ),
+                ordering=("vlan_id",),
+                # This registry's first inline with no admin counterpart —
+                # deliberate, not drift (ADR 0021 decision 6). VLANAdmin
+                # gets a `department` list_filter instead of an inline; the
+                # read-only UI has no filtering at all, so this inline is
+                # that filter's equivalent. The parity being kept is of
+                # *capability* (can a viewer find a department's VLANs?),
+                # not of markup.
+                permissions=("inventory.view_vlan",),
+            ),
+        ),
+        ordering=("name",),
+        detail_prefetch_related=("vlans",),
+        list_permissions=("inventory.view_department",),
+        detail_permissions=("inventory.view_department", "inventory.view_vlan"),
     ),
     "switchportvlanprofile": ModelSpec(
         slug="switchportvlanprofile",
@@ -1606,7 +1648,7 @@ def registry_permission_required(which: Literal["list", "detail"]) -> Callable[[
 
     Exists because Stage A's ``@permission_required([...])`` binds a
     literal codename list at import time (``views.py`` — see
-    ``rack_detail``'s decorator), and one generic view here serves eight
+    ``rack_detail``'s decorator), and one generic view here serves nine
     different permission sets, one per slug, resolved only once the
     request names which model it wants.
     """

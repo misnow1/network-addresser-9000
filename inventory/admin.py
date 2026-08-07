@@ -16,6 +16,7 @@ from .models import (
     _PROFILE_SYSTEM_LOCKED_FIELDS,
     VLAN,
     AuditedModel,
+    Department,
     NetworkDevice,
     NetworkDevicePort,
     NetworkDeviceType,
@@ -848,11 +849,38 @@ class NetworkDevicePortInline(admin.TabularInline):
         return False
 
 
+@admin.register(Department)
+class DepartmentAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
+    list_display = ["name", "description"]
+    search_fields = ["name"]
+    show_auditlog_history_link = True
+
+
 @admin.register(VLAN)
 class VLANAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
-    list_display = ["name", "vlan_id", "subnet", "default_gateway", "dhcp_range_start", "dhcp_range_end"]
+    list_display = [
+        "department",
+        "name",
+        "vlan_id",
+        "subnet",
+        "default_gateway",
+        "dhcp_range_start",
+        "dhcp_range_end",
+    ]
     search_fields = ["name", "vlan_id", "subnet"]
     ordering = ["vlan_id"]
+    list_filter = ["department"]
+    # A declarative attribute, not a get_queryset() override — and it has
+    # to be, for a reason Django's own auto-select_related() doesn't cover.
+    # ChangeList.has_related_field_in_list_display() does auto-apply
+    # select_related() whenever a real FK appears in list_display, which
+    # would make this redundant *if* department were required — but
+    # select_related_descend() (Django 6.0.7) reads `if not restricted:
+    # return not field.null`, so the bare auto-applied call descends
+    # nothing for a nullable FK. department is nullable (ADR 0021 decision
+    # 2), so the N+1 across the changelist is real, and naming the field
+    # here is what takes the `restricted` branch and actually fixes it.
+    list_select_related = ["department"]
     show_auditlog_history_link = True
 
 

@@ -24,6 +24,11 @@
     </div>
   {% else %}
     <p class="tile__meta">{{ vlan.subnet }}</p>
+    {% if vlan.department %}
+      <p class="tile__meta">Department:
+        <a href="{% url 'inventory:model_detail' 'department' vlan.department.pk %}">{{ vlan.department }}</a>
+      </p>
+    {% endif %}
 
     {# This figure is computed through the same call the admin's own "leave blank to #}
     {# suggest" uses, so it always agrees with what creating a range here would actually #}
