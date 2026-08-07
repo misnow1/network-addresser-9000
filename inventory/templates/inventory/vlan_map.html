@@ -8,6 +8,15 @@
     <span class="vlan-chip" style="--vlan-hue: {{ vlan.vlan_id|vlan_hue }}">VLAN {{ vlan.vlan_id }}</span>
     {{ vlan.name }}
   </h1>
+  {% if vlan.department %}
+    {# Above the three-way availability branch below, not beside #}
+    {# {{ vlan.subnet }} inside it (Codex review) — department and subnet #}
+    {# are independent, so an L2-only or malformed-subnet VLAN can still #}
+    {# carry a department, and that branch never reaches the subnet line. #}
+    <p class="tile__meta">Department:
+      <a href="{% url 'inventory:model_detail' 'department' vlan.department.pk %}">{{ vlan.department }}</a>
+    </p>
+  {% endif %}
 
   {% if unavailable_reason == "l2_only" %}
     <div class="panel">
@@ -24,11 +33,6 @@
     </div>
   {% else %}
     <p class="tile__meta">{{ vlan.subnet }}</p>
-    {% if vlan.department %}
-      <p class="tile__meta">Department:
-        <a href="{% url 'inventory:model_detail' 'department' vlan.department.pk %}">{{ vlan.department }}</a>
-      </p>
-    {% endif %}
 
     {# This figure is computed through the same call the admin's own "leave blank to #}
     {# suggest" uses, so it always agrees with what creating a range here would actually #}

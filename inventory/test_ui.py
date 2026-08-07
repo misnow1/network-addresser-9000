@@ -187,6 +187,20 @@ def _detail_field_text(content: str, label: str) -> str:
     return _clean_text(match.group(1))
 
 
+def _vlan_map_department_line(content: str) -> tuple[str, str]:
+    """The ``vlan_map.html`` header's department line — ``(href, text)`` —
+    for an exact-value assertion rather than a bare substring/
+    ``assertContains`` check (Codex review: a presence-only check on the
+    department's name wouldn't have caught the line disappearing from two
+    of the page's three states, since the name could still appear
+    elsewhere via the fixture). Raises if no department line is present.
+    """
+    match = re.search(r'<p class="tile__meta">Department:\s*<a href="([^"]+)">([^<]+)</a>', content)
+    if match is None:
+        raise AssertionError("no department line found in vlan_map header")
+    return match.group(1), _clean_text(match.group(2))
+
+
 def _list_row_cells(content: str, row_marker: str) -> list[str]:
     """Every ``<td>`` in the ``model_list.html`` row containing
     ``row_marker`` (a value unique to that row), stripped and in column
@@ -1232,6 +1246,21 @@ class RobustnessTests(TestCase):
         self.assertNotContains(response, "Shape of the subnet")
         self.assertContains(response, "no subnet")
 
+    def test_l2_only_vlan_with_department_still_shows_it(self) -> None:
+        # Codex review: the department line used to sit inside the
+        # subnet-valid branch, beside {{ vlan.subnet }} — a line the
+        # l2_only branch never reaches, so a real department silently
+        # disappeared from an L2-only VLAN's page. Department and subnet
+        # are independent (ADR 0021 doesn't touch ADR 0012's L2-only
+        # rule), so this must render regardless of unavailable_reason.
+        department = Department.objects.create(name="L2 Department")
+        l2_vlan = VLAN.objects.create(name="L2 Only", vlan_id=998, department=department)
+        response = self.client.get(f"/vlans/{l2_vlan.pk}/")
+        self.assertEqual(response.status_code, 200)
+        href, text = _vlan_map_department_line(response.content.decode())
+        self.assertEqual(href, f"/models/department/{department.pk}/")
+        self.assertEqual(text, "L2 Department")
+
     def test_department_less_vlan_map_renders_200_with_no_department_line(self) -> None:
         # ADR 0021: department is optional, and a read-only page must never
         # crash on data the write path allows (review note 3's posture,
@@ -1655,8 +1684,9 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
 
     def test_vlan_map_shows_department_in_header(self) -> None:
         response = self.client.get(f"/vlans/{self.vlan_native.pk}/")
-        self.assertContains(response, "StageB Grillework")
-        self.assertContains(response, f'href="/models/department/{self.department.pk}/"')
+        href, text = _vlan_map_department_line(response.content.decode())
+        self.assertEqual(href, f"/models/department/{self.department.pk}/")
+        self.assertEqual(text, "StageB Grillework")
 
     def test_department_renders_every_declared_column(self) -> None:
         list_response = self.client.get(self._list_url("department"))

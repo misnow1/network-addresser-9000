@@ -1766,7 +1766,7 @@ def model_detail(request: HttpRequest, slug: str, pk: int) -> HttpResponse:
 # (sync_roles.py:40-45, "who-changed-what is part of" seeing all data).
 # Renders LogEntry.changes and nothing else (decision 15): no object-state
 # reconstruction, and no applying today's AUDITLOG_INCLUDE_TRACKING_MODELS
-# (settings.py:263, 16 entries mixing whole-model/include_fields/
+# (settings.py:263, 17 entries mixing whole-model/include_fields/
 # exclude_fields/m2m_fields shapes) to an old row — tracking config
 # changes over time, and a row records what was tracked *then*.
 
