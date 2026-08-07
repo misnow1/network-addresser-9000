@@ -91,8 +91,8 @@ exercise into a search for missing *rules* rather than missing features — see
 - [x] Derived same-VLAN addresses via per-port slot offsets, for DiGiCo control+engine consoles — see ADR 0017 (partially supersedes ADR 0003)
 - [x] Implement ADR 0015 — one-line change to `required_block_size`, three existing tests to update
 - [x] Implement ADR 0016
-- [x] Implement ADR 0017 — `slot_offset`, derived offset-port addressing, span-aware rack-slot occupancy, and the narrowed same-VLAN pre-flight; see `PLAN-adr-0017.md`
-- [x] Production import — see `PLAN-prod-import.md` (revision 3), implemented as `manage.py import_prod_data` plus an independent `manage.py verify_prod_import`. Run against the real export: **183 addresses placed, 161 byte-identical, 2 differing by design (the DMI-DANTE pair), 20 correct-but-unrecorded switch addresses** — the plan's prediction exactly, 19 of 19 automatically-allocated rack bases reproduced, and every other `## Verification` check green. Two known gaps carried forward, neither blocking: the Netgear model (defers 3 of 23 switches to a second pass) and the per-device-type wiring rule for patch-panel-fed devices. Four items filed as `deferred`: #41, #42, #43, #44
+- [x] Implement ADR 0017 — `slot_offset`, derived offset-port addressing, span-aware rack-slot occupancy, and the narrowed same-VLAN pre-flight; see `docs/plans/PLAN-adr-0017.md`
+- [x] Production import — see `docs/plans/PLAN-prod-import.md` (revision 3), implemented as `manage.py import_prod_data` plus an independent `manage.py verify_prod_import`. Run against the real export: **183 addresses placed, 161 byte-identical, 2 differing by design (the DMI-DANTE pair), 20 correct-but-unrecorded switch addresses** — the plan's prediction exactly, 19 of 19 automatically-allocated rack bases reproduced, and every other `## Verification` check green. Two known gaps carried forward, neither blocking: the Netgear model (defers 3 of 23 switches to a second pass) and the per-device-type wiring rule for patch-panel-fed devices. Four items filed as `deferred`: #41, #42, #43, #44
 
 ## 13. Device companions
 
@@ -137,7 +137,7 @@ Read-only, mounted at `/`, with every mutation deep-linked into the admin — se
       `TEMPLATES["DIRS"]`, admin link gated on `is_staff` — the `TEMPLATES["DIRS"]` item is
       closed by *not* doing it: `LOGOUT_REDIRECT_URL = "/"` sidesteps
       `django.contrib.admin`'s `registration/logged_out.html` entirely rather than needing a
-      project-level dir to out-order it (`PLAN-read-only-ui.md` decision 6)
+      project-level dir to out-order it (`docs/plans/PLAN-read-only-ui.md` decision 6)
 - [x] The four shaped views: rack elevation, address map, device, spare pool
 - [x] Read-parity: plain views for the remaining registered models and their inlines
 - [x] Audit-trail view over `auditlog` — site-wide and per-object
