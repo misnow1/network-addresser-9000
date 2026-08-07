@@ -10,7 +10,7 @@ Mike wants to be reminded at both transitions — he will not always remember, s
 the reminder is your job, not his.
 
 **When planning work starts** — entering plan mode, being asked to design /
-architect / scope something, writing or revising a `PLAN-*.md`, or kicking off a
+architect / scope something, writing or revising a `docs/plans/PLAN-*.md`, or kicking off a
 review-council pass — check which model you are (your system prompt states it):
 
 - **Not Opus-class?** Say so before you start planning, and tell Mike:
@@ -95,7 +95,7 @@ values in Python, not in the command line.
 
 `/plan-cycle` (`.claude/skills/plan-cycle/`) runs the whole ritual hands-off after
 plan approval: an independent `codex` review of the plan → fold the notes into
-`PLAN-<topic>.md` as a revision with a `## Review response` table → implement on a
+`docs/plans/PLAN-<topic>.md` as a revision with a `## Review response` table → implement on a
 Sonnet subagent → an independent `codex` review of the code → the same subagent
 fixes or argues back against each finding → commits on the branch, then stops.
 Mike opens the PR.
