@@ -31,10 +31,13 @@ hard failures called out in each stage. Never ask "shall I continue?".
 
 ## Stage 0 — Set up
 
-1. **Resolve the plan.** It must be a repo-root `PLAN-<topic>.md` — that is the
-   convention (`PLAN-adr-0015-0016.md`, `PLAN-prod-import.md`). If the approved plan
-   only lives in `~/.claude/plans/`, copy it to the repo root under a descriptive
-   `PLAN-<topic>.md` name first. `<topic>` is reused for the review filenames.
+1. **Resolve the plan.** It must be `docs/plans/PLAN-<topic>.md` — that is the
+   convention (`docs/plans/PLAN-adr-0019.md`, `docs/plans/PLAN-prod-import.md`). Plans
+   live alongside `docs/adr/` rather than in the repo root, and they *are* committed:
+   the plan is the durable record of what was decided and why, which is why only the
+   `REVIEW-*.md` notes are gitignored. If the approved plan only lives in
+   `~/.claude/plans/`, copy it to `docs/plans/` under a descriptive `PLAN-<topic>.md`
+   name first. `<topic>` is reused for the review filenames.
 2. **Check the branch.** `git branch --show-current` must return something that is not
    `main`. An **empty** result means detached HEAD — treat it exactly like `main`, or the
    chain's commits end up orphaned. In either case create a feature branch named for the
@@ -56,10 +59,14 @@ already settled. Look for sections named:
 - `Carried as assumptions`
 
 These go into **both** review prompts as stated context that is out of scope to
-relitigate. This matters: `PLAN-adr-0015-0016.md` has a section titled *"Departure from
+relitigate. This matters: `PLAN-adr-0015-0016.md` had a section titled *"Departure from
 ADR 0016: there must be a `clean()`-time pre-flight"*, and ADR 0016 was implemented with
 two deliberate departures from its own text. A reviewer not told will flag them as
 defects, and a naive fold-in would silently revert a decision Mike made on purpose.
+
+(That plan was deleted in 93c7d6b rather than kept — the reason plans now live in
+`docs/plans/` and stay there. The departures survive only because they were amended into
+ADR 0016 itself.)
 
 ## Stage 1 — Independent plan review
 
@@ -95,7 +102,11 @@ sometimes, and a previous cycle recorded a review finding that *corrected a wron
 conclusion the grilling pass had reached* — the verification is what makes the fold-in
 trustworthy in both directions.
 
-Then rewrite `PLAN-<topic>.md` in the shape the repo already uses:
+If any ambiguity remains, **stop the chain** and escalate to Mike. Do not fold in a
+finding that is not understood, and do not argue with the reviewer — the point of this
+stage is to fold in the reviewer's knowledge, not to defend the plan.
+
+Then rewrite `docs/plans/PLAN-<topic>.md` in the shape the repo already uses:
 
 - A revision blockquote at the very top:
 

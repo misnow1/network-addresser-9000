@@ -69,7 +69,7 @@ for Audio Control, Dante Primary, and Dante Secondary. The 99 rows cover 89 dist
 `(rack, slot)` pairs; the 10-row surplus is discussed in §2.2.
 
 > **Historical.** The figures above (102/99/89) describe the *first* export. The corrected
-> export `PLAN-prod-import.md` implements against gives 94 data rows, 91 racked rows and 87
+> export `docs/plans/PLAN-prod-import.md` implements against gives 94 data rows, 91 racked rows and 87
 > distinct `(rack, slot)` pairs — see that plan's Verification section. This passage is a
 > dated record of what the first export showed and is left as originally written rather than
 > updated in place.
@@ -83,7 +83,7 @@ addresses anywhere — this file is purely switch port configuration, and maps o
 > **Historical.** "Five stacked per-model tables" describes the first export. The corrected
 > export has seven: it gained a TP-Link TL-SG108E table and a Cisco SG300-26P table, and the
 > derivation rule for secondary-switch profiles that made a sixth table unnecessary — see
-> `PLAN-prod-import.md` §6.
+> `docs/plans/PLAN-prod-import.md` §6.
 
 ## 2. Validation results
 
@@ -101,7 +101,7 @@ mismatches                  : 0
 That 259 is every assignment **as written**, including the duplicated rows of §2.2. Collapsing
 those to one device per slot gives **229 distinct** assignments across the 89 occupied slots —
 the figure that matters when checking an import, since 30 of the 259 are the same address
-written more than once. `PLAN-prod-import.md`'s verification section works from 229.
+written more than once. `docs/plans/PLAN-prod-import.md`'s verification section works from 229.
 
 This is `suggest_slot_address()` (`inventory/suggestions.py:73`) — `base + slot` — with the
 rack base being `suggest_rack_vlan_range()`'s block. The lookups table is independently
@@ -166,7 +166,7 @@ ranges from 2 to 19 slots. Collapsing the duplicate rows (§2.2), the 89 distinc
 
 > **Historical.** 89/66 describe the first export. The corrected export gives 87 distinct
 > slots — 23 addressed switches (unchanged) and 64 device slots, which become 63
-> `NetworkDevice` rows under ADR 0017's SD12 collapse — see `PLAN-prod-import.md` §7.
+> `NetworkDevice` rows under ADR 0017's SD12 collapse — see `docs/plans/PLAN-prod-import.md` §7.
 
 Two gaps worth noting, with different explanations:
 
@@ -175,13 +175,13 @@ Two gaps worth noting, with different explanations:
   each, fitting the ports file's "Unmanaged Switch" table (§5.2 notes that `XE300-1`'s two
   amps have no Dante card, so that rack leaves the table's two Dante ports unused), and an
   unmanaged switch
-  has no IP — so it can't appear in an addressing sheet. See `PLAN-prod-import.md` §6a.
+  has no IP — so it can't appear in an addressing sheet. See `docs/plans/PLAN-prod-import.md` §6a.
 - **`CONSOLES` starts at slot 2 with slot 1 empty**, and slots 2–3 carry addresses with blank
   descriptions whose three-VLAN signature matches Primary/Redundant Switch. That one does
   look like lost data.
 
 Rack-by-rack composition, and how it maps onto the five switch port tables, is tabulated in
-`PLAN-prod-import.md` §6a — that mapping turns out to be largely derivable from amp and
+`docs/plans/PLAN-prod-import.md` §6a — that mapping turns out to be largely derivable from amp and
 processor counts rather than needing to be supplied.
 
 ## 3. Would the current system address a site this way?
@@ -259,7 +259,7 @@ Two minor representation gaps this file exposes:
 "Primary Switch"/"Redundant Switch", and the ports file has no rack column — but it is
 largely *derivable*. Each table's amp or processor port count matches exactly one rack
 family's composition (3-amp tables to the `WPC*` racks with 3× IK42, the "LM26 1/2 Dante"
-table to the `W8LM*` racks, and so on). `PLAN-prod-import.md` §6a tabulates all five with the
+table to the `W8LM*` racks, and so on). `docs/plans/PLAN-prod-import.md` §6a tabulates all five with the
 evidence for each. What genuinely can't be derived is the four switch profiles missing from
 the file altogether — see §5.
 
@@ -399,7 +399,7 @@ adapter — one interface, on Dante Primary. The sheet gives all 19 a Control ad
 All 19 Control addresses (`10.200.3.1`–`10.200.3.19`) are dropped on import; the Dante Primary
 addresses (`10.201.3.1`–`10.201.3.19`) are correct and kept. Their device types are the
 simplest in the whole dataset — one port each, Dante Primary, 1×1GbE copper — which narrows the
-tier-3 blocker in `PLAN-prod-import.md` §7 to identity strings only, since the port shape is now
+tier-3 blocker in `docs/plans/PLAN-prod-import.md` §7 to identity strings only, since the port shape is now
 known.
 
 ### 5.4 The three together: 34 addresses, one root cause
@@ -434,11 +434,11 @@ assembled a port at a time, and all 34 of these would have been unrepresentable 
 > **Historical.** This section describes the first export's gaps. The corrected export
 > closed all four: it gained the TP-Link TL-SG108E and Cisco SG300-26P tables, a documented
 > derivation rule for the redundant-switch layout, and `CONSOLES` slots 2–3 were deleted as
-> genuinely unallocated rather than lost data — see `PLAN-prod-import.md` §6. Left as
+> genuinely unallocated rather than lost data — see `docs/plans/PLAN-prod-import.md` §6. Left as
 > originally written rather than updated in place.
 
 Four switch profiles are deployed but absent from the ports file entirely — detailed in
-`PLAN-prod-import.md` §6. Briefly: no redundant-switch layout exists anywhere (7 are
+`docs/plans/PLAN-prod-import.md` §6. Briefly: no redundant-switch layout exists anywhere (7 are
 deployed, and their amp ports should carry Dante Secondary where every table shows Dante
 Primary); the three `FLOATSWITCH` TP-Link SG108Es have no table; `Spare SG300-26` has no
 table; and `CONSOLES` slots 2–3 are blank-description rows whose three-VLAN signature matches
@@ -598,5 +598,5 @@ exists for exactly this, so the import can set it on those two switches.
 | `default-vlan tagged`, unused-port state | §4 — noted, minor |
 | **34 addresses (15%) assigned to interfaces that don't exist** | §5.1–5.4 — all resolved; omitted on import, and the device type's port list makes the whole class unrepresentable |
 | Device-type addressing modes (would have prevented all 34) | §5.4 — parked in `ROADMAP.md` "Later"; needs a VLAN role concept, and two modes are blocked by #27 |
-| Four deployed switch profiles absent from the ports file | §5 — needs running configs; `PLAN-prod-import.md` §6 |
-| Data defects, missing type identities | §5, §4 — source-data and import work; see `PLAN-prod-import.md` |
+| Four deployed switch profiles absent from the ports file | §5 — needs running configs; `docs/plans/PLAN-prod-import.md` §6 |
+| Data defects, missing type identities | §5, §4 — source-data and import work; see `docs/plans/PLAN-prod-import.md` |
