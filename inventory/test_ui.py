@@ -44,8 +44,9 @@ from django.db import connection
 from django.db.models import Q
 from django.test import TestCase
 from django.test.utils import CaptureQueriesContext
-from django.urls import reverse
+from django.urls import resolve, reverse
 
+from . import urls as inventory_urls
 from .models import (
     VLAN,
     NetworkDevice,
@@ -376,6 +377,15 @@ class ParityFixtureMixin:
         self.editor = User.objects.create_user("stageb-editor", password="testpass123", is_staff=True)
         self.editor.groups.add(Group.objects.get(name="Editor"))
         self.no_group = User.objects.create_user("stageb-nogroup", password="testpass123", is_staff=False)
+        # Stage C's fixture: a Viewer provisioned exactly the way ADR 0020
+        # decision 7 says Viewers provision — is_staff=False — so the
+        # admin-lockout test can prove this specific, real shape reaches
+        # every UI route rather than a staff Viewer that merely happens to
+        # be in the right group.
+        self.non_staff_viewer = User.objects.create_user(
+            "stageb-viewer-nonstaff", password="testpass123", is_staff=False
+        )
+        self.non_staff_viewer.groups.add(Group.objects.get(name="Viewer"))
 
         self.pk_by_slug = {
             "vlan": self.vlan_native.pk,
@@ -393,6 +403,83 @@ class ParityFixtureMixin:
 
     def _detail_url(self, slug: str) -> str:
         return reverse("inventory:model_detail", args=[slug, self.pk_by_slug[slug]])
+
+
+# ---------------------------------------------------------------------------
+# The route enumeration — one source of truth, derived from
+# ``inventory.urls.urlpatterns`` (Stage C).
+#
+# Before this, two hand-maintained route lists existed independently:
+# ``UIAccessControlTests._routes()`` (the five Stage A paths) and
+# ``ParityAccessTests._routes()`` (audit plus the sixteen registry
+# list/detail paths). Together they happened to cover all eight URL
+# patterns in ``urls.py``, but "happened to" is exactly the failure mode
+# Stage C's admin-lockout test cannot tolerate: that test's entire value is
+# being *exhaustive* — it is what certifies that flipping a Viewer to
+# ``is_staff=False`` costs them nothing, and a stale list wouldn't fail, it
+# would silently certify something false.
+#
+# ``UrlconfCoverageTests`` (below, in the Stage C section) is the guard —
+# but it must check what ``_shaped_routes``/``_parity_routes`` actually
+# *produce*, not a fourth hand-written name list sitting next to them
+# (Codex review: an earlier revision of this comment introduced exactly
+# that — two frozensets that never touched the functions below at all, so
+# deleting a route from ``_shaped_routes()`` would leave the frozensets,
+# and the guard, unchanged). ``_covered_route_names()`` closes that gap by
+# resolving every route the builders actually emit and reading back the
+# ``url_name`` Django itself assigns each one.
+def _shaped_routes(*, rack_pk: int, vlan_pk: int, device_pk: int) -> list[str]:
+    """The five Stage A shaped-view routes."""
+    return [
+        reverse("inventory:index"),
+        reverse("inventory:rack", args=[rack_pk]),
+        reverse("inventory:vlan_map", args=[vlan_pk]),
+        reverse("inventory:device", args=[device_pk]),
+        reverse("inventory:spares"),
+    ]
+
+
+def _parity_routes(*, pk_by_slug: dict[str, int]) -> list[str]:
+    """``/audit/`` plus the sixteen Stage B list/detail routes — one pair
+    per ``REGISTRY`` slug, so this stays exhaustive as the registry grows
+    without anyone touching this function.
+    """
+    routes = [reverse("inventory:audit")]
+    for slug in REGISTRY:
+        routes.append(reverse("inventory:model_list", args=[slug]))
+        routes.append(reverse("inventory:model_detail", args=[slug, pk_by_slug[slug]]))
+    return routes
+
+
+def _all_ui_routes(*, rack_pk: int, vlan_pk: int, device_pk: int, pk_by_slug: dict[str, int]) -> list[str]:
+    """Every concrete route this app serves outside ``/admin/`` and the two
+    auth routes — the shaped views plus read-parity plus the audit trail.
+    This is what the Stage C admin-lockout test sweeps: the claim it proves
+    is that nothing on this list is unreachable once ``/admin/`` is gone.
+    """
+    return _shaped_routes(rack_pk=rack_pk, vlan_pk=vlan_pk, device_pk=device_pk) + _parity_routes(
+        pk_by_slug=pk_by_slug
+    )
+
+
+def _covered_route_names(
+    *, rack_pk: int, vlan_pk: int, device_pk: int, pk_by_slug: dict[str, int]
+) -> set[str]:
+    """The distinct ``url_name`` Django resolves each of
+    ``_all_ui_routes()``'s routes to — what the shared builders *actually*
+    cover, as opposed to a second hand-written set of names that could
+    silently drift from what the builders build (Codex review). Used by
+    ``UrlconfCoverageTests`` to check the builders' real output against
+    ``inventory.urls.urlpatterns``, rather than checking one hand-written
+    list against another.
+    """
+    routes = _all_ui_routes(rack_pk=rack_pk, vlan_pk=vlan_pk, device_pk=device_pk, pk_by_slug=pk_by_slug)
+    names: set[str] = set()
+    for route in routes:
+        url_name = resolve(route).url_name
+        assert url_name is not None, f"resolved route has no url_name: {route}"
+        names.add(url_name)
+    return names
 
 
 class UIAccessControlTests(TestCase):
@@ -434,13 +521,10 @@ class UIAccessControlTests(TestCase):
         self.non_staff_viewer.groups.add(Group.objects.get(name="Viewer"))
 
     def _routes(self) -> list[str]:
-        return [
-            "/",
-            f"/racks/{self.rack.pk}/",
-            f"/vlans/{self.vlan.pk}/",
-            f"/devices/{self.device.pk}/",
-            "/spares/",
-        ]
+        # Delegates to the shared enumeration (Stage C) rather than
+        # hand-listing these five paths a second time — see the comment
+        # above ``_shaped_routes``.
+        return _shaped_routes(rack_pk=self.rack.pk, vlan_pk=self.vlan.pk, device_pk=self.device.pk)
 
     def test_every_route_200_for_all_three_roles(self) -> None:
         for username in ["viewer", "editor", "adminrole"]:
@@ -479,7 +563,7 @@ class UIAccessControlTests(TestCase):
         self.assertContains(self.client.get("/"), 'href="/admin/"')
         self.client.logout()
 
-        self.client.login(username="viewer2", password="testpass123")
+        self.client.login(username=self.non_staff_viewer.username, password="testpass123")
         self.assertNotContains(self.client.get("/"), 'href="/admin/"')
 
 
@@ -1365,11 +1449,10 @@ class ParityAccessTests(ParityFixtureMixin, TestCase):
     """
 
     def _routes(self) -> list[str]:
-        routes = ["/audit/"]
-        for slug in REGISTRY:
-            routes.append(self._list_url(slug))
-            routes.append(self._detail_url(slug))
-        return routes
+        # Delegates to the shared enumeration (Stage C) rather than
+        # hand-listing these paths a second time — see the comment above
+        # ``_parity_routes``.
+        return _parity_routes(pk_by_slug=self.pk_by_slug)
 
     def test_every_route_200_or_redirect_for_all_three_roles(self) -> None:
         canonical_slugs = {slug for slug, spec in REGISTRY.items() if spec.canonical_detail_view}
@@ -1940,3 +2023,178 @@ class AuditPaginationFilterTests(TestCase):
             content_type=ContentType.objects.get_for_model(NetworkSwitch), object_id=decoy.pk
         ).latest("timestamp")
         self.assertNotIn(f'data-logentry-pk="{decoy_entry.pk}"', content)
+
+
+# ---------------------------------------------------------------------------
+# Stage C — Viewers leave the admin
+# ---------------------------------------------------------------------------
+
+
+class UrlconfCoverageTests(ParityFixtureMixin, TestCase):
+    """Guards the shared route enumeration itself (``_shaped_routes``/
+    ``_parity_routes``/``_all_ui_routes`` above) against silent drift.
+
+    Codex review found the first revision of this guard checked
+    ``inventory.urls.urlpatterns`` against ``_SHAPED_ROUTE_NAMES`` /
+    ``_PARITY_ROUTE_NAMES`` — two hand-written frozensets sitting next to
+    the builders, not the builders' own output. That is a **third**
+    hand-maintained list, and it demonstrably doesn't guard what it
+    claims: delete the ``device`` line from ``_shaped_routes()`` and the
+    frozensets still say ``"device"``, ``urlpatterns`` still says
+    ``"device"``, and the guard stays green while every sweep built on the
+    enumeration — including the Stage C admin-lockout test — silently
+    narrows. ``_covered_route_names()`` fixes this by resolving every URL
+    the builders actually emit and reading back the ``url_name`` Django
+    itself assigns, so what's under test is the builders' real output.
+    """
+
+    def test_route_builders_cover_every_urlconf_pattern(self) -> None:
+        covered_names = _covered_route_names(
+            rack_pk=self.rack.pk,
+            vlan_pk=self.vlan_native.pk,
+            device_pk=self.device.pk,
+            pk_by_slug=self.pk_by_slug,
+        )
+        actual_names = {pattern.name for pattern in inventory_urls.urlpatterns}
+        self.assertEqual(covered_names, actual_names)
+
+        # A name-set comparison alone can't catch two different patterns
+        # sharing one name (Codex review) — this app's reverse()-by-name
+        # usage throughout this module assumes every name in ``urls.py``
+        # is used by exactly one pattern, so assert the pattern count
+        # against the distinct-name count too: if they ever diverge, some
+        # name in ``urlpatterns`` is no longer unique.
+        self.assertEqual(len(inventory_urls.urlpatterns), len(actual_names))
+
+    def test_guard_is_not_vacuous_a_dropped_route_would_fail_it(self) -> None:
+        """Proves the assertion above would actually catch the failure
+        Codex review demonstrated — a route silently dropped from one of
+        the builders — rather than passing regardless of what they
+        produce. Simulates the drop (removing ``"device"`` from the
+        covered-names set) instead of editing ``_shaped_routes()`` itself,
+        since editing the real builder would also break every other test
+        that depends on it.
+        """
+        covered_names = _covered_route_names(
+            rack_pk=self.rack.pk,
+            vlan_pk=self.vlan_native.pk,
+            device_pk=self.device.pk,
+            pk_by_slug=self.pk_by_slug,
+        )
+        actual_names = {pattern.name for pattern in inventory_urls.urlpatterns}
+        self.assertIn("device", covered_names)  # sanity: the route this simulation drops is really there
+        self.assertNotEqual(covered_names - {"device"}, actual_names)
+
+
+class AdminLockoutTests(ParityFixtureMixin, TestCase):
+    """Stage C's real gate (ADR 0020 decision 7, plan Stage C). No code
+    flips a Viewer's ``is_staff`` — existing Viewers are flipped by hand in
+    the admin — so nothing here exercises ``sync_roles.py``. What this
+    proves is the *consequence* of that flip: ``AdminSite.has_permission()``
+    gates on ``is_active and is_staff``, so ``is_staff=False`` is a total
+    lockout from every admin page, and that is only safe because Stages A
+    and B brought the read-only UI to parity with what a Viewer could
+    previously see in the admin. This test is what certifies that parity
+    is real — it reaches every route this app serves outside ``/admin/``
+    itself, as the exact user shape ADR 0020 decision 7 describes, and
+    separately proves the admin refuses that same user precisely (not just
+    "not 200").
+    """
+
+    def test_non_staff_viewer_reaches_every_ui_route(self) -> None:
+        """Status codes alone can't tell "this route serves the real page"
+        from "this route serves an empty or wrong one" (Codex review) — a
+        200 with an error-shaped or blank body, or a 301 to the login page,
+        would both pass a status-only sweep. Every 200 route below is
+        checked against a fixture value that could only render from that
+        route's own data (``ParityFixtureMixin``'s own docstring already
+        chose these values so none is a substring of another rendered value
+        on the same page); every 301 is checked against its exact redirect
+        target, not merely a 3xx.
+        """
+        self.client.login(username=self.non_staff_viewer.username, password="testpass123")
+
+        # Rack and NetworkDevice's model_detail routes redirect (decision
+        # 13) to their canonical shaped page — checked against the *exact*
+        # target, since any 3xx (including one to the login page) would
+        # otherwise pass.
+        canonical_targets = {
+            reverse("inventory:model_detail", args=[slug, self.pk_by_slug[slug]]): reverse(
+                spec.canonical_detail_view, args=[self.pk_by_slug[slug]]
+            )
+            for slug, spec in REGISTRY.items()
+            if spec.canonical_detail_view
+        }
+
+        # A route-specific marker for every other route — reusing the
+        # exact distinctive fixture values ``ParityContentTests`` already
+        # proved render in these positions, rather than inventing a second
+        # set of expected values.
+        markers = {
+            reverse("inventory:index"): "StageB Rack",
+            reverse("inventory:rack", args=[self.rack.pk]): "stageb-device1",
+            reverse("inventory:vlan_map", args=[self.vlan_native.pk]): "StageB Native",
+            reverse("inventory:device", args=[self.device.pk]): "StageB Device Port",
+            reverse("inventory:spares"): "stageb-dhcp-device",
+            reverse("inventory:audit"): "stageb-switch1",
+            self._list_url("vlan"): "StageB Native",
+            self._detail_url("vlan"): "StageB Native",
+            self._list_url("switchportvlanprofile"): "StageB Profile",
+            self._detail_url("switchportvlanprofile"): "StageB Profile",
+            self._list_url("racktemplate"): "StageB Template",
+            self._detail_url("racktemplate"): "StageB Template",
+            self._list_url("rack"): "StageB Rack",
+            self._list_url("networkswitchtype"): "StageB Switch Type",
+            self._detail_url("networkswitchtype"): "StageB Switch Type",
+            self._list_url("networkswitch"): "stageb-switch1",
+            self._detail_url("networkswitch"): "stageb-switch1",
+            self._list_url("networkdevicetype"): "StageB Device Type",
+            self._detail_url("networkdevicetype"): "StageB Device Type",
+            self._list_url("networkdevice"): "stageb-device1",
+        }
+
+        routes = _all_ui_routes(
+            rack_pk=self.rack.pk,
+            vlan_pk=self.vlan_native.pk,
+            device_pk=self.device.pk,
+            pk_by_slug=self.pk_by_slug,
+        )
+        self.assertGreater(len(routes), 0)  # a broken enumeration must not vacuously pass
+        # Every route the enumeration produces must be accounted for by
+        # exactly one of the two dicts above — proof this test's own
+        # expectations are as exhaustive as the enumeration, not a subset
+        # of it that would silently stop growing.
+        self.assertEqual(set(routes), set(canonical_targets) | set(markers))
+
+        for route in routes:
+            if route in canonical_targets:
+                response = self.client.get(route)
+                self.assertEqual(response.status_code, 301, route)
+                self.assertEqual(response["Location"], canonical_targets[route], route)
+            else:
+                response = self.client.get(route)
+                self.assertEqual(response.status_code, 200, route)
+                self.assertContains(response, markers[route], msg_prefix=f"{route}: ")
+
+    def test_non_staff_viewer_refused_by_admin_precisely(self) -> None:
+        # A bare assertNotEqual(status, 200) would also pass if "/admin/"
+        # simply didn't resolve, which proves nothing about the lockout.
+        # Django's admin redirects an unauthorised user to its own login
+        # page rather than 403ing, so assert that specific redirect target,
+        # then follow it and assert the Viewer does not end up logged into
+        # the admin.
+        self.client.login(username=self.non_staff_viewer.username, password="testpass123")
+        response = self.client.get("/admin/")
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response["Location"].startswith("/admin/login/"), response["Location"])
+
+        # AdminSite.login() re-checks has_permission() on the way in and,
+        # since it's still False, renders its own "authenticated but not
+        # authorized" notice (admin/login.html) rather than the "Site
+        # administration" index — the precise proof that an authenticated,
+        # non-staff Viewer never actually gets past the door, not merely
+        # that the URL resolved to *something*.
+        login_page = self.client.get(response["Location"])
+        self.assertEqual(login_page.status_code, 200)
+        self.assertContains(login_page, "not authorized to access this page")
+        self.assertContains(login_page, self.non_staff_viewer.username)

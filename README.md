@@ -34,7 +34,20 @@ A few things worth knowing before relying on this in practice:
 
 ## Setting up accounts
 
-Create a user via `/admin/auth/user/add/` with **Staff status** checked (required for any Django-admin access, including the read-only Viewer role), then assign them to one of the three groups — Viewer, Editor, or Admin (see CONTEXT.md's "Roles") — from the user's own admin page. Under Docker, those groups are created automatically on every container start (see "Running with Docker"). Outside Docker, run `python manage.py sync_roles` once after `migrate` (safe to re-run any time, e.g. after adding a model). Also run `python manage.py seed_defaults` after `migrate` — it re-seeds the system Default VLAN/Switch Port VLAN Profile (ADR 0012) if they're ever missing; `migrate` seeds them once already, but can't repair them if removed some other way (e.g. `manage.py flush`).
+Create a user via `/admin/auth/user/add/`, then assign them to one of the three groups — Viewer, Editor, or Admin (see CONTEXT.md's "Roles") — from the user's own admin page. **Staff status** depends on the role: leave it **unchecked** for a Viewer, who reads through the purpose-built UI at `/` and never needs the admin at all (it refuses non-staff users entirely — see [ADR 0020](./docs/adr/0020-read-only-purpose-built-ui.md)); check it for an Editor or Admin, since every mutation in this app is a deep link into the admin and reaching one requires admin access. Under Docker, those groups are created automatically on every container start (see "Running with Docker"). Outside Docker, run `python manage.py sync_roles` once after `migrate` (safe to re-run any time, e.g. after adding a model). Also run `python manage.py seed_defaults` after `migrate` — it re-seeds the system Default VLAN/Switch Port VLAN Profile (ADR 0012) if they're ever missing; `migrate` seeds them once already, but can't repair them if removed some other way (e.g. `manage.py flush`).
+
+**Password changes are superuser-performed for now.** A non-staff Viewer has no admin
+password-change form, and this app deliberately does not mount password reset — that would
+need email infrastructure this deployment does not have (ADR 0020 decision 2: no forms, no
+`POST` handlers, of the read-only UI's own). Until a read/write UI exists to provide a `POST`
+surface, changing a Viewer's password means a **superuser** — not merely a member of the
+"Admin" group — sets it for them via `/admin/auth/user/<id>/password/`. `sync_roles.py` only
+ever grants permissions on this app's own models plus one `auditlog` codename; it never
+touches `auth.change_user`, which Django's `UserAdmin` requires to open that form, so a group
+Admin who is not also a Django superuser cannot perform this operation. "Admin" here is this
+project's group name (see CONTEXT.md's "Roles"), not Django's own superuser flag — the two are
+easy to conflate because the words overlap, but only a superuser can reach this form. This
+also means that superuser knows the password they set — a deliberate trade, not an oversight.
 
 ## Planned stack
 

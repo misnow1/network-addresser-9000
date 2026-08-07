@@ -141,9 +141,13 @@ Read-only, mounted at `/`, with every mutation deep-linked into the admin — se
 - [x] The four shaped views: rack elevation, address map, device, spare pool
 - [x] Read-parity: plain views for the remaining registered models and their inlines
 - [x] Audit-trail view over `auditlog` — site-wide and per-object
-- [ ] Flip Viewer provisioning to `is_staff=False` (gated on parity + the audit view landing)
+- [x] Flip Viewer provisioning to `is_staff=False` (gated on parity + the audit view landing)
 
 ## Later / not yet designed
+- A non-staff Viewer cannot change their own password (no admin password form, and password
+  reset is deliberately unrouted — see README.md "Setting up accounts"); password changes stay
+  admin-performed until a read/write UI provides a `POST` surface. Mounting `PasswordChangeView`
+  now would contradict ADR 0020 decision 2 ("no forms, no `POST` handlers")
 - Device-replacement workflow (swapping a spare into an already-addressed slot) — flagged in ADR 0003, design deferred
 - Addressing modeled per `(device, VLAN)` instead of per port — the actual fix for Switched Mode's bridged-jack limitation (ADR 0010, ADR 0013) — see #27
 - Two *independent* static addresses on one VLAN (a Yamaha console's "For Device Control" interface) — see #42. ADR 0018 covers the same hardware but solves a different problem (existence and lifecycle, not addressing) and leaves this open: if it ever lands, those consoles collapse to one device and their companion links fall away
