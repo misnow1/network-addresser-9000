@@ -26,6 +26,7 @@ from django.db.models import ProtectedError
 from django.forms import inlineformset_factory, modelform_factory
 from django.test import RequestFactory, TestCase
 from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
 
 from .admin import (
     AuditedModelAdminMixin,
@@ -6824,6 +6825,172 @@ class OperatorSetPortTests(TestCase):
             self.assertTrue(port.is_dhcp)
             self.assertIsNone(port.address)
 
+    def test_operator_addresses_mapping_is_per_instance_not_shared(self) -> None:
+        """Codex review of PR 1, P2 — ``_operator_addresses``'s class-level
+        default is a ``dict`` (unlike ``_port_addressing``'s ``str``, which
+        has no equivalent hazard since strings are immutable). A device
+        created with no ``operator_addresses`` kwarg at all must not read
+        back whatever another device's mapping happened to leave behind —
+        proven here via two devices created in sequence, the second with
+        no mapping of its own.
+        """
+        device_type = self._make_console_type(name="DM7C Not Shared")
+        first = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=device_type,
+            rack=self.rack,
+            rack_slot=5,
+            operator_addresses={"Device Control": "10.201.6.4"},
+        )
+        second = NetworkDevice(device_type=device_type)  # unsaved — no operator_addresses given at all
+        self.assertEqual(second.operator_addresses, {})
+        self.assertIsNot(second.operator_addresses, first.operator_addresses)
+
+    def test_mutating_one_devices_mapping_does_not_leak_into_another(self) -> None:
+        """The sharper version of the test above: even an *in-place*
+        mutation on one instance's dict-typed property — the natural way
+        to write to it — must not be visible from a second instance that
+        never set its own.
+        """
+        device_type = self._make_console_type(name="DM7C Mutation Isolation")
+        first = NetworkDevice(device_type=device_type)
+        second = NetworkDevice(device_type=device_type)
+        first.operator_addresses["Device Control"] = "10.201.6.4"
+        self.assertEqual(second.operator_addresses, {})
+
+
+class OperatorPortDeriveCascadeIsolationTests(TestCase):
+    """Codex review of PR 1, P1 — a profile may legally hold a ``SLOT``
+    offset-0 port, an ``OPERATOR`` offset-0 port and a ``SLOT`` offset>0
+    port all on one VLAN (a console whose Device Control shares a VLAN
+    with a Dante Primary that itself derives an engine-like sibling).
+    Editing the ``OPERATOR`` port's independent address must never be
+    mistaken for editing the *control* address the offset>0 sibling
+    derives from; editing the genuine ``SLOT`` control address must still
+    cascade exactly as ADR 0017 always has.
+    """
+
+    def setUp(self) -> None:
+        self.vlan = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=10)
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.201.6.0/27")
+        self.device_type = NetworkDeviceType.objects.create(
+            manufacturer="Yamaha", model="DM7C+Engine", name="Cascade Isolation", port_count=3
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=self.device_type,
+            description="Dante Primary",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=self.device_type,
+            description="Derived Sibling",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan,
+            slot_offset=1,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=self.device_type,
+            description="Device Control",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan,
+            address_source=PortAddressSource.OPERATOR,
+            hostname_suffix="device-control",
+        )
+        self.device = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=5,
+            operator_addresses={"Device Control": "10.201.6.4"},
+        )
+
+    def test_operator_port_edit_does_not_touch_derived_sibling(self) -> None:
+        sibling_before = self.device.ports.get(description="Derived Sibling").address
+        device_control = self.device.ports.get(description="Device Control")
+        device_control.address = "10.201.6.20"
+        device_control.save()
+        sibling = self.device.ports.get(description="Derived Sibling")
+        self.assertEqual(sibling.address, sibling_before)
+
+    def test_slot_port_edit_still_cascades_to_derived_sibling(self) -> None:
+        dante_primary = self.device.ports.get(description="Dante Primary")
+        dante_primary.address = "10.201.6.9"
+        dante_primary.save()
+        sibling = self.device.ports.get(description="Derived Sibling")
+        self.assertEqual(sibling.address, "10.201.6.10")
+
+
+class OperatorAddressSelfCollisionTests(TestCase):
+    """Codex review of PR 1, P2 — an operator address that collides with
+    the pending ``SLOT`` suggestion on the same VLAN, or two operator
+    ports given the same address, must be caught in the pre-flight —
+    neither candidate exists in the database yet for
+    ``_validate_static_address()``'s own uniqueness check to catch it
+    against, so without this the pre-flight (and the admin form) would
+    pass and materialization would fail partway through on the second
+    port instead.
+    """
+
+    def setUp(self) -> None:
+        self.vlan = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=10)
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.201.6.0/27")
+
+    def test_operator_address_colliding_with_slot_suggestion_rejected(self) -> None:
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="Yamaha", model="DM7C", name="Self Collision Slot", port_count=2
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type, description="Dante Primary", port_type=PortType.GBE_RJ45, vlan=self.vlan
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type,
+            description="Device Control",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan,
+            address_source=PortAddressSource.OPERATOR,
+        )
+        # Dante Primary (SLOT, offset 0) at rack_slot 5 would suggest
+        # 10.201.6.5 — hand the operator port that exact same address.
+        with self.assertRaises(ValidationError):
+            NetworkDevice.objects.create(  # type: ignore[misc]
+                device_type=device_type,
+                rack=self.rack,
+                rack_slot=5,
+                operator_addresses={"Device Control": "10.201.6.5"},
+            )
+        self.assertEqual(NetworkDevicePort.objects.count(), 0)  # nothing written
+
+    def test_two_operator_ports_given_same_address_rejected(self) -> None:
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="Yamaha", model="DM7C", name="Self Collision Operator", port_count=2
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type,
+            description="Device Control A",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan,
+            address_source=PortAddressSource.OPERATOR,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type,
+            description="Device Control B",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan,
+            address_source=PortAddressSource.OPERATOR,
+        )
+        with self.assertRaises(ValidationError):
+            NetworkDevice.objects.create(  # type: ignore[misc]
+                device_type=device_type,
+                rack=self.rack,
+                rack_slot=5,
+                operator_addresses={
+                    "Device Control A": "10.201.6.4",
+                    "Device Control B": "10.201.6.4",
+                },
+            )
+        self.assertEqual(NetworkDevicePort.objects.count(), 0)  # nothing written
+
 
 class HostnameSuffixLockExemptionTests(TestCase):
     """ADR 0022 decision 4 — ``hostname_suffix`` is exempt from the
@@ -6889,6 +7056,56 @@ class HostnameSuffixLockExemptionTests(TestCase):
         inline = NetworkDeviceTypePortInline(NetworkDeviceType, AdminSite())
         readonly = inline.get_readonly_fields(RequestFactory().get("/"), unlocked_type)
         self.assertEqual(readonly, [])
+
+    def test_created_by_change_via_update_fields_still_refused(self) -> None:
+        """Codex review of PR 1, P1 — the original comparison hand-listed
+        eight fields and silently omitted ``created_by``/``created_at``,
+        which let exactly this write (``update_fields=["created_by"]``, no
+        ``hostname_suffix`` involved at all) slip through the lock. Every
+        concrete field is compared now, introspected from
+        ``_meta.concrete_fields`` rather than hand-listed, so a future
+        field addition can't reopen this by omission either.
+        """
+        user = User.objects.create_user("suffixlockuser", password="x")
+        self.type_port.created_by = user
+        with self.assertRaises(ValidationError):
+            self.type_port.save(update_fields=["created_by"])
+        self.type_port.refresh_from_db()
+        self.assertIsNone(self.type_port.created_by)
+
+    def test_created_at_change_still_refused(self) -> None:
+        self.type_port.created_at = timezone.now()
+        with self.assertRaises(ValidationError):
+            self.type_port.save(update_fields=["created_at"])
+
+    def test_update_fields_hostname_suffix_only_ignores_dirty_other_field(self) -> None:
+        """``update_fields`` is honored going forward too, not just as an
+        escape route to close: a dirty in-memory ``description`` this
+        specific ``save()`` call excludes must not block the
+        ``hostname_suffix`` write it *does* include — mirrors
+        ``_check_locked_fields_unchanged()``'s own ``update_fields``
+        semantics elsewhere in this module.
+        """
+        self.type_port.hostname_suffix = "engine"
+        self.type_port.description = "Renamed"  # dirty, but excluded below
+        self.type_port.save(update_fields=["hostname_suffix"])  # must not raise
+        self.type_port.refresh_from_db()
+        self.assertEqual(self.type_port.hostname_suffix, "engine")
+        self.assertEqual(self.type_port.description, "Port 1")  # unchanged — excluded from this write
+
+    def test_queryset_update_bypasses_lock_pre_existing_documented_gap(self) -> None:
+        """Not a new gap opened by the ``hostname_suffix`` exemption —
+        ``QuerySet.update()`` bypasses ``Model.save()`` (and therefore
+        every lock check inside it) for *every* locked field on this
+        model, exemption or not; ``_check_locked_fields_unchanged()``
+        already documents this as an accepted, unclosed limitation for
+        every other locked-field invariant in this module. Recorded here
+        as a regression/documentation test — proving the gap is real and
+        pre-existing, not something this PR's fix is expected to close.
+        """
+        NetworkDeviceTypePort.objects.filter(pk=self.type_port.pk).update(description="Renamed via queryset")
+        self.type_port.refresh_from_db()
+        self.assertEqual(self.type_port.description, "Renamed via queryset")  # bypassed, as documented
 
 
 class DerivedPortHostnameTests(TestCase):
@@ -7023,6 +7240,138 @@ class OperatorAddressAddFormTests(TestCase):
         self.assertEqual(port.address, "10.201.6.4")
 
 
+class OperatorAddressAdminViewTests(TestCase):
+    """Codex review of PR 1, P1 — the operator-address field must actually
+    *render* in, and be usable through, the real admin add view, not just
+    exist on the form class in isolation (``OperatorAddressAddFormTests``
+    above proves the form class works standalone; this proves the admin
+    view actually wires it up). Django's ``ModelAdmin`` computes the
+    rendered fieldset from the form *class*'s ``base_fields`` — set once
+    when ``modelform_factory()`` builds the class, before any instance's
+    ``__init__`` ever runs — so a field only ever added inside ``__init__``
+    is real for validation but invisible on the page.
+    ``NetworkDeviceAddForm.with_operator_fields()``, wired through
+    ``NetworkDeviceAdmin.get_form()``, is what fixes that.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.admin_user = User.objects.create_user("opadmin", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="opadmin", password="testpass123")
+        self.vlan = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=10)
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.201.6.0/27")
+        self.device_type = NetworkDeviceType.objects.create(
+            manufacturer="Yamaha", model="DM7C", name="DM7C Admin View", port_count=2
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=self.device_type,
+            description="Dante Primary",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan,
+        )
+        self.device_control = NetworkDeviceTypePort.objects.create(
+            device_type=self.device_type,
+            description="Device Control",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan,
+            address_source=PortAddressSource.OPERATOR,
+            hostname_suffix="device-control",
+        )
+
+    def test_get_renders_operator_field_for_chosen_type(self) -> None:
+        response = self.client.get(f"/admin/inventory/networkdevice/add/?device_type={self.device_type.pk}")
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, f'name="operator_address__{self.device_control.pk}"')
+
+    def test_get_omits_operator_field_when_no_type_chosen(self) -> None:
+        response = self.client.get("/admin/inventory/networkdevice/add/")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, "operator_address__")
+
+    def test_get_omits_operator_field_for_a_type_with_none(self) -> None:
+        plain_type = NetworkDeviceType.objects.create(
+            manufacturer="Test", model="Plain", name="Plain Admin View", port_count=1
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=plain_type, description="Only Port", port_type=PortType.GBE_RJ45, vlan=self.vlan
+        )
+        response = self.client.get(f"/admin/inventory/networkdevice/add/?device_type={plain_type.pk}")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, "operator_address__")
+
+    def test_post_creates_device_with_operator_address(self) -> None:
+        response = self.client.post(
+            "/admin/inventory/networkdevice/add/",
+            {
+                "device_type": self.device_type.pk,
+                "hostname": "dm7c-1",
+                "serial_number": "",
+                "rack": self.rack.pk,
+                "rack_slot": "5",
+                "port_addressing": PortAddressing.STATIC,
+                f"operator_address__{self.device_control.pk}": "10.201.6.4",
+                "ports-TOTAL_FORMS": "0",
+                "ports-INITIAL_FORMS": "0",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+            },
+        )
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        device = NetworkDevice.objects.get(hostname="dm7c-1")
+        port = device.ports.get(description="Device Control")
+        self.assertEqual(port.address, "10.201.6.4")
+
+    def test_post_missing_operator_address_reports_field_error_not_silent_failure(self) -> None:
+        response = self.client.post(
+            "/admin/inventory/networkdevice/add/",
+            {
+                "device_type": self.device_type.pk,
+                "hostname": "dm7c-2",
+                "serial_number": "",
+                "rack": self.rack.pk,
+                "rack_slot": "6",
+                "port_addressing": PortAddressing.STATIC,
+                "ports-TOTAL_FORMS": "0",
+                "ports-INITIAL_FORMS": "0",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+            },
+        )
+        self.assertEqual(response.status_code, 200)  # re-rendered with a field error, not a 302
+        self.assertContains(response, "required for a device that will get a static address")
+        self.assertFalse(NetworkDevice.objects.filter(hostname="dm7c-2").exists())
+
+    def test_post_unracked_device_does_not_require_operator_address(self) -> None:
+        """Codex review of PR 1, P2 — the field must not block a device
+        that will never actually materialize it (an unracked device
+        always goes DHCP, ADR 0013 decision 3).
+        """
+        response = self.client.post(
+            "/admin/inventory/networkdevice/add/",
+            {
+                "device_type": self.device_type.pk,
+                "hostname": "dm7c-spare",
+                "serial_number": "",
+                "rack": "",
+                "rack_slot": "",
+                "port_addressing": PortAddressing.STATIC,
+                "ports-TOTAL_FORMS": "0",
+                "ports-INITIAL_FORMS": "0",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+            },
+        )
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        device = NetworkDevice.objects.get(hostname="dm7c-spare")
+        port = device.ports.get(description="Device Control")
+        self.assertTrue(port.is_dhcp)
+        self.assertIsNone(port.address)
+
+
 class ValidateDnsLabelTests(TestCase):
     """ADR 0022 decision 4 / ``PLAN-hostname-ingredients.md`` decision 7 —
     ``validate_dns_label``'s spec exactly: ``^[a-z0-9]([a-z0-9-]*[a-z0-9])?$``,
@@ -7060,8 +7409,11 @@ class ValidateDnsLabelTests(TestCase):
 
 class HostnameSuffixNormalizationTests(TestCase):
     """ADR 0022 decision 4 — ``hostname_suffix`` is stripped and
-    lowercased in both ``clean()`` and ``save()``, so a direct
-    ``objects.create()`` (which never calls ``clean()``) still normalizes.
+    lowercased in ``clean_fields()``, ``clean()`` and ``save()`` alike, so
+    a direct ``objects.create()`` (which never calls ``clean()``) still
+    normalizes, and so does ``full_clean()`` (which would otherwise
+    validate the raw value before ``clean()`` ever ran — Codex review of
+    PR 1, P2).
     """
 
     def setUp(self) -> None:
@@ -7083,15 +7435,7 @@ class HostnameSuffixNormalizationTests(TestCase):
 
     def test_suffix_normalized_by_clean_directly(self) -> None:
         """``clean()``'s own normalization, called directly — not through
-        ``full_clean()``. ``Model.full_clean()`` runs ``clean_fields()``
-        (which validates ``hostname_suffix`` against ``validate_dns_label``
-        on the *raw*, not-yet-normalized value) before it ever calls
-        ``clean()`` — Django's own ordering, not this model's choice — so
-        ``full_clean()`` on mixed-case input still reports a field error
-        even though ``clean()`` goes on to normalize ``self`` in memory
-        regardless. This asserts ``clean()``'s own effect in isolation,
-        the same discipline ``test_suffix_lowercased_and_stripped_on_save``
-        proves for the non-``full_clean()`` path above.
+        ``full_clean()``.
         """
         type_port = NetworkDeviceTypePort(
             device_type=self.device_type,
@@ -7101,4 +7445,28 @@ class HostnameSuffixNormalizationTests(TestCase):
             hostname_suffix="  Engine  ",
         )
         type_port.clean()
+        self.assertEqual(type_port.hostname_suffix, "engine")
+
+    def test_suffix_normalized_by_full_clean(self) -> None:
+        """Codex review of PR 1, P2 — ``Model.full_clean()`` runs
+        ``clean_fields()`` (which validates ``hostname_suffix`` against
+        its own ``validate_dns_label`` field validator) *before* it calls
+        ``clean()`` (Django's own ordering). The original version
+        normalized only inside ``clean()``, so ``full_clean()`` on
+        mixed-case/whitespace input validated the *raw* value and failed
+        before ``clean()`` ever got a chance to strip/lowercase it —
+        contradicting this field's documented contract (``"MPS "`` stores
+        ``"mps"`` rather than erroring). ``clean_fields()`` is now
+        overridden to normalize first, so ``full_clean()`` on this input
+        succeeds and stores the normalized form, matching
+        ``validate_dns_label``'s spec exactly.
+        """
+        type_port = NetworkDeviceTypePort(
+            device_type=self.device_type,
+            description="Engine",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan,
+            hostname_suffix="  Engine  ",
+        )
+        type_port.full_clean()  # must not raise
         self.assertEqual(type_port.hostname_suffix, "engine")
