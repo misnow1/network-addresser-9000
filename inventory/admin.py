@@ -27,6 +27,7 @@ from .models import (
     NetworkSwitchType,
     NetworkSwitchTypePort,
     PortAddressing,
+    PortAddressSource,
     PortMode,
     Rack,
     RackTemplate,
@@ -386,7 +387,24 @@ class NetworkDeviceAddForm(forms.ModelForm):
     device's own hostname onto its companion, decision 3). ``host`` is
     excluded outright — never operator-editable; a host materializes its
     own companion, nothing sets this by hand (review note 3).
+
+    Also carries one ``GenericIPAddressField`` per ``OPERATOR``-sourced
+    Network Device Type Port on the chosen type (ADR 0022) — a Yamaha
+    console's Device Control interface, e.g. — labelled from the port's
+    ``description``. These aren't model fields either; ``clean()``
+    assembles them into ``self.instance.operator_addresses``, the
+    transient property ``_materialize_ports()`` reads from. Which fields
+    exist depends on ``device_type``, so ``__init__`` reads it off bound
+    POST data (a submission) or initial data (a prefilled GET, e.g. the
+    spare-pool deep link) — an unbound add-form GET with no type chosen
+    yet simply has none of these fields, same as every dynamic-per-type
+    admin form in this codebase.
     """
+
+    #: Prefix for the per-type-port dynamic fields above — never collides
+    #: with a real model field name, so ``cleaned_data`` keys built from it
+    #: can be told apart from everything else Meta.fields draws in.
+    _OPERATOR_ADDRESS_FIELD_PREFIX = "operator_address__"
 
     port_addressing = forms.ChoiceField(
         choices=PortAddressing.choices,
@@ -433,6 +451,28 @@ class NetworkDeviceAddForm(forms.ModelForm):
         device_type_field = cast(forms.ModelChoiceField, self.fields["device_type"])
         assert device_type_field.queryset is not None  # ModelForm always sets this for an FK field
         device_type_field.queryset = device_type_field.queryset.filter(companion_of__isnull=True)
+
+        # One field per OPERATOR-sourced type port on the chosen type (ADR
+        # 0022) — self.data (bound: a submission) takes priority over
+        # self.initial (unbound: a prefilled GET), matching how every
+        # other ModelChoiceField on this form resolves its value.
+        device_type_id = (self.data or {}).get("device_type") or self.initial.get("device_type")
+        self._operator_type_ports: list[NetworkDeviceTypePort] = []
+        if device_type_id:
+            self._operator_type_ports = list(
+                NetworkDeviceTypePort.objects.filter(
+                    device_type_id=device_type_id, address_source=PortAddressSource.OPERATOR
+                ).order_by("ordinal")
+            )
+        for type_port in self._operator_type_ports:
+            self.fields[f"{self._OPERATOR_ADDRESS_FIELD_PREFIX}{type_port.pk}"] = forms.GenericIPAddressField(
+                protocol="IPv4",
+                label=type_port.description,
+                help_text=(
+                    f"Static address for {type_port.description} on {type_port.vlan} — the "
+                    "system has no way to compute this one (ADR 0022)."
+                ),
+            )
 
     def clean(self) -> dict[str, Any]:
         """Blank ``rack_slot``/``companion_rack_slot`` are filled in with the
@@ -508,6 +548,17 @@ class NetworkDeviceAddForm(forms.ModelForm):
         self.instance.port_addressing = self.cleaned_data.get("port_addressing") or PortAddressing.STATIC
         self.instance.companion_rack_slot = self.cleaned_data.get("companion_rack_slot")
         self.instance.companion_hostname = self.cleaned_data.get("companion_hostname")
+        # Assembled from the dynamic per-type-port fields __init__() added
+        # (ADR 0022), keyed by description — exactly what
+        # NetworkDevice._materialize_ports() reads from. A field missing
+        # from cleaned_data (this row's own validation failed) is simply
+        # omitted here; the model's own pre-flight reports the missing
+        # address by name rather than this silently supplying a blank one.
+        self.instance.operator_addresses = {
+            type_port.description: self.cleaned_data[f"{self._OPERATOR_ADDRESS_FIELD_PREFIX}{type_port.pk}"]
+            for type_port in self._operator_type_ports
+            if f"{self._OPERATOR_ADDRESS_FIELD_PREFIX}{type_port.pk}" in self.cleaned_data
+        }
         super()._post_clean()  # type: ignore[misc]
 
 
@@ -719,7 +770,15 @@ class NetworkDeviceTypePortInline(admin.TabularInline):
     model = NetworkDeviceTypePort
     formset = NetworkDeviceTypePortFormSet
     extra = 0
-    fields = ["port_number", "description", "port_type", "vlan", "slot_offset"]
+    fields = [
+        "port_number",
+        "description",
+        "port_type",
+        "vlan",
+        "slot_offset",
+        "address_source",
+        "hostname_suffix",
+    ]
 
     def has_add_permission(self, request: HttpRequest, obj: Any = None) -> bool:
         if _profile_locked(obj, "devices"):
@@ -727,14 +786,28 @@ class NetworkDeviceTypePortInline(admin.TabularInline):
         return super().has_add_permission(request, obj)
 
     def has_change_permission(self, request: HttpRequest, obj: Any = None) -> bool:
-        if _profile_locked(obj, "devices"):
-            return False
+        # Deliberately *not* gated on _profile_locked() (ADR 0022 review
+        # note 9) — a locked profile still needs to let a change POST
+        # through, because hostname_suffix is exempt from the profile lock
+        # at the model layer (NetworkDeviceTypePort._hostname_suffix_only_
+        # edit()). Returning False outright here, as this used to, would
+        # make that model-level exemption unreachable through the admin.
+        # get_readonly_fields() below is what actually locks every other
+        # field once the profile has instances.
         return super().has_change_permission(request, obj)
 
     def has_delete_permission(self, request: HttpRequest, obj: Any = None) -> bool:
         if _profile_locked(obj, "devices"):
             return False
         return super().has_delete_permission(request, obj)
+
+    def get_readonly_fields(self, request: HttpRequest, obj: Any = None) -> list[str]:
+        # hostname_suffix stays editable even once the profile is locked
+        # (ADR 0022 decision 4) — every other field freezes, matching
+        # NetworkDeviceTypePort's own model-layer exemption.
+        if _profile_locked(obj, "devices"):
+            return ["port_number", "description", "port_type", "vlan", "slot_offset", "address_source"]
+        return []
 
 
 class NetworkSwitchPortInline(admin.TabularInline):

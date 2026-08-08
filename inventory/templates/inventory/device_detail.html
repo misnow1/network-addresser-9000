@@ -49,6 +49,7 @@
           <tr>
             <td>
               {{ port.description }}
+              {% if port.hostname %}<span class="tile__meta">({{ port.hostname }})</span>{% endif %}
               {% if port.slot_offset > 0 %}<span class="tag-derived" title="The hardware works this address out from another of its own ports, and won't let it be changed.">derived</span>{% endif %}
             </td>
             <td>{{ port.port_number|default:"—" }}</td>

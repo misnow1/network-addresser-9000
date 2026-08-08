@@ -889,6 +889,9 @@ def vlan_map(request: HttpRequest, pk: int) -> HttpResponse:
         # a field this page reads that its own codename list didn't yet
         # declare (Codex review, Stage B pass).
         "inventory.view_networkswitchport",
+        # ADR 0022 — a port's derived hostname reads its
+        # ``source_type_port``, which is a Network Device Type Port.
+        "inventory.view_networkdevicetypeport",
     ],
     raise_exception=True,
 )
@@ -897,9 +900,10 @@ def device_detail(request: HttpRequest, pk: int) -> HttpResponse:
     table — port number, description, VLAN, port type, the numeric
     ``slot_offset`` (Stage B — the admin's inline shows *by how much* an
     address is derived, ADR 0017, not just *that* it is), address or DHCP,
-    a ``derived`` tag where ``slot_offset > 0``, ``default_gateway`` (read
-    live off the port's VLAN, ``models.py:4640`` — never recomputed here),
-    and the connected switch **port** (Stage B — not just the switch, per
+    a ``derived`` tag where ``slot_offset > 0``, its derived hostname where
+    it has one (ADR 0022), ``default_gateway`` (read live off the port's
+    VLAN, ``models.py:4640`` — never recomputed here), and the connected
+    switch **port** (Stage B — not just the switch, per
     ``NetworkDevicePort.switch_port``) via ``switch_port__switch``. The
     companion tether (ADR 0018) renders if either half of the pair is set.
 
@@ -914,9 +918,12 @@ def device_detail(request: HttpRequest, pk: int) -> HttpResponse:
         NetworkDevice.objects.select_related("device_type", "rack", "host").prefetch_related(
             Prefetch(
                 "ports",
-                queryset=NetworkDevicePort.objects.select_related("vlan", "switch_port__switch").order_by(
-                    "ordinal"
-                ),
+                # source_type_port (ADR 0022) — port.hostname reads it on
+                # every row; without it here, rendering the port table is
+                # an N+1 across every port.
+                queryset=NetworkDevicePort.objects.select_related(
+                    "vlan", "switch_port__switch", "source_type_port"
+                ).order_by("ordinal"),
             ),
             "companion",
         ),
@@ -1410,6 +1417,8 @@ REGISTRY: dict[str, ModelSpec] = {
                     FieldSpec("Port type", "port_type", render="choice"),
                     FieldSpec("VLAN", "vlan", render="relation"),
                     FieldSpec("Slot offset", "slot_offset"),
+                    FieldSpec("Address source", "address_source", render="choice"),
+                    FieldSpec("Hostname suffix", "hostname_suffix"),
                 ),
                 ordering=("ordinal",),
                 permissions=("inventory.view_networkdevicetypeport",),
