@@ -13,7 +13,6 @@ moment Mike wrote down ten pieces of real hardware and what each one *does*
 | Hardware | Optional? | Removable? | Host sets address? | Hostname same as host? |
 |---|---|---|---|---|
 | DiGiCo SD12 audio engine | No | No | Forced by host | Slug: `-engine` |
-| Yamaha built-in Dante (DM3/DM7/CL/QL) | No | No | Set by user in host UI | Yes |
 | Yamaha Device Control | No | No | Set by user in host UI | Slug: `-device-control` |
 | Marian Clara E — in a Waves LiveBox-D | No | No | No | Yes |
 | Martin Audio IK Dante card | **Yes** | **No** | No | Yes |
@@ -46,9 +45,15 @@ None of the three asks about lifecycle, which is the only thing that actually va
 
 ## Tier 1 — one physical box is one device
 
-An SD12's audio engine, a Yamaha console's built-in Dante, and a Yamaha console's Device Control
-interface are all **not optional and not removable**. You cannot buy the console without them, and
-you cannot take them out and keep them. They are addresses on one box, and the box is the device.
+An SD12's audio engine and a Yamaha console's Device Control interface are both **not optional and
+not removable**. You cannot buy the console without them, and you cannot take them out and keep
+them. They are addresses on one box, and the box is the device.
+
+A Yamaha console's built-in Dante interface belongs here too, and is the reason this tier is worth
+stating rather than assuming: it is already modelled as two ports on the console, and it stays that
+way. It appeared in an earlier revision of the hardware table and was struck from it, which is the
+correct instinct — a built-in interface with no separate identity is not *constituent hardware*, it
+is what the console is.
 
 The hostnames in the addressing sheet — `SD12-96-1-Engine`, `dm7c-1-device-control` — are
 bookkeeping labels for those addresses, not network identities of separate hardware. Nothing racks
@@ -63,7 +68,11 @@ piece of hardware needs:
   behaviour: an address suggested from the rack slot and freely editable afterwards (ADR 0003, ADR
   0019). A Yamaha console's built-in Dante Primary and Secondary.
 - **"Set by user in host UI"** where the port is the *second* on a VLAN that already carries one —
-  **not currently expressible**, and the reason ADR 0018 exists.
+  **not currently expressible**, and the reason ADR 0018 exists. The Yamaha Device Control, whose
+  table entry states the constraint exactly: *"Different VLAN from host, same VLAN as host's Dante
+  Primary interface."* It shares the console's **Dante Primary** VLAN, not its control VLAN — which
+  is what production shows (`10.201.6.4`, annotated *"Only on Dante Primary for controlling
+  snakes"*), and worth stating because an earlier draft of this ADR asserted the opposite.
 
 That last gap is issue #42. `_check_static_materialization_possible()` (`inventory/models.py:3379-
 3390`) groups a type's ports by `(vlan_id, slot_offset)` and refuses any group above one, because
