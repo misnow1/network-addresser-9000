@@ -29,6 +29,7 @@ from django.test.utils import CaptureQueriesContext
 
 from .admin import (
     AuditedModelAdminMixin,
+    DepartmentAdmin,
     NetworkDeviceAddForm,
     NetworkDeviceAdmin,
     NetworkDeviceChangeForm,
@@ -55,6 +56,7 @@ from .models import (
     DEFAULT_VLAN_ID,
     DEFAULT_VLAN_NAME,
     VLAN,
+    Department,
     NetworkDevice,
     NetworkDevicePort,
     NetworkDeviceType,
@@ -5786,6 +5788,105 @@ class ReviewCouncilRegressionTests(TestCase):
         link.delete()
 
         self.assertTrue(LogEntry.objects.filter(object_pk=str(pk), action=LogEntry.Action.DELETE).exists())
+
+
+class DepartmentModelTests(TestCase):
+    """ADR 0021: Department is a table, optional on VLAN, PROTECT-guarded,
+    trimmed the same way RackTemplate is, and never system-seeded.
+    """
+
+    def test_vlan_saves_with_no_department(self) -> None:
+        vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.assertIsNone(vlan.department)
+
+    def test_protect_refuses_delete_of_department_with_vlans(self) -> None:
+        department = Department.objects.create(name="Audio")
+        vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21", department=department)
+        with self.assertRaises(ProtectedError) as ctx:
+            department.delete()
+        self.assertIn(vlan, ctx.exception.protected_objects)
+        self.assertTrue(Department.objects.filter(pk=department.pk).exists())
+
+    def test_delete_succeeds_for_department_with_no_vlans(self) -> None:
+        department = Department.objects.create(name="Audio")
+        department.delete()
+        self.assertFalse(Department.objects.filter(name="Audio").exists())
+
+    def test_name_is_stripped_on_save(self) -> None:
+        department = Department.objects.create(name="  Audio  ")
+        self.assertEqual(department.name, "Audio")
+
+    def test_name_is_stripped_by_full_clean(self) -> None:
+        department = Department(name="  Audio  ")
+        department.full_clean()
+        self.assertEqual(department.name, "Audio")
+
+    def test_case_variant_duplicate_rejected(self) -> None:
+        Department.objects.create(name="Audio")
+        with self.assertRaises(IntegrityError):
+            Department.objects.create(name="audio")
+
+    def test_blank_name_rejected_by_db_constraint(self) -> None:
+        with self.assertRaises(IntegrityError):
+            Department.objects.create(name="")
+
+    def test_str_returns_name(self) -> None:
+        department = Department.objects.create(name="Audio")
+        self.assertEqual(str(department), "Audio")
+
+    def test_no_department_exists_on_fresh_database_and_seed_defaults_creates_none(self) -> None:
+        # A decision nothing tests is an intention (ADR 0021 review note 8)
+        # — this is what makes "no system-seeded departments" a tested
+        # claim rather than an untested one. An accidental migration seed
+        # would otherwise pass every other test in this class.
+        call_command("seed_defaults")
+        self.assertEqual(Department.objects.count(), 0)
+
+
+class DepartmentAuditTests(TestCase):
+    """ADR 0021: audit coverage for the new model and, more importantly,
+    for the VLAN side — proof that VLAN's existing bare registration in
+    ``AUDITLOG_INCLUDE_TRACKING_MODELS`` picks up the new ``department``
+    field with no settings change (review note 6 — the Department-side
+    tests alone don't demonstrate this).
+    """
+
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(username="editor", password="x")
+        self.factory = RequestFactory()
+
+    def _request(self):
+        request = self.factory.post("/admin/inventory/department/add/")
+        request.user = self.user
+        return request
+
+    def test_save_model_sets_created_by_on_creation(self) -> None:
+        # Follows AuditedModelAdminTests (tests.py:371), not
+        # RackTemplateAuditTests — that class demonstrates mutation
+        # logging, not created_by stamping (review note 6).
+        admin = DepartmentAdmin(Department, AdminSite())
+        obj = Department(name="Audio")
+        admin.save_model(self._request(), obj, form=None, change=False)
+        self.assertEqual(obj.created_by, self.user)
+
+    def test_department_edit_produces_update_log_entry(self) -> None:
+        department = Department.objects.create(name="Audio")
+        LogEntry.objects.filter(object_pk=str(department.pk)).delete()
+        department.description = "Front-of-house audio equipment"
+        department.save()
+        self.assertTrue(
+            LogEntry.objects.filter(object_pk=str(department.pk), action=LogEntry.Action.UPDATE).exists()
+        )
+
+    def test_vlan_department_assignment_produces_update_log_entry_naming_department(self) -> None:
+        department = Department.objects.create(name="Audio")
+        vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        LogEntry.objects.filter(object_pk=str(vlan.pk)).delete()
+        vlan.department = department
+        vlan.save()
+        entries = LogEntry.objects.filter(object_pk=str(vlan.pk), action=LogEntry.Action.UPDATE)
+        self.assertEqual(entries.count(), 1)
+        self.assertIn("department", entries.first().changes_dict)
 
 
 class RackTemplateModelTests(TestCase):

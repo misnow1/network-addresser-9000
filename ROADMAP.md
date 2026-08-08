@@ -2,7 +2,7 @@
 
 High-level phases only — day-to-day task tracking belongs in GitHub Issues once there's code to file issues against. This file exists so it's obvious what phase the project is in and what's next, even after a fresh start.
 
-**Current phase: 16 — scoped, ADR not yet written. Phases 1–6 and 8–15 done; phase 7 scoped but skipped.**
+**Current phase: 17 — scoped, ADR not yet written. Phases 1–6 and 8–16 done; phase 7 scoped but skipped.**
 
 ## 1. Foundation — done
 
@@ -154,7 +154,7 @@ work.** Every UI item in `MORE_MUSINGS.md` — live JavaScript, the rack creatio
 password change form — is parked in Later behind a single gate, so the data model settles before
 a second frontend is built on top of it.
 
-## 16. VLAN metadata: Department
+## 16. VLAN metadata: Department — done
 
 `CONTEXT.md` describes VLANs as flat — an 802.1Q ID plus its IPv4 addressing, nothing else. Two
 parked features have each wanted a field on VLAN, and `MORE_MUSINGS.md` now asks for department
@@ -163,21 +163,24 @@ a second time from a different direction: as an organizational label operators a
 the old "watch item" was waiting for — so the flat-VLAN position gets reversed **once**,
 deliberately, rather than three times by accident.
 
-- [ ] ADR: VLAN carries descriptive metadata. Settles **both** axes on paper — department as an
-      *operator vocabulary*, role as a *code vocabulary* — and ships only the first
-- [ ] `Department` model: unique, non-blank name (mind #10's trimming/case-folding gap) plus an
+- [x] ADR: VLAN carries descriptive metadata. Settles **both** axes on paper — department as an
+      *operator vocabulary*, role as a *code vocabulary* — and ships only the first (ADR 0021)
+- [x] `Department` model: unique, non-blank name (mind #10's trimming/case-folding gap) plus an
       optional description. A real table rather than `TextChoices`, because no code branches on
       the value and adding a department must not require a migration and a redeploy — a dead end
       for the non-networking users `MORE_MUSINGS.md` opens by naming
-- [ ] `VLAN.department`: optional `PROTECT` FK. Optional because the system-seeded VLAN 1
+- [x] `VLAN.department`: optional `PROTECT` FK. Optional because the system-seeded VLAN 1
       ("Default VLAN") has no department and every existing row needs a valid backfill; `PROTECT`
       to match ADR 0007's removal semantics and the codebase's 14-`PROTECT`-to-9-`CASCADE` habit
       for operator-managed entities
-- [ ] No system-seeded rows — unlike the "Default" Switch Port VLAN Profile, no department is
+- [x] No system-seeded rows — unlike the "Default" Switch Port VLAN Profile, no department is
       meaningfully a default
-- [ ] Admin CRUD, an admin list filter, and a column/grouping on the existing read-only VLAN and
-      address-map views
-- [ ] Tests: department is optional; `PROTECT` refuses to delete a department that has VLANs
+- [x] Admin CRUD and an admin list filter on the VLAN changelist, plus a Department column
+      (not a grouping) on the read-only VLAN list/detail pages and the address-map view, and a
+      new `/models/department/` read-only page. **Not** a grouping of the index page's VLAN
+      tiles — ADR 0021 decision 6 declined that as a layout change to a shaped view, distinct
+      from adding a field
+- [x] Tests: department is optional; `PROTECT` refuses to delete a department that has VLANs
 
 **Role is designed here but not built.** It ships with phase 21, as `TextChoices` — addressing
 modes branch on "which VLAN is Control here", exactly as the code branches on `PortMode` — and
@@ -419,11 +422,12 @@ work.
 
 ### Resolved
 
-- **Watch item — VLAN metadata** (*closed by phase 16*). The item asked for a third axis before
-  reversing `CONTEXT.md`'s flat-VLAN position. Department arriving a second time from an
-  independent direction — an operator-facing organizational label rather than allocation scoping —
-  was taken as that signal, and phase 16 makes the reversal as one deliberate decision covering
-  both known axes (department, and role for phase 21) rather than three incremental ones
+- **Watch item — VLAN metadata** (*closed by ADR 0021, implemented in phase 16*). The item asked
+  for a third axis before reversing `CONTEXT.md`'s flat-VLAN position. Department arriving a
+  second time from an independent direction — an operator-facing organizational label rather than
+  allocation scoping — was taken as that signal, and ADR 0021 makes the reversal as one deliberate
+  decision covering both known axes (department, and role for phase 21) rather than three
+  incremental ones
 - **Hostname templating** (*promoted to phases 17 and 18*). #31 was filed as blocked on #30; the
   `MORE_MUSINGS.md` component scheme dissolves that dependency, and the issue has been rewritten
   to describe the component scheme instead of the template language it used to propose

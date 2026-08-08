@@ -49,6 +49,7 @@ from django.urls import resolve, reverse
 from . import urls as inventory_urls
 from .models import (
     VLAN,
+    Department,
     NetworkDevice,
     NetworkDeviceType,
     NetworkDeviceTypePort,
@@ -186,6 +187,20 @@ def _detail_field_text(content: str, label: str) -> str:
     return _clean_text(match.group(1))
 
 
+def _vlan_map_department_line(content: str) -> tuple[str, str]:
+    """The ``vlan_map.html`` header's department line — ``(href, text)`` —
+    for an exact-value assertion rather than a bare substring/
+    ``assertContains`` check (Codex review: a presence-only check on the
+    department's name wouldn't have caught the line disappearing from two
+    of the page's three states, since the name could still appear
+    elsewhere via the fixture). Raises if no department line is present.
+    """
+    match = re.search(r'<p class="tile__meta">Department:\s*<a href="([^"]+)">([^<]+)</a>', content)
+    if match is None:
+        raise AssertionError("no department line found in vlan_map header")
+    return match.group(1), _clean_text(match.group(2))
+
+
 def _list_row_cells(content: str, row_marker: str) -> list[str]:
     """Every ``<td>`` in the ``model_list.html`` row containing
     ``row_marker`` (a value unique to that row), stripped and in column
@@ -288,6 +303,9 @@ class ParityFixtureMixin:
         # "10.210.0.0/21" or default_gateway "10.210.0.1", so a test can
         # assert the VLAN ID column specifically rendered rather than
         # merely that *a* string containing similar digits appears.
+        self.department = Department.objects.create(
+            name="StageB Grillework", description="StageB Grillework Description"
+        )
         self.vlan_native = VLAN.objects.create(
             name="StageB Native",
             vlan_id=4077,
@@ -295,6 +313,7 @@ class ParityFixtureMixin:
             default_gateway="10.210.0.1",
             dhcp_range_start="10.210.0.50",
             dhcp_range_end="10.210.0.99",
+            department=self.department,
         )
         self.vlan_allowed_1 = VLAN.objects.create(
             name="StageB Allowed One", vlan_id=4078, subnet="10.211.0.0/21"
@@ -389,6 +408,7 @@ class ParityFixtureMixin:
 
         self.pk_by_slug = {
             "vlan": self.vlan_native.pk,
+            "department": self.department.pk,
             "switchportvlanprofile": self.profile.pk,
             "racktemplate": self.rack_template.pk,
             "rack": self.rack.pk,
@@ -411,7 +431,7 @@ class ParityFixtureMixin:
 #
 # Before this, two hand-maintained route lists existed independently:
 # ``UIAccessControlTests._routes()`` (the five Stage A paths) and
-# ``ParityAccessTests._routes()`` (audit plus the sixteen registry
+# ``ParityAccessTests._routes()`` (audit plus the eighteen registry
 # list/detail paths). Together they happened to cover all eight URL
 # patterns in ``urls.py``, but "happened to" is exactly the failure mode
 # Stage C's admin-lockout test cannot tolerate: that test's entire value is
@@ -440,7 +460,7 @@ def _shaped_routes(*, rack_pk: int, vlan_pk: int, device_pk: int) -> list[str]:
 
 
 def _parity_routes(*, pk_by_slug: dict[str, int]) -> list[str]:
-    """``/audit/`` plus the sixteen Stage B list/detail routes — one pair
+    """``/audit/`` plus the eighteen Stage B list/detail routes — one pair
     per ``REGISTRY`` slug, so this stays exhaustive as the registry grows
     without anyone touching this function.
     """
@@ -641,6 +661,7 @@ class PartialGrantAccessTests(TestCase):
                 "view_rackvlanrange",
                 "view_networkswitchaddress",
                 "view_networkdeviceport",
+                "view_department",
             ],
         )
 
@@ -708,17 +729,22 @@ class WritesNothingTests(TestCase):
         self.spare_device = NetworkDevice.objects.create(device_type=self.device_type, hostname="spare1")
 
         # Stage B fixtures — one of every other registered model, so the
-        # sweep below actually exercises all eight /models/<slug>/ list
-        # pages and the six non-redirecting detail pages, not just the
+        # sweep below actually exercises all nine /models/<slug>/ list
+        # pages and the seven non-redirecting detail pages, not just the
         # four models Stage A already had fixtures for.
         self.profile = SwitchPortVlanProfile.objects.create(name="WN Profile", native_vlan=self.vlan)
         self.rack_template = RackTemplate.objects.create(name="WN Template", slot_count=5)
+        self.department = Department.objects.create(name="WN Department")
 
         self.admin_user = User.objects.create_user("adminrole", password="testpass123", is_staff=True)
         self.admin_user.groups.add(Group.objects.get(name="Admin"))
         self.client.login(username="adminrole", password="testpass123")
 
     def test_get_sweep_executes_no_mutating_sql_and_changes_no_row_counts(self) -> None:
+        # This route list is hand-maintained, not derived from
+        # _parity_routes()/_all_ui_routes() (review note 5) — so a future
+        # registry addition must be swept in here by hand too, or it goes
+        # untested by this class while staying green.
         routes = [
             "/",
             f"/racks/{self.rack.pk}/",
@@ -730,6 +756,8 @@ class WritesNothingTests(TestCase):
             "/audit/?actor=&action=&content_type=",
             "/models/vlan/",
             f"/models/vlan/{self.vlan.pk}/",
+            "/models/department/",
+            f"/models/department/{self.department.pk}/",
             "/models/switchportvlanprofile/",
             f"/models/switchportvlanprofile/{self.profile.pk}/",
             "/models/racktemplate/",
@@ -757,7 +785,7 @@ class WritesNothingTests(TestCase):
         # tables — ContentType.objects.get_for_model() (and, transitively,
         # auditlog's LogEntry.objects.get_for_object(), which the Stage B
         # audit panel used to call) is documented to create the row on a
-        # cache miss. A row-count sweep over just the eight inventory
+        # cache miss. A row-count sweep over just the nine inventory
         # models and LogEntry — the original shape of this test — could
         # not have caught that: every registered model's ContentType row
         # already exists by the time any test runs (Django's post_migrate
@@ -1218,6 +1246,29 @@ class RobustnessTests(TestCase):
         self.assertNotContains(response, "Shape of the subnet")
         self.assertContains(response, "no subnet")
 
+    def test_l2_only_vlan_with_department_still_shows_it(self) -> None:
+        # Codex review: the department line used to sit inside the
+        # subnet-valid branch, beside {{ vlan.subnet }} — a line the
+        # l2_only branch never reaches, so a real department silently
+        # disappeared from an L2-only VLAN's page. Department and subnet
+        # are independent (ADR 0021 doesn't touch ADR 0012's L2-only
+        # rule), so this must render regardless of unavailable_reason.
+        department = Department.objects.create(name="L2 Department")
+        l2_vlan = VLAN.objects.create(name="L2 Only", vlan_id=998, department=department)
+        response = self.client.get(f"/vlans/{l2_vlan.pk}/")
+        self.assertEqual(response.status_code, 200)
+        href, text = _vlan_map_department_line(response.content.decode())
+        self.assertEqual(href, f"/models/department/{department.pk}/")
+        self.assertEqual(text, "L2 Department")
+
+    def test_department_less_vlan_map_renders_200_with_no_department_line(self) -> None:
+        # ADR 0021: department is optional, and a read-only page must never
+        # crash on data the write path allows (review note 3's posture,
+        # applied to the new field) — self.vlan carries no department.
+        response = self.client.get(f"/vlans/{self.vlan.pk}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, "Department:")
+
     def test_ordinal_beyond_address_space_renders_blank_not_500(self) -> None:
         # A block near the top of the whole IPv4 address space — an
         # ordinal within slot_count but past the block's own top pushes
@@ -1303,7 +1354,7 @@ class QueryBudgetTests(TestCase):
         self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
 
     def test_model_list_query_count_independent_of_row_count(self) -> None:
-        """Stage B: every one of the eight ``/models/<slug>/`` list pages
+        """Stage B: every one of the nine ``/models/<slug>/`` list pages
         must cost the same number of queries whether it lists 2 rows or
         50 — proof the declared ``list_select_related``/
         ``list_prefetch_related`` hints actually eliminate the N+1 a naive
@@ -1326,6 +1377,7 @@ class QueryBudgetTests(TestCase):
                 name=f"QB Profile {i}", native_vlan=native_vlan
             ),
             "racktemplate": lambda i: RackTemplate.objects.create(name=f"QB Template {i}"),
+            "department": lambda i: Department.objects.create(name=f"QB Department {i}"),
             "rack": lambda i: Rack.objects.create(name=f"QB Rack {i}", slot_count=1),
             "networkswitchtype": lambda i: NetworkSwitchType.objects.create(
                 manufacturer="QB", model="M", name=f"QB SwitchType {i}", port_count=0
@@ -1604,7 +1656,16 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         cells = _list_row_cells(response.content.decode(), "StageB Native")
         self.assertEqual(
             cells,
-            ["StageB Native", "4077", "10.210.0.0/21", "10.210.0.1", "10.210.0.50", "10.210.0.99", "Details"],
+            [
+                "StageB Native",
+                "4077",
+                "10.210.0.0/21",
+                "10.210.0.1",
+                "10.210.0.50",
+                "10.210.0.99",
+                "StageB Grillework",
+                "Details",
+            ],
         )
 
     def test_vlan_detail_renders_every_declared_field(self) -> None:
@@ -1616,6 +1677,38 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         self.assertEqual(_detail_field_text(content, "Default gateway"), "10.210.0.1")
         self.assertEqual(_detail_field_text(content, "DHCP start"), "10.210.0.50")
         self.assertEqual(_detail_field_text(content, "DHCP end"), "10.210.0.99")
+        self.assertEqual(_detail_field_text(content, "Department"), "StageB Grillework")
+        # Links to the department's own detail page — _linked_text_for()
+        # (ADR 0021 review note 3), not a template special-case.
+        self.assertIn(f'href="/models/department/{self.department.pk}/"', content)
+
+    def test_vlan_map_shows_department_in_header(self) -> None:
+        response = self.client.get(f"/vlans/{self.vlan_native.pk}/")
+        href, text = _vlan_map_department_line(response.content.decode())
+        self.assertEqual(href, f"/models/department/{self.department.pk}/")
+        self.assertEqual(text, "StageB Grillework")
+
+    def test_department_renders_every_declared_column(self) -> None:
+        list_response = self.client.get(self._list_url("department"))
+        self.assertEqual(
+            _list_row_cells(list_response.content.decode(), "StageB Grillework"),
+            ["StageB Grillework", "StageB Grillework Description", "Details"],
+        )
+
+        detail_response = self.client.get(self._detail_url("department"))
+        content = detail_response.content.decode()
+        self.assertEqual(_detail_field_text(content, "Name"), "StageB Grillework")
+        self.assertEqual(_detail_field_text(content, "Description"), "StageB Grillework Description")
+        # The VLANs inline — this registry's first inline with no admin
+        # counterpart (ADR 0021 decision 6) — names vlan_native, which is
+        # assigned to this department, and not vlan_allowed_1/2, which
+        # belong to no department at all.
+        self.assertEqual(
+            _inline_row_cells(content, "VLANs", "StageB Native"),
+            ["StageB Native", "4077", "10.210.0.0/21"],
+        )
+        self.assertNotIn("StageB Allowed One", content)
+        self.assertNotIn("StageB Allowed Two", content)
 
     def test_switchportvlanprofile_renders_every_declared_column(self) -> None:
         # The value a naive `_meta.fields` walk would have dropped
@@ -2139,6 +2232,8 @@ class AdminLockoutTests(ParityFixtureMixin, TestCase):
             reverse("inventory:audit"): "stageb-switch1",
             self._list_url("vlan"): "StageB Native",
             self._detail_url("vlan"): "StageB Native",
+            self._list_url("department"): "StageB Grillework",
+            self._detail_url("department"): "StageB Grillework",
             self._list_url("switchportvlanprofile"): "StageB Profile",
             self._detail_url("switchportvlanprofile"): "StageB Profile",
             self._list_url("racktemplate"): "StageB Template",

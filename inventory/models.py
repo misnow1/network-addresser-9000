@@ -491,9 +491,64 @@ class AuditedModel(models.Model):
         abstract = True
 
 
+class Department(AuditedModel):
+    """An operator-facing organizational label a VLAN may optionally carry
+    (ADR 0021) — "Audio", "Lighting", "Video". Descriptive only: nothing in
+    this codebase branches on a department's value, and it does not scope
+    allocation — a rack range, suggestion or stored address is computed
+    identically regardless of which department(s) its VLANs belong to.
+
+    Not to be confused with the *role* a VLAN plays within a department
+    (Control, Dante Primary, Dante Secondary — ADR 0021 designs it, phase
+    21 builds it). Department is who owns the VLAN; role is what code
+    branches on to decide which VLAN is which within that ownership. This
+    model carries only the former.
+
+    No row here is ever system-seeded (unlike the "Default" Switch Port
+    VLAN Profile and its Default VLAN, ADR 0012) — a fresh database has no
+    departments until an operator creates one.
+    """
+
+    name = models.CharField(max_length=100, unique=True)
+    description = models.TextField(blank=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(condition=~models.Q(name=""), name="department_name_not_blank"),
+        ]
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return self.name
+
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        # Stripped here too, not just clean() — Model.save() never calls
+        # clean(), so a direct Department.objects.create(name="Audio ")
+        # would otherwise bypass the strip and persist trailing whitespace
+        # the DB's case-insensitive collation doesn't also fold away.
+        if self.name:
+            self.name = self.name.strip()
+        super().save(
+            force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
+        )
+
+    def clean(self) -> None:
+        super().clean()
+        if self.name:
+            self.name = self.name.strip()
+
+
 class VLAN(AuditedModel):
     """An 802.1Q VLAN and its IPv4 addressing — one row, per CONTEXT.md."""
 
+    department = models.ForeignKey(
+        Department,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="vlans",
+        help_text="Optional. The department that owns this VLAN, e.g. Audio, Lighting, Video.",
+    )
     name = models.CharField(max_length=100)
     vlan_id = models.PositiveIntegerField(
         unique=True,

@@ -262,6 +262,9 @@ STORAGES = {
 # gap with its own CREATE/DELETE log entries.
 AUDITLOG_INCLUDE_TRACKING_MODELS = (
     "inventory.VLAN",
+    # Bare, all fields tracked (ADR 0021) — VLAN is already registered bare
+    # above, so its new `department` FK is covered with no entry change.
+    "inventory.Department",
     "inventory.Rack",
     "inventory.NetworkSwitchType",
     "inventory.NetworkDeviceType",
