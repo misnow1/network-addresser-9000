@@ -197,13 +197,36 @@ so scoped and global alignment are identical on real data; and the spreadsheet's
 offset per rack applied to *every* VLAN base. The ADR says so explicitly, so nobody later assumes
 Department implied it.
 
-## 17. Hostname ingredients
+## 17. The device model rework, then hostname ingredients
 
 `MORE_MUSINGS.md` specifies a computed hostname as five dash-joined components: owner, location,
 device type, an optional free-form purpose, and an optional sequence. Three of the five have no
 representation in the data model at all. This phase adds them as ordinary optional fields and
 computes nothing — each is independently meaningful, and no naming behaviour changes until
 phase 18 turns it on.
+
+**It opens with work nobody planned.** Asking where the `-engine` and `-device-control` suffixes
+live turned out to require deciding whether a DiGiCo SD12's audio engine is a *port* or a *device*
+— and the answer was that the model's port/companion/independent-device boundaries had been drawn
+by criteria that don't sort real hardware. `docs/adr/0022-add-in-cards-and-operator-set-ports.md`
+redraws them from a table of ten real pieces of hardware
+(`docs/Constituent Device Design - Sheet1.csv`), sorting them on two questions: *can you leave it
+out?* and *can you take it out?* It supersedes ADR 0018 and closes issue #42. It is scheduled here,
+inside this phase, because it exists only because this phase hit it — see
+`docs/plans/PLAN-adr-0022.md` for the three PRs.
+
+- [ ] ADR 0022's PR 1: `NetworkDeviceTypePort.address_source` (`SLOT`/`OPERATOR`), which lets one
+      device hold two independent static addresses on one VLAN and **closes #42**; plus
+      `hostname_suffix` on the same model with a derived, read-only port hostname, and the shared
+      `validate_dns_label` that the rest of this phase reuses
+- [ ] ADR 0022's PR 2: the Yamaha Device Control interfaces become **ports on their consoles**, and
+      every part of ADR 0018 is deleted — `companion_type`, the materialization machinery, the
+      paired-move machinery, the tether UI. `CONSOLES` slots 4 and 16 are released; no other address
+      moves
+- [ ] ADR 0022's PR 3: `NetworkDevice.host` and `NetworkDeviceType.is_add_in_card` — a DMI-DANTE is
+      an ordinary device in its own slot that records which console it is currently fitted to, and
+      keeps its slot and address when pulled. **#41 stays open** by decision: a card's address is
+      programmed into the card, so it does not follow whichever console it currently sits in
 
 **This is not issue #31 as filed.** #31 imagined `mps-{{ rack_name }}-{{ device_name }}-{{ slot_no }}`,
 where `device_name` is a per-slot label only a populated rack template could supply — hence its
@@ -236,8 +259,11 @@ Cisco switch — so every field decision here lands on both hierarchies.
       in use is `ik42`, while `slugify("SG300-10MP")` happens to be right
 - [ ] Blank `hostname_slug` means that Type offers no computed hostnames, so existing Types need
       no backfill and creating a Type isn't blocked on choosing an abbreviation
-- [ ] `hostname_suffix` on `NetworkDeviceTypePort`, beside `slot_offset`, materialized onto
-      `NetworkDevicePort` per ADR 0010. Device-side only — `slot_offset` is a device-side concept
+- [ ] `hostname_suffix` on `NetworkDeviceTypePort`, beside `slot_offset` — **shipped by ADR 0022's
+      PR 1 above**, and *derived* on `NetworkDevicePort` rather than materialized onto it (ADR 0022
+      decision 4: a stored copy would have nothing to keep it in step, and the field is exempt from
+      ADR 0010's type-port lock so a typo stays fixable). Device-side only — `slot_offset` is a
+      device-side concept
 - [ ] Tests: the rack-derived owner default and its override; `location_slug` uniqueness ignores
       blanks; the suffix materializes with the port
 
@@ -253,13 +279,10 @@ Assembles phase 17's components at creation, enforces uniqueness, and resolves c
 Computed at materialization and stored — **not** immutable, and never re-derived automatically.
 That is the same rule ADR 0003 gives static addresses, and what #31 already committed to.
 
-- [ ] ADR: hostname computation. It **amends ADR 0018 decision 3**, whose companion hostname
-      copies the host's verbatim on the default path — `inventory/models.py`: *"duplicate
-      hostnames are already legal in this model"*. Under uniqueness that default becomes an
-      integrity error on every Yamaha companion creation. `MORE_MUSINGS.md` supplies the
-      replacement: the companion derives its name from the host plus a suffix
-      (`-device-control`). The verbatim copy was a placeholder for the absence of a naming
-      scheme; there is now a naming scheme
+- [ ] ADR: hostname computation. It no longer has ADR 0018 to amend — phase 17's ADR 0022
+      superseded it outright, and the Yamaha Device Control interface that forced the question is
+      now a *port* on its console carrying `hostname_suffix="device-control"`, so nothing copies a
+      host's hostname verbatim any more and the uniqueness rule below meets no companion
 - [ ] `hostname_purpose` and `hostname_sequence` stored on `NetworkSwitch`/`NetworkDevice`
       alongside the existing editable `hostname`. Stored rather than transient like ADR 0013's
       `port_addressing`, because recomputation is impossible if the parts can't be recovered from
@@ -270,9 +293,10 @@ That is the same rule ADR 0003 gives static addresses, and what #31 already comm
       second, stricter mechanism for names; blank-exempt means the spare pool and every existing
       row need no backfill
 - [ ] A `NetworkDevicePort` hostname as a **derived, read-only property** —
-      `<device.hostname>-<hostname_suffix>` — exactly mirroring how ADR 0017 already treats an
-      offset port's *address*. This is where `…-sd12-engine` lives. Ports have no hostname field
-      and gain none
+      `<device.hostname>-<hostname_suffix>` — **already shipped by phase 17's ADR 0022 PR 1**. This
+      is where `…-sd12-engine` and `…-device-control` live. Ports have no hostname field and gain
+      none. Known gap for this ADR to name: a derived port hostname sits outside the cross-table
+      uniqueness check below, so nothing stops a *device* being hand-named to collide with one
 - [ ] Collisions bump `hostname_sequence` until the name is free, in physical and virtual racks
       alike, and never block a save. Two advisory messages ride along: recommend assigning `1` to
       a twin that has no sequence, and where the rack has a `location_slug`, note that a purpose
@@ -286,8 +310,8 @@ That is the same rule ADR 0003 gives static addresses, and what #31 already comm
       into a hostname, the same staleness class as an already-static address surviving a slot
       move. A staleness *indicator* is the cheap answer and would cover both
 - [ ] Tests: assembly with and without each optional component; blank hostnames don't collide
-      with each other; a switch-vs-device collision is caught; sequence auto-bump; a companion
-      pair materializes two legal names
+      with each other; a switch-vs-device collision is caught; sequence auto-bump; a console with a
+      labelled port renders both its own name and the port's derived one
 
 Because computation always yields a free name, the `full_clean()` uniqueness error only ever
 fires on a **hand-typed** duplicate — which is exactly when it should.
@@ -407,7 +431,7 @@ work.
 ### Design deferred
 
 - Device-replacement workflow (swapping a spare into an already-addressed slot) — flagged in ADR 0003, design deferred
-- Two *independent* static addresses on one VLAN (a Yamaha console's "For Device Control" interface) — see #42. ADR 0018 covers the same hardware but solves a different problem (existence and lifecycle, not addressing) and leaves this open: if it ever lands, those consoles collapse to one device and their companion links fall away. Nearest neighbour of phase 20
+- ~~Two *independent* static addresses on one VLAN (a Yamaha console's "For Device Control" interface) — see #42.~~ **Closed by ADR 0022, built in phase 17** as `NetworkDeviceTypePort.address_source`. This entry predicted the outcome exactly — *"if it ever lands, those consoles collapse to one device and their companion links fall away"* — which is what phase 17's PR 2 does, ADR 0018 and all. Still the nearest neighbour of phase 20, which needs the opposite shape: two ports *sharing* one address (#27), not two addresses on one VLAN
 - Slot moves don't re-suggest an already-static device port's address (armed by default now that static materializes by default, ADR 0013; follows from ADR 0003's "stored, not immutable") — see #28, and its hostname sibling #54 (a rack move leaves a stale location baked into a computed hostname). Both are the same problem on two fields, and a single staleness *indicator* would cover both — report, don't enforce, as in phase 19
 - Multicast configuration: port-level filtering plus switch-level IGMP snooping — see #22
 - Populated rack templates: slot layouts that materialize equipment (needs Type `PROTECT`, unlike the VLAN-only feature) — see #30. **No longer blocks hostnames** (phase 17); it would *enhance* them by prefilling the purpose component, and it does gate the rack creation wizard

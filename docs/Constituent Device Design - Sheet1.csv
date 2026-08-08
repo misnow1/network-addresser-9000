@@ -1,0 +1,11 @@
+Manufacturer,Model,Description,Optional?,Removable?,Host Sets Address(es)?,Hostname same as host?,Host Type,IP Address Restrictions
+Digico,SD12 Engine,The engine IP address of the console.,No,No,Forced by host,Slug: `-engine`,SD12 Console,"Same VLAN as host, host address +1 (automatically computed, cannot be changed)"
+Yamaha,Yamaha Dante (built-in to console),"Yamaha DM3, DM7, CL series and QL series Dante interface",No,No,Set by user in host UI,Yes,Yamaha console as described in column B,Different VLAN from host
+Yamaha,Yamaha Device Control,"Yamaha DM3, DM7, CL series and QL series Dante interface",No,No,Set by user in host UI,Slug: `-device-control`,Yamaha console as described in column B,Same VLAN as host
+Digico,DMI-DANTE,Add-in card for Digico SD12 and Quantum consoles providing 64 channels of Dante audio at 96k,Yes,Yes,No,No,Digico SD12 or Quantum console,None
+Behringer,X-Dante,Add-in card for Behringer X32 and Midas M32 consoles providing 32 channels of Dante audio at 48k,Yes,Yes,No,No,X32 or M32 series console,None
+Martin Audio,IK Dante Card,Dante interface for IK-series amps providing 4 channels at 96k,Yes,No,No,Yes,Martin Audio IK amp,None
+Allen & Heath,AH-M-SQ-SDANTE64-A,Add-in card for Allen & Heath SQ consoles providing 64 channels of Dante audio at 48k,Yes,Yes,No,No,Allen & Heath SQ console,None
+Marian,Clara E (when installed in Waves LiveBox-D),PCIe card for computers providing up to 512 channels of Dante audio at 96k,No,No,No,Yes,Waves LiveBox D,None
+Marian,Clara E (generic),PCIe card for computers providing up to 512 channels of Dante audio at 96k,Yes,Yes,No,No,Generic PC,None
+Digico,DMI-WAVES,Add-in card providing 64 channels of SoundGrid audio at 96k,Yes,Yes,No,N/A,Digico SD12 or Quantum console,None: IPv6 link-local addressing only
