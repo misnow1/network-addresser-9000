@@ -587,6 +587,21 @@ class ImportProdDataTests(TestCase):
         with self.assertRaises(CommandError):
             call_command("verify_prod_import", data_dir=str(self.data_dir))
 
+    def test_verify_catches_a_stale_device_at_a_released_device_control_slot(self) -> None:
+        # ADR 0022 — the Device Control row's own slot (5, for the DM7C
+        # pair in this fixture) is released; nothing should occupy it. A
+        # stale device left there (e.g. a leftover row from before a
+        # re-import) must be caught as an unexplained extra against the
+        # complete expected device-slot set, not silently ignored because
+        # no CSV row names that key to check "expected device" against.
+        rack = Rack.objects.get(name="CONSOLES")
+        device_type = NetworkDeviceType.objects.get(manufacturer="DiGiCo", model="SD9")
+        NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=device_type, rack=rack, rack_slot=5, hostname="stale", port_addressing="dhcp"
+        )
+        with self.assertRaises(CommandError):
+            call_command("verify_prod_import", data_dir=str(self.data_dir))
+
     def test_verify_catches_a_wrong_extra_switch_address(self) -> None:
         # AMPRACK1's primary switch's Dante Secondary column is blank in the
         # sheet — the "extra" address §8 documents. Corrupting it must be
@@ -747,6 +762,31 @@ class ImportProdDataMalformedDeviceControlTests(TestCase):
             write_fixture_csvs(data_dir, addressing_source_rows=malformed_rows)
             with self.assertRaises(CommandError):
                 call_command("import_prod_data", data_dir=str(data_dir))
+
+
+class VerifyCatchesADeviceControlRowsExtraColumnsTests(TestCase):
+    """ADR 0022, Codex review P2 — only ``dante_primary`` is ever read off
+    a ``-device-control`` row (both by the importer's pre-pass and by the
+    verifier's own independent check); a populated ``control``/``dante_
+    secondary`` column would otherwise describe a real address that's
+    silently discarded on both sides. Its own one-off fixture, since the
+    shared fixture's rows are all well-formed and the importer's own
+    pre-pass never reads the other two columns at all — nothing here
+    corrupts the database after the fact, it corrupts the *sheet* the
+    import is built from.
+    """
+
+    def test_verify_catches_a_populated_control_column_on_a_device_control_row(self) -> None:
+        malformed_rows = [
+            row if row[0] != "dm7c-1-device-control" else (row[0], row[1], row[2], "10.130.6.4", *row[4:])
+            for row in ADDRESSING_ROWS
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_fixture_csvs(data_dir, addressing_source_rows=malformed_rows)
+            call_command("import_prod_data", data_dir=str(data_dir))  # succeeds — the column is ignored
+            with self.assertRaises(CommandError):
+                call_command("verify_prod_import", data_dir=str(data_dir))
 
 
 class CrossVlanAlignmentExemptionTests(TestCase):

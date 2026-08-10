@@ -2839,7 +2839,7 @@ class RetireCompanionsMigrationTests(TransactionTestCase):
                 ordinal=ordinal,
             )
         companion = NetworkDevice.objects.create(
-            device_type=types["companion_type"], hostname=self._unique("host") + "-device-control", host=host
+            device_type=types["companion_type"], hostname=f"{host.hostname}-device-control", host=host
         )
         companion_port = None
         for i in range(companion_ports):
@@ -2951,6 +2951,55 @@ class RetireCompanionsMigrationTests(TransactionTestCase):
             address=self._next_address(),
             ordinal=1,
         )
+        with self.assertRaises(RuntimeError):
+            self._run_migration()
+
+    def test_raises_on_a_host_instance_with_no_companion(self) -> None:
+        # A host instance the companion-only guard loop never reaches at
+        # all — its companion is simply missing, not merely orphaned or
+        # unlinked. Only a guard that separately enumerates host instances
+        # (not just companions) can see this (Codex review, P1).
+        apps = self.apps
+        NetworkDevice = apps.get_model("inventory", "NetworkDevice")
+        NetworkDevicePort = apps.get_model("inventory", "NetworkDevicePort")
+        types = self._make_types()
+        host = NetworkDevice.objects.create(device_type=types["host_type"], hostname=self._unique("host"))
+        for ordinal, description in enumerate(types["descriptions"], start=1):
+            NetworkDevicePort.objects.create(
+                device=host,
+                description=description,
+                vlan=types["vlan_control"] if description == "Control" else types["vlan_dante"],
+                port_type="1gbe_rj45",
+                address=self._next_address(),
+                ordinal=ordinal,
+            )
+        with self.assertRaises(RuntimeError):
+            self._run_migration()
+
+    def test_raises_on_a_companion_with_an_unexpected_hostname(self) -> None:
+        # ADR 0018 permitted a companion named anything at all; settled
+        # decision 9 refuses to guess at a shape import_prod_data.py's own
+        # "<host>-device-control" convention never produces (Codex review,
+        # P1).
+        apps = self.apps
+        NetworkDevice = apps.get_model("inventory", "NetworkDevice")
+        types = self._make_types()
+        pair = self._make_device_pair(types)
+        NetworkDevice.objects.filter(pk=pair["companion"].pk).update(hostname="totally-unrelated-name")
+        with self.assertRaises(RuntimeError):
+            self._run_migration()
+
+    def test_raises_when_the_moved_port_has_drifted_from_its_type_port(self) -> None:
+        # The companion instance's own port disagrees with the companion
+        # type's sole type port (port_type here) — moving it onto the new
+        # Device Control type port would leave a materialized row whose
+        # source_type_port describes different hardware (Codex review,
+        # P1).
+        apps = self.apps
+        NetworkDevicePort = apps.get_model("inventory", "NetworkDevicePort")
+        types = self._make_types()
+        pair = self._make_device_pair(types)
+        NetworkDevicePort.objects.filter(pk=pair["companion_port"].pk).update(port_type="1gbe_sfp")
         with self.assertRaises(RuntimeError):
             self._run_migration()
 

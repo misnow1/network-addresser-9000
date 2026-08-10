@@ -29,6 +29,14 @@ from typing import Any
 
 from django.db import migrations, models
 
+#: Case-insensitive hostname suffix identifying a companion's row (ADR
+#: 0018/0022) — the same convention ``import_prod_data.py``'s
+#: ``DEVICE_CONTROL_SUFFIX`` uses, independently declared here since this
+#: migration imports no application module. Settled decision 9: a
+#: companion whose name doesn't follow it is a shape this migration was
+#: not written for, and it refuses rather than guesses.
+DEVICE_CONTROL_SUFFIX = "-device-control"
+
 
 def retire_companions(apps, schema_editor):
     """Fold every ADR 0018 companion pair into its host as a fourth,
@@ -45,6 +53,12 @@ def retire_companions(apps, schema_editor):
        ``OneToOneField(..., on_delete=CASCADE)``, ``0011_device_
        companions.py``); the corruption that *can* exist is an unlinked
        instance of a companion type, and that is what this checks for.
+       Also checked, per instance: the companion's hostname follows the
+       ``<host>-device-control`` convention (settled decision 9 — ADR 0018
+       permitted other names, and this migration was not written to guess
+       at them); and, over the *host* population separately (not reachable
+       by iterating companions alone), that every host instance has
+       exactly one companion.
     2. Create the ``Device Control`` type port on each affected host type,
        copying ``port_type``/``port_number`` from the companion's sole type
        port, and bump that type's ``port_count`` — once per *type*, not
@@ -53,7 +67,10 @@ def retire_companions(apps, schema_editor):
     3. Guard the destination, then move each companion instance's one port
        row onto its host — never create-then-delete:
        ``unique_device_port_vlan_address_value`` forbids both rows existing
-       at once, and moving preserves the port's audit history.
+       at once, and moving preserves the port's audit history. Also checked
+       here: the moved row's own ``port_type``/``port_number`` agree with
+       the type port step 2 created, so a materialized port never ends up
+       pointing at a ``source_type_port`` describing different hardware.
     4. Clear ``companion_type`` on every host type — the FK is ``PROTECT``,
        so deletion is refused while it is set.
     5. Delete the now-portless companion devices and their types.
@@ -127,6 +144,37 @@ def retire_companions(apps, schema_editor):
                     f"({companion.hostname!r})'s port is not statically addressed — this "
                     "migration only handles a statically-addressed companion (ADR 0022)."
                 )
+            stem = companion.hostname[: -len(DEVICE_CONTROL_SUFFIX)]
+            if not companion.hostname.lower().endswith(DEVICE_CONTROL_SUFFIX) or (
+                stem.lower() != host.hostname.lower()
+            ):
+                raise RuntimeError(
+                    f"Cannot retire companions: {companion_type} instance pk={companion.pk} "
+                    f"({companion.hostname!r}) does not follow the '<host>{DEVICE_CONTROL_SUFFIX}' "
+                    f"hostname convention against its host {host.hostname!r} — settled decision 9 "
+                    "refuses to guess at a companion shape ADR 0018 permitted but this migration "
+                    "was not written for (a name other than the convention the importer used)."
+                )
+
+        # Every affected *host* instance, not just companions with a host —
+        # a host instance the companion pass above never reaches (its
+        # companion is simply missing) is invisible to a companion-only
+        # loop (Codex review, first pass). Every host of a companion-
+        # declaring type must have been given a companion at creation
+        # (ADR 0018's own materialize-together guarantee); this is the
+        # guard that actually checks that promise held, rather than
+        # trusting it.
+        host_instances = NetworkDevice.objects.using(alias).filter(device_type_id=host_type.pk)
+        for host in host_instances:
+            companion_count = NetworkDevice.objects.using(alias).filter(
+                device_type_id=companion_type.pk, host_id=host.pk
+            ).count()
+            if companion_count != 1:
+                raise RuntimeError(
+                    f"Cannot retire companions: host {host_type} instance pk={host.pk} "
+                    f"({host.hostname!r}) has {companion_count} companions, not exactly one — "
+                    "every host of a companion-declaring type must have exactly one (ADR 0022)."
+                )
 
     # -- Step 2: one Device Control type port per host type -------------
     new_type_port_by_host_type_id: dict[int, Any] = {}
@@ -182,6 +230,15 @@ def retire_companions(apps, schema_editor):
                     f"{new_type_port.ordinal} — refusing to move the companion's port onto it."
                 )
             port = NetworkDevicePort.objects.using(alias).get(device_id=companion.pk)
+            if port.port_type != new_type_port.port_type or port.port_number != new_type_port.port_number:
+                raise RuntimeError(
+                    f"Cannot retire companions: {companion_type} instance pk={companion.pk}'s port "
+                    f"(port_type={port.port_type!r}, port_number={port.port_number!r}) does not "
+                    f"match the type port just created for {host_type} "
+                    f"(port_type={new_type_port.port_type!r}, port_number={new_type_port.port_number!r}) "
+                    "— the instance port has drifted from its own type port; refusing to move it "
+                    "onto a source_type_port describing different hardware."
+                )
             NetworkDevicePort.objects.using(alias).filter(pk=port.pk).update(
                 device_id=host_id,
                 description="Device Control",

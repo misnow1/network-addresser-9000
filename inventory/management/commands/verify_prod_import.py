@@ -433,6 +433,7 @@ def _check_device_control_pairs(
     consumed: set[tuple[str, int]],
     actual_devices: dict[tuple[str, int], NetworkDevice],
     vlan_id_by_function: dict[str, int],
+    expected_device_keys: set[tuple[str, int]],
 ) -> int:
     """Independent Device Control check (ADR 0022) — mirrors the SD12
     Control/Engine lookahead inside the main per-row loop below, but keyed
@@ -456,6 +457,21 @@ def _check_device_control_pairs(
     **one** device: the host's hostname, type identity, its three ordinary
     ports, and — independently, by description, since it shares a VLAN
     with Dante Primary — the Device Control port's own address.
+
+    Adds the host's ``(rack, slot)`` to ``expected_device_keys`` (Codex
+    review, P2) — unconditionally, whether or not the host device is
+    actually found — so the caller's final actual-vs-expected device-slot
+    comparison can prove the *complete* claim this PR rests on: not just
+    that the host exists, but that the Device Control row's own ``(rack,
+    slot)`` never gets a key added at all, so a stale device sitting there
+    (a released slot, e.g. ``CONSOLES`` 4/16, that this import should have
+    left empty) is caught as an unexplained extra rather than silently
+    ignored.
+
+    Also asserts the Device Control row's own ``control``/``dante_
+    secondary`` columns are blank (Codex review, P2) — only ``dante_
+    primary`` is ever read below; a populated column would otherwise
+    describe a real address this check silently discards.
 
     Returns the number of byte-identical static addresses verified here,
     so the caller can fold it into its own running total — this pass runs
@@ -487,7 +503,17 @@ def _check_device_control_pairs(
         host_key = (host_row.rack, host_row.slot)
         consumed.add(key)
         consumed.add(host_key)
+        expected_device_keys.add(host_key)
         pairs_checked += 1
+
+        if row.control or row.dante_secondary:
+            findings.fail(
+                "address_diff",
+                f"{row.rack}/{row.slot} ({row.description}): Device Control row has a "
+                f"control={row.control!r}/dante_secondary={row.dante_secondary!r} value — only "
+                "dante_primary is ever read from this row, so a populated column here would be "
+                "silently discarded.",
+            )
 
         host = actual_devices.get(host_key)
         if host is None:
@@ -593,13 +619,20 @@ def _check_hostnames_and_types_and_addresses(
     extra_verified = 0
     dmi_dante_rack_slot: dict[str, int] = {}
 
+    # Every (rack, slot) an actual NetworkDevice is expected to occupy,
+    # built up alongside the loops below and compared against
+    # actual_devices' own key set at the end (Codex review, P2) — the only
+    # thing that actually proves a released slot (CONSOLES 4/16) is empty,
+    # as opposed to merely never being asserted present.
+    expected_device_keys: set[tuple[str, int]] = set()
+
     # ADR 0022 — Device Control pairs, verified (and their two (rack, slot)
     # keys consumed) *before* the main per-row loop below, mirroring how
     # the SD12 branch inside that loop self-contains its own pair. See
     # _check_device_control_pairs()'s own docstring for why this can't be
     # a lookahead from inside the loop the way SD12's is.
     byte_identical += _check_device_control_pairs(
-        findings, addressing_rows, consumed, actual_devices, vlan_id_by_function
+        findings, addressing_rows, consumed, actual_devices, vlan_id_by_function, expected_device_keys
     )
 
     for row in addressing_rows:
@@ -690,6 +723,7 @@ def _check_hostnames_and_types_and_addresses(
             if engine_row is not None and engine_row.description == f"{stem}-Engine":
                 consumed.add(key)
                 consumed.add(engine_key)
+                expected_device_keys.add(key)
                 device = actual_devices.get(key)
                 if device is None:
                     findings.fail(
@@ -723,10 +757,12 @@ def _check_hostnames_and_types_and_addresses(
                         )
                     else:
                         dmi_dante_rack_slot[row.rack] = DMI_DANTE_SLOT
+                        expected_device_keys.add((DMI_DANTE_RACK, DMI_DANTE_SLOT))
                 continue
 
         # ordinary device row
         consumed.add(key)
+        expected_device_keys.add(key)
         device = actual_devices.get(key)
         if device is None:
             findings.fail(
@@ -807,6 +843,26 @@ def _check_hostnames_and_types_and_addresses(
             f"({differs_by_design}) + verified-extra ({extra_verified}) — "
             f"{total_placed - accounted} placed address(es) match no expected row at all.",
         )
+
+    # The complete actual device-slot set against the complete expected
+    # one (Codex review, P2) — every earlier check here confirms an
+    # *expected* row's device exists and is correct, but none of them ever
+    # asked the opposite question: does an actual device exist at a key
+    # nothing expects one at? That's the only thing that actually proves a
+    # released slot (CONSOLES 4/16, ADR 0022) is empty rather than merely
+    # unasserted — a stale device sitting there would otherwise pass
+    # silently, since no CSV row ever names that key to check "expected
+    # device, none found" against.
+    actual_device_keys = set(actual_devices.keys())
+    missing_devices = expected_device_keys - actual_device_keys
+    extra_devices = actual_device_keys - expected_device_keys
+    if missing_devices or extra_devices:
+        findings.fail(
+            "devices",
+            "actual device-slot set does not match the expected set — "
+            f"missing {sorted(missing_devices)}, extra {sorted(extra_devices)}.",
+        )
+    findings.count("expected_device_keys_checked", len(expected_device_keys))
 
 
 def _device_address(device: NetworkDevice, *, description: str) -> str | None:
