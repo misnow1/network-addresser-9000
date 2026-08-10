@@ -1,5 +1,14 @@
 # Device port addressing at creation: static by default, revising ADR 0010
 
+> **Amended by [ADR 0022](./0022-add-in-cards-and-operator-set-ports.md).** Decision 5's "duplicate
+> VLAN across ports" refusal — the one-address-per-VLAN rule "The constraint that shapes the design"
+> derives from `suggest_slot_address()` yielding exactly one address per `(rack slot, VLAN)` — is
+> narrowed from "a device may not have two ports on a VLAN" to "a device may not have two
+> *slot-addressed* ports on a VLAN." An `address_source=OPERATOR` port (ADR 0022) never asks
+> `suggest_slot_address()` for anything, so it is exempt from this refusal entirely — that exemption
+> is what closes issue #42. The constraint this ADR actually names — one *derivable* address per
+> `(rack slot, VLAN)` — is untouched.
+
 Creating a device in a rack always materialized its ports as DHCP (`is_dhcp=True`, `address=None`) — a deliberate ADR 0010 decision. In practice, racked devices are statically addressed, so every device creation was followed by hand-editing each port. This closes #24: device creation now offers a DHCP-or-static choice, **defaulting to static**, computed in the usual rack-range-base + rack-slot style `suggest_slot_address()` already uses everywhere else.
 
 **The choice is transient, never stored.** No migration, no new column. `NetworkDevice.port_addressing` is a writable `@property` over a private `_port_addressing` class-level default (`PortAddressing.STATIC`) — not a plain class attribute. Django's `Model.__init__` only accepts an unknown keyword when the name is a field or a `property` (`opts._property_names`), so a property is what makes `NetworkDevice.objects.create(..., port_addressing=PortAddressing.DHCP)` work at all; a plain class attribute would raise `TypeError` from that call. The setter rejects anything outside `PortAddressing.values`, raising `ValidationError` rather than silently falling through to DHCP — a non-property attribute would have let an invalid value through unchecked. The materialized `NetworkDevicePort` rows are the only record of what was chosen; a stored field would go stale the moment an operator flips one port to DHCP by hand, so there is deliberately nothing to keep in sync.

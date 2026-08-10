@@ -32,7 +32,7 @@ from typing import Any, cast
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
-from django.db import models, router, transaction
+from django.db import models, transaction
 from django.db.models.functions import Coalesce
 
 from .suggestions import (
@@ -2766,18 +2766,6 @@ class NetworkDeviceType(AuditedModel):
     port_count = models.PositiveIntegerField(
         help_text="Must equal the number of Network Device Type Ports defined for this profile."
     )
-    companion_type = models.ForeignKey(
-        "self",
-        null=True,
-        blank=True,
-        on_delete=models.PROTECT,
-        related_name="companion_of",
-        help_text=(
-            "The type this type's instances materialize as an inseparable companion device at "
-            "creation (ADR 0018) — e.g. a Yamaha DM7C's Device Control Interface. Leave blank "
-            "for an ordinary type with no companion."
-        ),
-    )
 
     class Meta:
         constraints = [
@@ -2791,25 +2779,20 @@ class NetworkDeviceType(AuditedModel):
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
         with transaction.atomic():
-            # Both rows, one call — _lock_type_rows() sorts ids, so a
-            # concurrent A.companion_type=B / B.companion_type=A pair
-            # acquires locks in the same order instead of deadlocking
-            # (ADR 0018 review note 7).
-            _lock_type_rows(NetworkDeviceType, self.pk, self.companion_type_id)
-            self._validate_companion_type()
-            if self.pk is not None and self.devices.exists():
-                _check_locked_fields_unchanged(
-                    NetworkDeviceType,
-                    self.pk,
-                    {
-                        "manufacturer": self.manufacturer,
-                        "model": self.model,
-                        "name": self.name,
-                        "port_count": self.port_count,
-                        "companion_type": self.companion_type_id,
-                    },
-                    update_fields=update_fields,
-                )
+            if self.pk is not None:
+                _lock_type_rows(NetworkDeviceType, self.pk)
+                if self.devices.exists():
+                    _check_locked_fields_unchanged(
+                        NetworkDeviceType,
+                        self.pk,
+                        {
+                            "manufacturer": self.manufacturer,
+                            "model": self.model,
+                            "name": self.name,
+                            "port_count": self.port_count,
+                        },
+                        update_fields=update_fields,
+                    )
             super().save(
                 force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
             )
@@ -2835,7 +2818,6 @@ class NetworkDeviceType(AuditedModel):
 
     def clean(self) -> None:
         super().clean()
-        self._validate_companion_type()
         if self.pk is not None and self.devices.exists():
             _check_locked_fields_unchanged(
                 NetworkDeviceType,
@@ -2845,50 +2827,9 @@ class NetworkDeviceType(AuditedModel):
                     "model": self.model,
                     "name": self.name,
                     "port_count": self.port_count,
-                    "companion_type": self.companion_type_id,
                 },
                 update_fields=None,
             )
-
-    def _validate_companion_type(self) -> None:
-        """Refuse a self-reference, a chain downward (the chosen companion
-        itself already declares its own ``companion_type``), or a chain
-        upward (``self`` is already some other type's ``companion_type``
-        and is now declaring one of its own) — ADR 0018 decision 5.
-
-        Must run after ``save()``'s ``_lock_type_rows()`` holds both this
-        row's and ``companion_type``'s row locks, and reads every value
-        fresh from the database rather than trusting any cached/in-memory
-        related object — otherwise two concurrent saves
-        (``A.companion_type = B`` racing ``B.companion_type = A``) could
-        each validate against stale state and together commit a cycle
-        (ADR 0018 review note 7). ``clean()`` calls this too, unlocked,
-        as an advisory pre-flight — same trade-off every other ``clean()``
-        check in this module makes.
-        """
-        if self.companion_type_id is None:
-            return
-        if self.companion_type_id == self.pk:
-            raise ValidationError("A Network Device Type cannot declare itself as its own companion_type.")
-        companion_declares_its_own = (
-            NetworkDeviceType._default_manager.filter(pk=self.companion_type_id)
-            .exclude(companion_type__isnull=True)
-            .exists()
-        )
-        if companion_declares_its_own:
-            raise ValidationError(
-                f"{self.companion_type} already declares its own companion_type — a companion "
-                "chain is not allowed (ADR 0018)."
-            )
-        if self.pk is not None:
-            self_is_already_a_companion = NetworkDeviceType._default_manager.filter(
-                companion_type_id=self.pk
-            ).exists()
-            if self_is_already_a_companion:
-                raise ValidationError(
-                    f"{self} is already another type's companion_type — a companion chain is "
-                    "not allowed (ADR 0018)."
-                )
 
 
 class NetworkDeviceTypePortQuerySet(models.QuerySet):
@@ -3172,51 +3113,6 @@ class NetworkDeviceTypePort(AuditedModel):
         self.ordinal = existing_max + 1
 
 
-class NetworkDeviceQuerySet(models.QuerySet):
-    """Blocks bulk ``QuerySet.delete()`` from removing a companion device
-    on its own (ADR 0018) — the model's own ``delete()`` override below
-    only guards a single ``instance.delete()``; a queryset delete bypasses
-    ``Model.delete()`` for every row, the same reason
-    ``NetworkDevicePortQuerySet`` carries its own ``delete()`` override
-    alongside the model's (mirrored verbatim here, one table up).
-
-    Deliberately does **not** guard the host's own cascade delete
-    (``on_delete=CASCADE`` on ``NetworkDevice.host``) — Django's deletion
-    ``Collector`` issues the cascaded companion row's DELETE directly and
-    never routes it through a related model's custom manager/queryset, so
-    removing a host still removes its companion in one step, as
-    ``NetworkDevicePortQuerySet`` already documents for the identical
-    reason one table up.
-
-    Known gap (documented, not closed), same root cause as
-    ``_check_locked_fields_unchanged()``'s own docstring: a raw
-    ``bulk_create()`` against this table is unsupported for the companion
-    invariants above.
-    """
-
-    def delete(self):
-        with transaction.atomic():
-            # Only a hosted row whose host is *not also* part of this same
-            # selection is "alone" (Codex review round 2, finding 5) — the
-            # original version flagged every hosted row unconditionally, so
-            # selecting both halves of a pair (or "select all") refused a
-            # deletion the host's own cascade would have carried out safely
-            # anyway. ``pks`` is evaluated once, up front, so the exclusion
-            # reads a stable snapshot of the selection rather than a
-            # subquery re-evaluated against a queryset that's mid-delete.
-            pks = set(self.values_list("pk", flat=True))
-            hosted = list(
-                self.exclude(host__isnull=True).exclude(host_id__in=pks).values("pk", "host__hostname")
-            )
-            if hosted:
-                names = ", ".join(f"pk={row['pk']} (host {row['host__hostname']!r})" for row in hosted)
-                raise ValidationError(
-                    f"Cannot delete a companion device on its own (ADR 0018): {names} — delete "
-                    "the host instead."
-                )
-            return super().delete()
-
-
 class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
     """An end-point device instance. Unracked (rack is null) = spare pool.
 
@@ -3224,17 +3120,6 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
     (ADR 0010): re-typing a device (e.g. adding a Dante card to an amp)
     means removing and recreating it, not editing this field. This is
     expected to be rare (DESIGN.md's "Concrete Device Examples").
-
-    ``host`` (ADR 0018) is set only on a *companion* device — hardware
-    that cannot exist without another ``NetworkDevice`` (a Yamaha DM7C's
-    Device Control Interface). A host materializes its companion in the
-    same transaction as its own ports (``_materialize_companion()``); the
-    companion's ``rack``/``rack_slot`` are host-managed (locked at the
-    model layer, see ``_locked_fields()``) and move with the host
-    (``_move_companion()``); deleting the host cascades to the companion,
-    deleting the companion alone is refused (``delete()``,
-    ``NetworkDeviceQuerySet.delete()``). Addresses are never derived —
-    only existence and lifecycle are linked; see ADR 0018.
     """
 
     device_type = models.ForeignKey(NetworkDeviceType, on_delete=models.PROTECT, related_name="devices")
@@ -3242,17 +3127,6 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
     serial_number = models.CharField(max_length=100, blank=True)
     rack = models.ForeignKey(Rack, on_delete=models.PROTECT, null=True, blank=True, related_name="devices")
     rack_slot = models.PositiveIntegerField(null=True, blank=True, validators=[MinValueValidator(1)])
-    host = models.OneToOneField(
-        "self",
-        null=True,
-        blank=True,
-        on_delete=models.CASCADE,
-        related_name="companion",
-        help_text=(
-            "Set only for a companion device (ADR 0018) — the device this one cannot exist "
-            "without. Never set directly; a host materializes its own companion at creation."
-        ),
-    )
 
     #: Class-level default for the ``port_addressing`` property below —
     #: never a plain class attribute, since Django's ``Model.__init__``
@@ -3267,21 +3141,6 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
     #: — never stored; the materialized ``NetworkDevicePort.address`` is
     #: the record of what was chosen.
     _operator_addresses: dict[str, str] = {}
-
-    #: Creation/move-time inputs for the companion device — not fields,
-    #: following ``_port_addressing`` exactly, so ``objects.create(...)``
-    #: accepts them as ordinary kwargs (ADR 0018).
-    _companion_rack_slot: int | None = None
-    _companion_hostname: str | None = None
-
-    #: Set only by ``_park_companion_if_colliding()``/``_finish_companion_
-    #: move()`` while they write a companion's host-managed ``rack``/
-    #: ``rack_slot`` — modelled exactly on
-    #: ``NetworkDevicePort._deriving_address`` (ADR 0017). The single
-    #: legitimate writer of an otherwise-locked companion's placement.
-    _host_managed_move: bool = False
-
-    objects = NetworkDeviceQuerySet.as_manager()
 
     class Meta:
         constraints = [
@@ -3326,66 +3185,10 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         # ``self.pk is None or self._state.adding`` — see NetworkSwitch.save().
         is_new = self.pk is None or self._state.adding
         with transaction.atomic():
-            pending_move: dict[str, Any] | None = None
             if not is_new:
                 _check_locked_fields_unchanged(
                     NetworkDevice, self.pk, self._locked_fields(), update_fields=update_fields
                 )
-                self._check_companion_type_compatibility()
-                if self.host_id is None:
-                    pending_move = self._plan_companion_move(update_fields)
-                    # Reset once _plan_companion_move() has run for THIS
-                    # save() call, regardless of what it returned (Codex
-                    # review round 5, finding 4) — moved here from inside
-                    # _finish_companion_move(), which never runs when the
-                    # host and the companion's *explicit* target both
-                    # already match what's persisted (a true no-op, e.g.
-                    # pair at 5/4, explicit companion_rack_slot=4 given
-                    # again). The input was still consulted this call;
-                    # leaving it set would let a *later* save() on the
-                    # same instance misread it as a fresh explicit target
-                    # rather than a stale leftover. This is the single
-                    # site covering every exit from this branch, not a
-                    # per-branch patch.
-                    self._companion_rack_slot = None
-                    if pending_move is not None:
-                        # Lock order (Codex review round 4, finding 5) —
-                        # both pair rows, sorted by pk, before either
-                        # row's own UPDATE runs. _lock_type_rows() already
-                        # solves the identical problem for type rows
-                        # (:2650). Without this, a colliding move (which
-                        # parks the companion first — a real save() on the
-                        # companion row, i.e. UPDATE companion, then UPDATE
-                        # host below) and a non-colliding move (UPDATE
-                        # host below, then UPDATE companion in
-                        # _finish_companion_move()) acquire the pair in
-                        # opposite orders. Two such moves running
-                        # concurrently can each hold one row and wait on
-                        # the other — a real deadlock, not just contention.
-                        # Locked only when an actual move is planned, not
-                        # on every save() of a host-with-companion, so a
-                        # hostname-only edit doesn't needlessly widen its
-                        # lock window over a row it's never going to write.
-                        #
-                        # Note this still doesn't lock *before*
-                        # _plan_companion_move()'s own reads run (Codex
-                        # review round 5, finding 3) — that method also
-                        # runs unlocked from clean()'s pre-flight, so
-                        # locking ahead of it isn't free; see
-                        # _plan_companion_move()'s own handling of a
-                        # companion that's vanished by the time its
-                        # (unlocked) read runs, immediately below this
-                        # comment block's call.
-                        _lock_type_rows(NetworkDevice, self.pk, pending_move["companion_pk"])
-                        # Unconditional, not just clean()'s pre-flight
-                        # (Codex review round 3, finding 1) — a bare
-                        # save() never calls clean(), and nothing else on
-                        # the save path checks the pair's ranges against
-                        # each other; see _check_pending_move_no_overlap()'s
-                        # docstring for why _finish_companion_move()'s own
-                        # full_clean() structurally can't catch this.
-                        self._check_pending_move_no_overlap(pending_move)
-                        self._park_companion_if_colliding(pending_move)
             elif self.device_type_id is not None:
                 # Locks the type row so a concurrent edit to its port
                 # templates/count can't interleave with this materialization.
@@ -3394,16 +3197,8 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                 # instance loaded earlier (Codex review round 5,
                 # finding 2) — locking a row and then continuing to
                 # trust a stale in-memory copy of it defeats the point
-                # of the lock. Without this, a concurrent, already-
-                # committed edit to companion_type is invisible to both
-                # the compatibility check below and
-                # _materialize_companion() further down (both read via
-                # _get_related(self, "device_type"), i.e. off this same
-                # cached object) — a host could materialize a companion
-                # of the type's *old* companion_type while its own,
-                # now-locked type row says something else.
+                # of the lock.
                 self.device_type = NetworkDeviceType._default_manager.get(pk=self.device_type_id)
-                self._check_companion_type_compatibility()
             try:
                 super().save(
                     force_insert=force_insert,
@@ -3413,9 +3208,6 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                 )
                 if is_new:
                     self._materialize_ports()
-                    self._materialize_companion()
-                elif pending_move is not None:
-                    self._finish_companion_move(pending_move)
             except Exception:
                 if is_new and self._state.adding is False and self.pk is not None:
                     # The atomic block below still rolls back the INSERT
@@ -3423,35 +3215,28 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                     # cleared self._state.adding on this in-memory object
                     # — a DB rollback doesn't undo those Python attributes
                     # (Codex review round 5, finding 1). Left as-is, a
-                    # caller that catches this, fixes whatever was wrong
-                    # (e.g. an unavailable companion slot), and retries
-                    # the *same* instance would compute is_new = False on
-                    # the next call, take the update path, have its
-                    # UPDATE affect zero rows (the row was rolled back),
-                    # fall back to Django's own zero-row-UPDATE→INSERT
-                    # behavior, and skip both materializers — reproducing
-                    # this finding's own bug (a host with no ports and no
-                    # companion) by a different route than finding 3
-                    # below. Restored so a retry takes the creation path
-                    # again, in full, exactly as a fresh instance would.
+                    # caller that catches this, fixes whatever was wrong,
+                    # and retries the *same* instance would compute
+                    # is_new = False on the next call, take the update
+                    # path, have its UPDATE affect zero rows (the row was
+                    # rolled back), fall back to Django's own zero-row-
+                    # UPDATE→INSERT behavior, and skip materialization.
+                    # Restored so a retry takes the creation path again,
+                    # in full, exactly as a fresh instance would.
                     self.pk = None
                     self._state.adding = True
                 raise
 
     def clean(self) -> None:
         super().clean()
-        self._check_companion_type_compatibility()
         if self.pk is None or self._state.adding:
             device_type = _get_related(self, "device_type")
             if device_type is not None and device_type.pk is not None:
                 _validate_device_type_port_profile(device_type)
                 if self._materializes_static():
                     self._check_static_materialization_possible()
-                self._check_companion_creation_possible(device_type)
         else:
             _check_locked_fields_unchanged(NetworkDevice, self.pk, self._locked_fields(), update_fields=None)
-            if self.host_id is None:
-                self._check_companion_move_possible()
 
     @property
     def port_addressing(self) -> str:
@@ -3485,36 +3270,6 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
     @operator_addresses.setter
     def operator_addresses(self, value: dict[str, str]) -> None:
         self._operator_addresses = value
-
-    @property
-    def companion_rack_slot(self) -> int | None:
-        """Creation/move-time input: the companion's own rack slot (ADR
-        0018). Not a field — see ``port_addressing`` above for the
-        pattern. ``None`` (the default) means "preserve the current
-        relative offset" on an existing host's move (decision 1); a
-        companion-declaring type's *new* host requires this whenever it's
-        being created racked, since there's no existing offset yet to
-        preserve.
-        """
-        return self._companion_rack_slot
-
-    @companion_rack_slot.setter
-    def companion_rack_slot(self, value: int | None) -> None:
-        if value is not None and value < 1:
-            raise ValidationError(f"companion_rack_slot must be >= 1 (got {value}).")
-        self._companion_rack_slot = value
-
-    @property
-    def companion_hostname(self) -> str | None:
-        """Creation-time input: the companion's own hostname (ADR 0018).
-        Blank/``None`` copies the host's own hostname verbatim (decision
-        3) — duplicate hostnames are already legal in this model.
-        """
-        return self._companion_hostname
-
-    @companion_hostname.setter
-    def companion_hostname(self, value: str | None) -> None:
-        self._companion_hostname = value
 
     @property
     def slot_span(self) -> int:
@@ -3776,19 +3531,9 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         # type's slot_span (a switch always spans 1, so only this side
         # needs the aggregate — plan review note 6) and tests range overlap
         # against it, not equality.
-        #
-        # Excludes self's whole companion pair (_companion_pair_pks()), not
-        # just self.pk (ADR 0018 review note 1) — a vacate-then-place move
-        # (host 5→4, companion 4→3) would otherwise have the host's own
-        # pre-flight see its companion still sitting at the host's target
-        # slot and reject a legal move before save() ever gets a chance to
-        # park it. Excluding the partner here does *not* by itself stop a
-        # host and its companion from landing on each other — that's
-        # checked explicitly, once, by _check_companion_move_possible()/
-        # _check_companion_creation_possible().
         conflict = (
             NetworkDevice.objects.filter(rack=self.rack, rack_slot__lte=my_end)
-            .exclude(pk__in=self._companion_pair_pks())
+            .exclude(pk=self.pk)
             .annotate(_span=Coalesce(models.Max("device_type__type_ports__slot_offset"), 0) + 1)
             .annotate(_end=models.F("rack_slot") + models.F("_span") - 1)
             .filter(_end__gte=my_start)
@@ -3801,96 +3546,6 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                 f"Rack slot(s) {my_start}-{my_end} in {self.rack} overlap {conflict}'s existing "
                 f"occupied range ({conflict.rack_slot}-{conflict_end})."
             )
-
-    def validate_unique(self, exclude=None) -> None:
-        """Excludes this device's own companion-pair partner from Django's
-        *built-in* ``(rack, rack_slot)`` uniqueness check (the
-        ``unique_device_rack_slot`` constraint) — the same partner
-        exclusion ``_check_rack_slot_not_occupied()`` applies above, for
-        the same reason (ADR 0018 review note 1), but that method is
-        this app's *own* occupancy pre-flight; ``Model.validate_unique()``
-        is a separate, unrelated step ``full_clean()`` also runs, whose
-        own uniqueness query only ever excludes ``self.pk``. Without this,
-        a vacate-then-place move's target slot — briefly still occupied in
-        the database by the other half of the pair, in the window between
-        ``clean()`` and ``save()``'s park — trips Django's own "already
-        exists" error before this app's pair-aware logic ever gets a
-        chance to run.
-
-        Skips Django's exact-match check only when both are set (nothing
-        to skip for a spare-pool device); every other unique check on this
-        model (there are none today, but a future one) still runs via
-        ``super().validate_unique()`` unaffected.
-        """
-        skip_rack_slot = self.rack_id is not None and self.rack_slot is not None
-        excluded_fields = set(exclude) if exclude is not None else set()
-        super().validate_unique(
-            exclude=excluded_fields | {"rack", "rack_slot"} if skip_rack_slot else exclude
-        )
-        if skip_rack_slot:
-            conflict = (
-                NetworkDevice._default_manager.filter(rack=self.rack, rack_slot=self.rack_slot)
-                .exclude(pk__in=self._companion_pair_pks())
-                .exists()
-            )
-            if conflict:
-                raise ValidationError("Network device with this Rack and Rack slot already exists.")
-
-    def validate_constraints(self, exclude=None) -> None:
-        """``full_clean()`` calls both ``validate_unique()`` above *and*
-        ``validate_constraints()`` — the latter re-checks ``Meta.constraints``
-        (including ``unique_device_rack_slot``) directly, entirely
-        independently of the override above, via each constraint's own
-        ``.validate()``. ``UniqueConstraint.validate()`` excludes only
-        ``self.pk``, with no knowledge of a companion pair, so a
-        vacate-then-place move's target slot — still occupied in the
-        database by the pair's other half at ``clean()`` time — trips this
-        raw constraint check even though ``validate_unique()``'s pair-aware
-        version above already passed moments earlier. (The two failures
-        are textually indistinguishable: ``UniqueConstraint``'s default
-        violation message and the literal string raised above both read
-        "Network device with this Rack and Rack slot already exists.")
-
-        Skips the ``unique_device_rack_slot`` constraint specifically —
-        already re-checked, pair-aware, by ``validate_unique()`` — rather
-        than excluding the ``rack``/``rack_slot`` *fields* wholesale:
-        this model's two ``CheckConstraint``s also reference those field
-        names, and ``CheckConstraint.validate()`` skips any constraint
-        whose condition references an excluded field, so a field-based
-        exclude would silently stop enforcing "rack_slot >= 1" and
-        "rack and rack_slot together" too. Every other constraint,
-        including both ``CheckConstraint``s, still runs exactly as
-        ``Model.validate_constraints()`` would run it.
-        """
-        using = router.db_for_write(self.__class__, instance=self)
-        errors: dict[str, list[Any]] = {}
-        for model_class, model_constraints in self.get_constraints():
-            for constraint in model_constraints:
-                if (
-                    isinstance(constraint, models.UniqueConstraint)
-                    and constraint.name == "unique_device_rack_slot"
-                ):
-                    continue
-                try:
-                    constraint.validate(model_class, self, exclude=exclude, using=using)
-                except ValidationError as e:
-                    # ``fields`` only exists on UniqueConstraint, not the base
-                    # class — getattr(), not a direct attribute access, so a
-                    # CheckConstraint's ValidationError (never code=="unique")
-                    # can't trip an AttributeError here, matching upstream
-                    # Model.validate_constraints()'s reliance on short-circuit
-                    # evaluation for the same safety.
-                    constraint_fields = getattr(constraint, "fields", None)
-                    if (
-                        getattr(e, "code", None) == "unique"
-                        and constraint_fields is not None
-                        and len(constraint_fields) == 1
-                    ):
-                        errors.setdefault(constraint_fields[0], []).append(e)
-                    else:
-                        errors = e.update_error_dict(errors)
-        if errors:
-            raise ValidationError(errors)
 
     def _validate_existing_addresses_still_fit(self) -> None:
         for port in self.ports.filter(address__isnull=False):
@@ -3905,608 +3560,8 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
             if error:
                 raise ValidationError(f"Moving {self} would leave an existing address invalid: {error}")
 
-    # ------------------------------------------------------------------
-    # ADR 0018 — device companions
-    # ------------------------------------------------------------------
-
-    def delete(self, using=None, keep_parents=False) -> tuple[int, dict[str, int]]:
-        """Refuse deleting a companion device on its own (ADR 0018) — the
-        queryset twin (``NetworkDeviceQuerySet.delete()``) guards a bulk
-        delete; this guards a single ``instance.delete()``. Deliberately
-        does **not** fire during the host's own cascade delete: Django's
-        deletion ``Collector`` issues the cascaded companion row's DELETE
-        directly, bypassing both this override and the queryset's, so
-        removing a host still removes its companion in one step (see
-        ``NetworkDeviceQuerySet``'s docstring).
-
-        Reads the *persisted* ``host_id`` (``_persisted_host_id()``), not
-        ``self``'s in-memory one — ``delete()`` has no locked-field
-        validation, so ``self.host_id`` is untrusted here the same way
-        ``NetworkDevicePort.delete()`` treats its own identity fields as
-        untrusted (``_persisted_delete_guard_fields()``).
-        """
-        with transaction.atomic():
-            persisted_host_id = self._persisted_host_id()
-            if persisted_host_id is not None:
-                host = NetworkDevice._default_manager.filter(pk=persisted_host_id).first()
-                host_label = host if host is not None else f"device #{persisted_host_id}"
-                raise ValidationError(
-                    f"Cannot delete a companion device on its own (ADR 0018): {self} belongs to "
-                    f"{host_label} — delete the host instead."
-                )
-            return super().delete(using=using, keep_parents=keep_parents)
-
-    def _persisted_host_id(self) -> int | None:
-        if self.pk is None:
-            return None
-        return NetworkDevice._default_manager.filter(pk=self.pk).values_list("host_id", flat=True).first()
-
     def _locked_fields(self) -> dict[str, Any]:
-        # ``device_type``/``host`` identify what this row is and, for a
-        # companion, which host it belongs to — neither is ever meant to
-        # change after creation (a companion can never be reparented, ADR
-        # 0018). ``rack``/``rack_slot`` are additionally locked whenever
-        # this row is *persisted* as a companion (``_persisted_host_id()``
-        # — not the in-memory ``self.host_id``, same lesson as
-        # ``NetworkDevicePort._locked_fields()``: an in-memory ``host =
-        # None`` must not unlock the check), unless the write is the one
-        # legitimate mover (``_host_managed_move``, set only by
-        # ``_park_companion_if_colliding()``/``_finish_companion_move()``).
-        fields: dict[str, Any] = {
-            "device_type": self.device_type_id,
-            "host": self.host_id,
-        }
-        if self._persisted_host_id() is not None and not self._host_managed_move:
-            fields["rack"] = self.rack_id
-            fields["rack_slot"] = self.rack_slot
-        return fields
-
-    def _companion_pair_pks(self) -> set[int]:
-        """``{self.pk, the other half of self's host/companion pair}`` —
-        used by ``_check_rack_slot_not_occupied()`` to exclude a pair's own
-        two rows from each other's occupancy pre-flight (ADR 0018 review
-        note 1). ``self.pk`` is included whenever set; the partner is read
-        from the *persisted* ``host_id`` when ``self`` is a companion, or
-        from the existing ``companion`` relation when ``self`` is a host.
-        """
-        pks: set[int] = {self.pk} if self.pk is not None else set()
-        persisted_host_id = self._persisted_host_id()
-        if persisted_host_id is not None:
-            pks.add(persisted_host_id)
-        elif self.pk is not None:
-            companion = _get_related(self, "companion")
-            if companion is not None and companion.pk is not None:
-                pks.add(companion.pk)
-        return pks
-
-    def _check_companion_type_compatibility(self) -> None:
-        """Enforce the type graph against ``host`` (ADR 0018 review note
-        3) — ``host`` being merely non-null is not enough:
-
-        - a device whose type is some other type's ``companion_type`` must
-          have a ``host``;
-        - a device with a ``host`` must satisfy ``self.device_type_id ==
-          host.device_type.companion_type_id``;
-        - a device whose type declares a ``companion_type`` may not itself
-          have a ``host`` — it's a host, not a companion.
-
-        Called from both ``clean()`` and ``save()`` — the latter because
-        ``objects.create()`` never calls ``clean()``.
-        """
-        device_type = _get_related(self, "device_type")
-        if device_type is not None and device_type.pk is not None:
-            if device_type.companion_type_id is not None and self.host_id is not None:
-                raise ValidationError(
-                    f"{device_type} declares its own companion_type — an instance of it cannot "
-                    "also be someone else's companion (ADR 0018)."
-                )
-            if self.host_id is None and device_type.companion_of.exists():
-                raise ValidationError(
-                    f"{device_type} is another type's companion_type — an instance of it must "
-                    "have a host (ADR 0018); it cannot be created standalone."
-                )
-        if self.host_id is not None:
-            host = _get_related(self, "host")
-            if (
-                host is not None
-                and host.pk is not None
-                and device_type is not None
-                and device_type.pk is not None
-            ):
-                host_device_type = _get_related(host, "device_type")
-                if (
-                    host_device_type is not None
-                    and host_device_type.pk is not None
-                    and device_type.pk != host_device_type.companion_type_id
-                ):
-                    raise ValidationError(
-                        f"{self} (type {device_type}) cannot be {host}'s companion — {host}'s "
-                        f"type declares {host_device_type.companion_type} as its companion_type "
-                        "(ADR 0018)."
-                    )
-
-    def _check_companion_creation_possible(self, device_type: "NetworkDeviceType") -> None:
-        """Pre-flight for whether ``_materialize_companion()`` would
-        succeed — pure, so it can run from both ``clean()`` (admin form
-        errors) and the top of ``_materialize_companion()`` itself (the
-        ``objects.create()`` path, which never calls ``clean()``). Same
-        shape as ``_check_static_materialization_possible()``, one level
-        up. A no-op for an ordinary type with no ``companion_type``.
-        """
-        if device_type.companion_type_id is None:
-            return
-        if self.rack is None:
-            return  # unracked host materializes an unracked companion — nothing to place
-        if self._companion_rack_slot is None:
-            raise ValidationError(
-                f"companion_rack_slot is required when creating a racked {device_type} — it "
-                "materializes a companion device that needs its own rack slot (ADR 0018)."
-            )
-        companion_type = device_type.companion_type
-        assert companion_type is not None  # companion_type_id checked non-null above
-        companion_span = companion_type.slot_span
-        companion_start = self._companion_rack_slot
-        companion_end = companion_start + companion_span - 1
-        if companion_end > self.rack.slot_count:
-            raise ValidationError(
-                f"companion_rack_slot {companion_start} plus {companion_type}'s span "
-                f"({companion_span}, ending at ordinal {companion_end}) exceeds {self.rack}'s "
-                f"slot_count ({self.rack.slot_count})."
-            )
-        # The pair's own two target ranges, checked against each other
-        # explicitly (ADR 0018 review note 1) — neither row exists yet, so
-        # the occupancy queries below can't see this overlap on their own.
-        host_span = device_type.slot_span
-        if self.rack_slot is not None:
-            host_start, host_end = self.rack_slot, self.rack_slot + host_span - 1
-            if companion_start <= host_end and host_start <= companion_end:
-                raise ValidationError(
-                    f"companion_rack_slot {companion_start}-{companion_end} would overlap this "
-                    f"device's own rack_slot range ({host_start}-{host_end}) — a host and its "
-                    "companion can't occupy the same ordinal (ADR 0018)."
-                )
-        if NetworkSwitch.objects.filter(
-            rack=self.rack, rack_slot__gte=companion_start, rack_slot__lte=companion_end
-        ).exists():
-            raise ValidationError(
-                f"companion_rack_slot(s) {companion_start}-{companion_end} in {self.rack} are "
-                "already occupied by a switch."
-            )
-        conflict = (
-            NetworkDevice.objects.filter(rack=self.rack, rack_slot__lte=companion_end)
-            .annotate(_span=Coalesce(models.Max("device_type__type_ports__slot_offset"), 0) + 1)
-            .annotate(_end=models.F("rack_slot") + models.F("_span") - 1)
-            .filter(_end__gte=companion_start)
-            .first()
-        )
-        if conflict is not None:
-            assert conflict.rack_slot is not None
-            conflict_end = conflict.rack_slot + conflict.slot_span - 1
-            raise ValidationError(
-                f"companion_rack_slot(s) {companion_start}-{companion_end} in {self.rack} "
-                f"overlap {conflict}'s existing occupied range ({conflict.rack_slot}-{conflict_end})."
-            )
-        if self.port_addressing != PortAddressing.STATIC:
-            return
-        addressable = [tp for tp in companion_type.type_ports.select_related("vlan") if tp.vlan.subnet]
-        for type_port in addressable:
-            address = _suggest_rack_slot_address(
-                self.rack, companion_start, type_port.vlan_id, type_port.slot_offset
-            )
-            if address is None:
-                raise ValidationError(
-                    f"No usable address range for {type_port.vlan} in {self.rack} — assign a "
-                    f"Rack VLAN Range for this VLAN before creating a static {companion_type} "
-                    "companion here."
-                )
-            try:
-                _validate_static_address(
-                    address,
-                    type_port.vlan,
-                    self.rack,
-                    companion_start,
-                    exclude_switch_address_pk=None,
-                    exclude_device_port_pk=None,
-                )
-            except ValidationError as exc:
-                # Same trap _check_static_materialization_possible() guards
-                # against: _validate_static_address() raises keyed on
-                # "address", the right shape for NetworkDevicePort.clean()
-                # but not this call site (checking the *companion's*
-                # prospective address from the host's own clean()) — a
-                # dict-keyed ValidationError for a nonexistent field
-                # crashes Django admin's add_error(), so re-raise flat.
-                raise ValidationError(exc.messages) from exc
-
-    def _check_companion_move_possible(self) -> None:
-        """Pair-aware pre-flight for an existing host's own ``clean()``
-        (ADR 0018 review note 1): explicitly checks the pair's own two
-        *target* ranges against each other, which
-        ``_check_rack_slot_not_occupied()``'s partner exclusion
-        deliberately does not — excluding the partner without this would
-        let a host and its companion land on top of each other. A no-op
-        when this device has no companion, or when the move plan finds
-        nothing actually changing.
-
-        This is the ``clean()``-path pre-flight (a nice admin form error) —
-        ``save()`` calls ``_check_pending_move_no_overlap()`` directly and
-        unconditionally for the same check on the *save* path, since a bare
-        ``save()`` never reaches this method at all (Codex review round 3,
-        finding 1).
-        """
-        companion = _get_related(self, "companion")
-        if companion is None or companion.pk is None:
-            return
-        pending_move = self._plan_companion_move(update_fields=None)
-        if pending_move is None:
-            return
-        self._check_pending_move_no_overlap(pending_move)
-
-    def _check_pending_move_no_overlap(self, pending_move: dict[str, Any]) -> None:
-        """The pair's own two *target* ranges, checked against each other —
-        shared by ``_check_companion_move_possible()`` (the ``clean()``-path
-        pre-flight, for a nice admin form error) and ``save()`` itself
-        (Codex review round 3, finding 1).
-
-        Before this, the only path that ran this check was ``clean()``,
-        which a bare ``save()`` never calls — and nothing on the save path
-        caught it either: the companion's own ``full_clean()`` in
-        ``_finish_companion_move()`` deliberately *excludes* its host from
-        occupancy conflicts (via ``_companion_pair_pks()``, review note 1),
-        precisely because pair-vs-pair overlap is this check's job, not
-        ``_check_rack_slot_not_occupied()``'s. And ``unique_device_rack_slot``
-        only compares *starting* slots, so a host spanning several ordinals
-        (a non-zero ``slot_offset`` type, ADR 0017) could commit an
-        overlapping companion at a *different* starting slot — 5–6 and 6,
-        say — through a bare ``host.save()`` with nothing to stop it.
-
-        Fetches the companion fresh rather than trusting any cached
-        relation on ``self`` — ``slot_span`` depends only on
-        ``device_type``, which never changes, so freshness doesn't matter
-        for *that*, but doing it here keeps this method usable standalone
-        without relying on a caller's possibly-stale ``_get_related()``
-        result.
-        """
-        host_start = pending_move["host_new_rack_slot"]
-        companion_start = pending_move["companion_new_rack_slot"]
-        if host_start is None or companion_start is None:
-            return  # unracking, or the companion ends up unracked — nothing can overlap
-        companion = NetworkDevice._default_manager.get(pk=pending_move["companion_pk"])
-        # ``self.slot_span`` reads through ``self.device_type`` — possibly
-        # dirty in memory (Codex review round 4, finding 1): ``device_type``
-        # is locked, but ``_check_locked_fields_unchanged()`` only checks
-        # fields named in ``update_fields``, so ``save(update_fields=
-        # ["rack_slot"])`` never even looks at it. A persisted span-2 host
-        # temporarily holding an in-memory, never-to-be-persisted span-1
-        # type would validate against the wrong span while the database
-        # keeps the real one. Fetched fresh, the same pattern ``companion``
-        # above already uses, since ``device_type`` never actually changes
-        # — only what ``self`` happens to hold in memory does.
-        persisted_self = NetworkDevice._default_manager.get(pk=self.pk)
-        host_end = host_start + persisted_self.slot_span - 1
-        companion_end = companion_start + companion.slot_span - 1
-        if host_start <= companion_end and companion_start <= host_end:
-            raise ValidationError(
-                f"Moving {self} to rack_slot {host_start} would overlap its companion "
-                f"{companion}'s target rack_slot {companion_start} (ADR 0018) — choose a "
-                "companion_rack_slot that doesn't collide with the host's own range."
-            )
-
-    def _materialize_companion(self) -> None:
-        """One-time creation of this (now-saved, ``self.pk`` set) device's
-        companion, when its type declares one (ADR 0018) — the ADR's "one
-        level up" of ADR 0010's seed-once port materialization. Runs
-        inside the same transaction ``_materialize_ports()`` already
-        opened via ``save()``'s ``is_new`` branch, so a failure anywhere
-        (an unavailable companion slot, an address collision on the
-        companion's own ports) rolls back the host, its ports, and any
-        partial companion state together.
-
-        The companion inherits the host's ``port_addressing`` (a
-        creation-time choice made once, ADR 0013) and defaults its
-        hostname to the host's own, verbatim, when none was given
-        (decision 3).
-
-        Resets ``self._companion_rack_slot``/``self._companion_hostname``
-        to their class defaults once consumed here — unlike
-        ``_port_addressing`` (which this property/setter pair otherwise
-        mirrors), this input is read a *second* time, with a *different*
-        meaning, if the same in-memory host is later moved
-        (``_plan_companion_move()``'s "blank preserves the offset, a
-        value given is an explicit absolute target" — decision 1). Without
-        the reset, a host object reused after creation to perform an
-        immediate move would misread its own leftover creation-time slot
-        as an explicit move-time override.
-        """
-        device_type = _get_related(self, "device_type")
-        if device_type is None or device_type.companion_type_id is None:
-            return
-        self._check_companion_creation_possible(device_type)
-        companion = NetworkDevice(
-            host=self,
-            device_type_id=device_type.companion_type_id,
-            rack=self.rack,
-            rack_slot=self._companion_rack_slot if self.rack is not None else None,
-            hostname=self._companion_hostname or self.hostname,
-            created_by=self.created_by,
-        )
-        companion.port_addressing = self.port_addressing
-        companion.full_clean()
-        companion.save()
-        self._companion_rack_slot = None
-        self._companion_hostname = None
-
-    def _plan_companion_move(
-        self, update_fields: "list[str] | frozenset[str] | None"
-    ) -> dict[str, Any] | None:
-        """Compute the target ``rack``/``rack_slot`` for ``self``'s
-        companion, from ``self``'s own pending rack/slot change, without
-        writing anything — called from both ``save()``'s not-new branch
-        (before ``super().save()`` writes ``self``'s own row) and
-        ``clean()``'s pair pre-flight (``_check_companion_move_possible()``).
-
-        Returns ``None`` when there's nothing to move: no companion,
-        ``update_fields`` excludes both rack fields (review note 5), or
-        **neither row's** effective new values differ from what's already
-        persisted — checked for the host *and* the companion (Codex review
-        round 4, finding 2), not the host alone. An explicit
-        ``companion_rack_slot`` with the host otherwise stationary (the
-        change form's "host slot unchanged, companion slot edited" case)
-        is a real move that used to be discarded here before the
-        companion's own target was ever computed.
-
-        A blank (``None``) ``companion_rack_slot`` preserves the current
-        relative offset (decision 1); an explicit one is an absolute
-        target — this **implements** that decision rather than reopening
-        it. Racking a previously-unracked assembly with no existing offset
-        to preserve requires an explicit ``companion_rack_slot``
-        (decision 6).
-        """
-        normalized = _normalize_update_fields(NetworkDevice, update_fields)
-        if normalized is not None and not ({"rack", "rack_slot"} & normalized):
-            return None
-        if self.pk is None:
-            return None
-        companion = _get_related(self, "companion")
-        if companion is None or companion.pk is None:
-            return None
-        persisted = NetworkDevice._default_manager.filter(pk=self.pk).values("rack_id", "rack_slot").first()
-        if persisted is None:
-            # Not "nothing to move" (Codex review round 4, finding 4) —
-            # every caller of this method has already established
-            # ``self.pk`` is set and this isn't a new row, so a missing
-            # persisted row means something else deleted this host between
-            # it being loaded and this ``save()`` reaching here (READ
-            # COMMITTED — see ``django_mysql_read_committed`` in project
-            # memory — so a concurrent transaction's commit is visible
-            # mid-transaction). Returning ``None`` here would let
-            # ``super().save()`` fall through to Django's own "``UPDATE``
-            # affected 0 rows, so ``INSERT`` instead" fallback — and since
-            # ``is_new`` was already captured as ``False`` at the top of
-            # ``save()``, neither ``_materialize_ports()`` nor
-            # ``_materialize_companion()`` would run, resurrecting an
-            # invalid orphan host with no ports and no companion. Fail
-            # loudly instead of proceeding.
-            raise ValidationError(
-                f"Cannot save {self}: this device no longer exists in the database (deleted by "
-                "another operation) — reload it before making further changes."
-            )
-        old_rack_id, old_rack_slot = persisted["rack_id"], persisted["rack_slot"]
-        # Effective post-save values (Codex review round 2, finding 2), not
-        # blindly ``self.rack_id``/``self.rack_slot`` — when ``update_fields``
-        # names only one of the pair, ``super().save()`` below leaves the
-        # other field's DB value untouched no matter what ``self`` holds in
-        # memory. A caller that mutates both and then calls
-        # ``save(update_fields=["rack"])`` must plan the companion's move
-        # from the *persisted* old slot, not an unsaved dirty one that's
-        # never actually going to be written for this call.
-        new_rack_id = self.rack_id if normalized is None or "rack" in normalized else old_rack_id
-        new_rack_slot = self.rack_slot if normalized is None or "rack_slot" in normalized else old_rack_slot
-        if new_rack_id is not None and new_rack_slot is None:
-            # An inconsistent in-memory state ("rack and rack_slot must
-            # both be set or both be empty" — RackSlotAssignmentMixin.clean(),
-            # backed by the networkdevice_rack_and_slot_together
-            # CheckConstraint) that a bare save() can still reach here,
-            # *before* the DB constraint would ever get a chance to reject
-            # it — this runs ahead of super().save(). Caught explicitly so
-            # the arithmetic below never has to add None to an int.
-            raise ValidationError(
-                "rack_slot is required when rack is set — cannot plan this device's companion "
-                "move from an inconsistent in-memory state (rack and rack_slot must both be set "
-                "or both be empty)."
-            )
-        # Read from the DB, not ``companion.rack_id``/``companion.rack_slot``
-        # (Codex review round 3, finding 2) — ``companion`` here is whatever
-        # ``_get_related()``'s reverse-relation cache holds, which
-        # ``_finish_companion_move()`` never updates: that method writes
-        # through a *separately fetched* instance
-        # (``NetworkDevice._default_manager.get(pk=...)``), so reusing the
-        # same host object for a second move reads the companion's
-        # pre-*first*-move slot, computing every offset from stale state —
-        # silently, no error, just a wrong target.
-        #
-        # Fetched *before* the "nothing to move" decision (moved from where
-        # round 3 left it, right after this comment, to the very end of the
-        # function) — round 4 finding 2's fix needs the companion's own
-        # persisted position to decide whether *it* is moving, not just the
-        # host.
-        companion_persisted = (
-            NetworkDevice._default_manager.filter(pk=companion.pk).values("rack_id", "rack_slot").first()
-        )
-        if companion_persisted is None:
-            # Not "nothing to move" (Codex review round 5, finding 3, the
-            # companion-side twin of round 4 finding 4's fix on the host's
-            # own lookup above) — ``host`` is ``CASCADE``, so this is the
-            # *more* likely branch to fire under a concurrent host
-            # deletion: whether the race lands here or on the host's own
-            # lookup above is decided by which of two unlocked reads a few
-            # lines apart loses to the other transaction's commit.
-            # Returning ``None`` here would let ``super().save()`` fall
-            # through to the same zero-row-``UPDATE``→``INSERT`` fallback
-            # that resurrects an orphan host with no ports and no
-            # companion. Raising here doesn't make these reads locked —
-            # they still run before ``save()``'s own
-            # ``_lock_type_rows(NetworkDevice, self.pk, ...)`` a few lines
-            # up its call site, since that call needs the companion's pk
-            # from this method's return value in the first place — it
-            # closes the silent-resurrection outcome, not the underlying
-            # race window itself.
-            raise ValidationError(
-                f"Cannot move {self}: its companion no longer exists in the database (deleted by "
-                "another operation) — reload it before making further changes."
-            )
-        companion_old_rack_id = companion_persisted["rack_id"]
-        companion_old_rack_slot = companion_persisted["rack_slot"]
-        companion_new_rack_id: int | None
-        companion_new_rack_slot: int | None
-        if new_rack_id is None:
-            companion_new_rack_id = None
-            companion_new_rack_slot = None
-        else:
-            companion_new_rack_id = new_rack_id
-            if self._companion_rack_slot is not None:
-                companion_new_rack_slot = self._companion_rack_slot
-            elif companion_old_rack_slot is not None and old_rack_slot is not None:
-                assert new_rack_slot is not None  # guarded above: new_rack_id set implies new_rack_slot set
-                companion_new_rack_slot = new_rack_slot + (companion_old_rack_slot - old_rack_slot)
-            else:
-                raise ValidationError(
-                    "companion_rack_slot is required: this move has no existing relative offset "
-                    "to preserve (ADR 0018 decision 6) — the assembly was unracked, or the "
-                    "companion had no rack_slot recorded."
-                )
-        host_unchanged = new_rack_id == old_rack_id and new_rack_slot == old_rack_slot
-        companion_unchanged = (
-            companion_new_rack_id == companion_old_rack_id
-            and companion_new_rack_slot == companion_old_rack_slot
-        )
-        if host_unchanged and companion_unchanged:
-            return None
-        return {
-            "companion_pk": companion.pk,
-            "host_old_rack_id": old_rack_id,
-            "host_old_rack_slot": old_rack_slot,
-            "host_new_rack_id": new_rack_id,
-            "host_new_rack_slot": new_rack_slot,
-            "companion_old_rack_id": companion_old_rack_id,
-            "companion_old_rack_slot": companion_old_rack_slot,
-            "companion_new_rack_id": companion_new_rack_id,
-            "companion_new_rack_slot": companion_new_rack_slot,
-        }
-
-    def _park_companion_if_colliding(self, pending_move: dict[str, Any]) -> None:
-        """Vacate the companion first, but only when it's actually
-        necessary (ADR 0018 review note 6) — the host's new target range
-        overlapping the companion's *currently occupied* range, the only
-        case where writing the host's own row first would land it on the
-        companion's still-occupied slot and trip
-        ``unique_device_rack_slot``. Every ordinary move (the common case)
-        skips this, and ``_finish_companion_move()`` alone does a single,
-        truthful ``save()``.
-
-        When a park *is* needed, it's a real
-        ``save(update_fields=["rack", "rack_slot"])`` under
-        ``_host_managed_move``, not a ``QuerySet.update()`` — auditlog
-        tracks these fields (``config/settings.py:244``), and ``update()``
-        would leave a false ``None → target`` entry on the following
-        placement instead of two truthful ones (``old → None``, then
-        ``None → target``).
-        """
-        host_new_rack_id = pending_move["host_new_rack_id"]
-        host_new_rack_slot = pending_move["host_new_rack_slot"]
-        companion_old_rack_id = pending_move["companion_old_rack_id"]
-        companion_old_rack_slot = pending_move["companion_old_rack_slot"]
-        if (
-            host_new_rack_id is None
-            or host_new_rack_slot is None
-            or companion_old_rack_id is None
-            or companion_old_rack_slot is None
-            or host_new_rack_id != companion_old_rack_id
-        ):
-            return
-        companion = NetworkDevice._default_manager.get(pk=pending_move["companion_pk"])
-        # Persisted, not self.slot_span (audit finding while fixing Codex
-        # review round 5 — a third instance of round 4 finding 1's class:
-        # self.slot_span reads through self.device_type, possibly dirty
-        # under a save(update_fields=[...]) that never touches
-        # device_type). The exact-tuple case unique_device_rack_slot
-        # actually enforces doesn't depend on either span — host_start and
-        # companion_start alone decide it, and neither reads slot_span —
-        # so a dirty span here can only ever make this *more* willing to
-        # skip a park the DB constraint wouldn't have needed anyway, never
-        # less. Fixed to match round 4 finding 1's site regardless, so
-        # nothing in this method depends on that argument staying true.
-        persisted_self = NetworkDevice._default_manager.get(pk=self.pk)
-        host_start, host_end = host_new_rack_slot, host_new_rack_slot + persisted_self.slot_span - 1
-        companion_start = companion_old_rack_slot
-        companion_end = companion_start + companion.slot_span - 1
-        if not (host_start <= companion_end and companion_start <= host_end):
-            return  # ranges don't actually overlap — no park needed
-        companion.rack = None
-        companion.rack_slot = None
-        companion._host_managed_move = True
-        companion.save(update_fields=["rack", "rack_slot"])
-
-    def _finish_companion_move(self, pending_move: dict[str, Any]) -> None:
-        """Place the companion at its final target — the second half of
-        the vacate-then-place sequence (review note 6); the park in
-        ``_park_companion_if_colliding()`` is a no-op unless the target
-        actually collided, so most moves reach here as the *only*
-        companion write, with a truthful ``old → new`` audit entry.
-
-        Also validates both rows' addresses against their new placement
-        (review note 2) — ``_validate_existing_addresses_still_fit()`` is
-        only ever reached from ``clean()``, and ``save()`` never calls
-        ``clean()``, so a bare ``host.save()`` (no ``full_clean()``) would
-        otherwise silently leave a stale, now-out-of-range address on
-        either row.
-
-        Validates the **host's** addresses off a freshly re-fetched
-        instance, not ``self`` directly (Codex review round 3, finding 3)
-        — ``self.rack``/``self.rack_slot`` can hold a dirty in-memory value
-        that ``update_fields`` excluded from this very ``save()`` call
-        (e.g. ``save(update_fields=["rack"])`` after also mutating
-        ``rack_slot`` in memory), and ``_address_containment_error()``
-        silently skips its rack-range check whenever ``rack_slot`` is
-        ``None`` — not a failure, just nothing checked. By the time this
-        runs, ``super().save()`` has already written ``self``'s own row,
-        so re-fetching gets exactly what ``update_fields`` actually
-        persisted, the same effective-value fix ``_plan_companion_move()``
-        already applies to the move plan itself, applied here to the
-        address check that plan doesn't cover.
-
-        Runs ``companion.full_clean()`` before saving (Codex review round
-        2, finding 1) — the pair-vs-pair overlap is already pre-flighted
-        by ``_check_companion_move_possible()``/``_park_companion_if_
-        colliding()``, but nothing before this checked the companion's
-        *own* target against a third row: another device's or switch's
-        occupied range, or ``rack.slot_count``, neither backed by a DB
-        constraint. ``_host_managed_move`` is set **before** calling
-        ``full_clean()``, not just before ``save()`` — ``clean()`` is what
-        actually reads it (via ``_locked_fields()``), so setting it any
-        later would trip the very placement lock the flag exists to
-        bypass. ``full_clean()`` subsumes the explicit address-fit call
-        above (``RackSlotAssignmentMixin.clean()`` already runs it), and
-        its own ``validate_unique()``/``validate_constraints()`` overrides
-        correctly exclude this pair's own host via ``_companion_pair_
-        pks()`` — a genuine conflict here can only be against an unrelated
-        row.
-        """
-        NetworkDevice._default_manager.get(pk=self.pk)._validate_existing_addresses_still_fit()
-        companion = NetworkDevice._default_manager.get(pk=pending_move["companion_pk"])
-        companion.rack_id = pending_move["companion_new_rack_id"]
-        companion.rack_slot = pending_move["companion_new_rack_slot"]
-        companion._host_managed_move = True
-        companion.full_clean()
-        companion.save(update_fields=["rack", "rack_slot"])
-        # ``self._companion_rack_slot`` is reset by ``save()`` itself,
-        # right after ``_plan_companion_move()`` returns — not here (Codex
-        # review round 5, finding 4) — because this method never runs at
-        # all when the host and the companion's own explicit target both
-        # already match what's persisted (a true no-op), and the input
-        # was still consulted for that call. See ``save()``'s comment at
-        # that reset for the full reasoning; round 4 finding 3 originally
-        # placed the reset here, one exit path short.
+        return {"device_type": self.device_type_id}
 
 
 class NetworkDevicePortQuerySet(models.QuerySet):

@@ -44,7 +44,7 @@ from auditlog.models import LogEntry
 from django.contrib.auth import get_user_model
 from django.contrib.auth.decorators import login_required, permission_required
 from django.contrib.contenttypes.models import ContentType
-from django.core.exceptions import ObjectDoesNotExist, PermissionDenied, ValidationError
+from django.core.exceptions import PermissionDenied, ValidationError
 from django.core.paginator import Paginator
 from django.db.models import Count, Max, Model, Prefetch, Q
 from django.http import Http404, HttpRequest, HttpResponse
@@ -235,31 +235,6 @@ class ElevationCell:
 
 
 @dataclass(frozen=True)
-class TetherInfo:
-    """The other half of an ADR 0018 companion pair, for the dashed-tether
-    badge — deliberately not a positional line drawn across rows. A pair's
-    two rack slots can be arbitrarily far apart (production has both a
-    below and an above example on consoles from the same manufacturer),
-    and this project has no JavaScript to draw a connector across an
-    unbounded row distance. An in-page anchor link plus this pk is the
-    encoding instead, and it is checkable exactly where a drawn line
-    wouldn't be: by pk, not by pixel position.
-
-    ``ordinal`` is ``None`` when this half of the pair is unracked —
-    ADR 0018's companion link is an existence/lifecycle relationship, true
-    whether or not either half currently has a rack slot (a host and
-    companion materialize together, racked or not, and the spare pool is
-    an entirely legitimate state for both). A ``None`` ordinal means the
-    badge has no in-page row to anchor to (device-detail's spare-pool
-    case), not that the relationship itself is somehow absent.
-    """
-
-    pk: int
-    label: str
-    ordinal: int | None
-
-
-@dataclass(frozen=True)
 class Occupant:
     """The device or switch that owns one or more elevation rows."""
 
@@ -270,7 +245,6 @@ class Occupant:
     row_kind: str  # "start" | "continuation" — this row's position within the occupant's span
     span: int  # 1 for a switch or an ordinary device; > 1 only for an ADR 0017 offset device
     is_span_end: bool  # True on the last ordinal of a multi-ordinal span
-    tether: TetherInfo | None = None
 
     @property
     def bracketed(self) -> bool:
@@ -281,7 +255,7 @@ class Occupant:
 class ConflictOccupant:
     """One claimant in an ``ElevationRow.conflicts`` list — a minimal
     label + admin link, not a full ``Occupant``: with the ordinal
-    genuinely disputed, there's no single span/tether/cell state that
+    genuinely disputed, there's no single span/cell state that
     could honestly describe "this" occupant of the row, so a conflict
     entry carries only enough to identify and link to each claimant.
     """
@@ -392,37 +366,6 @@ def _device_port_index(
     return by_offset_vlan, vlans_with_port
 
 
-def _tether_for(device: NetworkDevice) -> TetherInfo | None:
-    """This device's companion-pair badge (ADR 0018), if it is either half
-    of one — the host (has a ``companion``) or the companion itself (has
-    ``host_id`` set). ``None`` for a device with no companion relationship
-    at all, which is the ordinary case for most types.
-
-    Rendered whenever either half of the pair *exists*, regardless of
-    whether it currently has a rack slot (Codex review round 2, finding
-    6) — ADR 0018's companion link is existence and lifecycle, not
-    addressing: a host materializes its companion in the same transaction
-    whether or not it's racked (``_materialize_companion()``), so an
-    unracked host in the spare pool has a real, existing companion just
-    as much as a racked one does. An earlier revision required
-    ``rack_slot is not None`` on the partner before returning anything,
-    which hid the relationship entirely for any unracked pair —
-    contradicting the ADR's own point that the link doesn't come and go
-    with placement. ``TetherInfo.ordinal`` is ``None`` in that case; it's
-    the caller's job to render "spare pool" instead of a slot number.
-    """
-    try:
-        companion = device.companion
-    except ObjectDoesNotExist:
-        companion = None
-    if companion is not None:
-        return TetherInfo(pk=companion.pk, label=str(companion), ordinal=companion.rack_slot)
-    host = device.host
-    if host is not None:
-        return TetherInfo(pk=host.pk, label=str(host), ordinal=host.rack_slot)
-    return None
-
-
 def _empty_cell(column: RackVlanRange, ordinal: int) -> ElevationCell:
     return ElevationCell(state="empty", would_be_address=safe_slot_address(column.address_range, ordinal))
 
@@ -454,7 +397,6 @@ def _switch_row(columns: list[RackVlanRange], switch: NetworkSwitch) -> tuple[Oc
         row_kind="start",
         span=1,
         is_span_end=True,
-        tether=None,
     )
     return occupant, cells
 
@@ -502,7 +444,6 @@ def _device_row(
         row_kind=entry.row_kind,
         span=span,
         is_span_end=(offset == span - 1),
-        tether=_tether_for(device),
     )
     return occupant, cells
 
@@ -593,11 +534,9 @@ def rack_detail(request: HttpRequest, pk: int) -> HttpResponse:
     0017) somewhere to put its second address — a one-row-per-device grid
     can't express that.
 
-    Four encodings, each guarding a specific documented failure — see
-    ``ElevationCell``/``Occupant``/``TetherInfo`` for the detail of each:
-    a solid bracket for an ADR 0017 span, a dashed tether for an ADR 0018
-    companion pair (deliberately unlike the bracket — a companion's
-    address bears no relation to its host's), an em-dash for "no port on
+    Three encodings, each guarding a specific documented failure — see
+    ``ElevationCell``/``Occupant`` for the detail of each:
+    a solid bracket for an ADR 0017 span, an em-dash for "no port on
     this VLAN" (absence, not missing data), and a greyed would-be address
     on a genuinely empty ordinal.
 
@@ -621,9 +560,8 @@ def rack_detail(request: HttpRequest, pk: int) -> HttpResponse:
     switch_qs = NetworkSwitch.objects.select_related("switch_type").prefetch_related(
         Prefetch("addresses", queryset=NetworkSwitchAddress.objects.select_related("vlan"))
     )
-    device_qs = NetworkDevice.objects.select_related("device_type", "host").prefetch_related(
+    device_qs = NetworkDevice.objects.select_related("device_type").prefetch_related(
         Prefetch("ports", queryset=NetworkDevicePort.objects.select_related("vlan")),
-        "companion",
     )
     rack = get_object_or_404(
         Rack.objects.prefetch_related(
@@ -904,8 +842,7 @@ def device_detail(request: HttpRequest, pk: int) -> HttpResponse:
     it has one (ADR 0022), ``default_gateway`` (read live off the port's
     VLAN, ``models.py:4640`` — never recomputed here), and the connected
     switch **port** (Stage B — not just the switch, per
-    ``NetworkDevicePort.switch_port``) via ``switch_port__switch``. The
-    companion tether (ADR 0018) renders if either half of the pair is set.
+    ``NetworkDevicePort.switch_port``) via ``switch_port__switch``.
 
     This is the *canonical* device page (Stage B decision 13): the generic
     parity route for ``NetworkDevice`` redirects here rather than rendering
@@ -915,7 +852,7 @@ def device_detail(request: HttpRequest, pk: int) -> HttpResponse:
     holds ``auditlog.view_logentry``.
     """
     device = get_object_or_404(
-        NetworkDevice.objects.select_related("device_type", "rack", "host").prefetch_related(
+        NetworkDevice.objects.select_related("device_type", "rack").prefetch_related(
             Prefetch(
                 "ports",
                 # source_type_port (ADR 0022) — port.hostname reads it on
@@ -925,7 +862,6 @@ def device_detail(request: HttpRequest, pk: int) -> HttpResponse:
                     "vlan", "switch_port__switch", "source_type_port"
                 ).order_by("ordinal"),
             ),
-            "companion",
         ),
         pk=pk,
     )
@@ -933,7 +869,6 @@ def device_detail(request: HttpRequest, pk: int) -> HttpResponse:
     context = {
         "device": device,
         "ports": list(device.ports.all()),
-        "tether": _tether_for(device),
         "admin_change_url": reverse("admin:inventory_networkdevice_change", args=[device.pk]),
         "rack_url": reverse("inventory:rack", args=[device.rack_id]) if device.rack_id else None,
         "audit_entries": audit_entries,
@@ -1398,14 +1333,12 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Model", "model"),
             FieldSpec("Name", "name"),
             FieldSpec("Port count", "port_count"),
-            FieldSpec("Companion type", "companion_type", render="relation"),
         ),
         detail_fields=(
             FieldSpec("Manufacturer", "manufacturer"),
             FieldSpec("Model", "model"),
             FieldSpec("Name", "name"),
             FieldSpec("Port count", "port_count"),
-            FieldSpec("Companion type", "companion_type", render="relation"),
         ),
         inlines=(
             InlineSpec(
@@ -1425,8 +1358,6 @@ REGISTRY: dict[str, ModelSpec] = {
             ),
         ),
         ordering=("manufacturer", "model", "name"),
-        list_select_related=("companion_type",),
-        detail_select_related=("companion_type",),
         detail_prefetch_related=("type_ports__vlan",),
         list_permissions=("inventory.view_networkdevicetype",),
         detail_permissions=(
@@ -1446,7 +1377,6 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Serial number", "serial_number"),
             FieldSpec("Rack", "rack", render="relation"),
             FieldSpec("Rack slot", "rack_slot"),
-            FieldSpec("Host", "host", render="relation"),
         ),
         # Never actually rendered — see the Rack entry's identical note.
         detail_fields=(
@@ -1455,7 +1385,6 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Serial number", "serial_number"),
             FieldSpec("Rack", "rack", render="relation"),
             FieldSpec("Rack slot", "rack_slot"),
-            FieldSpec("Host", "host", render="relation"),
         ),
         inlines=(
             InlineSpec(
@@ -1478,7 +1407,7 @@ REGISTRY: dict[str, ModelSpec] = {
         ),
         canonical_detail_view="inventory:device",
         ordering=("hostname",),
-        list_select_related=("device_type", "rack", "host"),
+        list_select_related=("device_type", "rack"),
         list_permissions=(
             "inventory.view_networkdevice",
             "inventory.view_networkdevicetype",

@@ -35,6 +35,7 @@ from inventory.models import (
     NetworkSwitch,
     NetworkSwitchAddress,
     NetworkSwitchType,
+    PortAddressSource,
     Rack,
 )
 from inventory.suggestions import suggest_slot_address
@@ -57,6 +58,16 @@ SWITCH_PORTS_CSV_NAME = "MPS Audio Network Standards - Switch Ports.csv"
 FN_CONTROL = "Audio Control"
 FN_DANTE_PRIMARY = "Dante Primary"
 FN_DANTE_SECONDARY = "Dante Secondary"
+
+#: VLAN function name -> the device port ``description`` this dataset's
+#: catalog always uses for it — every device type here names its ports
+#: this way (SD12's "Engine" and the consoles' "Device Control" are the
+#: only exceptions, both handled by their own callers, not this map).
+FUNCTION_TO_PORT_DESCRIPTION: dict[str, str] = {
+    FN_CONTROL: "Control",
+    FN_DANTE_PRIMARY: "Dante Primary",
+    FN_DANTE_SECONDARY: "Dante Secondary",
+}
 
 MANUAL_RANGE_RACKS = frozenset({"SHURE", "CONSOLES"})
 DHCP_SERVER_RACKS = frozenset({"FOH Drive #1", "FOH Drive #2"})
@@ -116,9 +127,12 @@ SECONDARY_TABLE_TO_TYPE_NAME = {
 }
 
 #: Independently-declared expected ``(manufacturer, model, name)`` per
-#: addressing-sheet Device Description, for ordinary (non-switch, non-SD12)
-#: device rows — re-typed from PLAN-prod-import.md §7, not imported from
-#: ``import_prod_data.DESCRIPTION_TO_DEVICE_KEY``.
+#: addressing-sheet Device Description, for ordinary (non-switch, non-SD12,
+#: non-Device-Control) device rows — re-typed from PLAN-prod-import.md §7,
+#: not imported from ``import_prod_data.DESCRIPTION_TO_DEVICE_KEY``. The two
+#: ``-device-control`` rows aren't here (ADR 0022) — ``_check_device_
+#: control_pairs()`` consumes and verifies those directly, against the
+#: host's own identity.
 DESCRIPTION_TO_DEVICE_IDENTITY: dict[str, tuple[str, str, str]] = {
     "IK42": ("Martin Audio", "IK-42", "with Dante Card"),
     "IK81": ("Martin Audio", "IK-81", "with Dante Card"),
@@ -128,10 +142,8 @@ DESCRIPTION_TO_DEVICE_IDENTITY: dict[str, tuple[str, str, str]] = {
     "SD9": ("DiGiCo", "SD9", "Default"),
     "SD11": ("DiGiCo", "SD11", "Default"),
     "DM7C-1": ("Yamaha", "DM7C", "Default"),
-    "dm7c-1-device-control": ("Yamaha", "DM7C", "Device Control Interface"),
     "DM7-EX-1": ("Yamaha", "DM7-EX", "Default"),
     "bej-dm3-1": ("Yamaha", "DM3", "Default"),
-    "bej-dm3-1-device-control": ("Yamaha", "DM3", "Device Control Interface"),
     "bej-tio1608-d2-1": ("Yamaha", "Tio1608-D2", "Default"),
     "SQ5-1": ("Allen & Heath", "SQ-5", "Default"),
 }
@@ -157,18 +169,11 @@ AVIO_IDENTITY_PATTERNS: tuple[tuple[re.Pattern[str], tuple[str, str, str]], ...]
 SD12_IDENTITY = ("DiGiCo", "SD12", "Default")
 DMI_DANTE_IDENTITY = ("DiGiCo", "DMI-DANTE", "Default")
 
-#: Case-insensitive hostname suffix identifying a companion device-control
-#: interface row (ADR 0018) — re-declared independently of
-#: ``import_prod_data.DEVICE_CONTROL_SUFFIX``, same convention.
+#: Case-insensitive hostname suffix identifying a Yamaha console's Device
+#: Control row in the addressing sheet (ADR 0022) — re-declared
+#: independently of ``import_prod_data.DEVICE_CONTROL_SUFFIX``, same
+#: convention.
 DEVICE_CONTROL_SUFFIX = "-device-control"
-
-#: Independently-declared expected host identity -> companion identity
-#: (ADR 0018), re-typed from the ADR rather than imported from
-#: ``import_prod_data.py``'s ``DeviceTypeSpec.companion_key``.
-EXPECTED_COMPANION_TYPES: dict[tuple[str, str, str], tuple[str, str, str]] = {
-    ("Yamaha", "DM7C", "Default"): ("Yamaha", "DM7C", "Device Control Interface"),
-    ("Yamaha", "DM3", "Default"): ("Yamaha", "DM3", "Device Control Interface"),
-}
 
 #: A plain 1GbE copper jack is the only device port type in this dataset
 #: (PROD-DATA-ANALYSIS.md §7.3) — re-declared as a literal here rather than
@@ -211,19 +216,23 @@ EXPECTED_DEVICE_TYPE_PORTS: dict[tuple[str, str, str], tuple[tuple[str, str, int
         ("Dante Primary", FN_DANTE_PRIMARY, 0),
         ("Dante Secondary", FN_DANTE_SECONDARY, 0),
     ),
+    # The fourth, OPERATOR-sourced Device Control port (ADR 0022, closing
+    # #42) shares its VLAN with the console's own Dante Primary port —
+    # verified by ``_check_device_control_pairs()``, not by the
+    # (vlan, offset)-keyed generic address check.
     ("Yamaha", "DM7C", "Default"): (
         ("Control", FN_CONTROL, 0),
         ("Dante Primary", FN_DANTE_PRIMARY, 0),
         ("Dante Secondary", FN_DANTE_SECONDARY, 0),
+        ("Device Control", FN_DANTE_PRIMARY, 0),
     ),
-    ("Yamaha", "DM7C", "Device Control Interface"): (("Dante Primary", FN_DANTE_PRIMARY, 0),),
     ("Yamaha", "DM7-EX", "Default"): (("Control", FN_CONTROL, 0),),
     ("Yamaha", "DM3", "Default"): (
         ("Control", FN_CONTROL, 0),
         ("Dante Primary", FN_DANTE_PRIMARY, 0),
         ("Dante Secondary", FN_DANTE_SECONDARY, 0),
+        ("Device Control", FN_DANTE_PRIMARY, 0),
     ),
-    ("Yamaha", "DM3", "Device Control Interface"): (("Dante Primary", FN_DANTE_PRIMARY, 0),),
     ("Yamaha", "Tio1608-D2", "Default"): (
         ("Control", FN_CONTROL, 0),
         ("Dante Primary", FN_DANTE_PRIMARY, 0),
@@ -415,39 +424,54 @@ def _check_rack_ranges(findings: _Findings, rack_offset_rows: list[Any], vlan_ro
     findings.count("rack_ranges_checked", checked)
 
 
-# -- Companion pairs (ADR 0018) -----------------------------------------------------
+# -- Device Control pairs (ADR 0022) -------------------------------------------------
 
 
-def _check_companion_pairs(
+def _check_device_control_pairs(
     findings: _Findings,
     addressing_rows: list[AddressingRow],
     consumed: set[tuple[str, int]],
     actual_devices: dict[tuple[str, int], NetworkDevice],
     vlan_id_by_function: dict[str, int],
+    expected_device_keys: set[tuple[str, int]],
 ) -> int:
-    """Independent companion-pair check (ADR 0018) — mirrors the SD12
+    """Independent Device Control check (ADR 0022) — mirrors the SD12
     Control/Engine lookahead inside the main per-row loop below, but keyed
     on the ``-device-control`` hostname suffix rather than slot adjacency
-    (a companion can sit either below or above its host — DM7C/DM3
+    (the row can sit either below or above its host — DM7C/DM3
     respectively — which slot-adjacency can't express in both directions
     at once), and re-declared independently of ``import_prod_data.py``'s
-    own companion pre-pass.
+    own pre-pass.
 
     Runs as a genuine pre-pass over *every* row, not a lookahead triggered
-    while iterating — CSV order isn't reliable (the DM7C's companion row
-    precedes its host, the DM3's follows it), so this must find pairs
+    while iterating — CSV order isn't reliable (the DM7C's Device Control
+    row precedes its host, the DM3's follows it), so this must find pairs
     regardless of which row it meets first. Marks both rows' ``(rack,
     slot)`` keys consumed so the main loop's ordinary per-row branch never
     re-processes either one — mirroring how the SD12 branch consumes its
     own pair inline.
 
-    Self-contained, same shape as the SD12 branch: verifies each row's own
-    hostname, type identity and static addresses at its own slot (nothing
-    is derived, ADR 0018 — the pair's address accounting still balances
-    exactly as an ordinary device's would), plus the one thing an ordinary
-    per-row check can't: that ``device.host`` actually links the two rows,
-    in the right direction (the companion's ``host`` is the console, never
-    the reverse).
+    Unlike ADR 0018's superseded shape, the Device Control row's address is
+    folded into its console's own device row rather than a second device
+    (ADR 0022) — this consumes both CSV rows but locates and verifies
+    **one** device: the host's hostname, type identity, its three ordinary
+    ports, and — independently, by description, since it shares a VLAN
+    with Dante Primary — the Device Control port's own address.
+
+    Adds the host's ``(rack, slot)`` to ``expected_device_keys`` (Codex
+    review, P2) — unconditionally, whether or not the host device is
+    actually found — so the caller's final actual-vs-expected device-slot
+    comparison can prove the *complete* claim this PR rests on: not just
+    that the host exists, but that the Device Control row's own ``(rack,
+    slot)`` never gets a key added at all, so a stale device sitting there
+    (a released slot, e.g. ``CONSOLES`` 4/16, that this import should have
+    left empty) is caught as an unexplained extra rather than silently
+    ignored.
+
+    Also asserts the Device Control row's own ``control``/``dante_
+    secondary`` columns are blank (Codex review, P2) — only ``dante_
+    primary`` is ever read below; a populated column would otherwise
+    describe a real address this check silently discards.
 
     Returns the number of byte-identical static addresses verified here,
     so the caller can fold it into its own running total — this pass runs
@@ -472,98 +496,78 @@ def _check_companion_pairs(
         )
         if host_row is None:
             findings.fail(
-                "companion_link", f"{row.rack} slot {row.slot}: no host row matching {stem!r} found."
+                "device_control_link", f"{row.rack} slot {row.slot}: no host row matching {stem!r} found."
             )
             consumed.add(key)
             continue
         host_key = (host_row.rack, host_row.slot)
         consumed.add(key)
         consumed.add(host_key)
+        expected_device_keys.add(host_key)
         pairs_checked += 1
 
-        companion = actual_devices.get(key)
+        if row.control or row.dante_secondary:
+            findings.fail(
+                "address_diff",
+                f"{row.rack}/{row.slot} ({row.description}): Device Control row has a "
+                f"control={row.control!r}/dante_secondary={row.dante_secondary!r} value — only "
+                "dante_primary is ever read from this row, so a populated column here would be "
+                "silently discarded.",
+            )
+
         host = actual_devices.get(host_key)
-        if companion is None:
-            findings.fail("devices", f"{row.rack} slot {row.slot}: expected companion device, none found.")
         if host is None:
             findings.fail(
                 "devices", f"{host_row.rack} slot {host_row.slot}: expected host device, none found."
             )
-        if companion is None or host is None:
             continue
 
-        if companion.hostname != row.description:
-            findings.fail(
-                "hostnames",
-                f"{row.rack} slot {row.slot}: hostname {companion.hostname!r} != {row.description!r}.",
-            )
         if host.hostname != host_row.description:
             findings.fail(
                 "hostnames",
                 f"{host_row.rack} slot {host_row.slot}: hostname {host.hostname!r} != "
                 f"{host_row.description!r}.",
             )
+        expected_identity = _expected_device_identity(host_row)
+        _check_device_type_identity(
+            findings, f"{host_row.rack}/{host_row.slot} ({host_row.description})", host, expected_identity
+        )
 
-        host_identity = (host.device_type.manufacturer, host.device_type.model, host.device_type.name)
-        expected_companion_identity = EXPECTED_COMPANION_TYPES.get(host_identity)
-        if expected_companion_identity is None:
-            findings.fail(
-                "companion_link",
-                f"{host_row.rack}/{host_row.slot} ({host_row.description}): {host_identity} has no "
-                "expected companion type in EXPECTED_COMPANION_TYPES.",
-            )
-        else:
-            _check_device_type_identity(
-                findings, f"{row.rack}/{row.slot} ({row.description})", companion, expected_companion_identity
-            )
-
-        if companion.host_id != host.pk:
-            findings.fail(
-                "companion_link",
-                f"{row.rack}/{row.slot} ({row.description}): companion.host is "
-                f"{companion.host_id!r}, expected host {host.pk!r} ({host.hostname!r}).",
-            )
-        if host.host_id is not None:
-            # companion.host_id == host.pk alone doesn't rule out the link
-            # also running backwards (Codex review round 2, finding 6): a
-            # corrupted ``host.host_id = companion.pk`` is representable in
-            # the DB (host_id is a nullable OneToOne, so both rows pointing
-            # at each other doesn't violate anything at the schema level)
-            # and would pass the check above untouched, even though it
-            # means the row this command calls "host" is itself, per its
-            # own row, someone's companion. This command's whole point is
-            # independence from the importer (module docstring) — assert
-            # the direction outright rather than trusting the pairing.
-            findings.fail(
-                "companion_link",
-                f"{host_row.rack}/{host_row.slot} ({host_row.description}): expected to be a "
-                f"host, but has its own host_id={host.host_id!r} — the link runs the wrong way.",
+        for function, sheet_value in (
+            (FN_CONTROL, host_row.control),
+            (FN_DANTE_PRIMARY, host_row.dante_primary),
+            (FN_DANTE_SECONDARY, host_row.dante_secondary),
+        ):
+            actual_value = _device_address(host, description=FUNCTION_TO_PORT_DESCRIPTION[function])
+            if not sheet_value:
+                if actual_value is not None:
+                    findings.fail(
+                        "address_diff",
+                        f"{host_row.rack}/{host_row.slot} {function}: unexpected address {actual_value}.",
+                    )
+                continue
+            byte_identical += _compare(
+                findings,
+                "address_diff",
+                f"{host_row.rack}/{host_row.slot} {function}",
+                sheet_value,
+                actual_value,
             )
 
-        for description_row, device in ((row, companion), (host_row, host)):
-            for function, sheet_value in (
-                (FN_CONTROL, description_row.control),
-                (FN_DANTE_PRIMARY, description_row.dante_primary),
-                (FN_DANTE_SECONDARY, description_row.dante_secondary),
-            ):
-                vlan_id = vlan_id_by_function[function]
-                actual_value = _device_address(device, vlan_id, offset=0)
-                if not sheet_value:
-                    if actual_value is not None:
-                        findings.fail(
-                            "address_diff",
-                            f"{description_row.rack}/{description_row.slot} {function}: unexpected "
-                            f"address {actual_value}.",
-                        )
-                    continue
-                byte_identical += _compare(
-                    findings,
-                    "address_diff",
-                    f"{description_row.rack}/{description_row.slot} {function}",
-                    sheet_value,
-                    actual_value,
-                )
-    findings.count("companion_pairs_checked", pairs_checked)
+        # The Device Control port itself — asserted independently of Dante
+        # Primary above even though both live on the same VLAN (both
+        # addresses in production point in opposite directions from their
+        # console, ADR 0022), which is exactly why _device_address()
+        # selects by description rather than (vlan, offset) here.
+        device_control_actual = _device_address(host, description="Device Control")
+        byte_identical += _compare(
+            findings,
+            "address_diff",
+            f"{host_row.rack}/{host_row.slot} Device Control",
+            row.dante_primary,
+            device_control_actual,
+        )
+    findings.count("device_control_pairs_checked", pairs_checked)
     return byte_identical
 
 
@@ -615,13 +619,20 @@ def _check_hostnames_and_types_and_addresses(
     extra_verified = 0
     dmi_dante_rack_slot: dict[str, int] = {}
 
-    # ADR 0018 — companion pairs, verified (and their two (rack, slot)
+    # Every (rack, slot) an actual NetworkDevice is expected to occupy,
+    # built up alongside the loops below and compared against
+    # actual_devices' own key set at the end (Codex review, P2) — the only
+    # thing that actually proves a released slot (CONSOLES 4/16) is empty,
+    # as opposed to merely never being asserted present.
+    expected_device_keys: set[tuple[str, int]] = set()
+
+    # ADR 0022 — Device Control pairs, verified (and their two (rack, slot)
     # keys consumed) *before* the main per-row loop below, mirroring how
     # the SD12 branch inside that loop self-contains its own pair. See
-    # _check_companion_pairs()'s own docstring for why this can't be a
-    # lookahead from inside the loop the way SD12's is.
-    byte_identical += _check_companion_pairs(
-        findings, addressing_rows, consumed, actual_devices, vlan_id_by_function
+    # _check_device_control_pairs()'s own docstring for why this can't be
+    # a lookahead from inside the loop the way SD12's is.
+    byte_identical += _check_device_control_pairs(
+        findings, addressing_rows, consumed, actual_devices, vlan_id_by_function, expected_device_keys
     )
 
     for row in addressing_rows:
@@ -712,6 +723,7 @@ def _check_hostnames_and_types_and_addresses(
             if engine_row is not None and engine_row.description == f"{stem}-Engine":
                 consumed.add(key)
                 consumed.add(engine_key)
+                expected_device_keys.add(key)
                 device = actual_devices.get(key)
                 if device is None:
                     findings.fail(
@@ -725,9 +737,8 @@ def _check_hostnames_and_types_and_addresses(
                 _check_device_type_identity(
                     findings, f"{row.rack}/{row.slot} ({stem})", device, SD12_IDENTITY
                 )
-                control_vlan = vlan_id_by_function[FN_CONTROL]
-                control_actual = _device_address(device, control_vlan, offset=0)
-                engine_actual = _device_address(device, control_vlan, offset=1)
+                control_actual = _device_address(device, description="Control")
+                engine_actual = _device_address(device, description="Engine")
                 byte_identical += _compare(
                     findings, "address_diff", f"{stem} Control", row.control, control_actual
                 )
@@ -746,10 +757,12 @@ def _check_hostnames_and_types_and_addresses(
                         )
                     else:
                         dmi_dante_rack_slot[row.rack] = DMI_DANTE_SLOT
+                        expected_device_keys.add((DMI_DANTE_RACK, DMI_DANTE_SLOT))
                 continue
 
         # ordinary device row
         consumed.add(key)
+        expected_device_keys.add(key)
         device = actual_devices.get(key)
         if device is None:
             findings.fail(
@@ -775,8 +788,7 @@ def _check_hostnames_and_types_and_addresses(
                 or (column_name != "control" and key in NO_DANTE_CARD_SLOTS)
                 or (column_name == "control" and row.rack == "AVIO")
             )
-            vlan_id = vlan_id_by_function[function]
-            actual_value = _device_address(device, vlan_id, offset=0)
+            actual_value = _device_address(device, description=FUNCTION_TO_PORT_DESCRIPTION[function])
             if dropped:
                 if actual_value is not None:
                     findings.fail(
@@ -810,7 +822,7 @@ def _check_hostnames_and_types_and_addresses(
                 findings.fail("address_diff", f"DMI-DANTE {rack}: no RackVlanRange for {function}.")
                 continue
             expected = suggest_slot_address(range_cidr, slot)
-            actual_value = _device_address(device, vlan_id, offset=0)
+            actual_value = _device_address(device, description=FUNCTION_TO_PORT_DESCRIPTION[function])
             if actual_value != expected:
                 findings.fail(
                     "address_diff",
@@ -832,9 +844,37 @@ def _check_hostnames_and_types_and_addresses(
             f"{total_placed - accounted} placed address(es) match no expected row at all.",
         )
 
+    # The complete actual device-slot set against the complete expected
+    # one (Codex review, P2) — every earlier check here confirms an
+    # *expected* row's device exists and is correct, but none of them ever
+    # asked the opposite question: does an actual device exist at a key
+    # nothing expects one at? That's the only thing that actually proves a
+    # released slot (CONSOLES 4/16, ADR 0022) is empty rather than merely
+    # unasserted — a stale device sitting there would otherwise pass
+    # silently, since no CSV row ever names that key to check "expected
+    # device, none found" against.
+    actual_device_keys = set(actual_devices.keys())
+    missing_devices = expected_device_keys - actual_device_keys
+    extra_devices = actual_device_keys - expected_device_keys
+    if missing_devices or extra_devices:
+        findings.fail(
+            "devices",
+            "actual device-slot set does not match the expected set — "
+            f"missing {sorted(missing_devices)}, extra {sorted(extra_devices)}.",
+        )
+    findings.count("expected_device_keys_checked", len(expected_device_keys))
 
-def _device_address(device: NetworkDevice, vlan_id: int, *, offset: int) -> str | None:
-    port = device.ports.filter(vlan__vlan_id=vlan_id, slot_offset=offset).first()
+
+def _device_address(device: NetworkDevice, *, description: str) -> str | None:
+    """The address of one of ``device``'s already-materialized ports,
+    selected by ``description`` — not ``(vlan, slot_offset)`` (ADR 0022):
+    a console's Dante Primary and its Device Control interface now share
+    both, which made that selector ambiguous. Every port description in
+    this dataset's independently-declared catalog
+    (``EXPECTED_DEVICE_TYPE_PORTS``) is unique per device type, so
+    ``description`` alone disambiguates.
+    """
+    port = device.ports.filter(description=description).first()
     return port.address if port is not None else None
 
 
@@ -999,32 +1039,9 @@ def _check_device_type_ports(findings: _Findings, vlan_id_by_function: dict[str,
     on an upstream guarantee it never actually reads. A row-count match
     with a corrupted stored ``port_count`` is exactly the state that
     checking only ``len(actual_ports)`` sails past.
-
-    Also asserts ``companion_type`` against ``EXPECTED_COMPANION_TYPES``
-    (ADR 0018) — including the ``None`` case for every type with no
-    expected companion, so a stray link can't slip past unchecked the way
-    it would if this only asserted the positive cases.
     """
-    for device_type in NetworkDeviceType.objects.select_related("companion_type").prefetch_related(
-        "type_ports__vlan"
-    ):
+    for device_type in NetworkDeviceType.objects.prefetch_related("type_ports__vlan"):
         identity = (device_type.manufacturer, device_type.model, device_type.name)
-        expected_companion_identity = EXPECTED_COMPANION_TYPES.get(identity)
-        actual_companion_identity = None
-        if device_type.companion_type_id is not None:
-            companion_type = device_type.companion_type
-            assert companion_type is not None  # companion_type_id checked non-null above
-            actual_companion_identity = (
-                companion_type.manufacturer,
-                companion_type.model,
-                companion_type.name,
-            )
-        if actual_companion_identity != expected_companion_identity:
-            findings.fail(
-                "device_type_ports",
-                f"{device_type}: companion_type {actual_companion_identity} != "
-                f"{expected_companion_identity} (ADR 0018).",
-            )
         expected_ports = EXPECTED_DEVICE_TYPE_PORTS.get(identity)
         if expected_ports is None:
             findings.fail(
@@ -1094,11 +1111,24 @@ def _check_cross_vlan_alignment(findings: _Findings) -> None:
     coincidence of per-VLAN first-fit here, not an enforced invariant, so
     this is exactly the kind of drift the import is the one cheap moment to
     catch.
+
+    Excludes ``OPERATOR``-sourced ports (ADR 0022), resolved through
+    ``source_type_port`` — a console's Device Control interface has no
+    derivable relationship to the other ports' offset at all (production
+    points *both ways*: a DM7C's Device Control sits below its own Dante
+    Primary, a DM3's above), so including it here would make a correct
+    import fail this check. A port with ``source_type_port=None`` stays
+    included — the exemption is for ``OPERATOR`` specifically, not for
+    "no type port on record," so a corrupted ordinary ``SLOT`` port on the
+    same console still trips this.
     """
-    for device in NetworkDevice.objects.prefetch_related("ports__vlan"):
+    for device in NetworkDevice.objects.prefetch_related("ports__vlan", "ports__source_type_port"):
         offsets: dict[int, str] = {}
         for port in device.ports.all():
             if port.address is None:
+                continue
+            source_type_port = port.source_type_port
+            if source_type_port is not None and source_type_port.address_source == PortAddressSource.OPERATOR:
                 continue
             network = ipaddress.IPv4Network(port.vlan.subnet, strict=True)
             offset = (

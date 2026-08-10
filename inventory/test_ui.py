@@ -826,9 +826,9 @@ class WritesNothingTests(TestCase):
 
 
 class ElevationEncodingTests(TestCase):
-    """The four rack-elevation encodings, each asserted at a specific
-    coordinate with a negative control (review note 7) — a wrong-cell pass
-    is exactly what a presence-only assertion would miss.
+    """The rack-elevation encodings, each asserted at a specific coordinate
+    with a negative control (review note 7) — a wrong-cell pass is exactly
+    what a presence-only assertion would miss.
     """
 
     def setUp(self) -> None:
@@ -871,32 +871,20 @@ class ElevationEncodingTests(TestCase):
             device_type=self.plain_type, rack=self.rack, rack_slot=9, hostname="decoy"
         )
 
-        # ADR 0018 companion pair: host (Control, vlan_a) at slot 15,
-        # companion (Dante Primary, vlan_b) at slot 12 — deliberately
-        # non-adjacent, with a second decoy sitting between them, so the
-        # tether can only be proven correct by pk, never by proximity.
-        self.companion_type = _make_device_type(
-            port_count=1,
-            vlan=self.vlan_b,
-            manufacturer="Yamaha",
-            model="DM7C",
-            name="Device Control Interface",
-        )
-        self.host_type = _make_device_type(
+        # Two independent devices, deliberately non-adjacent — one with
+        # only a vlan_a port, the other with only a vlan_b port — so the
+        # em-dash assertion below can't be satisfied by coincidence.
+        self.vlan_a_only_type = _make_device_type(
             port_count=1, vlan=self.vlan_a, manufacturer="Yamaha", model="DM7C", name="Default"
         )
-        self.host_type.companion_type = self.companion_type
-        self.host_type.save()
-        self.host = NetworkDevice.objects.create(  # type: ignore[misc]
-            device_type=self.host_type,
-            rack=self.rack,
-            rack_slot=15,
-            companion_rack_slot=12,
-            hostname="dm7c-1",
+        self.vlan_b_only_type = _make_device_type(
+            port_count=1, vlan=self.vlan_b, manufacturer="Yamaha", model="DM3", name="Default"
         )
-        self.companion = self.host.companion
-        self.between_decoy = NetworkDevice.objects.create(
-            device_type=self.plain_type, rack=self.rack, rack_slot=13, hostname="between-decoy"
+        self.device_on_vlan_a = NetworkDevice.objects.create(
+            device_type=self.vlan_a_only_type, rack=self.rack, rack_slot=15, hostname="dm7c-1"
+        )
+        self.device_on_vlan_b = NetworkDevice.objects.create(
+            device_type=self.vlan_b_only_type, rack=self.rack, rack_slot=12, hostname="dm3-1"
         )
 
         self.admin_user = User.objects.create_user("adminrole", password="testpass123", is_staff=True)
@@ -924,15 +912,6 @@ class ElevationEncodingTests(TestCase):
         self.assertNotIn("add-slot-link", continuation_row)
         self.assertIn("add-slot-link", empty_row)
 
-    def test_tether_joins_the_actual_pair_not_the_decoy_between_them(self) -> None:
-        host_row = _row_html(self.content, 15)
-        companion_row = _row_html(self.content, 12)
-        between_decoy_row = _row_html(self.content, 13)
-        self.assertIn(f'data-tether-pk="{self.companion.pk}"', host_row)
-        self.assertIn(f'data-tether-pk="{self.host.pk}"', companion_row)
-        self.assertNotIn("tether", between_decoy_row)
-        self.assertNotIn(f'data-tether-pk="{self.between_decoy.pk}"', self.content)
-
     def test_em_dash_at_specific_intersection_not_where_port_exists(self) -> None:
         # Columns are ordered by vlan__vlan_id: vlan_a (200) then vlan_b (201).
         start_row_states = _cell_states(_row_html(self.content, 5))
@@ -940,10 +919,10 @@ class ElevationEncodingTests(TestCase):
         continuation_row_states = _cell_states(_row_html(self.content, 6))
         self.assertEqual(continuation_row_states, ["occupied", "absent"])  # Engine present, no Dante port
 
-        host_row_states = _cell_states(_row_html(self.content, 15))
-        self.assertEqual(host_row_states, ["occupied", "absent"])  # Control present, no Dante port
-        companion_row_states = _cell_states(_row_html(self.content, 12))
-        self.assertEqual(companion_row_states, ["absent", "occupied"])  # no Control port, Dante present
+        vlan_a_row_states = _cell_states(_row_html(self.content, 15))
+        self.assertEqual(vlan_a_row_states, ["occupied", "absent"])  # vlan_a port present, no vlan_b port
+        vlan_b_row_states = _cell_states(_row_html(self.content, 12))
+        self.assertEqual(vlan_b_row_states, ["absent", "occupied"])  # no vlan_a port, vlan_b port present
 
     def test_empty_ordinal_shows_the_address_suggest_slot_address_returns(self) -> None:
         empty_row = _row_html(self.content, 7)
@@ -953,7 +932,7 @@ class ElevationEncodingTests(TestCase):
         self.assertIn(expected_b, empty_row)
 
     def test_resolve_slot_spans_agrees_with_slot_span_property(self) -> None:
-        for device in [self.bracket_device, self.decoy, self.host, self.companion, self.between_decoy]:
+        for device in [self.bracket_device, self.decoy, self.device_on_vlan_a, self.device_on_vlan_b]:
             spans = resolve_slot_spans([device])
             self.assertEqual(
                 spans[device.device_type_id],
@@ -1118,54 +1097,6 @@ class BannerHatchConsistencyTests(TestCase):
             ipaddress.IPv4Address("10.200.0.10") in expected_network
             or ipaddress.IPv4Address("10.200.0.200") in expected_network
         )
-
-
-class UnrackedCompanionTetherTests(TestCase):
-    """The companion tether (ADR 0018) must render for an unracked pair
-    too — the link is existence and lifecycle, not addressing, so it
-    doesn't come and go with placement (Codex review round 2, finding 6).
-    """
-
-    def setUp(self) -> None:
-        call_command("sync_roles", stdout=io.StringIO())
-        self.dante_vlan = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
-        self.control_vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
-
-        self.companion_type = _make_device_type(
-            port_count=1,
-            vlan=self.dante_vlan,
-            manufacturer="Yamaha",
-            model="DM7C",
-            name="Device Control Interface",
-        )
-        self.host_type = _make_device_type(
-            port_count=1, vlan=self.control_vlan, manufacturer="Yamaha", model="DM7C", name="Default"
-        )
-        self.host_type.companion_type = self.companion_type
-        self.host_type.save()
-
-        # Unracked — no rack/rack_slot on the host, so none on the
-        # materialized companion either (both spare-pool, per ADR 0018).
-        self.host = NetworkDevice.objects.create(device_type=self.host_type, hostname="unracked-dm7c-1")
-        self.companion = self.host.companion
-
-        self.admin_user = User.objects.create_user("adminrole", password="testpass123", is_staff=True)
-        self.admin_user.groups.add(Group.objects.get(name="Admin"))
-        self.client.login(username="adminrole", password="testpass123")
-
-    def test_host_detail_shows_tether_to_unracked_companion(self) -> None:
-        response = self.client.get(f"/devices/{self.host.pk}/")
-        self.assertEqual(response.status_code, 200)
-        content = response.content.decode()
-        self.assertIn(f'data-tether-pk="{self.companion.pk}"', content)
-        self.assertIn("spare pool", content)
-
-    def test_companion_detail_shows_tether_to_unracked_host(self) -> None:
-        response = self.client.get(f"/devices/{self.companion.pk}/")
-        self.assertEqual(response.status_code, 200)
-        content = response.content.decode()
-        self.assertIn(f'data-tether-pk="{self.host.pk}"', content)
-        self.assertIn("spare pool", content)
 
 
 class RobustnessTests(TestCase):
@@ -1857,7 +1788,7 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         list_response = self.client.get(self._list_url("networkdevicetype"))
         self.assertEqual(
             _list_row_cells(list_response.content.decode(), "StageB Device Type"),
-            ["StageB Device Mfr", "SBDeviceModel", "StageB Device Type", "1", "—", "Details"],
+            ["StageB Device Mfr", "SBDeviceModel", "StageB Device Type", "1", "Details"],
         )
 
         detail_response = self.client.get(self._detail_url("networkdevicetype"))
@@ -1866,7 +1797,6 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         self.assertEqual(_detail_field_text(content, "Model"), "SBDeviceModel")
         self.assertEqual(_detail_field_text(content, "Name"), "StageB Device Type")
         self.assertEqual(_detail_field_text(content, "Port count"), "1")
-        self.assertEqual(_detail_field_text(content, "Companion type"), "—")  # no companion declared
         self.assertEqual(
             _inline_row_cells(content, "Type ports", "StageB Device Port"),
             [
@@ -1885,7 +1815,7 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         list_response = self.client.get(self._list_url("networkdevice"))
         self.assertEqual(
             _list_row_cells(list_response.content.decode(), "stageb-device1"),
-            ["stageb-device1", device_type_text, "SBDEV001", "StageB Rack", "5", "—", "Details"],
+            ["stageb-device1", device_type_text, "SBDEV001", "StageB Rack", "5", "Details"],
         )
         detail_response = self.client.get(self._detail_url("networkdevice"))
         self.assertEqual(detail_response.status_code, 301)

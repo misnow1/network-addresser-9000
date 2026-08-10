@@ -7,15 +7,6 @@
   <h1>{{ device }}</h1>
   <p class="tile__meta">{{ device.device_type }}</p>
 
-  {% if tether %}
-    <p>
-      <span class="tether" data-tether-pk="{{ tether.pk }}">
-        &#8644; companion <a href="{% url 'inventory:device' tether.pk %}">{{ tether.label }}</a>
-        {% if tether.ordinal %}(slot {{ tether.ordinal }}){% else %}(spare pool — unracked){% endif %}
-      </span>
-    </p>
-  {% endif %}
-
   <div class="panel">
     <h2 class="panel__heading">Placement</h2>
     {% if rack_url %}

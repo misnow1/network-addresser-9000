@@ -1,5 +1,14 @@
 # Device companions: hardware that cannot exist without its host
 
+> **Superseded by [ADR 0022](./0022-add-in-cards-and-operator-set-ports.md).** The gap this ADR
+> worked around — a device needing a second, independently-addressed static address on a VLAN it
+> already uses — is closed directly by `NetworkDeviceTypePort.address_source`; the Yamaha Device
+> Control interface is a port on its console, not a separate device. Every mechanism below
+> (`companion_type`, `NetworkDevice.host`, the paired-move machinery, the tether UI) is deleted, not
+> adapted — ADR 0022 decision 8 explains why reusing it would have meant keeping a mechanism whose
+> every property is the opposite of what phase 17's actual dependent-hardware case (an add-in card)
+> needs.
+
 A Yamaha DM7C or DM3 console reaches stage boxes for head-amp control through a second Dante
 interface, addressed separately from the console's own Dante Primary address. The production
 data has each one as its own row:

@@ -278,8 +278,7 @@ a {
 }
 
 /* Solid bracket — an ADR 0017 span (a device whose type declares offset
- * ports). Deliberately a *solid* border, unlike .tether's dashed one, so
- * the two encodings can never be mistaken for each other. */
+ * ports). */
 .ordinal-cell--span-start {
   border-top: 2px solid var(--accent);
   border-left: 2px solid var(--accent);
@@ -299,21 +298,6 @@ a {
 .occupant-link {
   font-weight: 600;
   text-decoration: none;
-}
-
-/* Dashed tether — an ADR 0018 companion pair. A badge, not a positional
- * line: the pair's slots can be arbitrarily far apart, and this project
- * draws no lines with no JavaScript to place them. Dashed border is the
- * only thing this shares visually with .ordinal-cell--span-*, and
- * deliberately so — the two must read as different encodings. */
-.tether {
-  display: inline-block;
-  margin-left: 0.4rem;
-  padding: 0 0.35rem;
-  border: 1px dashed var(--accent);
-  border-radius: 3px;
-  font-size: 0.75rem;
-  color: var(--text-muted);
 }
 
 /* Conflict — more than one occupant claims one ordinal (only reachable
