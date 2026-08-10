@@ -1,5 +1,6 @@
-> **Revision 2** — incorporates review notes from `REVIEW-1-PLAN-adr-0022.md`.
-> See "Review response" for the mapping.
+> **Revision 3** — PR 1 is merged (#58, `39cf6bc`). Incorporates a second independent review, of
+> the **PR 2 section only**, against the post-PR-1 tree: `REVIEW-1-PLAN-adr-0022-pr2.md`.
+> Revision 2 incorporated `REVIEW-1-PLAN-adr-0022.md`. See "Review response" for both mappings.
 
 # Implement ADR 0022 — Add-in cards and operator-set ports
 
@@ -28,8 +29,14 @@ cards, or a `fits_host_types` compatibility matrix (ADR 0022 decision 5 chose a 
 **What this plan does not change** (rev 2 — the earlier wording overstated this, review note 15).
 No address *value* moves except the two Device Control addresses changing which row owns them; no
 address *arithmetic* changes; no suggester, allocator, `slot_span` or `occupied_rack_slot_ranges()`
-change; no database constraint is added, dropped or altered. If a diff reaches `suggestions.py`,
-`_suggest_*`, `occupied_rack_slot_ranges()` or `unique_device_rack_slot`, something has gone wrong.
+change; **no addressing or allocation constraint** is added, dropped or altered. If a diff reaches
+`suggestions.py`, `_suggest_*`, `occupied_rack_slot_ranges()` or `unique_device_rack_slot`,
+something has gone wrong.
+
+*(Rev 3, review note 13: rev 2 said "no database constraint" flat, which was false. PR 2 drops
+`NetworkDevice.host` and `NetworkDeviceType.companion_type`, and with them a one-to-one `UNIQUE`
+index and two foreign keys. Those are schema constraints on the relationship being deleted, and
+dropping them is the point; the claim above is narrowed to the constraints that govern addressing.)*
 
 It *does* deliberately change three validation behaviours, named here so they are not mistaken for
 regressions: `_check_static_materialization_possible()` stops refusing a second port on a VLAN when
@@ -78,7 +85,15 @@ verification, because a DM7C at slot 5 carries its Device Control at `.4`).
    permitted arbitrary companion types, DHCP companions, multi-port companions and names other than
    `-device-control`. Collapsing all of those into one Device Control port would be a guess. The
    migration defines the admissible shape and raises on anything else rather than silently deleting
-   inventory.
+   inventory. *(Rev 3, review note 3: the guard enumerates types referenced by `companion_type`, not
+   devices that have a `host`. A companion orphaned by host deletion cannot exist — `host` was
+   `CASCADE` — so the shape rev 2's guard was written to catch was the wrong one.)*
+10. **`0014_retire_companions` uses historical models throughout** (rev 3, review note 5) —
+    `apps.get_model()`, `schema_editor.connection.alias`, and `address_source` written as the
+    literal `"operator"`. A module-level import would load the *post*-PR-2 models, where `host` and
+    `companion_type` no longer exist, and the live `save()` would reject the ownership and ordinal
+    changes as locked fields. This is standard Django practice, but rev 2 never said it, and the
+    migration is the one place in this plan where getting it wrong destroys data.
 
 ---
 
@@ -188,52 +203,82 @@ is an N+1 across every port) and `inventory.view_networkdevicetypeport` in the p
 The large one. It is a deletion plus an importer rewrite, and it changes which row owns two
 production addresses.
 
-### Model
+**All `file:line` citations in this section were refreshed against `main` after PR 1 merged**
+(rev 3, review note 15). Rev 2's citations were taken from the pre-PR-1 tree and several now point
+at unrelated code — `admin.py:1162` is now `NetworkSwitchTypeAdmin.get_readonly_fields`, which a
+mechanical deletion would have damaged.
 
-**Removed** (rev 2 — expanded per review note 2; the earlier list was incomplete and PR 2 would not
-have been coherent):
+### Model — `inventory/models.py`
 
-- `NetworkDeviceType.companion_type`, `_validate_companion_type()`, and `companion_type` from
-  `NetworkDeviceType`'s locked-field snapshot (`:2762-2821`).
-- `NetworkDevice.host` (the `OneToOneField` — see the note below), `_materialize_companion()`,
-  `_companion_rack_slot`, `_companion_hostname`, `_check_companion_creation_possible()`,
-  `_check_companion_type_compatibility()`, `_plan_companion_move()`, `_park_companion_if_colliding()`,
-  `_finish_companion_move()`, `_host_managed_move`, `_companion_pair_pks()` and its use in
-  `_check_rack_slot_not_occupied()`, the companion clauses in `_locked_fields()`, and the companion
-  branches in `delete()` / `NetworkDeviceQuerySet.delete()`.
+**Removed** (rev 3 — expanded again per review note 9; rev 2's list was still missing public API
+and a whole queryset class):
+
+- `NetworkDeviceType.companion_type` and `_validate_companion_type()`, and `companion_type` from
+  `NetworkDeviceType`'s locked-field snapshot.
+- `NetworkDevice.host` (the `OneToOneField`), `_materialize_companion()`,
+  `_check_companion_creation_possible()`, `_check_companion_type_compatibility()`,
+  `_plan_companion_move()`, `_park_companion_if_colliding()`, `_finish_companion_move()`,
+  `_host_managed_move`, `_companion_pair_pks()` and its use in `_check_rack_slot_not_occupied()`,
+  `_persisted_host_id()` (`:3939`), `_check_pending_move_no_overlap()`, the companion clauses in
+  `_locked_fields()`, and the companion branches in `delete()`.
+- **The public `companion_rack_slot` / `companion_hostname` properties** (`:3489-3517`) and their
+  `_companion_rack_slot` / `_companion_hostname` transient backing attributes. These are ADR 0018's
+  documented API, not internals.
+- **`NetworkDeviceQuerySet` and its custom manager in their entirety** (`:3175-3217`, `:3284`) —
+  the class exists only to give `delete()` companion-aware behaviour. `NetworkDevice.objects`
+  returns to a plain manager. Rev 2 described this as "a branch to edit", which understated it.
 - **The companion-only `validate_unique()` and `validate_constraints()` overrides**
-  (`models.py:3530-3618`).
+  (`:3805-3893`).
 
-**Kept and unchanged:** the `_lock_type_rows()` helper, which predates ADR 0018 and has other callers.
+**Kept and unchanged:** `_lock_type_rows()`, which predates ADR 0018 and has other callers.
 
-**Note on `host`:** PR 2 drops the `OneToOneField` and PR 3 adds a `ForeignKey` of the same name.
-Django supports that across two migrations; the review confirms the drop/add itself is not the
-hazard — *live references* are, which is why the inventory above and the admin/UI/registry inventory
-below must be complete in PR 2. Doing it as drop-then-add keeps each PR's migration honest about
-what that PR means, and the rows it held are deleted by PR 2 anyway.
+**Note on `host`:** PR 2 drops the `OneToOneField`; PR 3 adds a `ForeignKey` of the same name.
+Django supports that across two migrations — the review confirmed the drop/add is not the hazard,
+*live references* are, which is what the inventories in this section exist to make complete.
 
 ### Migration `0014_retire_companions`
 
-The one genuinely dangerous step in this plan. Order matters and is now specified exactly (review
-notes 1, 3, 4):
+The one genuinely dangerous step in this plan.
 
-1. **Guard.** For every `NetworkDevice` with a `host`, assert the admissible shape: it is linked, its
-   type has **exactly one** type port, that port is static (not DHCP) and its instance port carries an
-   address, and the host's type has a port on the same VLAN. Anything else — a multi-port companion, a
-   DHCP companion, a companion whose type has no live instance — raises `RuntimeError` naming the row.
-   **Never delete a companion shape this migration was not written for** (settled decision 9).
-2. **Create the type port on each affected host type**, not just an instance port (review note 3):
-   one `NetworkDeviceTypePort` with `address_source=OPERATOR`, `slot_offset=0`, the companion's VLAN,
-   `description="Device Control"`, `hostname_suffix="device-control"`, and the next free `ordinal`;
-   then **increment that type's `port_count`**. Without this the host type fails
-   `_validate_device_type_port_profile()`'s `count != port_count` check the next time a device of that
-   type is created.
-3. **Move the instance port row** (settled decision 8): update its `device`, `description`, `ordinal`
-   and `source_type_port` in one write. Do **not** create a new port and delete the old one —
-   `unique_device_port_vlan_address_value` forbids both existing at once, and moving preserves the
-   port's audit history.
+**Historical models only** (rev 3, review note 5 — rev 2 never said this, and it is the difference
+between a migration that works and one that cannot even import). Every lookup and write uses
+`apps.get_model()`, never a module-level import: the live models are the *post*-PR-2 shape, where
+`host` and `companion_type` no longer exist. Writes go through the historical model's `save()` /
+`update()`, never the live one, whose `_locked_fields()` would reject the ownership and ordinal
+changes outright. Every query uses `schema_editor.connection.alias`, and `address_source` is
+written as the literal `"operator"` rather than by importing the enum.
+
+Ordered steps:
+
+1. **Guard.** Enumerate the `NetworkDeviceType` rows referenced by any `companion_type`, and check
+   the whole population — **not** just devices that have a `host`. Rev 2's guard iterated devices
+   with a host and so could not see the failure it promised to catch (review note 3). Require:
+   every instance of a companion type has a host and a compatible host type; every affected host
+   instance has exactly one companion; each companion type has exactly one type port, static, with
+   an address on its instance port; and the host type has a port on that same VLAN. Anything else
+   raises `RuntimeError` naming the row.
+   **A companion orphaned by host deletion is not a case that can exist** — `host` is
+   `OneToOneField(..., on_delete=CASCADE)` (`inventory/migrations/0011_device_companions.py:103-116`),
+   so deleting a host took its companion with it. The corrupt case that *can* exist is an
+   **unlinked instance of a companion type**, and that is what the guard must catch.
+2. **Create the type port on each affected host type**, copying `port_type` **and `port_number`**
+   from the companion's sole type port (review note 2 — `port_type` is required, and a historical
+   `create()` will happily store `""` because choices are not a database constraint). Plus
+   `address_source="operator"`, `slot_offset=0`, the companion's VLAN, `description="Device
+   Control"`, `hostname_suffix="device-control"`, and the next free `ordinal`. Then **increment that
+   type's `port_count`**, or the host type fails `_validate_device_type_port_profile()`'s
+   `count != port_count` check the next time a device of that type is created.
+   **A host type shared by several devices gets exactly one type port and exactly one `port_count`
+   increment**, with every moved instance port pointing at it. Iterate types, not devices.
+3. **Guard the destination, then move the instance port row.** Moving can violate
+   `unique_device_port_description` or `unique_device_port_ordinal` (`inventory/models.py:4646-4647`)
+   if the host already carries a `"Device Control"` port or the chosen ordinal (review note 4).
+   Check both before writing, and check the moved row's `port_type`/`port_number` match the type
+   port created in step 2. Then update `device`, `description`, `ordinal` and `source_type_port` in
+   one write. Do **not** create-then-delete: `unique_device_port_vlan_address_value` forbids both
+   rows existing at once, and moving preserves the port's audit history.
 4. **Clear `companion_type` on every host type** before deleting the now-portless companion devices
-   and their types (review note 3) — the FK is `PROTECT`, so deletion is refused while it is set.
+   and their types — the FK is `PROTECT`, so deletion is refused while it is set.
 5. `RemoveField` ×2 (`companion_type`, `host`).
 
 Irreversible by design — say so in the docstring, and state that the production database is rebuilt
@@ -241,69 +286,81 @@ from the CSVs (ADR 0022, "What this does to production data").
 
 ### Importer — `inventory/management/commands/import_prod_data.py`
 
-- `DeviceTypeSpec` drops `companion_key`; its port tuples grow the two new fields.
+Rev 3 completes this inventory per review note 6 — rev 2 dropped `companion_key` while leaving
+three live readers of it.
+
+- `DeviceTypeSpec.companion_key` removed, **and `_DeviceEntry.companion_slot` /
+  `_DeviceEntry.companion_hostname`** (`:439-451`), **the stage-7 companion linking pass**
+  (`:794-805`), and **the now-obsolete constructor kwargs in `_stage9_devices()`** (`:1022-1027`),
+  which are replaced by an `operator_addresses` payload passed to `NetworkDevice`.
+- `DeviceTypeSpec.ports` tuples grow `address_source` and `hostname_suffix`.
 - `dm7c` and `dm3` each gain a fourth port: `("Device Control", FN_DANTE_PRIMARY, offset 0,
   OPERATOR, "device-control")`.
-- **`sd12`'s existing `Engine` port gains `hostname_suffix="engine"`** (review note 12) — it is half
-  the stated reason `hostname_suffix` exists, and the rev-1 plan never assigned it.
-- `dm7c_devctrl` and `dm3_devctrl` specs are **deleted**, as are their **`DESCRIPTION_TO_DEVICE_KEY`**
-  entries (`:337`, `:346`, `:349`) — the rev-1 plan called this mapping `DEVICE_TYPE_BY_DESCRIPTION`,
-  which does not exist (review note 14).
-- **`_classify_companion_pairs()`** (`:897` — *not* `_pair_device_control_rows()`, review note 14) is
-  rewritten: it still matches a `<host>-device-control` row to its host by hostname stem within one
-  rack, and still errors loudly on zero or several matches, but instead of emitting a merged companion
-  entry it feeds the row's address into the host's `operator_addresses`. The keyed-on-hostname
-  reasoning in its docstring stays true and stays.
-- **`CONSOLES` slots 4 and 16 are released.** Nothing else moves — every other device keeps its slot,
-  so no address anywhere else changes.
+- **`sd12`'s existing `Engine` port gains `hostname_suffix="engine"`** — half the stated reason
+  `hostname_suffix` exists, and rev 1 never assigned it.
+- `dm7c_devctrl` and `dm3_devctrl` specs deleted, with their `DESCRIPTION_TO_DEVICE_KEY` entries
+  (`:337`, `:346`, `:349`).
+- **`_classify_companion_pairs()`** (`:897`) is rewritten: it still matches a
+  `<host>-device-control` row to its host by hostname stem within one rack, and still errors loudly
+  on zero or several matches, but feeds the row's address into the host's `operator_addresses`
+  instead of emitting a merged companion entry. The keyed-on-hostname reasoning in its docstring
+  stays true and stays.
+- **`CONSOLES` slots 4 and 16 are released.** Nothing else moves — every other device keeps its
+  slot, so no address anywhere else changes.
 
-### `verify_prod_import.py` — three changes, all required (review notes 5, 6)
+### `verify_prod_import.py` — four changes, all required
 
-The rev-1 plan understated this; a correct import currently **fails** verification.
+Rev 2 said three. Review note 1 found a fourth that is not optional: the verifier **queries the
+deleted schema** and would raise `FieldError` on every run.
 
+- **Remove `EXPECTED_COMPANION_TYPES` (`:168`) and its two readers** (`:508`, and the
+  `select_related("companion_type")` query at `:1003-1028`). Delete the two companion identities
+  from the expected catalogue (`:183-226`) and **add a `Device Control` port to both console
+  profiles**, which currently expect three ports each.
 - **`_check_cross_vlan_alignment()` (`:1091-1110`) must exclude `address_source=OPERATOR` ports**,
   resolved through `source_type_port`. It requires every static port on a device to share one host
-  offset, and a DM7C at slot 5 carrying `.4` deliberately breaks that. This is a verification *rule*
-  change, not a data fix, and it needs a test covering both consoles.
-- **`_device_address()` must address ports by description or `source_type_port`, not by
-  `(vlan, offset)`** (`:550`, `:729-730`). Dante Primary and Device Control now share both values, so
-  the existing selector is ambiguous and would silently compare the wrong port.
-- **The companion pre-pass consumes both CSV rows but locates one host device**, and the expectations
-  become: `CONSOLES` slots 4 and 16 **empty**, the exact expected device-slot set, and both VLAN-201
-  addresses asserted independently. Negative tests: corrupt only the Device Control address, and add
-  an unexpected static port — both must fail verification.
+  offset, and a DM7C at slot 5 carrying `.4` deliberately breaks that. Without this a *correct*
+  import fails verification. A port with `source_type_port=NULL` stays included.
+- **`_device_address()` must select by description or `source_type_port`, not `(vlan, offset)`**
+  (`:550`, `:729-730`). Dante Primary and Device Control now share both values, so the existing
+  selector is ambiguous and would silently compare the wrong port.
+- **The companion pre-pass consumes both CSV rows but locates one host device**, and the
+  expectations become: `CONSOLES` slots 4 and 16 **empty**, the exact expected device-slot set, and
+  both VLAN-201 addresses asserted independently.
 
-### Admin
+### Admin — `inventory/admin.py`
 
-`NetworkDeviceAddForm` loses `companion_rack_slot` / `companion_hostname` and their validation;
-**`NetworkDeviceChangeForm`** loses its companion handling; `admin.py:1162`'s comment about
-creation-time-only companion inputs loses its companion half; **`delete_selected_devices`**
-(`:1113`) loses its companion branch; `NetworkDeviceAdmin` loses its `host` display and read-only
-handling; `NetworkDeviceTypeAdmin` loses `companion_type`.
+Rev 3 completes this per review note 7. Several of these are fatal at import or form-construction
+time, not cosmetic.
 
-### Read-only UI
+- **`NetworkDeviceTypeForm` and `NetworkDeviceTypeAdmin.form`** (`:1245-1287`) — companion-only, and
+  the form names a field that will no longer exist, so it breaks at form construction. Removed.
+- **`NetworkDeviceAddForm`'s `companion_of__isnull=True` queryset filter** (`:469-477`), both forms'
+  **`Meta.exclude = ["host"]`** and the companion-aware add-form branches (`:442-477`, `:568-628`,
+  `:665-727`), plus the `companion_rack_slot` / `companion_hostname` fields and their validation.
+- **`delete_selected_devices` (`:1301-1332`) and `NetworkDeviceAdmin.actions` referencing it** — the
+  action exists only to enforce companion deletion rules.
+- `NetworkDeviceAdmin` loses its `host` display and read-only handling; `NetworkDeviceTypeAdmin`
+  loses `companion_type`.
 
-`device_detail.html` and `rack_detail.html` lose the tether encoding, **and so do `TetherInfo`
-(`views.py:238`), `_tether_for()` (`:395`), `Occupant.tether` and the companion query shaping around
-them, plus the tether CSS and any UI fixtures that build a pair.** The registry loses its
-**`FieldSpec("Companion type", …)` entries (`views.py:1394`, `:1401`), its
-`list_select_related`/`detail_select_related` `companion_type` entries (`:1419-1420`), its
-`FieldSpec("Host", …)` entries (`:1440`, `:1449`)**, and `host` from the device querysets'
-`select_related` (`:624`, `:914`).
+### Read-only UI — `inventory/views.py`, templates
 
-`UnrackedCompanionTetherTests`, the tether assertions in `ElevationEncodingTests`, `DeviceCompanionTests`,
-`DeviceCompanionMigrationTests` **and the companion tests at `tests.py:6407-6597`** are deleted —
-**not** rewritten against PR 3's cards, which have no tether: a card owns its own slot and appears in
-the elevation in its own right.
+- `device_detail.html` and `rack_detail.html` lose the tether encoding, and so do **`TetherInfo`**
+  (`:238`), **`_tether_for()`** (`:395`), `Occupant.tether` and the companion query shaping around
+  them, plus the tether CSS and any UI fixtures that build a pair.
+- The registry loses its **`FieldSpec("Companion type", …)` entries**, its `companion_type`
+  relation hints (`:1428-1429`), and its **`FieldSpec("Host", …)` entries** (`:1449`, `:1458`).
+- **`REGISTRY["networkdevice"].list_select_related=("device_type", "rack", "host")`
+  (`views.py:1481`)** (review note 8) — rev 2 removed the Host *columns* but missed this, and it is
+  a live query that fails outright once `host` is dropped. `host` also comes out of the rack and
+  detail querysets (`:624`, `:914`).
 
 ### Docs
 
-`CONTEXT.md`'s **Device Companion** entry is deleted **and replaced by an Add-in Card entry** (review
-note 16 — deletion alone leaves the concept undocumented). **`DESIGN.md:114-125` loses its
-`companion_type` and cascading-`OneToOneField` bullets**, which would otherwise keep describing a
-model that no longer exists. ADR 0018 gains a superseded banner. ADR 0017 gains an amended banner
-naming its scope-boundary section. ADR 0013 gains an amended banner naming its one-address-per-VLAN
-rule.
+`CONTEXT.md`'s **Device Companion** entry is deleted and replaced by an **Add-in Card** entry.
+**`DESIGN.md:114-125` loses its `companion_type` and cascading-`OneToOneField` bullets.** ADR 0018
+gains a superseded banner. ADR 0017 gains an amended banner naming its scope-boundary section. ADR
+0013 gains an amended banner naming its one-address-per-VLAN rule.
 
 ---
 
@@ -406,14 +463,38 @@ accepts and rejects per its spec, and a suffix is lowercased and stripped on sav
 derived hostname renders, the device-detail query budget still holds with `source_type_port`
 prefetched, and the `networkdevicetype` inline shows both new fields.
 
-**PR 2** — the four deleted test classes plus `tests.py:6407-6597` go (settled decision 6); a DM7C
-materializes four ports with the Device Control at its supplied address; **the migration moves the
-port row rather than duplicating it, and the host type gains a type port and a bumped `port_count`**;
-the migration **raises on each inadmissible companion shape** (multi-port, DHCP, unlinked) and
-succeeds on a second valid pair beyond the two production ones; nothing else in `CONSOLES` moves slot.
-`test_prod_import.py`: the four CSV rows reproduce exactly, `CONSOLES` has two fewer devices, slots 4
-and 16 are free, both VLAN-201 addresses are asserted independently, corrupting only the Device
-Control address fails verification, and every other rack is byte-identical to before.
+**PR 2** (rev 3 — the deletion targets are now exact, per review notes 10, 11, 12, 14):
+
+*Deleted:* `DeviceCompanionTests`, `DeviceCompanionMigrationTests`, `UnrackedCompanionTetherTests`,
+the tether assertions in `ElevationEncodingTests`, and — **not** the range rev 2 named. `tests.py:6407-6597`
+was wrong: `:6407-6409` is the tail of an unrelated spanning-type helper and `:6422-6507` is ordinary
+rack-slot suggestion coverage that must survive. The companion-specific material is the helper at
+`:6411-6420`, the form inputs at `:6441-6442`, and the tests at `:6512-6605`. Delete those pieces.
+
+*Rewritten, not deleted:* `test_prod_import.py:537-561` for four console ports; `test_ui.py:1856-1889`,
+which expects the Companion type and Host columns; `ElevationEncodingTests` at `:943-960`, which uses
+a companion pair outside its tether assertion; and `tests.py:7204-7205`, which still submits the
+removed add-form fields.
+
+*Kept and renamed:* `ImportProdDataMalformedCompanionTests` (`test_prod_import.py:696-721`). The
+rewritten pre-pass still promises to reject an unmatched `-device-control` row, so the coverage
+stays; add the several-host-match case it also promises. Delete the broken/reverse-link tests at
+`:566-592`, which test a relationship that no longer exists.
+
+*New:* a DM7C materializes four ports with the Device Control at its supplied address; the migration
+**moves** the port row rather than duplicating it; the migration handles **a host type shared by two
+devices** — one type port created, `port_count` incremented once, both moved rows pointing at it; the
+migration **raises on each inadmissible shape** (multi-port, DHCP, and an *unlinked instance of a
+companion type*, which is the corruption that can actually exist) and succeeds on a second valid pair
+beyond the two production ones; the migration refuses when the destination already carries a
+`"Device Control"` description or the target ordinal; nothing else in `CONSOLES` moves slot.
+
+*Verifier:* the four CSV rows reproduce exactly, `CONSOLES` has two fewer devices, slots 4 and 16 are
+free, both VLAN-201 addresses are asserted independently, corrupting only the Device Control address
+fails verification, and every other rack is byte-identical to before. **The alignment exemption is
+bounded** (review note 14): a corrupted ordinary `SLOT` port on the same console must still fail
+alignment, and a port with `source_type_port=NULL` must still be included — otherwise an
+implementation that exempts the whole console passes the happy-path test.
 
 **PR 3** — a card is fitted to an existing host and pulled, keeping its rack, slot and addresses; a
 pulled card is re-fitted to a *different* host as the same row; deleting a host leaves its cards
@@ -465,6 +546,29 @@ No finding was rejected, and none reached the escalation gate — none contradic
 changes a deliverable, or attacks a decision settled with Mike on 2026-08-08. Notes 6 and 10 are the
 two that changed the plan's substance rather than its detail: one found a verification rule that
 would have failed a correct import, the other disproved a guard this plan claimed already existed.
+
+### Second review — `REVIEW-1-PLAN-adr-0022-pr2.md` (rev 3)
+
+The PR 2 section only, re-reviewed against the tree **after PR 1 merged**. Fifteen findings, all
+verified against the code, all folded in, none rejected and none escalated.
+
+| Note | Resolution | Section |
+|---|---|---|
+| 1 (P1) | Accepted — confirmed `EXPECTED_COMPANION_TYPES` at `verify_prod_import.py:168` with readers at `:508` and a `select_related("companion_type")` query at `:1003-1028`. The verifier would have raised `FieldError` on every run. Verifier work goes from three changes to four. | PR 2 "`verify_prod_import.py`" |
+| 2 (P1) | Accepted. The new type port copies `port_type` **and** `port_number` from the companion's type port; a historical `create()` would otherwise store `port_type=""` silently, since choices are not a DB constraint. | PR 2 migration step 2 |
+| 3 (P1) | Accepted, and it corrects the guard's whole premise — `host` was `CASCADE` in `0011`, so an orphaned companion cannot exist and rev 2's guard was watching for the wrong corruption. It now enumerates types referenced by `companion_type` and catches the case that can exist: an unlinked companion-type instance. | Settled decision 9; PR 2 migration step 1 |
+| 4 (P1) | Accepted — `unique_device_port_description` and `unique_device_port_ordinal` both apply to the destination device (`models.py:4646-4647`). Both are guarded before the move, with a shared-host-type test. | PR 2 migration step 3; Tests |
+| 5 (P1) | Accepted. Historical models, connection alias and literal enum value are now a settled decision of their own rather than an unstated assumption. | Settled decision 10; PR 2 migration preamble |
+| 6 (P1) | Accepted — rev 2 dropped `companion_key` while leaving three live readers. `_DeviceEntry.companion_slot`/`companion_hostname`, the stage-7 linking pass and the `_stage9_devices()` kwargs are now named. | PR 2 "Importer" |
+| 7 (P1) | Accepted. `NetworkDeviceTypeForm` breaks at form construction once the field is gone, which rev 2 would not have caught until runtime. That plus the queryset filter, both `Meta.exclude`, the add-form branches and the delete action are now listed. | PR 2 "Admin" |
+| 8 (P1) | Accepted — confirmed `list_select_related=("device_type", "rack", "host")` at `views.py:1481`. Rev 2 removed the Host *columns* and missed the live query behind them. | PR 2 "Read-only UI" |
+| 9 (P1) | Accepted. The public `companion_rack_slot`/`companion_hostname` properties, `_persisted_host_id()`, `_check_pending_move_no_overlap()`, and the whole of `NetworkDeviceQuerySet` and its manager are added — rev 2 called the last of these "a branch to edit", which understated it. | PR 2 "Model" |
+| 10 (P1) | Accepted, and the most dangerous finding here: the stated range `tests.py:6407-6597` begins inside an unrelated spanning-type helper and covers ordinary rack-slot suggestion tests. Replaced with the exact companion-specific pieces. | Tests, PR 2 |
+| 11 (P1) | Accepted. `ImportProdDataMalformedCompanionTests` is **kept and renamed** rather than deleted — the rewritten pre-pass still owes that behaviour — while the reverse-link tests go. | Tests, PR 2 |
+| 12 (P2) | Accepted. `test_ui.py:1856-1889`, `ElevationEncodingTests:943-960` and `tests.py:7204-7205` named as rewrites. | Tests, PR 2 |
+| 13 (P2) | Accepted. The "no database constraint" claim is narrowed to addressing and allocation constraints, and the dropped `UNIQUE`/FK indexes are acknowledged as the point of the change. | Context |
+| 14 (P2) | Accepted. The alignment exemption gets negative tests, so an implementation that exempts the whole console cannot pass. | Tests, PR 2 |
+| 15 (P3) | Accepted. All PR 2 citations refreshed against post-PR-1 `main`; `admin.py:1162` in particular now points at unrelated switch-admin code. | PR 2, throughout |
 
 ## Risks
 
