@@ -1,5 +1,15 @@
 # Derived same-VLAN addresses: per-port slot offsets and multi-ordinal devices
 
+> **Amended by [ADR 0022](./0022-add-in-cards-and-operator-set-ports.md).** The mechanism below
+> (`slot_offset`) is untouched. Its "Scope boundary" section's own worked example is not: `bej-dm3-1`
+> and `bej-dm3-1-device-control` no longer "stay two ordinary `NetworkDevice`s in two slots" — the
+> Device Control interface is now `address_source=OPERATOR` port on the console's own Type (ADR 0022
+> closes issue #42, which this ADR's own text names as the gap that pushed that pairing into two
+> devices in the first place). The scope-boundary *test* itself — "does the hardware compute the
+> second address from the first and refuse to let anyone change it?" — still stands and still
+> separates `slot_offset` (an SD12's engine) from an add-in card (a DMI-DANTE); only this section's
+> Device Control example no longer speaks for the model.
+
 A DiGiCo SD12 always occupies two addresses on the control network. The first is set by
 the operator and is what iPad control, OSC, and everything else talks to. The second is the
 console's audio engine, it is **always** the control address plus one, it is assigned

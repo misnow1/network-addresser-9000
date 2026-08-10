@@ -53,17 +53,6 @@
                 {% if row.occupant.row_kind == 'continuation' %}
                   <span class="badge">cont'd</span>
                 {% endif %}
-                {% if row.occupant.tether %}
-                  <span class="tether" data-tether-pk="{{ row.occupant.tether.pk }}">
-                    &#8644; companion
-                    {% if row.occupant.tether.ordinal %}
-                      <a href="#slot-{{ row.occupant.tether.ordinal }}">{{ row.occupant.tether.label }}</a>
-                      (slot {{ row.occupant.tether.ordinal }})
-                    {% else %}
-                      {{ row.occupant.tether.label }} (spare pool)
-                    {% endif %}
-                  </span>
-                {% endif %}
               {% else %}
                 <a class="add-slot-link" href="{{ row.add_url }}">+ add device</a>
               {% endif %}
