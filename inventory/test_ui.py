@@ -56,6 +56,7 @@ from .models import (
     NetworkSwitch,
     NetworkSwitchType,
     NetworkSwitchTypePort,
+    PortAddressing,
     PortMode,
     PortType,
     Rack,
@@ -678,6 +679,9 @@ class PartialGrantAccessTests(TestCase):
                 # Stage B's port table renders the connected switch port,
                 # not just the switch (Codex review, Stage B pass).
                 "view_networkswitchport",
+                # ADR 0022 — a port's derived hostname reads its
+                # source_type_port, a Network Device Type Port.
+                "view_networkdevicetypeport",
             ],
         )
 
@@ -1439,6 +1443,51 @@ class QueryBudgetTests(TestCase):
         self.assertEqual(big_response.status_code, 200)
         self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
 
+    def test_device_detail_query_count_independent_of_port_count(self) -> None:
+        """ADR 0022 — ``NetworkDevicePort.hostname`` reads ``source_type_
+        port`` on every row; without it in the canonical device page's own
+        ``Prefetch``, this is an N+1 across the port table.
+        """
+        vlan = VLAN.objects.create(name="QB Hostname VLAN", vlan_id=291, subnet="10.209.0.0/21")
+
+        small_type = NetworkDeviceType.objects.create(
+            manufacturer="QB", model="M", name="QB Small Device Type", port_count=1
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=small_type,
+            description="Port 1",
+            port_type=PortType.GBE_RJ45,
+            vlan=vlan,
+            hostname_suffix="port1",
+        )
+        small_device = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=small_type, hostname="qb-small", port_addressing=PortAddressing.DHCP
+        )
+
+        big_type = NetworkDeviceType.objects.create(
+            manufacturer="QB", model="M", name="QB Big Device Type", port_count=40
+        )
+        for n in range(1, 41):
+            NetworkDeviceTypePort.objects.create(
+                device_type=big_type,
+                description=f"Port {n}",
+                port_type=PortType.GBE_RJ45,
+                vlan=vlan,
+                hostname_suffix=f"port{n}",
+            )
+        big_device = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=big_type, hostname="qb-big", port_addressing=PortAddressing.DHCP
+        )
+
+        with CaptureQueriesContext(connection) as small_ctx:
+            small_response = self.client.get(f"/devices/{small_device.pk}/")
+        with CaptureQueriesContext(connection) as big_ctx:
+            big_response = self.client.get(f"/devices/{big_device.pk}/")
+
+        self.assertEqual(small_response.status_code, 200)
+        self.assertEqual(big_response.status_code, 200)
+        self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
+
     def test_audit_query_count_independent_of_total_entry_count(self) -> None:
         """Stage B decision 16: a fixed number of queries per audit page,
         independent of how many total ``LogEntry`` rows exist — the
@@ -1820,7 +1869,15 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         self.assertEqual(_detail_field_text(content, "Companion type"), "—")  # no companion declared
         self.assertEqual(
             _inline_row_cells(content, "Type ports", "StageB Device Port"),
-            ["7", "StageB Device Port", "1GbE RJ45 (copper)", "StageB Native (VLAN 4077)", "0"],
+            [
+                "7",
+                "StageB Device Port",
+                "1GbE RJ45 (copper)",
+                "StageB Native (VLAN 4077)",
+                "0",
+                "From the device&#x27;s rack slot",
+                "—",
+            ],
         )
 
     def test_networkdevice_list_renders_every_declared_column_and_detail_redirects(self) -> None:
@@ -1890,6 +1947,46 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         )
         response = self.client.get("/spares/")
         self.assertContains(response, f'href="/models/networkswitch/{spare_switch.pk}/"')
+
+
+class DerivedPortHostnameRenderingTests(TestCase):
+    """ADR 0022 — the canonical device page renders a port's derived
+    hostname where it has one (``NetworkDevicePort.hostname``), and
+    renders nothing extra for a port with no ``hostname_suffix``.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.admin_user = User.objects.create_user("hostnameadmin", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="hostnameadmin", password="testpass123")
+        self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.device_type = NetworkDeviceType.objects.create(
+            manufacturer="DiGiCo", model="SD12", name="SD12 UI", port_count=2
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=self.device_type, description="Control", port_type=PortType.GBE_RJ45, vlan=self.vlan
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=self.device_type,
+            description="Engine",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan,
+            slot_offset=1,
+            hostname_suffix="engine",
+        )
+        self.device = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=self.device_type, hostname="sd12-96-1", port_addressing=PortAddressing.DHCP
+        )
+
+    def test_derived_hostname_renders_for_suffixed_port(self) -> None:
+        response = self.client.get(f"/devices/{self.device.pk}/")
+        self.assertContains(response, "sd12-96-1-engine")
+
+    def test_no_derived_hostname_rendered_for_unsuffixed_port(self) -> None:
+        response = self.client.get(f"/devices/{self.device.pk}/")
+        cells = _list_row_cells(response.content.decode(), "Control")
+        self.assertEqual(cells[0], "Control")  # no parenthetical hostname, unlike the Engine row
 
 
 class AuditTrailTests(TestCase):
