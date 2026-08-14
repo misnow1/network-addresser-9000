@@ -402,9 +402,25 @@ never calls `clean()`, and this module enforces every other invariant on the sav
 - a `host` must not itself be an add-in card (no nesting);
 - `host` may not be `self`.
 
-**The self-host edge also gets a database `CheckConstraint`** (rev 4, review note 2): `~Q(host=F("id"))`
-is expressible in MariaDB and costs one line, so the one edge that *can* be enforced below the ORM
-is. The other two depend on a related row's column and cannot be.
+~~**The self-host edge also gets a database `CheckConstraint`**~~ (rev 4, review note 2) —
+**withdrawn during implementation. MariaDB will not accept it.**
+
+`~Q(host=F("id"))` raises error 1901, *"Function or expression 'AUTO_INCREMENT' cannot be used in the
+CHECK clause of `id`"*. Verified directly against this project's database, with a control confirming
+the identical CHECK is accepted on a non-`AUTO_INCREMENT` column — so it is the engine's rule about
+`AUTO_INCREMENT`, not the expression's shape, and no rephrasing gets around it.
+
+All three edges are therefore enforced in `_check_host_invariants()` on the `save()` and `clean()`
+paths only, with **no database backstop for any of them.** That raises the stakes on the save-path
+check: the code review found `objects.create(pk=42, host_id=42)` slipping past it, because
+dereferencing a host row that does not exist yet returns `None` and the guard exited early. The
+constraint would have caught exactly that. It now compares `host_id` against `pk` before
+dereferencing anything.
+
+This is the third engine limitation to defeat a planned constraint in this project — after
+`supports_partial_indexes = False` (`PLAN-hostname-ingredients.md` decision 4, and ADR 0022 decision
+9's `slot_claim` design before it was withdrawn). Recorded here so a fourth attempt starts from the
+answer.
 
 Cross-rack is explicitly *not* checked, and a card with no host is explicitly legal — both need a
 test asserting they are **allowed**, so a later reader does not add the "missing" validation.
@@ -415,7 +431,7 @@ the pool, which is ADR 0022's central claim and wants its own test.
 
 ### Migration `0015_add_in_cards`
 
-`AddField` ×2 plus `AddConstraint` for the self-host check. No data migration.
+`AddField` ×2. No data migration, and **no `AddConstraint`** — see the withdrawal above.
 
 `0014` dropped a `OneToOneField` named `host`; this adds a `ForeignKey` of the same name. Verify the
 resulting index name matches what a fresh build produces — `makemigrations --check` will not catch a
