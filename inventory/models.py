@@ -3625,12 +3625,22 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         different rack from its host (ADR 0022 decision 6) — and neither is
         a hostless card, which is simply the ordinary ``host is None`` case
         this whole method skips.
+
+        The self-host comparison reads ``self.host_id`` — the raw column —
+        rather than dereferencing ``self.host`` first (Codex review, P2). A
+        crafted ``objects.create(pk=42, host_id=42, ...)`` makes ``self.host``
+        resolve against a row that doesn't exist *yet* (this instance hasn't
+        been inserted), so ``_get_related()`` catches the resulting
+        ``DoesNotExist`` and returns ``None`` — and the old version bailed
+        out at "host is None" before ever comparing IDs, letting a
+        self-referencing row insert. ``host_id`` needs no dereference at all,
+        so it can't be fooled by that gap.
         """
+        if self.host_id is not None and self.pk is not None and self.host_id == self.pk:
+            raise ValidationError("A device cannot be fitted to itself.")
         host = _get_related(self, "host")
         if host is None:
             return
-        if self.pk is not None and host.pk == self.pk:
-            raise ValidationError("A device cannot be fitted to itself.")
         device_type = _get_related(self, "device_type")
         if device_type is not None and device_type.pk is not None and not device_type.is_add_in_card:
             raise ValidationError(
@@ -3686,23 +3696,42 @@ def _clear_installed_cards_before_delete(
     action all route through the same ``Collector``), one receiver covers
     all three without a custom manager/queryset on this model.
 
-    Locks ``instance`` and its currently-fitted cards together, in
-    ascending primary-key order (``_lock_devices_by_pk``) — the same
-    discipline the fit view uses — so a concurrent fit racing this deletion
-    resolves deterministically: whichever transaction acquires the host
-    row's lock first wins, and the loser observes the outcome once it
-    acquires its own lock (a fit sees the host is already gone and refuses;
-    a delete that wins the race sees the newly-fitted card, since the fit
-    already committed before yielding the lock, and clears it too).
+    Locks ``instance`` itself *first* — a single-row lock, via the same
+    ``_lock_devices_by_pk()`` the fit view uses — and only *then* reads
+    which cards currently point to it (Codex review, P1; the earlier
+    version read the card list with a plain, unlocked query *before*
+    taking any lock, so a concurrent fit that hadn't committed yet was
+    invisible to it: the receiver would go on to lock the host, the fit
+    would then commit, and Django's own lazy ``SET_NULL`` field-update
+    step — not this method — would be the one to clear that card, with no
+    audited save at all).
+
+    Once the host lock is held, no concurrent fit can complete a *new*
+    assignment onto this host — fitting always locks the host row too, as
+    part of the same combined ``_lock_devices_by_pk(host_pk, card_pk)``
+    call — so it is either already committed and visible to the read below,
+    or blocked on this same lock and cannot be. That read is deliberately
+    a plain, unlocked ``filter()`` rather than a second ``_lock_devices_by_
+    pk()`` call spanning the discovered cards: two *separate* multi-row
+    lock acquisitions (host, then cards) can deadlock against the fit
+    view's *single* combined one whenever a card's pk sorts below the
+    host's — the fit call would lock the card first while waiting on the
+    host this method already holds, while this method waits on the card the
+    fit call now holds. Each card found here is instead cleared through its
+    own ordinary ``save()``, whose implicit per-row lock only ever contends
+    with another writer of *that* row, never with a blocked multi-row
+    acquisition.
     """
     with transaction.atomic(using=using):
+        locked_host = _lock_devices_by_pk(instance.pk).get(instance.pk)
+        if locked_host is None:
+            return  # already gone — a concurrent delete won the race
         card_pks = list(
             NetworkDevice._default_manager.filter(host_id=instance.pk).values_list("pk", flat=True)
         )
-        locked = _lock_devices_by_pk(instance.pk, *card_pks)
-        for pk, card in locked.items():
-            if pk == instance.pk or card.host_id != instance.pk:
-                continue  # instance itself, or a card a concurrent write already moved elsewhere
+        for card in NetworkDevice._default_manager.filter(pk__in=card_pks):
+            if card.host_id != instance.pk:
+                continue  # a concurrent Pull already cleared it
             card.host = None
             card.save()
 

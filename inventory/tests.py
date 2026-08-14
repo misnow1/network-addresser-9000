@@ -15,6 +15,7 @@ import threading
 import time
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 from auditlog.context import set_actor
 from auditlog.models import LogEntry
@@ -34,6 +35,7 @@ from django.test import RequestFactory, TestCase, TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
+from . import models as inventory_models
 from .admin import (
     AuditedModelAdminMixin,
     DepartmentAdmin,
@@ -6544,6 +6546,26 @@ class AddInCardModelTests(TestCase):
         with self.assertRaises(ValidationError):
             self.card.save()
 
+    def test_self_host_guard_catches_an_explicitly_keyed_row(self) -> None:
+        """Codex review, P2 — ``objects.create(pk=X, host_id=X, ...)``
+        resolves ``self.host`` against a row that doesn't exist *yet* (this
+        instance hasn't been inserted), so ``_get_related()`` catches the
+        resulting ``DoesNotExist`` and returns ``None``. The old check
+        compared ``host.pk`` (dereferencing first) and so bailed out at
+        "host is None" before ever comparing IDs, letting a self-referencing
+        row insert. This matters more than an ordinary edge case: MariaDB
+        won't take the ``CheckConstraint`` the plan called for, so this
+        ``save()``-path guard is the *only* enforcement of the self-host
+        edge that exists.
+        """
+        forced_pk = 1_000_000
+        self.assertFalse(NetworkDevice.objects.filter(pk=forced_pk).exists())
+        with self.assertRaises(ValidationError):
+            NetworkDevice.objects.create(
+                pk=forced_pk, device_type=self.card_type, host_id=forced_pk, hostname="self-hosted"
+            )
+        self.assertFalse(NetworkDevice.objects.filter(pk=forced_pk).exists())
+
     def test_card_in_a_different_rack_from_its_host_is_allowed(self) -> None:
         card_elsewhere = NetworkDevice.objects.create(
             device_type=self.card_type,
@@ -6767,22 +6789,19 @@ class AddInCardConcurrencyTests(TransactionTestCase):
             connection.close()
 
     @staticmethod
-    def _locked_host_delete(
-        key: str,
-        host: NetworkDevice,
-        results: dict[str, str],
-        *,
-        hold_time: float = 0.0,
-        on_locked: Any = None,
-    ) -> None:
+    def _real_host_delete(key: str, host: NetworkDevice, results: dict[str, str]) -> None:
+        """Calls the real, unmodified ``NetworkDevice.delete()`` — no
+        external pre-lock. An earlier version of this helper locked the
+        host itself before calling ``delete()``, which happened to
+        serialize things correctly regardless of whether the production
+        ``pre_delete`` receiver locked before discovering children, masking
+        exactly the ordering bug Codex review found (P1): the receiver used
+        to read the card list with a plain, unlocked query *before* taking
+        any lock. Every concurrency test below now drives ``delete()``
+        directly, so a regression of that ordering fails these tests again.
+        """
         try:
-            with transaction.atomic():
-                _lock_devices_by_pk(host.pk)
-                if on_locked is not None:
-                    on_locked()
-                if hold_time:
-                    time.sleep(hold_time)
-                host.delete()
+            host.delete()
             results[key] = "deleted"
         except Exception as exc:  # noqa: BLE001 — recorded, not swallowed
             results[key] = f"error:{exc}"
@@ -6823,21 +6842,35 @@ class AddInCardConcurrencyTests(TransactionTestCase):
         fit must see the host is already gone and refuse cleanly — never
         silently fit the card to a host that no longer exists, and never
         cause the delete itself to fail on a newly created FK.
+
+        Drives the real ``host.delete()`` call, timed via an instrumented
+        ``_lock_devices_by_pk`` (patched only inside ``inventory.models``,
+        where the ``pre_delete`` receiver calls it — the fit thread's own
+        separately-imported reference is untouched) rather than an external
+        pre-lock, so this exercises the production locking order rather
+        than a test-only stand-in for it.
         """
         lock_acquired = threading.Event()
         results: dict[str, str] = {}
+        real_lock = inventory_models._lock_devices_by_pk
 
-        deleter = threading.Thread(
-            target=self._locked_host_delete,
-            args=("delete", self.host_a, results),
-            kwargs={"hold_time": 0.4, "on_locked": lock_acquired.set},
-        )
+        def instrumented_lock(*pks: int) -> dict[int, NetworkDevice]:
+            locked = real_lock(*pks)
+            if pks == (self.host_a.pk,):
+                lock_acquired.set()
+                time.sleep(0.4)
+            return locked
 
-        def start_fit() -> None:
+        def run_delete() -> None:
+            with mock.patch.object(inventory_models, "_lock_devices_by_pk", side_effect=instrumented_lock):
+                self._real_host_delete("delete", self.host_a, results)
+
+        def run_fit() -> None:
             lock_acquired.wait(timeout=5)
             self._locked_fit("fit", self.host_a.pk, self.card.pk, results)
 
-        fitter = threading.Thread(target=start_fit)
+        deleter = threading.Thread(target=run_delete)
+        fitter = threading.Thread(target=run_fit)
         deleter.start()
         fitter.start()
         deleter.join(timeout=10)
@@ -6852,8 +6885,10 @@ class AddInCardConcurrencyTests(TransactionTestCase):
     def test_host_deletion_racing_a_fit_clears_the_newly_fitted_card(self) -> None:
         """The other direction: the fit wins the race and commits first —
         the delete must still discover and audited-clear the newly-fitted
-        card rather than fail, since it locks before its own collector
-        step runs.
+        card rather than fail, since it locks before reading which cards
+        are fitted. Drives the real ``host.delete()`` call directly (no
+        pre-lock) — the fit thread's own held lock is what makes the delete
+        thread wait here, exactly as it would under real contention.
         """
         lock_acquired = threading.Event()
         results: dict[str, str] = {}
@@ -6864,11 +6899,11 @@ class AddInCardConcurrencyTests(TransactionTestCase):
             kwargs={"hold_time": 0.4, "on_locked": lock_acquired.set},
         )
 
-        def start_delete() -> None:
+        def run_delete() -> None:
             lock_acquired.wait(timeout=5)
-            self._locked_host_delete("delete", self.host_a, results)
+            self._real_host_delete("delete", self.host_a, results)
 
-        deleter = threading.Thread(target=start_delete)
+        deleter = threading.Thread(target=run_delete)
         fitter.start()
         deleter.start()
         fitter.join(timeout=10)
@@ -7050,6 +7085,40 @@ class FitAndPullAdminTests(TestCase):
         )
         self.assertEqual(response.status_code, 200)  # re-rendered with a form error
         self.assertFalse(NetworkDevice.objects.filter(hostname="should-not-exist").exists())
+
+    def test_crafted_post_with_a_malformed_device_type_id_is_refused_not_500(self) -> None:
+        """Codex review, P2 — a non-numeric ``device_type`` used to reach a
+        raw ``QuerySet.filter(device_type_id=<garbage>)`` call inside
+        ``with_operator_fields()`` before ``ModelChoiceField`` ever got a
+        chance to turn it into an ordinary form error, raising a bare
+        ``ValueError`` (a 500) instead.
+        """
+        self._login(self.editor)
+        response = self.client.post(
+            self._fit_url(),
+            {
+                "fit_mode": "create",
+                "device_type": "not-an-int",
+                "hostname": "should-not-exist-either",
+                "rack": str(self.rack.pk),
+                "rack_slot": "5",
+                "port_addressing": "dhcp",
+            },
+        )
+        self.assertEqual(response.status_code, 200)  # re-rendered with a form error, never a 500
+        self.assertFalse(NetworkDevice.objects.filter(hostname="should-not-exist-either").exists())
+
+    def test_fit_card_view_denies_get_for_staff_with_no_device_permissions(self) -> None:
+        """Codex review, P2 — ``admin_site.admin_view`` only supplies
+        login/staff gating, never a model permission check. Without an
+        explicit check, a staff user holding no ``NetworkDevice`` permission
+        at all could GET this URL directly and see the host rendered before
+        either per-section template guard ever runs.
+        """
+        no_perms_user = User.objects.create_user("fit-no-perms", password="testpass123", is_staff=True)
+        self._login(no_perms_user)
+        response = self.client.get(self._fit_url())
+        self.assertEqual(response.status_code, 403)
 
     def test_create_path_prompts_for_operator_port_address(self) -> None:
         """A card type carrying an OPERATOR port must still prompt for its

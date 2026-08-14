@@ -458,8 +458,25 @@ class NetworkDeviceAddForm(forms.ModelForm):
         ``__init__`` (instance fields, for direct construction) and
         ``with_operator_fields()`` (class-level fields, for the real admin
         view).
+
+        Coerces to ``int`` here, defensively, rather than trusting a caller
+        to have already validated it (Codex review of ADR 0022 PR 3, P2) —
+        ``__init__`` reads this straight from ``self.data``/``self.initial``
+        (an unvalidated request value) on *every* construction, not only
+        through ``with_operator_fields()``, so a fix only at that one call
+        site (ADR 0022 PR 3's fit view) would still have left this the raw,
+        crashing path for a crafted ``device_type`` reaching ``__init__``
+        directly — a bare ``QuerySet.filter(device_type_id=<garbage>)``
+        raises ``ValueError`` before ``ModelChoiceField`` ever gets a
+        chance to turn it into an ordinary form error. A non-coercible value
+        degrades to "no type chosen yet" (``[]``), the same shape a blank
+        value already produces.
         """
         if not device_type_id:
+            return []
+        try:
+            device_type_id = int(device_type_id)
+        except (TypeError, ValueError):
             return []
         return list(
             NetworkDeviceTypePort.objects.filter(
@@ -742,6 +759,29 @@ def _profile_locked(type_obj: Any, instances_related_name: str) -> bool:
         and type_obj.pk is not None
         and getattr(type_obj, instances_related_name).exists()
     )
+
+
+def _clean_device_type_id(raw: str | None) -> int | None:
+    """Best-effort int coercion for a raw, unvalidated ``device_type`` POST
+    value — used only to decide which ``OPERATOR``-port fields ``With_
+    operator_fields()`` should declare on the create-a-card form, never to
+    look a row up directly.
+
+    A malformed value (``"not-an-int"``, from a crafted POST) must fall
+    through to the ordinary, already-robust ``ModelChoiceField`` validation
+    on the resulting form — which converts exactly this shape of bad input
+    into a field error — rather than reach a raw ``QuerySet.filter(device_
+    type_id=raw)`` call, which raises a bare ``ValueError`` past any form
+    (Codex review, P2; ``NetworkDeviceAdmin._fit_new_card``). Returning
+    ``None`` here reproduces the "no type chosen yet" shape ``with_operator_
+    fields()``/``_operator_type_ports_for()`` already handle.
+    """
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 class NetworkSwitchTypePortInline(admin.TabularInline):
@@ -1249,7 +1289,23 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
         card-typed host is refused by ``NetworkDevice._check_host_
         invariants()`` (via ``full_clean()``/``save()``), not merely hidden
         from view by the queryset restriction.
+
+        ``admin_site.admin_view`` (``get_urls()``) supplies only login/staff
+        gating, the same as every other admin view — it never checks a
+        model permission (Codex review, P2). Without an explicit check here,
+        a staff user holding *no* ``NetworkDevice`` permission at all could
+        GET this URL directly and see the host and every hostless card
+        rendered before either per-section ``can_use_existing``/``can_
+        create`` guard in the template ever runs. The floor is "holds at
+        least one of the two capabilities this page offers" — the same
+        change-or-add posture ``_fit_existing_card``/``_fit_new_card``
+        individually require, checked before any row is fetched.
         """
+        if not (
+            request.user.has_perm("inventory.change_networkdevice")
+            or request.user.has_perm("inventory.add_networkdevice")
+        ):
+            raise PermissionDenied
         host = get_object_or_404(NetworkDevice.objects.select_related("device_type"), pk=host_id)
         if host.device_type.is_add_in_card:
             messages.error(request, f"{host} is itself an add-in card and cannot host another.")
@@ -1347,7 +1403,7 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
             and request.user.has_perm("inventory.change_networkdevice")
         ):
             raise PermissionDenied
-        device_type_id = request.POST.get("device_type")
+        device_type_id = _clean_device_type_id(request.POST.get("device_type"))
         form_cls = NetworkDeviceAddForm.with_operator_fields(device_type_id)
         with transaction.atomic():
             locked = _lock_devices_by_pk(host.pk)
