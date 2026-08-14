@@ -1965,8 +1965,10 @@ def _validate_profile_allowed_vlans_change(
     reverse: bool,
     **kwargs: Any,
 ) -> None:
-    """The one signal receiver in this module (see ``SwitchPortVlanProfile``
-    docstring for why): ``Model.clean()`` can't validate ``allowed_vlans`` —
+    """The ``m2m_changed`` receiver in this module (see ``SwitchPortVlanProfile``
+    docstring for why) — ``_clear_installed_cards_before_delete()`` below is
+    the other one, on ``pre_delete``, for an unrelated reason (ADR 0022 PR
+    3's Audit section). ``Model.clean()`` can't validate ``allowed_vlans`` —
     no pk yet on create, and stale on edit since ``ModelForm.save_m2m()``
     runs after ``save()`` — and the through model's own ``clean()``/``save()``
     only catches *direct* row creation, since ``.add()``/``.set()`` write the
@@ -2766,6 +2768,13 @@ class NetworkDeviceType(AuditedModel):
     port_count = models.PositiveIntegerField(
         help_text="Must equal the number of Network Device Type Ports defined for this profile."
     )
+    is_add_in_card = models.BooleanField(
+        default=False,
+        help_text=(
+            "This type's instances are cards fitted inside another device and routinely moved "
+            "between hosts — a DMI-DANTE, an X-Dante. Leave off for ordinary equipment."
+        ),
+    )
 
     class Meta:
         constraints = [
@@ -2783,15 +2792,7 @@ class NetworkDeviceType(AuditedModel):
                 _lock_type_rows(NetworkDeviceType, self.pk)
                 if self.devices.exists():
                     _check_locked_fields_unchanged(
-                        NetworkDeviceType,
-                        self.pk,
-                        {
-                            "manufacturer": self.manufacturer,
-                            "model": self.model,
-                            "name": self.name,
-                            "port_count": self.port_count,
-                        },
-                        update_fields=update_fields,
+                        NetworkDeviceType, self.pk, self._locked_snapshot(), update_fields=update_fields
                     )
             super().save(
                 force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
@@ -2820,16 +2821,22 @@ class NetworkDeviceType(AuditedModel):
         super().clean()
         if self.pk is not None and self.devices.exists():
             _check_locked_fields_unchanged(
-                NetworkDeviceType,
-                self.pk,
-                {
-                    "manufacturer": self.manufacturer,
-                    "model": self.model,
-                    "name": self.name,
-                    "port_count": self.port_count,
-                },
-                update_fields=None,
+                NetworkDeviceType, self.pk, self._locked_snapshot(), update_fields=None
             )
+
+    def _locked_snapshot(self) -> dict[str, Any]:
+        # Shared by save()/clean() above. is_add_in_card joins the snapshot
+        # (ADR 0022 PR 3) — flipping it after instances exist would either
+        # strand fitted devices (turning it off under a card with a host)
+        # or retroactively offer ordinary equipment to the fit picker
+        # (turning it on under stock that was never meant to be fitted).
+        return {
+            "manufacturer": self.manufacturer,
+            "model": self.model,
+            "name": self.name,
+            "port_count": self.port_count,
+            "is_add_in_card": self.is_add_in_card,
+        }
 
 
 class NetworkDeviceTypePortQuerySet(models.QuerySet):
@@ -3127,6 +3134,21 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
     serial_number = models.CharField(max_length=100, blank=True)
     rack = models.ForeignKey(Rack, on_delete=models.PROTECT, null=True, blank=True, related_name="devices")
     rack_slot = models.PositiveIntegerField(null=True, blank=True, validators=[MinValueValidator(1)])
+    host = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="installed_cards",
+        help_text=(
+            "The device this add-in card is currently fitted inside, if any (ADR 0022). A soft "
+            "'currently fitted to' pointer with no addressing meaning whatsoever — it does not "
+            "derive an address, constrain a VLAN, share an ordinal, or move anything. A pulled "
+            "card keeps its own rack slot and addresses. Only meaningful when this device's own "
+            "type is an add-in card; fitting happens through the dedicated 'Fit a card' flow, "
+            "never this field directly."
+        ),
+    )
 
     #: Class-level default for the ``port_addressing`` property below —
     #: never a plain class attribute, since Django's ``Model.__init__``
@@ -3156,6 +3178,23 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                 ),
                 name="networkdevice_rack_and_slot_together",
             ),
+            # ADR 0022 PR 3, decision 6's self-host edge was *planned* as a
+            # database CheckConstraint (~Q(host=F("id"))) — cheap, and the
+            # one of the three edges that depends only on this row's own
+            # columns rather than a related row's. It isn't one: MariaDB
+            # categorically refuses any CHECK constraint that references an
+            # AUTO_INCREMENT column (error 1901, "Function or expression
+            # 'AUTO_INCREMENT' cannot be used in the CHECK clause of `id`"),
+            # verified directly against this project's MariaDB with a bare
+            # `CHECK (id > 0)` on an unrelated table — not a comparison
+            # quirk, a blanket refusal to let `id` appear in a CHECK at all.
+            # All three edges — including this one — are therefore enforced
+            # only in _check_host_invariants(), called unconditionally from
+            # both save() and clean() so objects.create() is covered too;
+            # this narrows to the same "ORM-only, not DB-level" posture the
+            # other two edges already had, and to the same documented gap
+            # models.py:203-206 already names for a raw bulk write that
+            # bypasses save() entirely.
         ]
         ordering = ["hostname"]
 
@@ -3199,6 +3238,7 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                 # trust a stale in-memory copy of it defeats the point
                 # of the lock.
                 self.device_type = NetworkDeviceType._default_manager.get(pk=self.device_type_id)
+            self._check_host_invariants()
             try:
                 super().save(
                     force_insert=force_insert,
@@ -3237,6 +3277,7 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                     self._check_static_materialization_possible()
         else:
             _check_locked_fields_unchanged(NetworkDevice, self.pk, self._locked_fields(), update_fields=None)
+        self._check_host_invariants()
 
     @property
     def port_addressing(self) -> str:
@@ -3562,6 +3603,111 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
 
     def _locked_fields(self) -> dict[str, Any]:
         return {"device_type": self.device_type_id}
+
+    def _check_host_invariants(self) -> None:
+        """The three edges ADR 0022 decision 6 draws around ``host`` —
+        enforced here, in ``save()``, as well as in ``clean()`` (called from
+        both), because ``objects.create()`` never calls ``clean()`` and this
+        module enforces every other invariant on the save path too.
+
+        - A device with a ``host`` must itself be an add-in card
+          (``device_type.is_add_in_card``) — the "fit a card" flow's type
+          picker only ever offers card types, but a direct ORM/API write has
+          no picker to lean on.
+        - ``host`` must not itself be an add-in card — no nesting.
+        - ``host`` may not be ``self``. This one was planned as a database
+          ``CheckConstraint`` too (it depends only on this row's own
+          columns, unlike the other two) — MariaDB refuses it outright, so
+          it's ORM-only like its neighbours. See ``Meta.constraints``' own
+          comment for the verified error.
+
+        Cross-rack is deliberately *not* checked here — a card may sit in a
+        different rack from its host (ADR 0022 decision 6) — and neither is
+        a hostless card, which is simply the ordinary ``host is None`` case
+        this whole method skips.
+        """
+        host = _get_related(self, "host")
+        if host is None:
+            return
+        if self.pk is not None and host.pk == self.pk:
+            raise ValidationError("A device cannot be fitted to itself.")
+        device_type = _get_related(self, "device_type")
+        if device_type is not None and device_type.pk is not None and not device_type.is_add_in_card:
+            raise ValidationError(
+                f"{self} cannot have a host — {device_type} is not marked as an add-in card (ADR 0022)."
+            )
+        host_type = _get_related(host, "device_type")
+        if host_type is not None and host_type.pk is not None and host_type.is_add_in_card:
+            raise ValidationError(f"{host} is itself an add-in card and cannot host another (ADR 0022).")
+
+
+def _lock_devices_by_pk(*pks: "int | None") -> "dict[int, NetworkDevice]":
+    """Acquire ``SELECT ... FOR UPDATE`` locks on the given ``NetworkDevice``
+    rows, in one query, ordered by ascending primary key — the deterministic
+    lock order ADR 0022 PR 3's Concurrency section requires. Both the "fit a
+    card" admin view and ``_clear_installed_cards_before_delete()`` below use
+    this, so the two can never deadlock against each other: whichever
+    acquires a contested host row first wins, and the other observes the
+    outcome once its own lock is granted. Must run inside
+    ``transaction.atomic()``.
+
+    Returns only the rows that still exist, keyed by pk — a caller tells
+    "locked" apart from "already gone" (e.g. deleted by a transaction that
+    won the race) by membership, not by a placeholder ``None``.
+    """
+    ids = sorted({pk for pk in pks if pk is not None})
+    if not ids:
+        return {}
+    return {
+        obj.pk: obj
+        for obj in NetworkDevice._default_manager.select_for_update().filter(pk__in=ids).order_by("pk")
+    }
+
+
+def _clear_installed_cards_before_delete(
+    sender: type[models.Model], instance: "NetworkDevice", using: "str | None", **kwargs: Any
+) -> None:
+    """Clears every add-in card fitted to ``instance`` through an ordinary,
+    audited ``save()`` per row, before the deletion collector's own
+    ``QuerySet.update()`` would otherwise silently null them out with no
+    trace on the card's own history (ADR 0022 PR 3's Audit section).
+
+    Django's deletion collector clears ``SET_NULL`` reverse FKs (every
+    ``NetworkDevice`` whose ``host`` is ``instance``) with a bulk
+    ``update()`` that bypasses ``Model.save()`` and therefore every
+    auditlog signal — adding ``host`` to ``AUDITLOG_INCLUDE_TRACKING_
+    MODELS`` is necessary but not sufficient. This fires from ``pre_delete``,
+    which the collector sends *before* it performs its own field-clearing
+    and row-deletion steps, and inside the same atomic block the collector
+    already wraps its own work in (see
+    ``django.db.models.deletion.Collector.delete()``) — and, because Django
+    sends this signal per object for **every** deletion path (instance
+    ``.delete()``, a queryset ``.delete()``, and the admin's bulk delete
+    action all route through the same ``Collector``), one receiver covers
+    all three without a custom manager/queryset on this model.
+
+    Locks ``instance`` and its currently-fitted cards together, in
+    ascending primary-key order (``_lock_devices_by_pk``) — the same
+    discipline the fit view uses — so a concurrent fit racing this deletion
+    resolves deterministically: whichever transaction acquires the host
+    row's lock first wins, and the loser observes the outcome once it
+    acquires its own lock (a fit sees the host is already gone and refuses;
+    a delete that wins the race sees the newly-fitted card, since the fit
+    already committed before yielding the lock, and clears it too).
+    """
+    with transaction.atomic(using=using):
+        card_pks = list(
+            NetworkDevice._default_manager.filter(host_id=instance.pk).values_list("pk", flat=True)
+        )
+        locked = _lock_devices_by_pk(instance.pk, *card_pks)
+        for pk, card in locked.items():
+            if pk == instance.pk or card.host_id != instance.pk:
+                continue  # instance itself, or a card a concurrent write already moved elsewhere
+            card.host = None
+            card.save()
+
+
+models.signals.pre_delete.connect(_clear_installed_cards_before_delete, sender=NetworkDevice)
 
 
 class NetworkDevicePortQuerySet(models.QuerySet):

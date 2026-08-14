@@ -467,6 +467,11 @@ class ImportProdDataTests(TestCase):
         # the pin isn't just an accident of "highest slot + 1" here.
         card = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=17)
         self.assertEqual(card.device_type.model, "DMI-DANTE")
+        # ADR 0022 PR 3 — linked to the console whose row carried the
+        # marker, read from the data rather than guessed (settled decision
+        # 7). #41 stays open: no address changes from this link.
+        self.assertTrue(card.device_type.is_add_in_card)
+        self.assertEqual(card.host_id, console.pk)
         dp_port = card.ports.get(vlan__vlan_id=_VLAN_ID_BY_FUNCTION[FN_DANTE_PRIMARY])
         ds_port = card.ports.get(vlan__vlan_id=_VLAN_ID_BY_FUNCTION[FN_DANTE_SECONDARY])
         self.assertEqual(dp_port.address, addr(FN_DANTE_PRIMARY, "CONSOLES", 17))
@@ -659,6 +664,17 @@ class ImportProdDataTests(TestCase):
         with self.assertRaises(CommandError):
             call_command("verify_prod_import", data_dir=str(self.data_dir))
 
+    def test_verify_catches_a_dmi_dante_card_linked_to_the_wrong_console(self) -> None:
+        # ADR 0022 PR 3 — the card's host link is a real expectation, not
+        # merely "some device exists": re-pointing it at a different,
+        # unrelated CONSOLES device must fail verification even though
+        # every address is untouched.
+        card = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=17)
+        wrong_host = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=4)
+        NetworkDevice.objects.filter(pk=card.pk).update(host=wrong_host.pk)
+        with self.assertRaises(CommandError):
+            call_command("verify_prod_import", data_dir=str(self.data_dir))
+
 
 class ImportProdDataMalformedDmiDanteTests(TestCase):
     """The DMI-DANTE card's rack/slot is pinned (PLAN-prod-import.md §9),
@@ -694,6 +710,59 @@ class ImportProdDataMalformedDmiDanteTests(TestCase):
             write_fixture_csvs(data_dir, addressing_source_rows=malformed_rows)
             with self.assertRaises(CommandError):
                 call_command("import_prod_data", data_dir=str(data_dir))
+
+    def test_refuses_with_zero_markers(self) -> None:
+        """ADR 0022 PR 3, settled decision 7/review note 10 — exactly one
+        marker is *required*, not merely tolerated: the shared fixture's
+        SD12-TEST-1-Control row is the only marker, so blanking its Dante
+        Primary/Secondary columns (still a well-formed SD12 pair, just no
+        longer carrying the DMI-DANTE artifact) leaves zero.
+        """
+        malformed_rows = [
+            (row[0], row[1], row[2], row[3], "", "", row[6]) if row[0] == "SD12-TEST-1-Control" else row
+            for row in ADDRESSING_ROWS
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_fixture_csvs(data_dir, addressing_source_rows=malformed_rows)
+            with self.assertRaises(CommandError):
+                call_command("import_prod_data", data_dir=str(data_dir))
+            self.assertFalse(Rack.objects.exists())  # refused before any writes committed
+
+    def test_refuses_with_two_markers_on_the_same_rack(self) -> None:
+        """The bug settled decision 7 corrects: ``dmi_dante_racks`` used to
+        be a ``set[str]`` of rack names, so two marker-bearing consoles in
+        the same rack (``CONSOLES``, same as the shared fixture's existing
+        SD12-TEST-1 marker) collapsed to one entry and passed the guard
+        undetected. Collecting the marker *rows* instead catches this.
+        """
+        malformed_rows = [
+            *ADDRESSING_ROWS,
+            (
+                "SD12-TEST-2-Control",
+                "CONSOLES",
+                20,
+                addr(FN_CONTROL, "CONSOLES", 20),
+                "10.131.9.19",
+                "10.132.9.19",
+                "",
+            ),
+            (
+                "SD12-TEST-2-Engine",
+                "CONSOLES",
+                21,
+                addr(FN_CONTROL, "CONSOLES", 21),
+                "",
+                "",
+                "",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_fixture_csvs(data_dir, addressing_source_rows=malformed_rows)
+            with self.assertRaises(CommandError):
+                call_command("import_prod_data", data_dir=str(data_dir))
+            self.assertFalse(Rack.objects.exists())  # refused before any writes committed
 
 
 class ImportProdDataMalformedDeviceControlTests(TestCase):

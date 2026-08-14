@@ -4,12 +4,14 @@ from auditlog.mixins import AuditlogHistoryAdminMixin
 from django import forms
 from django.contrib import admin, messages
 from django.contrib.admin.actions import delete_selected as default_delete_selected
-from django.core.exceptions import ValidationError
-from django.db import IntegrityError
+from django.core.exceptions import PermissionDenied, ValidationError
+from django.db import IntegrityError, transaction
 from django.db.models import QuerySet
 from django.forms import BaseInlineFormSet, BaseModelFormSet
-from django.http import HttpRequest, HttpResponseRedirect
+from django.http import HttpRequest, HttpResponse, HttpResponseRedirect
+from django.shortcuts import get_object_or_404, redirect
 from django.template.response import TemplateResponse
+from django.urls import URLPattern, path
 
 from .models import (
     _PROFILE_IN_USE_LOCKED_FIELDS,
@@ -34,6 +36,7 @@ from .models import (
     RackVlanRange,
     SwitchAddressing,
     SwitchPortVlanProfile,
+    _lock_devices_by_pk,
     occupied_rack_slot_ranges,
     switch_port_profile_summary,
 )
@@ -1128,7 +1131,8 @@ class NetworkSwitchAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
 
 @admin.register(NetworkDeviceType)
 class NetworkDeviceTypeAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
-    list_display = ["manufacturer", "model", "name", "port_count"]
+    list_display = ["manufacturer", "model", "name", "port_count", "is_add_in_card"]
+    list_filter = ["is_add_in_card"]
     search_fields = ["manufacturer", "model", "name"]
     inlines = [NetworkDeviceTypePortInline]
     show_auditlog_history_link = True
@@ -1136,19 +1140,27 @@ class NetworkDeviceTypeAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, 
     def get_readonly_fields(self, request: HttpRequest, obj: Any = None) -> list[str]:
         # ADR 0010's lock on manufacturer/model/name/port_count once the
         # profile has instances: NetworkDeviceType.save()/clean() lock it
-        # identically.
+        # identically. is_add_in_card joins the lock (ADR 0022 PR 3) —
+        # flipping it after instances exist would either strand fitted
+        # devices or retroactively offer ordinary equipment to the fit
+        # picker.
         if _profile_locked(obj, "devices"):
-            return ["manufacturer", "model", "name", "port_count"]
+            return ["manufacturer", "model", "name", "port_count", "is_add_in_card"]
         return []
 
 
 @admin.register(NetworkDevice)
 class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
-    list_display = ["hostname", "device_type", "serial_number", "rack", "rack_slot"]
+    list_display = ["hostname", "device_type", "serial_number", "rack", "rack_slot", "host"]
     search_fields = ["hostname", "serial_number"]
-    list_filter = ["rack", "device_type"]
+    # ("host", EmptyFieldListFilter) gives fitted/unfitted as the filter
+    # choices (ADR 0022 PR 3) — a plain "host" filter would instead list
+    # every individual host, which isn't the question this filter answers.
+    list_filter = ["rack", "device_type", ("host", admin.EmptyFieldListFilter)]
+    list_select_related = ["device_type", "rack", "host"]
     inlines = [NetworkDevicePortInline]
     show_auditlog_history_link = True
+    actions = ["pull_cards"]
 
     def get_readonly_fields(self, request: HttpRequest, obj: Any = None) -> list[str]:
         # device_type is fixed at creation (ADR 0010) — editable on Add,
@@ -1177,3 +1189,188 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
         else:
             kwargs["form"] = NetworkDeviceChangeForm
         return super().get_form(request, obj, change=change, **kwargs)
+
+    # -- Pull (ADR 0022 PR 3) -----------------------------------------------------
+
+    @admin.action(permissions=["change"], description="Pull selected cards from their host")
+    def pull_cards(self, request: HttpRequest, queryset: QuerySet) -> None:
+        """Clears ``host`` on every selected, currently-fitted card through
+        an ordinary, audited ``save()`` per row — never ``queryset.
+        update()``, which would leave no trace on the card's own history
+        (ADR 0022 PR 3's Audit section). Leaves ``rack``, ``rack_slot`` and
+        every address alone: a pulled card keeps its address in the pool.
+
+        ``permissions=["change"]`` restricts this action to users who hold
+        ``inventory.change_networkdevice`` — Django's own
+        ``_filter_actions_by_permissions`` mechanism, not a hand-rolled
+        check.
+        """
+        pulled = 0
+        skipped = 0
+        for card in queryset:
+            with transaction.atomic():
+                locked = _lock_devices_by_pk(card.pk)
+                current = locked.get(card.pk)
+                if current is None or current.host_id is None:
+                    skipped += 1
+                    continue
+                current.host = None
+                current.save()
+                pulled += 1
+        if pulled:
+            messages.success(request, f"Pulled {pulled} card(s) from their host.")
+        if skipped:
+            messages.info(request, f"{skipped} selected device(s) had no host to pull.")
+
+    # -- Fit a card (ADR 0022 PR 3) -----------------------------------------------
+
+    def get_urls(self) -> list[URLPattern]:
+        custom = [
+            path(
+                "<int:host_id>/fit-card/",
+                self.admin_site.admin_view(self.fit_card_view),
+                name="inventory_networkdevice_fit_card",
+            ),
+        ]
+        return custom + super().get_urls()
+
+    def fit_card_view(self, request: HttpRequest, host_id: int) -> HttpResponse:
+        """The dedicated "fit a card" flow (ADR 0022 PR 3), reached from an
+        object tool on a host's change page (``admin/inventory/
+        networkdevice/change_form_object_tools.html``). Two mutually
+        exclusive paths: choosing an existing hostless card, or creating a
+        new one. GET only renders the picker; every mutation is POST, and
+        wrapped (via ``get_urls()``) in ``admin_site.admin_view`` for the
+        same login/staff gating every other admin view gets.
+
+        Host and card/type are re-validated server-side inside a locked
+        transaction regardless of what either picker's own queryset would
+        have offered — a crafted POST naming a non-card type or a
+        card-typed host is refused by ``NetworkDevice._check_host_
+        invariants()`` (via ``full_clean()``/``save()``), not merely hidden
+        from view by the queryset restriction.
+        """
+        host = get_object_or_404(NetworkDevice.objects.select_related("device_type"), pk=host_id)
+        if host.device_type.is_add_in_card:
+            messages.error(request, f"{host} is itself an add-in card and cannot host another.")
+            return redirect("admin:inventory_networkdevice_change", host.pk)
+
+        if request.method == "POST":
+            mode = request.POST.get("fit_mode")
+            if mode == "existing":
+                return self._fit_existing_card(request, host)
+            if mode == "create":
+                return self._fit_new_card(request, host)
+            messages.error(request, "Unrecognized fit action.")
+            return redirect(request.path)
+
+        return self._render_fit_card_page(request, host)
+
+    def _render_fit_card_page(
+        self, request: HttpRequest, host: NetworkDevice, create_form: NetworkDeviceAddForm | None = None
+    ) -> TemplateResponse:
+        if create_form is None:
+            create_form = NetworkDeviceAddForm.with_operator_fields(None)(instance=NetworkDevice(host=host))
+        create_form.fields["device_type"].queryset = NetworkDeviceType.objects.filter(  # type: ignore[attr-defined]
+            is_add_in_card=True
+        )
+        existing_cards = (
+            NetworkDevice.objects.filter(device_type__is_add_in_card=True, host__isnull=True)
+            .exclude(pk=host.pk)
+            .select_related("device_type")
+            .order_by("hostname")
+        )
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"Fit a card to {host}",
+            "opts": self.model._meta,
+            "original": host,
+            "host": host,
+            "existing_cards": existing_cards,
+            "create_form": create_form,
+            # The existing-card path needs change on both rows (this app has
+            # no per-object permissions — see CONTEXT.md's roles — so
+            # "both rows" reduces to holding the one change_networkdevice
+            # codename); the create path needs add plus change, since the
+            # card row doesn't exist yet (review note 4).
+            "can_use_existing": request.user.has_perm("inventory.change_networkdevice"),
+            "can_create": (
+                request.user.has_perm("inventory.add_networkdevice")
+                and request.user.has_perm("inventory.change_networkdevice")
+            ),
+        }
+        return TemplateResponse(request, "admin/inventory/networkdevice/fit_card.html", context)
+
+    def _fit_existing_card(self, request: HttpRequest, host: NetworkDevice) -> HttpResponse:
+        if not request.user.has_perm("inventory.change_networkdevice"):
+            raise PermissionDenied
+        try:
+            card_id = int(request.POST.get("card", ""))
+        except (TypeError, ValueError):
+            messages.error(request, "Choose a card to fit.")
+            return redirect(request.path)
+        with transaction.atomic():
+            locked = _lock_devices_by_pk(host.pk, card_id)
+            locked_host = locked.get(host.pk)
+            card = locked.get(card_id)
+            if locked_host is None:
+                messages.error(request, "That host no longer exists.")
+                return redirect("admin:inventory_networkdevice_changelist")
+            if card is None:
+                messages.error(request, "That card no longer exists.")
+                return redirect(request.path)
+            if card.pk == locked_host.pk:
+                messages.error(request, "A device cannot be fitted to itself.")
+                return redirect(request.path)
+            if locked_host.device_type.is_add_in_card:
+                messages.error(request, f"{locked_host} is itself an add-in card and cannot host another.")
+                return redirect("admin:inventory_networkdevice_change", locked_host.pk)
+            if not card.device_type.is_add_in_card:
+                messages.error(request, f"{card} is not an add-in card type.")
+                return redirect(request.path)
+            if card.host_id is not None:
+                messages.error(request, f"{card} is already fitted to a host.")
+                return redirect(request.path)
+            card.host = locked_host
+            try:
+                card.full_clean()
+                card.save()
+            except ValidationError as exc:
+                messages.error(request, f"Could not fit card: {exc}")
+                return redirect(request.path)
+        messages.success(request, f"{card} fitted to {locked_host}.")
+        return redirect("admin:inventory_networkdevice_change", locked_host.pk)
+
+    def _fit_new_card(self, request: HttpRequest, host: NetworkDevice) -> HttpResponse:
+        if not (
+            request.user.has_perm("inventory.add_networkdevice")
+            and request.user.has_perm("inventory.change_networkdevice")
+        ):
+            raise PermissionDenied
+        device_type_id = request.POST.get("device_type")
+        form_cls = NetworkDeviceAddForm.with_operator_fields(device_type_id)
+        with transaction.atomic():
+            locked = _lock_devices_by_pk(host.pk)
+            locked_host = locked.get(host.pk)
+            if locked_host is None:
+                messages.error(request, "That host no longer exists.")
+                return redirect("admin:inventory_networkdevice_changelist")
+            if locked_host.device_type.is_add_in_card:
+                messages.error(request, f"{locked_host} is itself an add-in card and cannot host another.")
+                return redirect("admin:inventory_networkdevice_change", locked_host.pk)
+            # NetworkDeviceAddForm.with_operator_fields() (review note 5) —
+            # a bespoke form here would silently bypass that form's rack-
+            # slot suggester, operator-address fields and materialization
+            # pre-flight. instance=NetworkDevice(host=locked_host) so
+            # full_clean() sees the relationship and the row is inserted
+            # once with host already set, never patched in afterward.
+            form = form_cls(data=request.POST, instance=NetworkDevice(host=locked_host))
+            form.fields["device_type"].queryset = NetworkDeviceType.objects.filter(  # type: ignore[attr-defined]
+                is_add_in_card=True
+            )
+            if not form.is_valid():
+                return self._render_fit_card_page(request, locked_host, create_form=form)
+            form.instance.created_by = request.user
+            new_card = form.save()
+        messages.success(request, f"{new_card} created and fitted to {host}.")
+        return redirect("admin:inventory_networkdevice_change", host.pk)

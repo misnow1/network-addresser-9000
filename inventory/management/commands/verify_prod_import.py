@@ -597,7 +597,7 @@ def _check_hostnames_and_types_and_addresses(
             actual_switches[(s.rack.name, s.rack_slot)] = s
 
     actual_devices: dict[tuple[str, int], NetworkDevice] = {}
-    for d in NetworkDevice.objects.select_related("rack", "device_type"):
+    for d in NetworkDevice.objects.select_related("rack", "device_type", "host"):
         if d.rack is not None and d.rack_slot is not None:
             actual_devices[(d.rack.name, d.rack_slot)] = d
 
@@ -618,6 +618,11 @@ def _check_hostnames_and_types_and_addresses(
     differs_by_design = 0
     extra_verified = 0
     dmi_dante_rack_slot: dict[str, int] = {}
+    #: ADR 0022 PR 3 — the console (an already-verified NetworkDevice)
+    #: whose row carried the marker for each rack in dmi_dante_rack_slot,
+    #: so the final loop below can assert the DMI-DANTE card's ``host`` is
+    #: linked to *that* console specifically, not merely that a card exists.
+    dmi_dante_console_by_rack: dict[str, NetworkDevice] = {}
 
     # Every (rack, slot) an actual NetworkDevice is expected to occupy,
     # built up alongside the loops below and compared against
@@ -757,6 +762,7 @@ def _check_hostnames_and_types_and_addresses(
                         )
                     else:
                         dmi_dante_rack_slot[row.rack] = DMI_DANTE_SLOT
+                        dmi_dante_console_by_rack[row.rack] = device
                         expected_device_keys.add((DMI_DANTE_RACK, DMI_DANTE_SLOT))
                 continue
 
@@ -815,6 +821,20 @@ def _check_hostnames_and_types_and_addresses(
             findings.fail("devices", f"{rack} slot {slot}: expected the DMI-DANTE card device, none found.")
             continue
         _check_device_type_identity(findings, f"DMI-DANTE {rack}/{slot}", device, DMI_DANTE_IDENTITY)
+        # ADR 0022 PR 3 — the card is linked to the console whose row
+        # carried the marker (settled decision 7), not merely to *some*
+        # console. #41 stays open: no address changes here, and this check
+        # must never be widened to expect the card's addresses to match its
+        # console's.
+        expected_console = dmi_dante_console_by_rack.get(rack)
+        if expected_console is None or device.host_id != expected_console.pk:
+            findings.fail(
+                "devices",
+                f"DMI-DANTE {rack}/{slot}: expected host {expected_console} "
+                f"(pk={getattr(expected_console, 'pk', None)}), got host_id={device.host_id}.",
+            )
+        else:
+            findings.count("device_control_pairs_linked", 1)
         for function in (FN_DANTE_PRIMARY, FN_DANTE_SECONDARY):
             vlan_id = vlan_id_by_function[function]
             range_cidr = rack_range_cidr.get((rack, vlan_id))

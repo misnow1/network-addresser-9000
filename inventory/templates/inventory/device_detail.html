@@ -17,8 +17,38 @@
       <p>Spare pool — not racked.</p>
     {% endif %}
     <p class="tile__meta">Serial: {{ device.serial_number|default:"—" }}</p>
+    {% if device.host %}
+      {# ADR 0022 — a soft "currently fitted to" pointer, no addressing meaning. #}
+      <p>Fitted to <a href="{% url 'inventory:device' device.host_id %}">{{ device.host }}</a></p>
+    {% endif %}
     <p><a href="{{ admin_change_url }}">Edit in admin</a></p>
   </div>
+
+  {% if installed_cards %}
+    <div class="panel">
+      <h2 class="panel__heading">Cards fitted</h2>
+      <table class="plain">
+        <thead>
+          <tr>
+            <th>Hostname</th>
+            <th>Type</th>
+            <th>Rack</th>
+            <th>Slot</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for card in installed_cards %}
+            <tr>
+              <td><a href="{% url 'inventory:device' card.pk %}">{{ card }}</a></td>
+              <td>{{ card.device_type }}</td>
+              <td>{{ card.rack.name|default:"—" }}</td>
+              <td>{{ card.rack_slot|default:"—" }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
 
   <div class="panel">
     <h2 class="panel__heading">Ports</h2>
