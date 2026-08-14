@@ -1377,9 +1377,16 @@ class QueryBudgetTests(TestCase):
     def test_device_detail_query_count_independent_of_port_count(self) -> None:
         """ADR 0022 — ``NetworkDevicePort.hostname`` reads ``source_type_
         port`` on every row; without it in the canonical device page's own
-        ``Prefetch``, this is an N+1 across the port table.
+        ``Prefetch``, this is an N+1 across the port table. Extended for
+        ADR 0022 PR 3 (review note 8): ``installed_cards`` (the "Cards
+        fitted" panel) must be prefetched too, or it's an N+1 across
+        however many cards are fitted to a device.
         """
         vlan = VLAN.objects.create(name="QB Hostname VLAN", vlan_id=291, subnet="10.209.0.0/21")
+
+        card_type = NetworkDeviceType.objects.create(
+            manufacturer="QB", model="M", name="QB Card Type", port_count=0, is_add_in_card=True
+        )
 
         small_type = NetworkDeviceType.objects.create(
             manufacturer="QB", model="M", name="QB Small Device Type", port_count=1
@@ -1394,6 +1401,7 @@ class QueryBudgetTests(TestCase):
         small_device = NetworkDevice.objects.create(  # type: ignore[misc]
             device_type=small_type, hostname="qb-small", port_addressing=PortAddressing.DHCP
         )
+        NetworkDevice.objects.create(device_type=card_type, hostname="qb-small-card-1", host=small_device)
 
         big_type = NetworkDeviceType.objects.create(
             manufacturer="QB", model="M", name="QB Big Device Type", port_count=40
@@ -1409,6 +1417,8 @@ class QueryBudgetTests(TestCase):
         big_device = NetworkDevice.objects.create(  # type: ignore[misc]
             device_type=big_type, hostname="qb-big", port_addressing=PortAddressing.DHCP
         )
+        for i in range(10):
+            NetworkDevice.objects.create(device_type=card_type, hostname=f"qb-big-card-{i}", host=big_device)
 
         with CaptureQueriesContext(connection) as small_ctx:
             small_response = self.client.get(f"/devices/{small_device.pk}/")
@@ -1418,6 +1428,34 @@ class QueryBudgetTests(TestCase):
         self.assertEqual(small_response.status_code, 200)
         self.assertEqual(big_response.status_code, 200)
         self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
+
+    def test_device_detail_query_count_independent_of_whether_host_is_set(self) -> None:
+        """ADR 0022 PR 3 review note 8 — ``host`` must be ``select_related``,
+        or rendering a card's "Fitted to" line costs one extra query. A
+        to-one relation's absence doesn't scale with row count the way an
+        N+1 does, so this needs its own pair (hostless vs. fitted) rather
+        than the small-vs-big idiom above.
+        """
+        card_type = NetworkDeviceType.objects.create(
+            manufacturer="QB", model="M", name="QB Host-select Card Type", port_count=0, is_add_in_card=True
+        )
+        anchor_type = NetworkDeviceType.objects.create(
+            manufacturer="QB", model="M", name="QB Host-select Anchor Type", port_count=0
+        )
+        anchor_host = NetworkDevice.objects.create(device_type=anchor_type, hostname="qb-anchor-host")
+        hostless_card = NetworkDevice.objects.create(device_type=card_type, hostname="qb-hostless-card")
+        fitted_card = NetworkDevice.objects.create(
+            device_type=card_type, hostname="qb-fitted-card", host=anchor_host
+        )
+
+        with CaptureQueriesContext(connection) as hostless_ctx:
+            hostless_response = self.client.get(f"/devices/{hostless_card.pk}/")
+        with CaptureQueriesContext(connection) as fitted_ctx:
+            fitted_response = self.client.get(f"/devices/{fitted_card.pk}/")
+
+        self.assertEqual(hostless_response.status_code, 200)
+        self.assertEqual(fitted_response.status_code, 200)
+        self.assertEqual(len(hostless_ctx.captured_queries), len(fitted_ctx.captured_queries))
 
     def test_audit_query_count_independent_of_total_entry_count(self) -> None:
         """Stage B decision 16: a fixed number of queries per audit page,
@@ -1788,7 +1826,7 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         list_response = self.client.get(self._list_url("networkdevicetype"))
         self.assertEqual(
             _list_row_cells(list_response.content.decode(), "StageB Device Type"),
-            ["StageB Device Mfr", "SBDeviceModel", "StageB Device Type", "1", "Details"],
+            ["StageB Device Mfr", "SBDeviceModel", "StageB Device Type", "1", "No", "Details"],
         )
 
         detail_response = self.client.get(self._detail_url("networkdevicetype"))
@@ -1797,6 +1835,7 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         self.assertEqual(_detail_field_text(content, "Model"), "SBDeviceModel")
         self.assertEqual(_detail_field_text(content, "Name"), "StageB Device Type")
         self.assertEqual(_detail_field_text(content, "Port count"), "1")
+        self.assertEqual(_detail_field_text(content, "Add-in card"), "No")
         self.assertEqual(
             _inline_row_cells(content, "Type ports", "StageB Device Port"),
             [
@@ -1815,7 +1854,7 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         list_response = self.client.get(self._list_url("networkdevice"))
         self.assertEqual(
             _list_row_cells(list_response.content.decode(), "stageb-device1"),
-            ["stageb-device1", device_type_text, "SBDEV001", "StageB Rack", "5", "Details"],
+            ["stageb-device1", device_type_text, "SBDEV001", "StageB Rack", "5", "—", "Details"],
         )
         detail_response = self.client.get(self._detail_url("networkdevice"))
         self.assertEqual(detail_response.status_code, 301)
@@ -1917,6 +1956,53 @@ class DerivedPortHostnameRenderingTests(TestCase):
         response = self.client.get(f"/devices/{self.device.pk}/")
         cells = _list_row_cells(response.content.decode(), "Control")
         self.assertEqual(cells[0], "Control")  # no parenthetical hostname, unlike the Engine row
+
+
+class AddInCardRenderingTests(TestCase):
+    """ADR 0022 PR 3 — the canonical device page's "Fitted to …" line on a
+    card and "Cards fitted" list on a host.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.admin_user = User.objects.create_user("cardui-admin", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="cardui-admin", password="testpass123")
+
+        self.host_type = NetworkDeviceType.objects.create(
+            manufacturer="CardUI", model="Console", name="Default", port_count=0
+        )
+        self.card_type = NetworkDeviceType.objects.create(
+            manufacturer="CardUI", model="Card", name="Default", port_count=0, is_add_in_card=True
+        )
+        self.host = NetworkDevice.objects.create(device_type=self.host_type, hostname="cardui-host")
+        self.card = NetworkDevice.objects.create(
+            device_type=self.card_type, hostname="cardui-card", host=self.host
+        )
+        self.hostless_card = NetworkDevice.objects.create(
+            device_type=self.card_type, hostname="cardui-hostless"
+        )
+
+    def test_fitted_to_line_renders_on_the_card(self) -> None:
+        response = self.client.get(f"/devices/{self.card.pk}/")
+        self.assertContains(response, "Fitted to")
+        self.assertContains(response, f'href="/devices/{self.host.pk}/"')
+        self.assertContains(response, "cardui-host")
+
+    def test_no_fitted_to_line_for_a_hostless_card(self) -> None:
+        response = self.client.get(f"/devices/{self.hostless_card.pk}/")
+        self.assertNotContains(response, "Fitted to")
+
+    def test_cards_fitted_panel_renders_on_the_host(self) -> None:
+        response = self.client.get(f"/devices/{self.host.pk}/")
+        self.assertContains(response, "Cards fitted")
+        self.assertContains(response, f'href="/devices/{self.card.pk}/"')
+        self.assertContains(response, "cardui-card")
+        self.assertNotContains(response, "cardui-hostless")
+
+    def test_no_cards_fitted_panel_for_a_device_with_no_cards(self) -> None:
+        response = self.client.get(f"/devices/{self.hostless_card.pk}/")
+        self.assertNotContains(response, "Cards fitted")
 
 
 class AuditTrailTests(TestCase):

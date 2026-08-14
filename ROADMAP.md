@@ -215,15 +215,15 @@ out?* and *can you take it out?* It supersedes ADR 0018 and closes issue #42. It
 inside this phase, because it exists only because this phase hit it — see
 `docs/plans/PLAN-adr-0022.md` for the three PRs.
 
-- [ ] ADR 0022's PR 1: `NetworkDeviceTypePort.address_source` (`SLOT`/`OPERATOR`), which lets one
+- [x] ADR 0022's PR 1: `NetworkDeviceTypePort.address_source` (`SLOT`/`OPERATOR`), which lets one
       device hold two independent static addresses on one VLAN and **closes #42**; plus
       `hostname_suffix` on the same model with a derived, read-only port hostname, and the shared
       `validate_dns_label` that the rest of this phase reuses
-- [ ] ADR 0022's PR 2: the Yamaha Device Control interfaces become **ports on their consoles**, and
+- [x] ADR 0022's PR 2: the Yamaha Device Control interfaces become **ports on their consoles**, and
       every part of ADR 0018 is deleted — `companion_type`, the materialization machinery, the
       paired-move machinery, the tether UI. `CONSOLES` slots 4 and 16 are released; no other address
       moves
-- [ ] ADR 0022's PR 3: `NetworkDevice.host` and `NetworkDeviceType.is_add_in_card` — a DMI-DANTE is
+- [x] ADR 0022's PR 3: `NetworkDevice.host` and `NetworkDeviceType.is_add_in_card` — a DMI-DANTE is
       an ordinary device in its own slot that records which console it is currently fitted to, and
       keeps its slot and address when pulled. **#41 stays open** by decision: a card's address is
       programmed into the card, so it does not follow whichever console it currently sits in

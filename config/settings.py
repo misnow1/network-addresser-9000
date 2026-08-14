@@ -260,6 +260,16 @@ STORAGES = {
 # and so would otherwise leave a supported, config-changing write path
 # completely unaudited. Registering the through model itself closes that
 # gap with its own CREATE/DELETE log entries.
+#
+# ``NetworkDevice.host`` (ADR 0022 PR 3 — an add-in card's "currently fitted
+# to" pointer) joins the include list below, but this alone is *necessary,
+# not sufficient*: Django's deletion collector clears a ``SET_NULL`` reverse
+# FK with ``QuerySet.update()``, which bypasses ``Model.save()`` and every
+# auditlog signal, so orphaning a card by deleting its host would still
+# leave no trace on the card's own history without
+# ``inventory.models._clear_installed_cards_before_delete()`` (a
+# ``pre_delete`` receiver) doing the clearing through an ordinary, audited
+# ``save()`` per row first. Same reasoning for the admin's Pull action.
 AUDITLOG_INCLUDE_TRACKING_MODELS = (
     "inventory.VLAN",
     # Bare, all fields tracked (ADR 0021) — VLAN is already registered bare
@@ -279,7 +289,7 @@ AUDITLOG_INCLUDE_TRACKING_MODELS = (
     {"model": "inventory.NetworkSwitch", "include_fields": ["rack", "rack_slot", "created_at"]},
     {"model": "inventory.NetworkSwitchAddress", "include_fields": ["address", "created_at"]},
     {"model": "inventory.NetworkSwitchPort", "exclude_fields": ["description"]},
-    {"model": "inventory.NetworkDevice", "include_fields": ["rack", "rack_slot", "created_at"]},
+    {"model": "inventory.NetworkDevice", "include_fields": ["rack", "rack_slot", "host", "created_at"]},
     {
         "model": "inventory.NetworkDevicePort",
         "include_fields": ["address", "is_dhcp", "created_at"],

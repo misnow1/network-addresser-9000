@@ -1,6 +1,7 @@
-> **Revision 3** — PR 1 is merged (#58, `39cf6bc`). Incorporates a second independent review, of
-> the **PR 2 section only**, against the post-PR-1 tree: `REVIEW-1-PLAN-adr-0022-pr2.md`.
-> Revision 2 incorporated `REVIEW-1-PLAN-adr-0022.md`. See "Review response" for both mappings.
+> **Revision 4** — PR 1 (#58, `39cf6bc`) and PR 2 (#59, `f4417f4`) are both merged. Incorporates a
+> third independent review, of the **PR 3 section only**, against the post-PR-2 tree:
+> `REVIEW-1-PLAN-adr-0022-pr3.md`. Revisions 2 and 3 incorporated the two earlier reviews.
+> See "Review response" for all three mappings.
 
 # Implement ADR 0022 — Add-in cards and operator-set ports
 
@@ -366,6 +367,12 @@ gains a superseded banner. ADR 0017 gains an amended banner naming its scope-bou
 
 ## PR 3 — Add-in cards
 
+**All citations in this section were refreshed against `main` after PR 2 merged** (rev 4, review
+note 6). PR 2 deleted ~3,200 lines, and several PR 3 references had drifted — including one that was
+wrong from the start: the device forms do **not** use `Meta.exclude = ["host"]`, they use explicit
+field allowlists (`admin.py:431-433`, `:610-612`). `host` is absent from both, and **stays absent
+deliberately** — fitting happens through the dedicated flow below, never the ordinary add form.
+
 ### Model
 
 ```python
@@ -384,66 +391,140 @@ host = models.ForeignKey(
 )
 ```
 
-**`is_add_in_card` joins `NetworkDeviceType`'s locked-field snapshot** (`:2762-2821`, review note 11)
-and its admin read-only set. Flipping it after instances exist would either strand already-fitted
-devices or retroactively offer ordinary equipment to the fit picker.
+`is_add_in_card` joins `NetworkDeviceType`'s locked-field snapshots (`:2788-2793`, `:2825-2830`) and
+its admin read-only set. Flipping it after instances exist would either strand fitted devices or
+retroactively offer ordinary equipment to the fit picker.
 
-ADR 0022 decision 6's three edges are enforced **in `save()` as well as `clean()`** (review note 7) —
-`objects.create()` never calls `clean()`, and this module enforces every other invariant on the save
-path:
+ADR 0022 decision 6's three edges are enforced in **`save()` as well as `clean()`** — `objects.create()`
+never calls `clean()`, and this module enforces every other invariant on the save path:
 
 - a device with a `host` must have `is_add_in_card` set;
 - a `host` must not itself be an add-in card (no nesting);
-- `host` may not be `self` — asserted explicitly, which the rev-1 plan omitted.
+- `host` may not be `self`.
+
+~~**The self-host edge also gets a database `CheckConstraint`**~~ (rev 4, review note 2) —
+**withdrawn during implementation. MariaDB will not accept it.**
+
+`~Q(host=F("id"))` raises error 1901, *"Function or expression 'AUTO_INCREMENT' cannot be used in the
+CHECK clause of `id`"*. Verified directly against this project's database, with a control confirming
+the identical CHECK is accepted on a non-`AUTO_INCREMENT` column — so it is the engine's rule about
+`AUTO_INCREMENT`, not the expression's shape, and no rephrasing gets around it.
+
+All three edges are therefore enforced in `_check_host_invariants()` on the `save()` and `clean()`
+paths only, with **no database backstop for any of them.** That raises the stakes on the save-path
+check: the code review found `objects.create(pk=42, host_id=42)` slipping past it, because
+dereferencing a host row that does not exist yet returns `None` and the guard exited early. The
+constraint would have caught exactly that. It now compares `host_id` against `pk` before
+dereferencing anything.
+
+This is the third engine limitation to defeat a planned constraint in this project — after
+`supports_partial_indexes = False` (`PLAN-hostname-ingredients.md` decision 4, and ADR 0022 decision
+9's `slot_claim` design before it was withdrawn). Recorded here so a fourth attempt starts from the
+answer.
 
 Cross-rack is explicitly *not* checked, and a card with no host is explicitly legal — both need a
 test asserting they are **allowed**, so a later reader does not add the "missing" validation.
 
-`host` is **not** in `_locked_fields()`: changing it is what fitting and pulling *are*. `rack` and
-`rack_slot` are likewise untouched by fitting — a pulled card keeps both, holding its address in the
-pool, which is ADR 0022's central claim and wants its own test.
+`host` is **not** in `_locked_fields()` (`:3563-3564`): changing it is what fitting and pulling *are*.
+`rack` and `rack_slot` are untouched by fitting — a pulled card keeps both, holding its address in
+the pool, which is ADR 0022's central claim and wants its own test.
 
 ### Migration `0015_add_in_cards`
 
-`AddField` ×2. No data migration.
+`AddField` ×2. No data migration, and **no `AddConstraint`** — see the withdrawal above.
 
-### `config/settings.py`
+`0014` dropped a `OneToOneField` named `host`; this adds a `ForeignKey` of the same name. Verify the
+resulting index name matches what a fresh build produces — `makemigrations --check` will not catch a
+divergence that only shows up in the database.
 
-Add `host` to `NetworkDevice`'s `AUDITLOG_INCLUDE_TRACKING_MODELS` entry (`:282`), which currently
-tracks only `rack`, `rack_slot`, `created_at` (review note 17). Without it, fitting and pulling — the
-two operations this PR exists for — leave no audit trail, against ADR 0004.
+### Concurrency — `select_for_update`, in PK order
 
-### Admin
+Rev 4, review note 3. One transaction is not enough: two requests can each observe the same card as
+hostless and fit it to different hosts, last commit winning; and Django's deletion collector can
+discover `SET_NULL` children before a concurrent fit commits, then fail the host delete on the new
+FK.
 
-- `NetworkDeviceTypeAdmin`: `is_add_in_card` on the form, in `list_filter`, and read-only once
-  instances exist.
+The fit flow locks the target host **and** the existing card with `select_for_update()` in
+deterministic primary-key order, then re-checks inside the lock that the host still exists, is not
+itself a card, and the card is still hostless and card-typed. Host deletion locks the host before
+collector discovery. `TransactionTestCase` coverage for competing fits, and for a fit racing a host
+deletion.
+
+Deterministic lock ordering is the same discipline ADR 0018's move machinery needed and got wrong
+twice before review caught it; that code is gone, but the hazard is not.
+
+### Audit — the `SET_NULL` path does not audit itself
+
+Rev 4, review note 1, and the sharpest finding in this review. Django's deletion collector clears
+reverse FKs with `QuerySet.update()`, which bypasses `save()` and therefore every auditlog signal.
+Adding `host` to `AUDITLOG_INCLUDE_TRACKING_MODELS` (`config/settings.py:282`) is **necessary but not
+sufficient** — orphaning a card by deleting its host would silently leave no trace on the card.
+
+So deleting a host **clears its cards through audited per-row saves first**, then deletes the host.
+Same for **Pull**: it must not be `queryset.update(host=None)`.
+
+The tests must assert the card's own log records `host: <old pk> → None` **with the actor** — not
+merely that "an audit entry exists", which passes vacuously on the host's own deletion entry. Cover
+instance `delete()`, queryset delete, and the admin's delete action.
+
+### Admin — `inventory/admin.py`
+
+- `NetworkDeviceTypeAdmin`: `is_add_in_card` on the form, in `list_filter`, read-only once instances
+  exist.
 - `NetworkDeviceAdmin`: a host column in `list_display`, `host` in `list_select_related`, and
   **`("host", EmptyFieldListFilter)`** for fitted/unfitted — a plain `host` filter lists every
-  individual host (review note 8).
-- **A real "Fit a card" view, not a deep link to the add form** (review note 8). A deep link cannot
-  fit an *existing hostless card* without creating a second row, and `host` is excluded from both
-  current forms. The view takes a host, offers two mutually exclusive paths — *choose an existing
-  hostless card* or *create a new one* — validates the host and the chosen type server-side (not just
-  in the queryset), mutates on POST only, checks change permission on both rows, and runs in one
-  transaction. Its test must assert that the existing-card path **preserves the primary key**.
-- A **"Pull"** action clearing `host` and leaving `rack`, `rack_slot` and every address alone.
+  individual host.
+- **A dedicated "Fit a card" view**, wrapped in `admin_site.admin_view`, reached from an object tool
+  on the host's change page. Two mutually exclusive paths:
+  - *Choose an existing hostless card* — requires **change** permission on both rows.
+  - *Create a new card* — requires **add** permission on `NetworkDevice` plus **change** on the host
+    (review note 4; "change on both rows" is wrong for a row that does not exist yet).
 
-### Read-only UI
+  The create path **reuses `NetworkDeviceAddForm.with_operator_fields()`** with its type queryset
+  restricted to `is_add_in_card=True`, instantiated against `NetworkDevice(host=locked_host)` so
+  `full_clean()` sees the relationship and the row is inserted once with `host` already set (review
+  note 5). A bespoke form would silently bypass that form's rack-slot suggester, operator-address
+  fields, materialization pre-flight and transient properties.
+
+  Host and type are validated **server-side**, not merely shaped by a queryset — a crafted POST
+  naming a non-card type or a card-typed host must be refused. POST-only mutation, one transaction,
+  and a named redirect target.
+- A **"Pull"** action (change permission) clearing `host` via an audited save, leaving `rack`,
+  `rack_slot` and every address alone.
+
+### Read-only UI — `inventory/views.py`, templates
 
 `device_detail.html` grows a "Cards fitted" list on a host and a "Fitted to …" line on a card.
 `REGISTRY`'s `networkdevicetype` entry gains `is_add_in_card`; `networkdevice` gains `host` (a
-`FieldSpec` with `render="relation"`, plus `select_related`). `device_detail.html` is a shaped
-template (`canonical_detail_view` redirects), so the registry alone will not surface either.
+`FieldSpec` with `render="relation"` plus `list_select_related`).
 
-### Importer
+**The registry does not feed the device page.** `canonical_detail_view` redirects `networkdevice` to
+the shaped `device_detail()` (`views.py:854-865`), so the new relations must be added to *that*
+view's queryset (review note 8): `host` in `select_related()`, `installed_cards` prefetched with
+whatever type/rack relations the panel renders. Without it, "Fitted to" is one extra query and "Cards
+fitted" is an N+1. Extend the existing device-detail query-budget test.
 
-`dmi_dante` is marked `is_add_in_card=True`, and the card entry created at `:893` is linked to the
-console whose row carried the marker. Per settled decision 7 as revised, the detection at `:862-867`
-**collects the marker rows, not just their rack names**, and requires **exactly one** — two
-marker-bearing consoles in `CONSOLES` currently collapse into a single set entry and pass the guard
-undetected. `verify_prod_import.py` gains the link as an expectation, with a test that catches a card
-linked to the wrong console. **No address changes** — the card stays at `CONSOLES` slot 17 with
+### Importer — `inventory/management/commands/import_prod_data.py`
+
+`dmi_dante` is marked `is_add_in_card=True`, and the card entry is linked to the console whose row
+carried the marker.
+
+Per settled decision 7, the detection at **`:895-900`** must **collect the marker rows, not just
+their rack names**, and require **exactly one**. `dmi_dante_racks` is still a `set[str]` of rack
+names, so two marker-bearing consoles in `CONSOLES` collapse to one entry and pass the guard
+undetected. The entry is appended at `:926` and the device created at `:1055-1072` (rev 4, review
+note 6 — the rev-3 citations `:862-867` and `:893` now point at unrelated control flow).
+
+`verify_prod_import.py` gains the link as an expectation, with a test that catches a card linked to
+the wrong console. **No address changes** — the card stays at `CONSOLES` slot 17 with
 `10.201.6.17` / `10.202.6.17`, and **#41 stays open**.
+
+### Docs
+
+`CONTEXT.md`'s **Add-in Card** entry (`:45-47`) gains the nullable `host` link and states plainly
+that it carries no addressing meaning. **`DESIGN.md:109-124`** gains `is_add_in_card` and `host` in
+its model outline, noting that a card keeps its own rack, slot, addresses and lifecycle (rev 4,
+review note 9).
 
 ---
 
@@ -496,15 +577,42 @@ bounded** (review note 14): a corrupted ordinary `SLOT` port on the same console
 alignment, and a port with `source_type_port=NULL` must still be included — otherwise an
 implementation that exempts the whole console passes the happy-path test.
 
-**PR 3** — a card is fitted to an existing host and pulled, keeping its rack, slot and addresses; a
+**PR 3** (rev 4 — audit, concurrency and permission coverage added):
+
+*Lifecycle:* a card is fitted to an existing host and pulled, keeping its rack, slot and addresses; a
 pulled card is re-fitted to a *different* host as the same row; deleting a host leaves its cards
-racked, addressed and hostless; a non-card type cannot be given a host, a card cannot host a card,
-and a card cannot host itself — **each asserted through `objects.create()` as well as `full_clean()`**
-(review note 7); a card may sit in a different rack from its host and a hostless card is legal (both
-asserted as *allowed*); `is_add_in_card` cannot be changed once instances exist; the fit view's
-existing-card path preserves the primary key and its create path does not; fit, pull and host
-deletion each leave an audit entry. `test_ui.py`: the cards-fitted panel, the fitted-to line, and the
-registry additions.
+racked, addressed and hostless.
+
+*Edges:* a non-card type cannot be given a host, a card cannot host a card, and a card cannot host
+itself — **each through `objects.create()` as well as `full_clean()`**, and the self-host case also
+at the database level via the new `CheckConstraint`. A card may sit in a different rack from its host
+and a hostless card is legal — **both asserted as allowed**. `is_add_in_card` cannot be changed once
+instances exist.
+
+*Audit* (rev 4, review note 1): fitting, pulling, and **orphaning by host deletion** each write an
+entry **on the card**, asserted as `host: <old pk> → None` with the actor — not merely "an audit
+entry exists", which passes vacuously on the host's own deletion record. Covers instance `delete()`,
+queryset delete and the admin delete action.
+
+*Concurrency* (`TransactionTestCase`, review note 3): two competing fits of one card resolve to a
+single host rather than last-write-wins; a fit racing a host deletion neither orphans silently nor
+fails the delete on a newly created FK.
+
+*Permissions* (review note 4): the existing-card path requires change on both rows, the create path
+requires add on `NetworkDevice` plus change on the host, Pull requires change — with a denial test
+per missing permission, plus a crafted POST naming a type outside the picker queryset and one naming
+a card-typed host.
+
+*Fit flow:* the existing-card path **preserves the primary key**; the create path inserts once with
+`host` already set and goes through `NetworkDeviceAddForm.with_operator_fields()`, so a card type
+carrying an `OPERATOR` port still prompts for its address.
+
+*Importer* (review note 7): **zero** DMI-DANTE markers and **two same-rack** markers must each raise
+`CommandError`, and a failed import must leave no partial rows. The current guard passes both cases
+— zero because the block never runs, two because `dmi_dante_racks` is a set of rack names.
+
+`test_ui.py`: the cards-fitted panel, the fitted-to line, the registry additions, and the shaped
+device-detail query budget with `host` selected and `installed_cards` prefetched.
 
 ## Verification
 
@@ -570,6 +678,23 @@ verified against the code, all folded in, none rejected and none escalated.
 | 14 (P2) | Accepted. The alignment exemption gets negative tests, so an implementation that exempts the whole console cannot pass. | Tests, PR 2 |
 | 15 (P3) | Accepted. All PR 2 citations refreshed against post-PR-1 `main`; `admin.py:1162` in particular now points at unrelated switch-admin code. | PR 2, throughout |
 
+### Third review — `REVIEW-1-PLAN-adr-0022-pr3.md` (rev 4)
+
+The PR 3 section only, re-reviewed against the tree **after PR 2 merged**. Nine findings, all
+verified against the code. Eight accepted; one accepted in part with the remainder argued down.
+
+| Note | Resolution | Section |
+|---|---|---|
+| 1 (P1) | Accepted — the sharpest finding here. Django's deletion collector clears `SET_NULL` reverse FKs with `QuerySet.update()`, bypassing `save()` and every auditlog signal, so adding `host` to the tracking list was necessary but not sufficient: orphaning a card would have left no trace on the card. Host deletion and Pull both go through audited per-row saves, and the tests assert the specific `host: <pk> → None` transition with actor rather than "an entry exists". | PR 3 "Audit"; Tests |
+| 2 (P1) | **Accepted in part.** The self-host edge gains a database `CheckConstraint` (`~Q(host=F("id"))`) — cheap and worth having. **Rejected: narrow queryset/manager guards for `host`, `device_type` and `is_add_in_card`.** `models.py:203-206` already documents `QuerySet.update()`/`bulk_create()` bypassing `Model.save()` as a **known, deliberate, project-wide gap** covering every invariant in this module, not just these. Adding a custom queryset for `host` alone would be inconsistent with every neighbouring invariant, and PR 2 has just finished deleting the only device queryset this model ever had. Reintroducing one to guard the replacement relationship is exactly the shape of drift these reviews exist to prevent. The gap is documented and tested as a gap, not closed here; closing it belongs to a change that closes it everywhere. | PR 3 "Model"; Tests |
+| 3 (P1) | Accepted. `select_for_update()` on host and card in deterministic PK order, re-checking the invariants inside the lock; host deletion locks before collector discovery; `TransactionTestCase` coverage for competing fits and fit-versus-delete. PR 3 also gets its own Risks entry, which it lacked. | PR 3 "Concurrency"; Tests; Risks |
+| 4 (P1) | Accepted — "change permission on both rows" is wrong for a row that does not exist yet. Create requires `add` on `NetworkDevice` plus `change` on the host; the view is wrapped in `admin_site.admin_view`; denial tests per permission and for crafted POSTs. | PR 3 "Admin"; Tests |
+| 5 (P2) | Accepted. The create path reuses `NetworkDeviceAddForm.with_operator_fields()` against `NetworkDevice(host=locked_host)` rather than a bespoke form, which would have silently bypassed the rack-slot suggester, the operator-address fields and the materialization pre-flight. | PR 3 "Admin" |
+| 6 (P2) | Accepted. Citations refreshed; note that `Meta.exclude = ["host"]` never existed — both forms use explicit allowlists, and `host` stays out of them deliberately. | PR 3, throughout |
+| 7 (P2) | Accepted. Zero markers and two same-rack markers must each raise; the current guard passes both. | Tests, PR 3 |
+| 8 (P2) | Accepted — `canonical_detail_view` redirects to the shaped `device_detail()`, so registry `select_related` does nothing for it. Both relations move to that view's queryset, with the query budget extended. | PR 3 "Read-only UI"; Tests |
+| 9 (P3) | Accepted. `CONTEXT.md:45-47` and `DESIGN.md:109-124` both updated. | PR 3 "Docs" |
+
 ## Risks
 
 **PR 2's migration is the sharp edge.** It moves an address between rows, creates a type port,
@@ -587,6 +712,18 @@ inventory/ config/` should return nothing but historical migrations.
 model and the admin inline. It is justified (a derived label has no materialized counterpart), but it
 is the first exemption that lock has ever had, and both layers must compare against the *persisted*
 row or the exemption becomes a way to smuggle any edit through.
+
+**PR 3's sharp edge is concurrency, not data** (rev 4). Nothing it does destroys anything — the worst
+outcome is a card fitted to the wrong host, or orphaned without an audit trail. But `SET_NULL` and a
+fit flow that mutates two rows together put it in the same territory ADR 0018's move machinery
+occupied, and that code needed five rounds of review to get its lock ordering right. The machinery is
+gone; the hazard is not. `select_for_update()` in deterministic PK order, and `TransactionTestCase`
+coverage rather than `TestCase`, are the whole defence.
+
+**The `SET_NULL` audit gap is the kind of thing that passes review by looking done.** Adding a field
+to the auditlog tracking list reads as sufficient and is not, because the deletion collector never
+calls `save()`. A test asserting only that "an audit entry exists" passes on the host's own deletion
+record while the card silently has none.
 
 ## Out of scope
 

@@ -157,6 +157,11 @@ class DeviceTypeSpec:
     explicitly; nothing elsewhere contradicts it), so ``port_type`` isn't
     part of the spec — the importer applies it uniformly when
     materializing type ports below.
+
+    ``is_add_in_card`` (ADR 0022 PR 3) marks a type whose instances are
+    fitted into a host via ``NetworkDevice.host`` rather than occupying a
+    rack slot addressed on their own account for any other reason — only
+    ``dmi_dante`` sets this in this catalog.
     """
 
     key: str
@@ -164,6 +169,7 @@ class DeviceTypeSpec:
     model: str
     name: str
     ports: tuple[tuple[str, str, int, str, str], ...]
+    is_add_in_card: bool = False
 
 
 #: Default ``(address_source, hostname_suffix)`` for an ordinary
@@ -244,6 +250,7 @@ DEVICE_TYPES: tuple[DeviceTypeSpec, ...] = (
         "DMI-DANTE",
         "Default",
         (("Dante Primary", FN_DANTE_PRIMARY, 0, *_SLOT), ("Dante Secondary", FN_DANTE_SECONDARY, 0, *_SLOT)),
+        is_add_in_card=True,
     ),
     DeviceTypeSpec(
         "dm7c",
@@ -492,6 +499,14 @@ class _DeviceEntry:
     #: straight to ``NetworkDevice.operator_addresses``. Empty for every
     #: type with no ``OPERATOR``-sourced port.
     operator_addresses: dict[str, str] = field(default_factory=dict)
+    #: ADR 0022 PR 3 — the hostname of the device this entry's card should
+    #: be linked to via ``NetworkDevice.host``, set only for the DMI-DANTE
+    #: entry (settled decision 7: linked to the console whose row carried
+    #: the marker, read from the data rather than guessed). Empty for every
+    #: entry that isn't a card. Resolved against ``_stage9_devices()``'s own
+    #: hostname-keyed lookup, which is why this entry must be appended
+    #: *after* its host's own entry in the device-entries list.
+    host_hostname: str = ""
 
 
 class _Importer:
@@ -817,6 +832,7 @@ class _Importer:
                 model=spec.model,
                 name=spec.name,
                 port_count=len(spec.ports),
+                is_add_in_card=spec.is_add_in_card,
                 created_by=self.user,
             )
             device_type.full_clean()
@@ -844,7 +860,13 @@ class _Importer:
         consumed: set[tuple[str, int]] = set()
         switch_entries: list[_SwitchEntry] = []
         device_entries: list[_DeviceEntry] = []
-        dmi_dante_racks: set[str] = set()
+        #: ADR 0022 PR 3, settled decision 7/rev 4 review note 10 — the
+        #: marker *rows* (each paired with the console hostname it marks),
+        #: not just their rack names. A ``set[str]`` of rack names would
+        #: collapse two marker-bearing consoles in the same rack into one
+        #: entry and let the "exactly one" guard below pass undetected —
+        #: this is what that guard is actually for.
+        dmi_dante_markers: list[tuple[AddressingRow, str]] = []
         max_slot_by_rack: dict[str, int] = {}
 
         for row in deduped:
@@ -897,7 +919,9 @@ class _Importer:
                         # §5): the console's own "-Control" row is carrying
                         # the card's addresses. Re-addressed on the
                         # hardware at its own ordinal (#41), not copied.
-                        dmi_dante_racks.add(row.rack)
+                        # ADR 0022 PR 3 links the resulting card device to
+                        # this console (``stem``) via NetworkDevice.host.
+                        dmi_dante_markers.append((row, stem))
                     continue
 
             type_key = self._device_type_key_for(row)
@@ -905,25 +929,38 @@ class _Importer:
             device_entries.append(_DeviceEntry(row.rack, row.slot, hostname, type_key))
             consumed.add(key)
 
-        if dmi_dante_racks:
-            if dmi_dante_racks != {DMI_DANTE_RACK}:
-                raise CommandError(
-                    f"DMI-DANTE marker found on {sorted(dmi_dante_racks)}, but "
-                    f"PLAN-prod-import.md §9 pins the card to {DMI_DANTE_RACK} slot "
-                    f"{DMI_DANTE_SLOT} — refusing to guess a slot for a different rack."
-                )
-            if (DMI_DANTE_RACK, DMI_DANTE_SLOT) in by_key:
-                raise CommandError(
-                    f"{DMI_DANTE_RACK} slot {DMI_DANTE_SLOT} is pinned for the DMI-DANTE card "
-                    "(PLAN-prod-import.md §9) but the addressing sheet already has a row there."
-                )
-            if max_slot_by_rack.get(DMI_DANTE_RACK, 0) >= DMI_DANTE_SLOT:
-                raise CommandError(
-                    f"{DMI_DANTE_RACK} already has an occupant at or past the pinned DMI-DANTE "
-                    f"slot {DMI_DANTE_SLOT} (PLAN-prod-import.md §9) — the export has grown past "
-                    "what the pin assumed; resolve this before importing."
-                )
-            device_entries.append(_DeviceEntry(DMI_DANTE_RACK, DMI_DANTE_SLOT, "", "dmi_dante"))
+        # Exactly one marker is required, not merely tolerated (ADR 0022
+        # settled decision 7, corrected by rev 4 review note 10) — zero
+        # means the production sheet's known marker went missing (a silent
+        # DMI-DANTE-card device would otherwise never be created), and more
+        # than one (whether on one rack or several) is never guessable.
+        if len(dmi_dante_markers) != 1:
+            raise CommandError(
+                f"Expected exactly one DMI-DANTE marker row (a Control row carrying Dante "
+                f"Primary/Secondary addresses — PLAN-prod-import.md §9), found "
+                f"{len(dmi_dante_markers)}."
+            )
+        marker_row, host_hostname = dmi_dante_markers[0]
+        if marker_row.rack != DMI_DANTE_RACK:
+            raise CommandError(
+                f"DMI-DANTE marker found on {marker_row.rack!r}, but PLAN-prod-import.md §9 pins "
+                f"the card to {DMI_DANTE_RACK} slot {DMI_DANTE_SLOT} — refusing to guess a slot "
+                "for a different rack."
+            )
+        if (DMI_DANTE_RACK, DMI_DANTE_SLOT) in by_key:
+            raise CommandError(
+                f"{DMI_DANTE_RACK} slot {DMI_DANTE_SLOT} is pinned for the DMI-DANTE card "
+                "(PLAN-prod-import.md §9) but the addressing sheet already has a row there."
+            )
+        if max_slot_by_rack.get(DMI_DANTE_RACK, 0) >= DMI_DANTE_SLOT:
+            raise CommandError(
+                f"{DMI_DANTE_RACK} already has an occupant at or past the pinned DMI-DANTE "
+                f"slot {DMI_DANTE_SLOT} (PLAN-prod-import.md §9) — the export has grown past "
+                "what the pin assumed; resolve this before importing."
+            )
+        device_entries.append(
+            _DeviceEntry(DMI_DANTE_RACK, DMI_DANTE_SLOT, "", "dmi_dante", host_hostname=host_hostname)
+        )
 
         return switch_entries, device_entries
 
@@ -1053,9 +1090,23 @@ class _Importer:
     # -- Stage 9: devices -------------------------------------------------------------
 
     def _stage9_devices(self, entries: list[_DeviceEntry]) -> None:
+        # ADR 0022 PR 3 — hostname -> the device just created, so the
+        # DMI-DANTE entry (appended last by _classify_addressing_rows(), so
+        # its host's own entry always precedes it here) can resolve
+        # entry.host_hostname to a real NetworkDevice for NetworkDevice.host.
+        devices_by_hostname: dict[str, NetworkDevice] = {}
         for entry in entries:
             device_type = self.device_types_by_key[entry.type_key]
             rack = self.racks_by_name[entry.rack]
+            host = None
+            if entry.host_hostname:
+                try:
+                    host = devices_by_hostname[entry.host_hostname]
+                except KeyError:
+                    raise CommandError(
+                        f"{entry.hostname or entry.type_key!r} at {entry.rack}/{entry.slot} names "
+                        f"host {entry.host_hostname!r}, but no such device has been created yet."
+                    ) from None
             device = NetworkDevice(  # type: ignore[misc]
                 device_type=device_type,
                 rack=rack,
@@ -1066,7 +1117,10 @@ class _Importer:
                 # entry, and _materialize_ports() ignores it entirely
                 # unless device_type actually has an OPERATOR-sourced port.
                 operator_addresses=entry.operator_addresses,
+                host=host,
                 created_by=self.user,
             )
             device.full_clean()
             device.save()  # materializes static addresses (ADR 0013, 0017, 0022)
+            if entry.hostname:
+                devices_by_hostname[entry.hostname] = device

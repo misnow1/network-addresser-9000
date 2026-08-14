@@ -11,13 +11,17 @@ inside ``save()`` itself, can guard those paths.
 import importlib
 import io
 import ipaddress
+import threading
+import time
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
+from auditlog.context import set_actor
 from auditlog.models import LogEntry
 from django.contrib.admin.sites import AdminSite
 from django.contrib.auth import get_user_model
-from django.contrib.auth.models import Group
+from django.contrib.auth.models import Group, Permission
 from django.contrib.messages import get_messages
 from django.contrib.messages.storage.fallback import FallbackStorage
 from django.core.exceptions import ValidationError
@@ -31,6 +35,7 @@ from django.test import RequestFactory, TestCase, TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
+from . import models as inventory_models
 from .admin import (
     AuditedModelAdminMixin,
     DepartmentAdmin,
@@ -81,6 +86,7 @@ from .models import (
     SwitchAddressing,
     SwitchPortVlanProfile,
     SwitchPortVlanProfileAllowedVlan,
+    _lock_devices_by_pk,
     default_switch_port_vlan_profile,
 )
 from .suggestions import (
@@ -6415,3 +6421,786 @@ class HostnameSuffixNormalizationTests(TestCase):
         )
         type_port.full_clean()  # must not raise
         self.assertEqual(type_port.hostname_suffix, "engine")
+
+
+# ---------------------------------------------------------------------------
+# ADR 0022 PR 3 — Add-in cards
+# ---------------------------------------------------------------------------
+
+
+class AddInCardModelTests(TestCase):
+    """Lifecycle and the three edges ADR 0022 decision 6 draws around
+    ``NetworkDevice.host``.
+    """
+
+    def setUp(self) -> None:
+        self.vlan = VLAN.objects.create(name="Card Dante", vlan_id=810, subnet="10.210.0.0/24")
+        self.rack = Rack.objects.create(name="Card Rack", slot_count=20)
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.210.0.0/27")
+        self.other_rack = Rack.objects.create(name="Other Card Rack", slot_count=20)
+        # Carved from the *same* /24 VLAN subnet as self.rack's own range
+        # (10.210.0.0/27) — a different, non-overlapping block within it,
+        # not a different subnet entirely.
+        RackVlanRange.objects.create(rack=self.other_rack, vlan=self.vlan, address_range="10.210.0.32/27")
+        self.host_type = _make_device_type(name="Card Host Type")
+        self.card_type = _make_device_type(
+            port_count=1, vlan=self.vlan, name="Card Type", is_add_in_card=True
+        )
+        self.host = NetworkDevice.objects.create(
+            device_type=self.host_type, rack=self.rack, rack_slot=1, hostname="host1"
+        )
+        self.card = NetworkDevice.objects.create(
+            device_type=self.card_type, rack=self.rack, rack_slot=2, hostname="card1"
+        )
+
+    # -- Lifecycle --
+
+    def test_fit_then_pull_keeps_rack_slot_and_address(self) -> None:
+        original_address = self.card.ports.get().address
+
+        self.card.host = self.host
+        self.card.save()
+        self.card.refresh_from_db()
+        self.assertEqual(self.card.host_id, self.host.pk)
+        self.assertEqual(self.card.rack_id, self.rack.pk)
+        self.assertEqual(self.card.rack_slot, 2)
+        self.assertEqual(self.card.ports.get().address, original_address)
+
+        self.card.host = None
+        self.card.save()
+        self.card.refresh_from_db()
+        self.assertIsNone(self.card.host_id)
+        self.assertEqual(self.card.rack_id, self.rack.pk)
+        self.assertEqual(self.card.rack_slot, 2)
+        self.assertEqual(self.card.ports.get().address, original_address)
+
+    def test_pulled_card_refit_to_a_different_host_is_the_same_row(self) -> None:
+        pk = self.card.pk
+        self.card.host = self.host
+        self.card.save()
+        self.card.host = None
+        self.card.save()
+
+        other_host = NetworkDevice.objects.create(
+            device_type=self.host_type, rack=self.rack, rack_slot=3, hostname="host2"
+        )
+        self.card.host = other_host
+        self.card.save()
+        self.card.refresh_from_db()
+        self.assertEqual(self.card.pk, pk)
+        self.assertEqual(self.card.host_id, other_host.pk)
+
+    def test_deleting_host_leaves_card_racked_addressed_and_hostless(self) -> None:
+        self.card.host = self.host
+        self.card.save()
+        address = self.card.ports.get().address
+
+        self.host.delete()
+
+        self.card.refresh_from_db()
+        self.assertIsNone(self.card.host_id)
+        self.assertEqual(self.card.rack_id, self.rack.pk)
+        self.assertEqual(self.card.rack_slot, 2)
+        self.assertEqual(self.card.ports.get().address, address)
+
+    # -- Edges --
+
+    def test_non_card_type_cannot_be_given_a_host_via_full_clean(self) -> None:
+        ordinary = NetworkDevice(
+            device_type=self.host_type, rack=self.rack, rack_slot=4, hostname="ordinary", host=self.host
+        )
+        with self.assertRaises(ValidationError):
+            ordinary.full_clean()
+
+    def test_non_card_type_cannot_be_given_a_host_via_create(self) -> None:
+        with self.assertRaises(ValidationError):
+            NetworkDevice.objects.create(
+                device_type=self.host_type, rack=self.rack, rack_slot=4, hostname="ordinary", host=self.host
+            )
+
+    def test_card_cannot_host_a_card_via_full_clean(self) -> None:
+        second_card = NetworkDevice.objects.create(
+            device_type=self.card_type, rack=self.rack, rack_slot=5, hostname="card2"
+        )
+        second_card.host = self.card
+        with self.assertRaises(ValidationError):
+            second_card.full_clean()
+
+    def test_card_cannot_host_a_card_via_create(self) -> None:
+        with self.assertRaises(ValidationError):
+            NetworkDevice.objects.create(
+                device_type=self.card_type, rack=self.rack, rack_slot=5, hostname="card2", host=self.card
+            )
+
+    def test_existing_card_cannot_be_set_to_host_itself_via_full_clean(self) -> None:
+        self.card.host = self.card
+        with self.assertRaises(ValidationError):
+            self.card.full_clean()
+
+    def test_existing_card_cannot_be_set_to_host_itself_via_save(self) -> None:
+        # No DB CheckConstraint backs this one (see NetworkDevice.Meta's own
+        # comment) — MariaDB refuses any CHECK referencing an AUTO_INCREMENT
+        # column, verified directly against this project's database. save()
+        # is therefore the backstop that must catch this, not just clean().
+        self.card.host = self.card
+        with self.assertRaises(ValidationError):
+            self.card.save()
+
+    def test_self_host_guard_catches_an_explicitly_keyed_row(self) -> None:
+        """Codex review, P2 — ``objects.create(pk=X, host_id=X, ...)``
+        resolves ``self.host`` against a row that doesn't exist *yet* (this
+        instance hasn't been inserted), so ``_get_related()`` catches the
+        resulting ``DoesNotExist`` and returns ``None``. The old check
+        compared ``host.pk`` (dereferencing first) and so bailed out at
+        "host is None" before ever comparing IDs, letting a self-referencing
+        row insert. This matters more than an ordinary edge case: MariaDB
+        won't take the ``CheckConstraint`` the plan called for, so this
+        ``save()``-path guard is the *only* enforcement of the self-host
+        edge that exists.
+        """
+        forced_pk = 1_000_000
+        self.assertFalse(NetworkDevice.objects.filter(pk=forced_pk).exists())
+        with self.assertRaises(ValidationError):
+            NetworkDevice.objects.create(
+                pk=forced_pk, device_type=self.card_type, host_id=forced_pk, hostname="self-hosted"
+            )
+        self.assertFalse(NetworkDevice.objects.filter(pk=forced_pk).exists())
+
+    def test_card_in_a_different_rack_from_its_host_is_allowed(self) -> None:
+        card_elsewhere = NetworkDevice.objects.create(
+            device_type=self.card_type,
+            rack=self.other_rack,
+            rack_slot=1,
+            hostname="card-elsewhere",
+            host=self.host,
+        )
+        card_elsewhere.full_clean()  # must not raise
+        self.assertEqual(card_elsewhere.host_id, self.host.pk)
+
+    def test_hostless_card_is_legal(self) -> None:
+        self.assertIsNone(self.card.host_id)
+        self.card.full_clean()  # must not raise
+
+    def test_is_add_in_card_cannot_be_changed_once_instances_exist(self) -> None:
+        self.card_type.is_add_in_card = False
+        with self.assertRaises(ValidationError):
+            self.card_type.save()
+        with self.assertRaises(ValidationError):
+            self.card_type.full_clean()
+
+    def test_is_add_in_card_editable_before_any_instance_exists(self) -> None:
+        fresh_type = NetworkDeviceType.objects.create(
+            manufacturer="Fresh", model="Type", name="Default", port_count=0
+        )
+        fresh_type.is_add_in_card = True
+        fresh_type.full_clean()
+        fresh_type.save()  # must not raise — no instances yet
+        fresh_type.refresh_from_db()
+        self.assertTrue(fresh_type.is_add_in_card)
+
+
+class AddInCardAdminReadonlyTests(TestCase):
+    """The admin-layer half of the ``is_add_in_card`` lock — mirrors
+    ``PortProfileLockedFieldTests``'s pattern for the model-level guard.
+    """
+
+    def setUp(self) -> None:
+        self.card_type = NetworkDeviceType.objects.create(
+            manufacturer="RO", model="Card", name="Default", port_count=0, is_add_in_card=True
+        )
+
+    def test_is_add_in_card_readonly_once_instances_exist(self) -> None:
+        NetworkDevice.objects.create(device_type=self.card_type)
+        admin = NetworkDeviceTypeAdmin(NetworkDeviceType, AdminSite())
+        readonly = admin.get_readonly_fields(RequestFactory().get("/"), self.card_type)
+        self.assertIn("is_add_in_card", readonly)
+
+    def test_is_add_in_card_editable_with_no_instances(self) -> None:
+        admin = NetworkDeviceTypeAdmin(NetworkDeviceType, AdminSite())
+        readonly = admin.get_readonly_fields(RequestFactory().get("/"), self.card_type)
+        self.assertNotIn("is_add_in_card", readonly)
+
+
+def _host_cleared_entry(card_pk: int) -> LogEntry | None:
+    """The most recent ``LogEntry`` on ``card_pk`` whose diff names
+    ``host`` — used by the audit tests below to find the entry that
+    proves the clearing was audited on the *card's own* history, not
+    merely "some entry exists somewhere" (which would pass vacuously on
+    the host's own deletion record).
+    """
+    entries = LogEntry.objects.filter(object_pk=str(card_pk), action=LogEntry.Action.UPDATE).order_by(
+        "-timestamp", "-pk"
+    )
+    for entry in entries:
+        if "host" in entry.changes_dict:
+            return entry
+    return None
+
+
+class AddInCardAuditTests(TestCase):
+    """ADR 0022 PR 3's Audit section — the ``SET_NULL`` path does not audit
+    itself. Every assertion here checks the *specific* ``host: <pk> ->
+    None`` transition with its actor, not merely that some LogEntry exists.
+    """
+
+    def setUp(self) -> None:
+        self.host_type = _make_device_type(name="Audit Host Type")
+        self.card_type = _make_device_type(name="Audit Card Type", is_add_in_card=True)
+        self.rack = Rack.objects.create(name="Audit Card Rack", slot_count=10)
+        self.host = NetworkDevice.objects.create(
+            device_type=self.host_type, rack=self.rack, rack_slot=1, hostname="audit-host"
+        )
+        self.card = NetworkDevice.objects.create(
+            device_type=self.card_type, rack=self.rack, rack_slot=2, hostname="audit-card"
+        )
+        self.actor = User.objects.create_user("card-auditor", password="testpass123")
+
+    def _assert_host_cleared(self, card_pk: int, old_host_pk: int, actor: Any) -> None:
+        entry = _host_cleared_entry(card_pk)
+        self.assertIsNotNone(entry, "no LogEntry on the card's own history recorded the host change")
+        assert entry is not None  # narrows the type for mypy; asserted above
+        old_val, new_val = entry.changes_dict["host"]
+        self.assertEqual(old_val, str(old_host_pk))
+        self.assertEqual(new_val, "None")
+        self.assertEqual(entry.actor, actor)
+
+    def test_fitting_is_logged_on_the_card_with_actor(self) -> None:
+        with set_actor(actor=self.actor):
+            self.card.host = self.host
+            self.card.save()
+        entry = LogEntry.objects.filter(object_pk=str(self.card.pk), action=LogEntry.Action.UPDATE).latest(
+            "timestamp"
+        )
+        self.assertIn("host", entry.changes_dict)
+        old_val, new_val = entry.changes_dict["host"]
+        self.assertEqual(old_val, "None")
+        self.assertEqual(new_val, str(self.host.pk))
+        self.assertEqual(entry.actor, self.actor)
+
+    def test_pulling_is_logged_on_the_card_with_actor(self) -> None:
+        self.card.host = self.host
+        self.card.save()
+        with set_actor(actor=self.actor):
+            self.card.host = None
+            self.card.save()
+        self._assert_host_cleared(self.card.pk, self.host.pk, self.actor)
+
+    def test_host_instance_delete_clears_and_logs_on_the_card(self) -> None:
+        self.card.host = self.host
+        self.card.save()
+        host_pk = self.host.pk  # captured before delete() clears self.host.pk in-place
+        with set_actor(actor=self.actor):
+            self.host.delete()
+        self._assert_host_cleared(self.card.pk, host_pk, self.actor)
+        self.card.refresh_from_db()
+        self.assertIsNone(self.card.host_id)
+
+    def test_host_queryset_delete_clears_and_logs_on_the_card(self) -> None:
+        self.card.host = self.host
+        self.card.save()
+        with set_actor(actor=self.actor):
+            NetworkDevice.objects.filter(pk=self.host.pk).delete()
+        self._assert_host_cleared(self.card.pk, self.host.pk, self.actor)
+        self.card.refresh_from_db()
+        self.assertIsNone(self.card.host_id)
+
+    def test_host_admin_bulk_delete_action_clears_and_logs_on_the_card_with_actor(self) -> None:
+        self.card.host = self.host
+        self.card.save()
+        call_command("sync_roles", stdout=io.StringIO())
+        admin_user = User.objects.create_user("card-audit-admin", password="testpass123", is_staff=True)
+        admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="card-audit-admin", password="testpass123")
+
+        # Django's delete_selected is a two-step confirm; the actual bulk
+        # QuerySet.delete() only fires on the second POST ("post": "yes").
+        self.client.post(
+            "/admin/inventory/networkdevice/",
+            {"action": "delete_selected", "_selected_action": [str(self.host.pk)]},
+        )
+        response = self.client.post(
+            "/admin/inventory/networkdevice/",
+            {"action": "delete_selected", "_selected_action": [str(self.host.pk)], "post": "yes"},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(NetworkDevice.objects.filter(pk=self.host.pk).exists())
+
+        self._assert_host_cleared(self.card.pk, self.host.pk, admin_user)
+        self.card.refresh_from_db()
+        self.assertIsNone(self.card.host_id)
+
+
+class AddInCardConcurrencyTests(TransactionTestCase):
+    """ADR 0022 PR 3's Concurrency section. ``TransactionTestCase``, not
+    ``TestCase`` — a plain ``TestCase`` wraps everything in one transaction
+    and cannot exercise a real cross-connection lock wait.
+    """
+
+    def setUp(self) -> None:
+        self.host_type = _make_device_type(name="Concurrency Host Type")
+        self.card_type = _make_device_type(name="Concurrency Card Type", is_add_in_card=True)
+        self.rack = Rack.objects.create(name="Concurrency Card Rack", slot_count=10)
+        self.host_a = NetworkDevice.objects.create(
+            device_type=self.host_type, rack=self.rack, rack_slot=1, hostname="conc-host-a"
+        )
+        self.host_b = NetworkDevice.objects.create(
+            device_type=self.host_type, rack=self.rack, rack_slot=2, hostname="conc-host-b"
+        )
+        self.card = NetworkDevice.objects.create(
+            device_type=self.card_type, rack=self.rack, rack_slot=3, hostname="conc-card"
+        )
+
+    @staticmethod
+    def _locked_fit(
+        key: str,
+        host_pk: int,
+        card_pk: int,
+        results: dict[str, str],
+        *,
+        hold_time: float = 0.0,
+        on_locked: Any = None,
+    ) -> None:
+        """The same locking discipline ``NetworkDeviceAdmin._fit_existing_
+        card`` uses: lock host and card together, in ascending pk order,
+        then re-check inside the lock.
+        """
+        try:
+            with transaction.atomic():
+                locked = _lock_devices_by_pk(host_pk, card_pk)
+                if on_locked is not None:
+                    on_locked()
+                if hold_time:
+                    time.sleep(hold_time)
+                host = locked.get(host_pk)
+                card = locked.get(card_pk)
+                if host is None or card is None:
+                    results[key] = "gone"
+                    return
+                if host.device_type.is_add_in_card or not card.device_type.is_add_in_card:
+                    results[key] = "invalid"
+                    return
+                if card.host_id is not None:
+                    results[key] = "already-fitted"
+                    return
+                card.host = host
+                card.save()
+                results[key] = "fitted"
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _real_host_delete(key: str, host: NetworkDevice, results: dict[str, str]) -> None:
+        """Calls the real, unmodified ``NetworkDevice.delete()`` — no
+        external pre-lock. An earlier version of this helper locked the
+        host itself before calling ``delete()``, which happened to
+        serialize things correctly regardless of whether the production
+        ``pre_delete`` receiver locked before discovering children, masking
+        exactly the ordering bug Codex review found (P1): the receiver used
+        to read the card list with a plain, unlocked query *before* taking
+        any lock. Every concurrency test below now drives ``delete()``
+        directly, so a regression of that ordering fails these tests again.
+        """
+        try:
+            host.delete()
+            results[key] = "deleted"
+        except Exception as exc:  # noqa: BLE001 — recorded, not swallowed
+            results[key] = f"error:{exc}"
+        finally:
+            connection.close()
+
+    def test_competing_fits_resolve_to_a_single_host(self) -> None:
+        """Two requests each observing the card as hostless and fitting it
+        to different hosts must not resolve to last-write-wins — one wins,
+        the other observes the card already fitted once it acquires its
+        own lock.
+        """
+        lock_acquired = threading.Event()
+        results: dict[str, str] = {}
+
+        slow = threading.Thread(
+            target=self._locked_fit,
+            args=("a", self.host_a.pk, self.card.pk, results),
+            kwargs={"hold_time": 0.4, "on_locked": lock_acquired.set},
+        )
+
+        def start_fast() -> None:
+            lock_acquired.wait(timeout=5)
+            self._locked_fit("b", self.host_b.pk, self.card.pk, results)
+
+        fast = threading.Thread(target=start_fast)
+        slow.start()
+        fast.start()
+        slow.join(timeout=10)
+        fast.join(timeout=10)
+
+        self.assertEqual(sorted(results.values()), ["already-fitted", "fitted"])
+        self.card.refresh_from_db()
+        self.assertIn(self.card.host_id, (self.host_a.pk, self.host_b.pk))
+
+    def test_fit_racing_a_host_deletion_neither_orphans_nor_fails_the_delete(self) -> None:
+        """The delete wins the race (holds the lock first): the competing
+        fit must see the host is already gone and refuse cleanly — never
+        silently fit the card to a host that no longer exists, and never
+        cause the delete itself to fail on a newly created FK.
+
+        Drives the real ``host.delete()`` call, timed via an instrumented
+        ``_lock_devices_by_pk`` (patched only inside ``inventory.models``,
+        where the ``pre_delete`` receiver calls it — the fit thread's own
+        separately-imported reference is untouched) rather than an external
+        pre-lock, so this exercises the production locking order rather
+        than a test-only stand-in for it.
+        """
+        lock_acquired = threading.Event()
+        results: dict[str, str] = {}
+        real_lock = inventory_models._lock_devices_by_pk
+
+        def instrumented_lock(*pks: int) -> dict[int, NetworkDevice]:
+            locked = real_lock(*pks)
+            if pks == (self.host_a.pk,):
+                lock_acquired.set()
+                time.sleep(0.4)
+            return locked
+
+        def run_delete() -> None:
+            with mock.patch.object(inventory_models, "_lock_devices_by_pk", side_effect=instrumented_lock):
+                self._real_host_delete("delete", self.host_a, results)
+
+        def run_fit() -> None:
+            lock_acquired.wait(timeout=5)
+            self._locked_fit("fit", self.host_a.pk, self.card.pk, results)
+
+        deleter = threading.Thread(target=run_delete)
+        fitter = threading.Thread(target=run_fit)
+        deleter.start()
+        fitter.start()
+        deleter.join(timeout=10)
+        fitter.join(timeout=10)
+
+        self.assertEqual(results.get("delete"), "deleted")
+        self.assertEqual(results.get("fit"), "gone")
+        self.card.refresh_from_db()
+        self.assertIsNone(self.card.host_id)
+        self.assertFalse(NetworkDevice.objects.filter(pk=self.host_a.pk).exists())
+
+    def test_host_deletion_racing_a_fit_clears_the_newly_fitted_card(self) -> None:
+        """The other direction: the fit wins the race and commits first —
+        the delete must still discover and audited-clear the newly-fitted
+        card rather than fail, since it locks before reading which cards
+        are fitted. Drives the real ``host.delete()`` call directly (no
+        pre-lock) — the fit thread's own held lock is what makes the delete
+        thread wait here, exactly as it would under real contention.
+        """
+        lock_acquired = threading.Event()
+        results: dict[str, str] = {}
+
+        fitter = threading.Thread(
+            target=self._locked_fit,
+            args=("fit", self.host_a.pk, self.card.pk, results),
+            kwargs={"hold_time": 0.4, "on_locked": lock_acquired.set},
+        )
+
+        def run_delete() -> None:
+            lock_acquired.wait(timeout=5)
+            self._real_host_delete("delete", self.host_a, results)
+
+        deleter = threading.Thread(target=run_delete)
+        fitter.start()
+        deleter.start()
+        fitter.join(timeout=10)
+        deleter.join(timeout=10)
+
+        self.assertEqual(results.get("fit"), "fitted")
+        self.assertEqual(results.get("delete"), "deleted")
+        self.card.refresh_from_db()
+        self.assertIsNone(self.card.host_id)
+        self.assertFalse(NetworkDevice.objects.filter(pk=self.host_a.pk).exists())
+        entry = _host_cleared_entry(self.card.pk)
+        self.assertIsNotNone(entry, "the delete must clear the newly-fitted card through an audited save")
+
+
+class FitAndPullAdminTests(TestCase):
+    """The dedicated "fit a card" view and the Pull action — permissions,
+    server-side validation of a crafted POST, and the shape of each write.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.vlan = VLAN.objects.create(name="Fit VLAN", vlan_id=813, subnet="10.213.0.0/24")
+        self.rack = Rack.objects.create(name="Fit Rack", slot_count=10)
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.213.0.0/27")
+        self.host_type = _make_device_type(name="Fit Host Type")
+        self.card_type = _make_device_type(name="Fit Card Type", is_add_in_card=True)
+        self.non_card_type = _make_device_type(name="Fit Non-card Type")
+        self.card_host_type = _make_device_type(name="Fit Card Host Type", is_add_in_card=True)
+
+        self.host = NetworkDevice.objects.create(
+            device_type=self.host_type, rack=self.rack, rack_slot=1, hostname="fit-host"
+        )
+        self.hostless_card = NetworkDevice.objects.create(
+            device_type=self.card_type, rack=self.rack, rack_slot=2, hostname="fit-card"
+        )
+        self.card_typed_host = NetworkDevice.objects.create(
+            device_type=self.card_host_type, rack=self.rack, rack_slot=3, hostname="fit-card-as-host"
+        )
+
+        self.editor = User.objects.create_user("fit-editor", password="testpass123", is_staff=True)
+        self.editor.groups.add(Group.objects.get(name="Editor"))
+        self.viewer = User.objects.create_user("fit-viewer", password="testpass123", is_staff=True)
+        self.viewer.groups.add(Group.objects.get(name="Viewer"))
+
+        self.add_only = User.objects.create_user("fit-add-only", password="testpass123", is_staff=True)
+        self.add_only.user_permissions.add(
+            Permission.objects.get(codename="add_networkdevice"),
+            Permission.objects.get(codename="view_networkdevice"),
+        )
+        self.change_only = User.objects.create_user("fit-change-only", password="testpass123", is_staff=True)
+        self.change_only.user_permissions.add(
+            Permission.objects.get(codename="change_networkdevice"),
+            Permission.objects.get(codename="view_networkdevice"),
+        )
+
+    def _login(self, user: Any) -> None:
+        self.client.force_login(user)
+
+    def _fit_url(self, host: NetworkDevice | None = None) -> str:
+        return f"/admin/inventory/networkdevice/{(host or self.host).pk}/fit-card/"
+
+    # -- existing-card path --
+
+    def test_existing_card_path_preserves_pk_and_fits(self) -> None:
+        self._login(self.editor)
+        pk = self.hostless_card.pk
+        response = self.client.post(self._fit_url(), {"fit_mode": "existing", "card": str(pk)})
+        self.assertEqual(response.status_code, 302)
+        self.hostless_card.refresh_from_db()
+        self.assertEqual(self.hostless_card.pk, pk)
+        self.assertEqual(self.hostless_card.host_id, self.host.pk)
+
+    def test_existing_card_path_denied_without_change(self) -> None:
+        self._login(self.add_only)
+        response = self.client.post(
+            self._fit_url(), {"fit_mode": "existing", "card": str(self.hostless_card.pk)}
+        )
+        self.assertEqual(response.status_code, 403)
+        self.hostless_card.refresh_from_db()
+        self.assertIsNone(self.hostless_card.host_id)
+
+    def test_existing_card_path_denied_for_viewer(self) -> None:
+        self._login(self.viewer)
+        response = self.client.post(
+            self._fit_url(), {"fit_mode": "existing", "card": str(self.hostless_card.pk)}
+        )
+        self.assertEqual(response.status_code, 403)
+        self.hostless_card.refresh_from_db()
+        self.assertIsNone(self.hostless_card.host_id)
+
+    def test_crafted_post_naming_a_card_typed_host_is_refused(self) -> None:
+        self._login(self.editor)
+        response = self.client.post(
+            self._fit_url(host=self.card_typed_host),
+            {"fit_mode": "existing", "card": str(self.hostless_card.pk)},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.hostless_card.refresh_from_db()
+        self.assertIsNone(self.hostless_card.host_id)
+
+    def test_crafted_post_naming_a_non_card_row_as_the_card_is_refused(self) -> None:
+        self._login(self.editor)
+        non_card_device = NetworkDevice.objects.create(
+            device_type=self.non_card_type, rack=self.rack, rack_slot=4, hostname="not-a-card"
+        )
+        response = self.client.post(
+            self._fit_url(), {"fit_mode": "existing", "card": str(non_card_device.pk)}
+        )
+        self.assertEqual(response.status_code, 302)
+        non_card_device.refresh_from_db()
+        self.assertIsNone(non_card_device.host_id)
+
+    # -- create path --
+
+    def test_create_path_requires_add_and_change_and_inserts_once_with_host_set(self) -> None:
+        self._login(self.editor)
+        response = self.client.post(
+            self._fit_url(),
+            {
+                "fit_mode": "create",
+                "device_type": str(self.card_type.pk),
+                "hostname": "new-card",
+                "rack": str(self.rack.pk),
+                "rack_slot": "5",
+                "port_addressing": "dhcp",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        new_card = NetworkDevice.objects.get(hostname="new-card")
+        self.assertEqual(new_card.host_id, self.host.pk)
+        # Exactly one row for this hostname — construct-once, not an
+        # insert followed by a patch (review note 5).
+        self.assertEqual(NetworkDevice.objects.filter(hostname="new-card").count(), 1)
+
+    def test_create_path_denied_without_add(self) -> None:
+        self._login(self.change_only)
+        response = self.client.post(
+            self._fit_url(),
+            {
+                "fit_mode": "create",
+                "device_type": str(self.card_type.pk),
+                "hostname": "denied-card-1",
+                "rack": str(self.rack.pk),
+                "rack_slot": "5",
+                "port_addressing": "dhcp",
+            },
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(NetworkDevice.objects.filter(hostname="denied-card-1").exists())
+
+    def test_create_path_denied_without_change(self) -> None:
+        self._login(self.add_only)
+        response = self.client.post(
+            self._fit_url(),
+            {
+                "fit_mode": "create",
+                "device_type": str(self.card_type.pk),
+                "hostname": "denied-card-2",
+                "rack": str(self.rack.pk),
+                "rack_slot": "5",
+                "port_addressing": "dhcp",
+            },
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(NetworkDevice.objects.filter(hostname="denied-card-2").exists())
+
+    def test_crafted_post_naming_a_type_outside_the_picker_queryset_is_refused(self) -> None:
+        self._login(self.editor)
+        response = self.client.post(
+            self._fit_url(),
+            {
+                "fit_mode": "create",
+                "device_type": str(self.non_card_type.pk),
+                "hostname": "should-not-exist",
+                "rack": str(self.rack.pk),
+                "rack_slot": "5",
+                "port_addressing": "dhcp",
+            },
+        )
+        self.assertEqual(response.status_code, 200)  # re-rendered with a form error
+        self.assertFalse(NetworkDevice.objects.filter(hostname="should-not-exist").exists())
+
+    def test_crafted_post_with_a_malformed_device_type_id_is_refused_not_500(self) -> None:
+        """Codex review, P2 — a non-numeric ``device_type`` used to reach a
+        raw ``QuerySet.filter(device_type_id=<garbage>)`` call inside
+        ``with_operator_fields()`` before ``ModelChoiceField`` ever got a
+        chance to turn it into an ordinary form error, raising a bare
+        ``ValueError`` (a 500) instead.
+        """
+        self._login(self.editor)
+        response = self.client.post(
+            self._fit_url(),
+            {
+                "fit_mode": "create",
+                "device_type": "not-an-int",
+                "hostname": "should-not-exist-either",
+                "rack": str(self.rack.pk),
+                "rack_slot": "5",
+                "port_addressing": "dhcp",
+            },
+        )
+        self.assertEqual(response.status_code, 200)  # re-rendered with a form error, never a 500
+        self.assertFalse(NetworkDevice.objects.filter(hostname="should-not-exist-either").exists())
+
+    def test_fit_card_view_denies_get_for_staff_with_no_device_permissions(self) -> None:
+        """Codex review, P2 — ``admin_site.admin_view`` only supplies
+        login/staff gating, never a model permission check. Without an
+        explicit check, a staff user holding no ``NetworkDevice`` permission
+        at all could GET this URL directly and see the host rendered before
+        either per-section template guard ever runs.
+        """
+        no_perms_user = User.objects.create_user("fit-no-perms", password="testpass123", is_staff=True)
+        self._login(no_perms_user)
+        response = self.client.get(self._fit_url())
+        self.assertEqual(response.status_code, 403)
+
+    def test_create_path_prompts_for_operator_port_address(self) -> None:
+        """A card type carrying an OPERATOR port must still prompt for its
+        address — proof the create path really goes through
+        ``NetworkDeviceAddForm.with_operator_fields()`` rather than a
+        bespoke form that would silently skip it (review note 5).
+        """
+        operator_vlan = VLAN.objects.create(name="Fit Operator VLAN", vlan_id=814, subnet="10.214.0.0/24")
+        RackVlanRange.objects.create(rack=self.rack, vlan=operator_vlan, address_range="10.214.0.0/27")
+        operator_card_type = NetworkDeviceType.objects.create(
+            manufacturer="Fit", model="OperatorCard", name="Default", port_count=1, is_add_in_card=True
+        )
+        type_port = NetworkDeviceTypePort.objects.create(
+            device_type=operator_card_type,
+            description="Aux",
+            port_type=PortType.GBE_RJ45,
+            vlan=operator_vlan,
+            address_source=PortAddressSource.OPERATOR,
+        )
+        self._login(self.editor)
+
+        # No operator_address__<pk> supplied — must be refused, not silently
+        # materialized DHCP or with a blank address.
+        response = self.client.post(
+            self._fit_url(),
+            {
+                "fit_mode": "create",
+                "device_type": str(operator_card_type.pk),
+                "hostname": "operator-card",
+                "rack": str(self.rack.pk),
+                "rack_slot": "6",
+                "port_addressing": "static",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(NetworkDevice.objects.filter(hostname="operator-card").exists())
+
+        response = self.client.post(
+            self._fit_url(),
+            {
+                "fit_mode": "create",
+                "device_type": str(operator_card_type.pk),
+                "hostname": "operator-card",
+                "rack": str(self.rack.pk),
+                "rack_slot": "6",
+                "port_addressing": "static",
+                f"operator_address__{type_port.pk}": "10.214.0.20",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        card = NetworkDevice.objects.get(hostname="operator-card")
+        self.assertEqual(card.host_id, self.host.pk)
+        self.assertEqual(card.ports.get().address, "10.214.0.20")
+
+    # -- Pull --
+
+    def test_pull_requires_change(self) -> None:
+        self.hostless_card.host = self.host
+        self.hostless_card.save()
+        self._login(self.viewer)
+        response = self.client.post(
+            "/admin/inventory/networkdevice/",
+            {"action": "pull_cards", "_selected_action": [str(self.hostless_card.pk)]},
+        )
+        # An action outside the user's permitted set is dropped by Django's
+        # own action-permission filtering, not a 403 — the changelist just
+        # re-renders with nothing changed.
+        self.assertEqual(response.status_code, 200)
+        self.hostless_card.refresh_from_db()
+        self.assertEqual(self.hostless_card.host_id, self.host.pk)
+
+    def test_pull_clears_host_leaves_rack_and_slot(self) -> None:
+        self.hostless_card.host = self.host
+        self.hostless_card.save()
+        rack_id, slot = self.hostless_card.rack_id, self.hostless_card.rack_slot
+        self._login(self.editor)
+        response = self.client.post(
+            "/admin/inventory/networkdevice/",
+            {"action": "pull_cards", "_selected_action": [str(self.hostless_card.pk)]},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.hostless_card.refresh_from_db()
+        self.assertIsNone(self.hostless_card.host_id)
+        self.assertEqual(self.hostless_card.rack_id, rack_id)
+        self.assertEqual(self.hostless_card.rack_slot, slot)

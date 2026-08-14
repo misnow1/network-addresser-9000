@@ -1,0 +1,64 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block title %}{{ title }} | {{ site_title|default:_('Django site admin') }}{% endblock %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+<a href="{% url 'admin:index' %}">{% translate 'Home' %}</a>
+&rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a>
+&rsaquo; <a href="{% url 'admin:inventory_networkdevice_changelist' %}">{{ opts.verbose_name_plural|capfirst }}</a>
+&rsaquo; <a href="{% url 'admin:inventory_networkdevice_change' host.pk %}">{{ host }}</a>
+&rsaquo; {% translate "Fit a card" %}
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+  <h1>{% blocktranslate %}Fit a card to {{ host }}{% endblocktranslate %}</h1>
+  <p>
+    A card is an ordinary device with a soft "currently fitted to" link (ADR 0022) — it keeps its
+    own rack slot and addresses whether or not it is fitted to anything.
+  </p>
+
+  <fieldset class="module aligned">
+    <h2>{% translate "Choose an existing hostless card" %}</h2>
+    {% if can_use_existing %}
+      <form method="post" action="{% url 'admin:inventory_networkdevice_fit_card' host.pk %}">
+        {% csrf_token %}
+        <input type="hidden" name="fit_mode" value="existing">
+        <div class="form-row">
+          <label for="id_card">{% translate "Card" %}:</label>
+          <select name="card" id="id_card" required>
+            <option value="">---------</option>
+            {% for card in existing_cards %}
+              <option value="{{ card.pk }}">{{ card }} ({{ card.device_type }})</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="submit-row">
+          <input type="submit" value="{% translate 'Fit selected card' %}" class="default">
+        </div>
+      </form>
+    {% else %}
+      <p class="help">{% translate "You do not have permission to fit an existing card." %}</p>
+    {% endif %}
+  </fieldset>
+
+  <fieldset class="module aligned">
+    <h2>{% translate "Or create a new card" %}</h2>
+    {% if can_create %}
+      <form method="post" action="{% url 'admin:inventory_networkdevice_fit_card' host.pk %}">
+        {% csrf_token %}
+        <input type="hidden" name="fit_mode" value="create">
+        {{ create_form.as_p }}
+        <div class="submit-row">
+          <input type="submit" value="{% translate 'Create and fit' %}" class="default">
+        </div>
+      </form>
+    {% else %}
+      <p class="help">{% translate "You do not have permission to create a new card." %}</p>
+    {% endif %}
+  </fieldset>
+</div>
+{% endblock %}

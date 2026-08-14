@@ -842,7 +842,10 @@ def device_detail(request: HttpRequest, pk: int) -> HttpResponse:
     it has one (ADR 0022), ``default_gateway`` (read live off the port's
     VLAN, ``models.py:4640`` — never recomputed here), and the connected
     switch **port** (Stage B — not just the switch, per
-    ``NetworkDevicePort.switch_port``) via ``switch_port__switch``.
+    ``NetworkDevicePort.switch_port``) via ``switch_port__switch``. Also a
+    "Fitted to …" line when this device is itself a card (``host``) and a
+    "Cards fitted" list when other devices are fitted to this one
+    (``installed_cards``) — ADR 0022 PR 3.
 
     This is the *canonical* device page (Stage B decision 13): the generic
     parity route for ``NetworkDevice`` redirects here rather than rendering
@@ -850,9 +853,16 @@ def device_detail(request: HttpRequest, pk: int) -> HttpResponse:
     page doesn't render yet is a real gap, not a duplicate source of truth.
     An audit-history panel (Stage B) renders at the bottom when the viewer
     holds ``auditlog.view_logentry``.
+
+    ``canonical_detail_view`` (``REGISTRY["networkdevice"]``) redirects the
+    generic parity route here, so the registry's own ``select_related``/
+    ``prefetch_related`` hints never apply to this page — ``host`` and
+    ``installed_cards`` have to be declared in *this* queryset instead, or
+    "Fitted to" costs a query and "Cards fitted" is an N+1 (ADR 0022 PR 3
+    review note 8).
     """
     device = get_object_or_404(
-        NetworkDevice.objects.select_related("device_type", "rack").prefetch_related(
+        NetworkDevice.objects.select_related("device_type", "rack", "host").prefetch_related(
             Prefetch(
                 "ports",
                 # source_type_port (ADR 0022) — port.hostname reads it on
@@ -862,6 +872,10 @@ def device_detail(request: HttpRequest, pk: int) -> HttpResponse:
                     "vlan", "switch_port__switch", "source_type_port"
                 ).order_by("ordinal"),
             ),
+            Prefetch(
+                "installed_cards",
+                queryset=NetworkDevice.objects.select_related("device_type", "rack").order_by("hostname"),
+            ),
         ),
         pk=pk,
     )
@@ -869,6 +883,7 @@ def device_detail(request: HttpRequest, pk: int) -> HttpResponse:
     context = {
         "device": device,
         "ports": list(device.ports.all()),
+        "installed_cards": list(device.installed_cards.all()),
         "admin_change_url": reverse("admin:inventory_networkdevice_change", args=[device.pk]),
         "rack_url": reverse("inventory:rack", args=[device.rack_id]) if device.rack_id else None,
         "audit_entries": audit_entries,
@@ -1333,12 +1348,14 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Model", "model"),
             FieldSpec("Name", "name"),
             FieldSpec("Port count", "port_count"),
+            FieldSpec("Add-in card", "is_add_in_card", render="boolean"),
         ),
         detail_fields=(
             FieldSpec("Manufacturer", "manufacturer"),
             FieldSpec("Model", "model"),
             FieldSpec("Name", "name"),
             FieldSpec("Port count", "port_count"),
+            FieldSpec("Add-in card", "is_add_in_card", render="boolean"),
         ),
         inlines=(
             InlineSpec(
@@ -1377,6 +1394,7 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Serial number", "serial_number"),
             FieldSpec("Rack", "rack", render="relation"),
             FieldSpec("Rack slot", "rack_slot"),
+            FieldSpec("Host", "host", render="relation"),
         ),
         # Never actually rendered — see the Rack entry's identical note.
         detail_fields=(
@@ -1385,6 +1403,7 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Serial number", "serial_number"),
             FieldSpec("Rack", "rack", render="relation"),
             FieldSpec("Rack slot", "rack_slot"),
+            FieldSpec("Host", "host", render="relation"),
         ),
         inlines=(
             InlineSpec(
@@ -1407,7 +1426,7 @@ REGISTRY: dict[str, ModelSpec] = {
         ),
         canonical_detail_view="inventory:device",
         ordering=("hostname",),
-        list_select_related=("device_type", "rack"),
+        list_select_related=("device_type", "rack", "host"),
         list_permissions=(
             "inventory.view_networkdevice",
             "inventory.view_networkdevicetype",

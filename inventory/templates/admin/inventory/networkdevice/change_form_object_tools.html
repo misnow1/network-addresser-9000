@@ -1,0 +1,11 @@
+{% extends "admin/change_form_object_tools.html" %}
+{% load i18n %}
+
+{% block object-tools-items %}
+  {% if original.pk and not original.device_type.is_add_in_card and perms.inventory.change_networkdevice %}
+    <li>
+      <a href="{% url 'admin:inventory_networkdevice_fit_card' original.pk %}" class="fitcardlink">{% translate "Fit a card" %}</a>
+    </li>
+  {% endif %}
+  {{ block.super }}
+{% endblock %}
