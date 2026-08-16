@@ -568,6 +568,76 @@ class Department(AuditedModel):
             self.name = self.name.strip()
 
 
+class Owner(AuditedModel):
+    """Who owns a piece of equipment — "MPS", "BEJ" — the first component
+    of a computed hostname (ADR 0023 decision 1). A table rather than free
+    text for the same reason as ``Department`` (issue #10).
+
+    Not to be confused with ``Department`` (ADR 0021): a Department owns a
+    VLAN and is purely descriptive vocabulary nothing branches on; an
+    Owner owns equipment and is a **blocking** hostname component — no
+    owner means no computed hostname at all (ADR 0023 decision 1).
+    ``Rack.owner`` is a creation-time *default* for a racked item's own
+    ``owner``, not inheritance — moving a rack to a different owner never
+    touches equipment already in it (ADR 0019's suggest-don't-lock).
+    """
+
+    slug = models.CharField(
+        max_length=63,
+        unique=True,
+        validators=[validate_dns_label],
+        help_text='Short, DNS-safe identifier used in hostnames, e.g. "mps".',
+    )
+    name = models.CharField(max_length=100, unique=True, help_text='Full name, e.g. "MPS".')
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(condition=~models.Q(slug=""), name="owner_slug_not_blank"),
+            models.CheckConstraint(condition=~models.Q(name=""), name="owner_name_not_blank"),
+        ]
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.slug})"
+
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        # Stripped (and, for slug, lowercased) here too, not just clean() —
+        # Model.save() never calls clean() (Department.save()'s reasoning
+        # above), so a direct Owner.objects.create(slug="MPS ") would
+        # otherwise persist an unstripped, uncased value validate_dns_label
+        # would have rejected. slug is lowercased (unlike Department.name,
+        # which strips but deliberately doesn't casefold) because it's
+        # concatenated verbatim into a hostname.
+        if self.slug:
+            self.slug = self.slug.strip().lower()
+        if self.name:
+            self.name = self.name.strip()
+        super().save(
+            force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
+        )
+
+    def clean_fields(self, exclude=None) -> None:
+        # Normalize *before* the field validators run — Model.full_clean()
+        # calls clean_fields() (which runs slug's own validate_dns_label
+        # validator) before clean(), Django's own ordering. Normalizing
+        # only in clean()/save() left full_clean() validating the raw,
+        # not-yet-normalized value: "MPS " failed validate_dns_label here
+        # before clean() ever got a chance to strip/lowercase it,
+        # contradicting this field's documented contract. Mirrors
+        # NetworkDeviceTypePort.clean_fields()'s identical fix for
+        # hostname_suffix.
+        if self.slug:
+            self.slug = self.slug.strip().lower()
+        super().clean_fields(exclude=exclude)
+
+    def clean(self) -> None:
+        super().clean()
+        if self.slug:
+            self.slug = self.slug.strip().lower()
+        if self.name:
+            self.name = self.name.strip()
+
+
 class VLAN(AuditedModel):
     """An 802.1Q VLAN and its IPv4 addressing — one row, per CONTEXT.md."""
 
@@ -1063,6 +1133,30 @@ class Rack(AuditedModel):
 
     name = models.CharField(max_length=100)
     slot_count = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    owner = models.ForeignKey(
+        Owner,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="racks",
+        help_text=(
+            "Optional. Defaults a racked item's own Owner at creation (ADR 0023) — a suggestion, "
+            "not inheritance; moving this rack to a different owner never touches equipment "
+            "already in it."
+        ),
+    )
+    location_slug = models.CharField(
+        max_length=63,
+        null=True,
+        blank=True,
+        unique=True,
+        validators=[validate_dns_label],
+        help_text=(
+            'Optional, DNS-safe location name used in hostnames, e.g. "wpcsrl". Blank means '
+            "this rack contributes no location component — not that it's virtual: AVIO and "
+            "SPARE both carry one, only CONSOLES doesn't (ADR 0023)."
+        ),
+    )
 
     #: Class-level default for the ``template`` property below — never a
     #: plain class attribute, since Django's ``Model.__init__`` only
@@ -1081,6 +1175,11 @@ class Rack(AuditedModel):
         return self.name
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        # Stripped/lowercased/blank-to-None here too, not just clean() —
+        # Model.save() never calls clean() (Department.save()'s reasoning),
+        # so a direct Rack.objects.create(location_slug="  ") would
+        # otherwise persist an unstripped value instead of None.
+        self.location_slug = self._normalize_location_slug(self.location_slug)
         # ``self.pk is None or self._state.adding`` — see NetworkSwitch.save()
         # for why neither check alone is sufficient.
         is_new = self.pk is None or self._state.adding
@@ -1091,8 +1190,27 @@ class Rack(AuditedModel):
             if is_new and self._template is not None:
                 self._apply_template()
 
+    @staticmethod
+    def _normalize_location_slug(value: str | None) -> str | None:
+        # "" -> None (settled decision 5): null=True + unique=True is what
+        # MySQL enforces uniqueness on, and MySQL permits unlimited NULLs
+        # in a unique index — "" would collide with itself the moment a
+        # second blank rack were saved.
+        if value is None:
+            return None
+        value = value.strip().lower()
+        return value or None
+
+    def clean_fields(self, exclude=None) -> None:
+        # Normalize *before* the field validators run — see
+        # Owner.clean_fields()/NetworkDeviceTypePort.clean_fields() for why
+        # this can't wait for clean().
+        self.location_slug = self._normalize_location_slug(self.location_slug)
+        super().clean_fields(exclude=exclude)
+
     def clean(self) -> None:
         super().clean()
+        self.location_slug = self._normalize_location_slug(self.location_slug)
         if self.pk is None:
             # Advisory only — _apply_template() re-checks against the same
             # snapshot inside save()'s transaction, which is the real
@@ -2071,6 +2189,17 @@ class NetworkSwitchType(AuditedModel):
     port_count = models.PositiveIntegerField(
         help_text="Must equal the number of Network Switch Type Ports defined for this profile."
     )
+    hostname_slug = models.CharField(
+        max_length=63,
+        blank=True,
+        validators=[validate_dns_label],
+        help_text=(
+            'Operator-set hostname abbreviation, e.g. "sg300-10mp". Never auto-filled — '
+            'slugify("IK-42") gives "ik-42" where the name in use might be "ik42" — and '
+            "deliberately not unique: two profiles of one model both carry the same abbreviation. "
+            "Blank means this Type offers no computed hostnames (ADR 0023)."
+        ),
+    )
 
     class Meta:
         constraints = [
@@ -2083,6 +2212,12 @@ class NetworkSwitchType(AuditedModel):
         return f"{self.manufacturer} {self.model} — {self.name}"
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        # hostname_slug is normalized here, outside the locked-fields
+        # dict below — it deliberately never joins the lock (settled
+        # decision 3): a typo'd abbreviation must stay fixable without
+        # creating a new named profile.
+        if self.hostname_slug:
+            self.hostname_slug = self.hostname_slug.strip().lower()
         with transaction.atomic():
             if self.pk is not None:
                 _lock_type_rows(NetworkSwitchType, self.pk)
@@ -2102,8 +2237,17 @@ class NetworkSwitchType(AuditedModel):
                 force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
             )
 
+    def clean_fields(self, exclude=None) -> None:
+        # Normalize *before* the field validators run — see
+        # Owner.clean_fields() for why this can't wait for clean().
+        if self.hostname_slug:
+            self.hostname_slug = self.hostname_slug.strip().lower()
+        super().clean_fields(exclude=exclude)
+
     def clean(self) -> None:
         super().clean()
+        if self.hostname_slug:
+            self.hostname_slug = self.hostname_slug.strip().lower()
         if self.pk is not None and self.switches.exists():
             _check_locked_fields_unchanged(
                 NetworkSwitchType,
@@ -2285,6 +2429,27 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
     rack = models.ForeignKey(Rack, on_delete=models.PROTECT, null=True, blank=True, related_name="switches")
     rack_slot = models.PositiveIntegerField(null=True, blank=True, validators=[MinValueValidator(1)])
     dhcp_server_enabled = models.BooleanField(default=False)
+    owner = models.ForeignKey(
+        Owner,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="switches",
+        help_text="Hostname component 1 (ADR 0023) — defaults from this switch's rack at creation.",
+    )
+    hostname_purpose = models.CharField(
+        max_length=63,
+        blank=True,
+        validators=[validate_dns_label],
+        help_text='Hostname component 4, e.g. "sub" or "midhi-01-04" — a non-numeric qualifier '
+        "belongs here, not in the sequence below (ADR 0023).",
+    )
+    hostname_sequence = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Hostname component 5 — an integer distinguishing otherwise-identical names, "
+        "e.g. 1 or 2 for mps-avio-aes-1 and mps-avio-aes-2 (ADR 0023).",
+    )
 
     #: Class-level default for the ``address_materialization`` property
     #: below — never a plain class attribute, since Django's
@@ -2322,6 +2487,10 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
         # resets pk to None but leaves ``_state.adding`` False), which would
         # otherwise silently skip materialization on a re-save of the same
         # in-memory instance.
+        # Stripped/lowercased here too, not just clean() — Model.save()
+        # never calls clean() (Department.save()'s reasoning).
+        if self.hostname_purpose:
+            self.hostname_purpose = self.hostname_purpose.strip().lower()
         is_new = self.pk is None or self._state.adding
         with transaction.atomic():
             if not is_new:
@@ -2339,8 +2508,17 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
                 self._materialize_ports()
                 self._materialize_addresses()
 
+    def clean_fields(self, exclude=None) -> None:
+        # Normalize *before* the field validators run — see
+        # Owner.clean_fields() for why this can't wait for clean().
+        if self.hostname_purpose:
+            self.hostname_purpose = self.hostname_purpose.strip().lower()
+        super().clean_fields(exclude=exclude)
+
     def clean(self) -> None:
         super().clean()
+        if self.hostname_purpose:
+            self.hostname_purpose = self.hostname_purpose.strip().lower()
         if self.pk is None or self._state.adding:
             switch_type = _get_related(self, "switch_type")
             if switch_type is not None and switch_type.pk is not None:
@@ -2775,6 +2953,17 @@ class NetworkDeviceType(AuditedModel):
             "between hosts — a DMI-DANTE, an X-Dante. Leave off for ordinary equipment."
         ),
     )
+    hostname_slug = models.CharField(
+        max_length=63,
+        blank=True,
+        validators=[validate_dns_label],
+        help_text=(
+            'Operator-set hostname abbreviation, e.g. "ik42". Never auto-filled — '
+            'slugify("IK-42") gives "ik-42" where the name in use might be "ik42" — and '
+            "deliberately not unique: two profiles of one model both carry the same abbreviation. "
+            "Blank means this Type offers no computed hostnames (ADR 0023)."
+        ),
+    )
 
     class Meta:
         constraints = [
@@ -2787,6 +2976,12 @@ class NetworkDeviceType(AuditedModel):
         return f"{self.manufacturer} {self.model} — {self.name}"
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        # hostname_slug is normalized here, outside _locked_snapshot() —
+        # it deliberately never joins the lock (settled decision 3): a
+        # typo'd abbreviation must stay fixable without creating a new
+        # named profile.
+        if self.hostname_slug:
+            self.hostname_slug = self.hostname_slug.strip().lower()
         with transaction.atomic():
             if self.pk is not None:
                 _lock_type_rows(NetworkDeviceType, self.pk)
@@ -2817,8 +3012,17 @@ class NetworkDeviceType(AuditedModel):
         max_offset = self.type_ports.aggregate(models.Max("slot_offset"))["slot_offset__max"]
         return (max_offset or 0) + 1
 
+    def clean_fields(self, exclude=None) -> None:
+        # Normalize *before* the field validators run — see
+        # Owner.clean_fields() for why this can't wait for clean().
+        if self.hostname_slug:
+            self.hostname_slug = self.hostname_slug.strip().lower()
+        super().clean_fields(exclude=exclude)
+
     def clean(self) -> None:
         super().clean()
+        if self.hostname_slug:
+            self.hostname_slug = self.hostname_slug.strip().lower()
         if self.pk is not None and self.devices.exists():
             _check_locked_fields_unchanged(
                 NetworkDeviceType, self.pk, self._locked_snapshot(), update_fields=None
@@ -3134,6 +3338,27 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
     serial_number = models.CharField(max_length=100, blank=True)
     rack = models.ForeignKey(Rack, on_delete=models.PROTECT, null=True, blank=True, related_name="devices")
     rack_slot = models.PositiveIntegerField(null=True, blank=True, validators=[MinValueValidator(1)])
+    owner = models.ForeignKey(
+        Owner,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="devices",
+        help_text="Hostname component 1 (ADR 0023) — defaults from this device's rack at creation.",
+    )
+    hostname_purpose = models.CharField(
+        max_length=63,
+        blank=True,
+        validators=[validate_dns_label],
+        help_text='Hostname component 4, e.g. "sub" or "midhi-01-04" — a non-numeric qualifier '
+        "belongs here, not in the sequence below (ADR 0023).",
+    )
+    hostname_sequence = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Hostname component 5 — an integer distinguishing otherwise-identical names, "
+        "e.g. 1 or 2 for mps-avio-aes-1 and mps-avio-aes-2 (ADR 0023).",
+    )
     host = models.ForeignKey(
         "self",
         null=True,
@@ -3221,6 +3446,10 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         return self.hostname or f"Device #{self.pk}"
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        # Stripped/lowercased here too, not just clean() — Model.save()
+        # never calls clean() (Department.save()'s reasoning).
+        if self.hostname_purpose:
+            self.hostname_purpose = self.hostname_purpose.strip().lower()
         # ``self.pk is None or self._state.adding`` — see NetworkSwitch.save().
         is_new = self.pk is None or self._state.adding
         with transaction.atomic():
@@ -3267,8 +3496,17 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                     self._state.adding = True
                 raise
 
+    def clean_fields(self, exclude=None) -> None:
+        # Normalize *before* the field validators run — see
+        # Owner.clean_fields() for why this can't wait for clean().
+        if self.hostname_purpose:
+            self.hostname_purpose = self.hostname_purpose.strip().lower()
+        super().clean_fields(exclude=exclude)
+
     def clean(self) -> None:
         super().clean()
+        if self.hostname_purpose:
+            self.hostname_purpose = self.hostname_purpose.strip().lower()
         if self.pk is None or self._state.adding:
             device_type = _get_related(self, "device_type")
             if device_type is not None and device_type.pk is not None:

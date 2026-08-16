@@ -247,13 +247,13 @@ component scheme as columns; all 52 rows assemble as `'-'.join(non-empty).lower(
 the corrections below come from. `docs/plans/PLAN-hostname-ingredients.md` is this phase's build,
 in three PRs.
 
-- [ ] `Owner` model (short slug + full name) and optional `PROTECT` FKs on `Rack`,
+- [x] `Owner` model (short slug + full name) and optional `PROTECT` FKs on `Rack`,
       `NetworkSwitch` and `NetworkDevice`. A racked item's owner *defaults* from its rack at
       creation and stays overridable — ADR 0019's suggest-don't-lock pattern, not inheritance. A
       table rather than free text because #10 already documents what free-text identity fields do
-- [ ] Owner lives on equipment, not only on Rack: component 1 is never skipped, and spare-pool
+- [x] Owner lives on equipment, not only on Rack: component 1 is never skipped, and spare-pool
       equipment has no rack at all (`CONTEXT.md`, "Spare Pool")
-- [ ] `Rack.location_slug`: optional, DNS-safe, unique **where non-blank**. Blank contributes no
+- [x] `Rack.location_slug`: optional, DNS-safe, unique **where non-blank**. Blank contributes no
       location component **without** a purpose field or a pool concept. Neither `CONTEXT.md`'s
       "a Rack has no purpose field" nor ADR 0019 is amended; the question asked is
       "does this rack have a location name?", not "is this rack virtual?" — and that wording is
@@ -261,26 +261,26 @@ in three PRs.
       but production disagrees: `AVIO` and `SPARE` are both address pools and both contribute
       location components (`mps-avio-avio-aes-1`, `mps-spare-ik42-1`). Only `CONSOLES` is blank.
       The field is right; "virtual racks are location-free" was the wrong reason for it (ADR 0023)
-- [ ] Location lives on `Rack` and **only** on `Rack` — no per-device override. Two production
+- [x] Location lives on `Rack` and **only** on `Rack` — no per-device override. Two production
       names can't be reproduced as a result (`mps-foh-dm7c-1`, `mps-stage-rio-1`, both
       `CONSOLES`-resident), and that is accepted: they are Dante device names encoding where a
       console physically sits, not hostnames — see #64
-- [ ] Uniqueness lands on the new slug, not on `Rack.name`. `Rack.name` is **not** unique today
+- [x] Uniqueness lands on the new slug, not on `Rack.name`. `Rack.name` is **not** unique today
       (`inventory/models.py`), so `MORE_MUSINGS.md`'s premise that "rack name uniqueness is
       enforced" is false as written — and a brand-new field has no live rows to dedup or re-slug
-- [ ] `hostname_slug` on `NetworkSwitchType` and `NetworkDeviceType`: operator-set, **never
+- [x] `hostname_slug` on `NetworkSwitchType` and `NetworkDeviceType`: operator-set, **never
       auto-filled**, DNS-validated, deliberately **not** unique. Not derived, for two reasons: if
       blank auto-fills then the blank below is unreachable, and one rule gives two answers —
       `slugify("IK-42")` is `ik-42` where the name in use is `ik42`, while `slugify("SG300-10MP")`
       happens to be right. The example goes in `help_text`, including the trap (ADR 0023)
-- [ ] Blank `hostname_slug` means that Type offers no computed hostnames, so existing Types need
+- [x] Blank `hostname_slug` means that Type offers no computed hostnames, so existing Types need
       no backfill and creating a Type isn't blocked on choosing an abbreviation
-- [ ] `hostname_suffix` on `NetworkDeviceTypePort`, beside `slot_offset` — **shipped by ADR 0022's
+- [x] `hostname_suffix` on `NetworkDeviceTypePort`, beside `slot_offset` — **shipped by ADR 0022's
       PR 1 above**, and *derived* on `NetworkDevicePort` rather than materialized onto it (ADR 0022
       decision 4: a stored copy would have nothing to keep it in step, and the field is exempt from
       ADR 0010's type-port lock so a typo stays fixable). Device-side only — `slot_offset` is a
       device-side concept
-- [ ] `hostname_purpose` (`CharField(63)`, DNS-safe) and `hostname_sequence`
+- [x] `hostname_purpose` (`CharField(63)`, DNS-safe) and `hostname_sequence`
       (`PositiveIntegerField`) on `NetworkSwitch` and `NetworkDevice`. **Moved here from phase 18**
       by ADR 0023 decision 11, which draws the seam at fields-versus-behaviour: this phase is one
       migration with no logic, phase 18 is logic with almost none. They are independently
@@ -293,7 +293,7 @@ in three PRs.
       sheet carrying the components has no join key to the sheet the importer reads (zero of 52
       descriptions match, and its `Slot` column is empty), so recovering them would mean committing
       human inference as data
-- [ ] Tests: the rack-derived owner default and its override; `location_slug` uniqueness ignores
+- [x] Tests: the rack-derived owner default and its override; `location_slug` uniqueness ignores
       blanks and is enforced at the **database** level; `hostname_slug` stays editable after
       instances exist; the suffix materializes with the port; nothing computes a hostname
 

@@ -84,9 +84,14 @@ The list of objects that the system will need to track includes, but is not limi
     * Base Address / Prefix — optional; a VLAN with no subnet is **L2-only** and cannot have a Default Gateway, DHCP Range, rack address range, or static address (see [ADR 0012](./docs/adr/0012-switch-port-vlan-profiles.md))
     * Default Gateway
     * DHCP Range (start/end address pair)
+* Owner (ADR 0023): who owns a piece of equipment — "MPS", "BEJ". A table, like Department, for the reasons issue #10 documents. The hostname scheme's first, **blocking** component: no owner means no computed hostname (phase 18).
+    * Slug — short, DNS-safe, unique
+    * Name — full name, unique
 * Rack: an abstract grouping of devices with an address range from which device addresses are computed. Has no "purpose" field — a rack of spare equipment is just an ordinary Rack (see `CONTEXT.md`). A rack's ranges can be entered by hand or seeded in one step from a **Rack Template** (see "Rack Templates" below); either way, `RackVlanRange` rows created this way are ordinary, indistinguishable rows.
     * Slot Count — the number of addressable slots. A slot is an addressing ordinal (base address + slot number), not a physical rack-unit position; physical RU height/placement is deliberately not modeled.
     * IPv4 Address Range (per VLAN)
+    * Owner (ADR 0023) — optional; defaults a racked item's own Owner at creation, not inherited
+    * Location Slug (ADR 0023) — optional, unique where set; the hostname *location* component. Not a purpose field — see `CONTEXT.md`'s Rack entry
 A Network Switch/Device Type is a **purpose profile** built on a hardware model, not the bare hardware model itself: the same physical switch or device commonly needs several different profiles, because what each port is *used for* varies even though the hardware doesn't. For example, a Cisco SG350-10MP wired up for a drive rack (different VLAN per port) needs a different profile than the identical switch wired for an amp rack; a Martin Audio IK-42 with a Dante card needs a different profile (extra ports) than the same model without one. A Type is therefore identified by `(Manufacturer, Model, Name)`, where `Name` is a **required, non-blank** profile label (e.g. "For Drive Rack", "with Dante Card", "Default" for a model with only one profile) — this keeps the type selector unambiguous for an audience that may not have deep VLAN/subnetting knowledge.
 
 A Type's port list is fixed once any instance (switch/device) exists — editing or removing a Type Port at that point would silently leave existing instances holding a stale copy. To change a profile's port layout, create a new named profile instead.
@@ -96,6 +101,7 @@ A Type's port list is fixed once any instance (switch/device) exists — editing
     * Model
     * Name (profile label, required — see above)
     * Port Count (must equal the number of Network Switch Type Ports defined for this profile)
+    * Hostname Slug (ADR 0023) — optional, operator-set hostname abbreviation, e.g. "sg300-10mp". Never auto-filled and not unique (two profiles of one model can share it); blank means this Type offers no computed hostnames. Stays editable after instances exist — unlike every field above
 * Network Switch Type Port
     * Port Number
     * Port Description
@@ -105,6 +111,8 @@ A Type's port list is fixed once any instance (switch/device) exists — editing
     * ...
     * Serial Number
     * The switch's Type is fixed at creation and cannot be changed afterward. Re-typing a switch (e.g. moving it to a different profile) means removing and recreating it, not editing the Type field.
+    * Owner (ADR 0023) — optional; defaults from this switch's rack at creation, overridable, never re-derived
+    * Hostname Purpose / Hostname Sequence (ADR 0023) — optional hostname components 4 and 5. Nothing computes from them yet (phase 17); phase 18 assembles the full name
 * Network Switch Port: automatically populated from the switch's Type and its Type Ports, as a **one-time copy** made when the switch is first created — not kept in sync with later Type edits (which can't happen anyway, since the Type locks once the switch exists). Unlike every other materialized field here, the **Switch Port VLAN Profile is copied as a live reference, not a snapshot** (see below and [ADR 0012](./docs/adr/0012-switch-port-vlan-profiles.md)) — editing a profile's allowed VLANs changes every port using it immediately, including already-materialized ones. **A different profile can be selected** for an instantiated port unless a device is already connected to it, but the **physical Port Type is locked** — it's a hardware fact copied from the Type, not something that varies per switch. Conflict detection (such as incorrect VLAN assignment if a device is already connected) should be flagged, but this can be deferred to the custom UI.
 * Network Device Type (amp, processor, mixer, etc.) — also a purpose profile; see above. e.g. "Martin Audio IK-42 — with Dante Card" vs "— without Dante Card", or "Shure ULXD4Q — Split Mode" vs "— Redundant Mode".
     * Manufacturer
@@ -112,6 +120,7 @@ A Type's port list is fixed once any instance (switch/device) exists — editing
     * Name (profile label, required)
     * Ports: a list of "Network Device Type Port"
     * Add-in Card (`BooleanField`, default false) — this type's instances are cards fitted inside another device and routinely moved between hosts (a DMI-DANTE, an X-Dante); leave off for ordinary equipment. Joins the profile's other locked fields once any instance exists — flipping it afterward would either strand fitted devices or retroactively offer ordinary equipment to the fit picker. See [ADR 0022](./docs/adr/0022-add-in-cards-and-operator-set-ports.md) tier 3.
+    * Hostname Slug (ADR 0023) — same shape as Network Switch Type's, above
 * Network Device Type Port (a port definition for the port(s) that an instance of this device will always have)
     * Port Number (optional - most devices have fixed numbers of ports with fixed purpose that aren't numbered)
     * Port Description (required — this is the port's identity/purpose, e.g. "Dante Primary"; not optional the way Port Number is)
@@ -122,6 +131,7 @@ A Type's port list is fixed once any instance (switch/device) exists — editing
     * ...
     * Serial Number
     * The device's Type is fixed at creation and cannot be changed afterward, for the same reason as Network Switch above — e.g. adding a Dante card to an amp means removing and recreating that device entry, not editing it in place (expected to be very rare).
+    * Owner / Hostname Purpose / Hostname Sequence (ADR 0023) — same shape as Network Switch's, above
     * Host (`ForeignKey("self")`, nullable) — for an Add-in Card (a device whose own Type has Add-in Card set), the device this card is *currently fitted inside*, if any (ADR 0022). A soft "currently fitted to" pointer with no addressing meaning whatsoever: it does not derive an address, constrain a VLAN, share an ordinal, or move anything. A card keeps its own `rack`/`rack_slot` and every address exactly as they were whether it is fitted, pulled, or re-fitted to a different host — fitting and pulling change only this field. Deleting a host clears the link on every card fitted to it (rather than deleting the card, unlike ADR 0018's superseded companion relationship) through an audited save per card, never a bulk update, so the change is recorded on the card's own history.
 * Network Device Port: description/purpose/VLAN/Port Type/Slot Offset automatically populated (one-time copy, as with Network Switch Port above) when the device is created, from its Type's Network Device Type Ports. **Description, VLAN, physical Port Type, and Slot Offset are immutable.** The IP address/DHCP setting (and which switch port it's connected to) are editable — **except** a port's IP address at a non-zero Slot Offset, which is derived from the offset-0 port on the same VLAN and locked (ADR 0017): editing the offset-0 port's address recomputes every offset sibling's address to match (`control address + offset`), and taking the offset-0 port to DHCP takes its offset siblings to DHCP with it. Device creation offers a DHCP-or-static choice, defaulting to static: a racked device's ports get a computed rack-range-base + rack-slot (+ Slot Offset, for an offset port) address per VLAN, the same way a Network Switch's address is suggested; an unracked device (spare pool) always materializes DHCP regardless of the choice, and a port on an L2-only VLAN always materializes DHCP too (see ADR 0013). An operator can flip an offset-0 port's addressing either way afterward, and its offset siblings follow automatically. A port's identity is `(Device, Description)` — Port Number, when present at all, is neither required nor unique.
     * IPv4 Address -OR- DHCP

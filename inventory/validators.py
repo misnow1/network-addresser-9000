@@ -23,9 +23,9 @@ _DNS_LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 def validate_dns_label(value: str) -> None:
     """Validate that ``value`` is a single, bare DNS label — lowercase
     alphanumerics and internal hyphens only, no leading/trailing hyphen,
-    max 63 characters (RFC 1035). ADR 0022, ``PLAN-hostname-ingredients.md``
-    decision 7 — ships here so phase 18's hostname assembly can reuse it
-    rather than writing a second one.
+    max 63 characters (RFC 1035). Ships here in ADR 0022 so phase 18's
+    hostname assembly can reuse it rather than writing a second one; the
+    63-character cap is ADR 0023 decision 8.
 
     Deliberately does not lower/strip ``value`` itself — callers
     (``NetworkDeviceTypePort.clean()``/``save()``) normalize before

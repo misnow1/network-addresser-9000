@@ -275,6 +275,9 @@ AUDITLOG_INCLUDE_TRACKING_MODELS = (
     # Bare, all fields tracked (ADR 0021) — VLAN is already registered bare
     # above, so its new `department` FK is covered with no entry change.
     "inventory.Department",
+    # ADR 0023 — Owner, bare like Department: a descriptive vocabulary
+    # table with no per-field scoping needed.
+    "inventory.Owner",
     "inventory.Rack",
     "inventory.NetworkSwitchType",
     "inventory.NetworkDeviceType",
@@ -286,10 +289,35 @@ AUDITLOG_INCLUDE_TRACKING_MODELS = (
         "include_fields": ["profile", "vlan", "created_at"],
     },
     {"model": "inventory.RackVlanRange", "include_fields": ["address_range", "created_at"]},
-    {"model": "inventory.NetworkSwitch", "include_fields": ["rack", "rack_slot", "created_at"]},
+    # ADR 0023 — owner/hostname_purpose/hostname_sequence join the existing
+    # scoped include_fields lists below; a whitelist doesn't pick up new
+    # fields automatically (unlike Rack/the two Type models above, which
+    # are registered bare).
+    {
+        "model": "inventory.NetworkSwitch",
+        "include_fields": [
+            "rack",
+            "rack_slot",
+            "owner",
+            "hostname_purpose",
+            "hostname_sequence",
+            "created_at",
+        ],
+    },
     {"model": "inventory.NetworkSwitchAddress", "include_fields": ["address", "created_at"]},
     {"model": "inventory.NetworkSwitchPort", "exclude_fields": ["description"]},
-    {"model": "inventory.NetworkDevice", "include_fields": ["rack", "rack_slot", "host", "created_at"]},
+    {
+        "model": "inventory.NetworkDevice",
+        "include_fields": [
+            "rack",
+            "rack_slot",
+            "host",
+            "owner",
+            "hostname_purpose",
+            "hostname_sequence",
+            "created_at",
+        ],
+    },
     {
         "model": "inventory.NetworkDevicePort",
         "include_fields": ["address", "is_dhcp", "created_at"],
