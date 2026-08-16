@@ -239,6 +239,14 @@ removed — and is the tracking issue for both this phase and phase 18.
 The scheme covers switches as well as devices — component 3's own example, `sg300-10mp`, is a
 Cisco switch — so every field decision here lands on both hierarchies.
 
+`docs/adr/0023-hostname-scheme.md` settles the whole scheme — these ingredients *and* phase 18's
+computation and collision rules — before either ships, so that phase 17 cannot ship the wrong field
+types. Same pattern as ADR 0021: settle both axes on paper, build one at a time. It was written
+against `prod/MPS Audio Network Standards - Dante Devices.csv`, which turned out to carry the
+component scheme as columns; all 52 rows assemble as `'-'.join(non-empty).lower()`, which is where
+the corrections below come from. `docs/plans/PLAN-hostname-ingredients.md` is this phase's build,
+in three PRs.
+
 - [ ] `Owner` model (short slug + full name) and optional `PROTECT` FKs on `Rack`,
       `NetworkSwitch` and `NetworkDevice`. A racked item's owner *defaults* from its rack at
       creation and stays overridable — ADR 0019's suggest-don't-lock pattern, not inheritance. A
@@ -246,17 +254,25 @@ Cisco switch — so every field decision here lands on both hierarchies.
 - [ ] Owner lives on equipment, not only on Rack: component 1 is never skipped, and spare-pool
       equipment has no rack at all (`CONTEXT.md`, "Spare Pool")
 - [ ] `Rack.location_slug`: optional, DNS-safe, unique **where non-blank**. Blank contributes no
-      location component — which is how `AVIO`/`CONSOLES`/`SHURE` get `MORE_MUSINGS.md`'s
-      virtual-rack behaviour **without** a purpose field or a pool concept. Neither
-      `CONTEXT.md`'s "a Rack has no purpose field" nor ADR 0019 is amended; the question asked is
-      "does this rack have a location name?", not "is this rack virtual?"
+      location component **without** a purpose field or a pool concept. Neither `CONTEXT.md`'s
+      "a Rack has no purpose field" nor ADR 0019 is amended; the question asked is
+      "does this rack have a location name?", not "is this rack virtual?" — and that wording is
+      load-bearing. `MORE_MUSINGS.md` says items in a virtual rack "do not use this component",
+      but production disagrees: `AVIO` and `SPARE` are both address pools and both contribute
+      location components (`mps-avio-avio-aes-1`, `mps-spare-ik42-1`). Only `CONSOLES` is blank.
+      The field is right; "virtual racks are location-free" was the wrong reason for it (ADR 0023)
+- [ ] Location lives on `Rack` and **only** on `Rack` — no per-device override. Two production
+      names can't be reproduced as a result (`mps-foh-dm7c-1`, `mps-stage-rio-1`, both
+      `CONSOLES`-resident), and that is accepted: they are Dante device names encoding where a
+      console physically sits, not hostnames — see #64
 - [ ] Uniqueness lands on the new slug, not on `Rack.name`. `Rack.name` is **not** unique today
       (`inventory/models.py`), so `MORE_MUSINGS.md`'s premise that "rack name uniqueness is
       enforced" is false as written — and a brand-new field has no live rows to dedup or re-slug
-- [ ] `hostname_slug` on `NetworkSwitchType` and `NetworkDeviceType`: operator-set, prefilled by
-      slugifying the model as a convenience, DNS-validated, deliberately **not** unique. Not
-      derived, because one rule gives two answers — `slugify("IK-42")` is `ik-42` where the name
-      in use is `ik42`, while `slugify("SG300-10MP")` happens to be right
+- [ ] `hostname_slug` on `NetworkSwitchType` and `NetworkDeviceType`: operator-set, **never
+      auto-filled**, DNS-validated, deliberately **not** unique. Not derived, for two reasons: if
+      blank auto-fills then the blank below is unreachable, and one rule gives two answers —
+      `slugify("IK-42")` is `ik-42` where the name in use is `ik42`, while `slugify("SG300-10MP")`
+      happens to be right. The example goes in `help_text`, including the trap (ADR 0023)
 - [ ] Blank `hostname_slug` means that Type offers no computed hostnames, so existing Types need
       no backfill and creating a Type isn't blocked on choosing an abbreviation
 - [ ] `hostname_suffix` on `NetworkDeviceTypePort`, beside `slot_offset` — **shipped by ADR 0022's
@@ -264,8 +280,22 @@ Cisco switch — so every field decision here lands on both hierarchies.
       decision 4: a stored copy would have nothing to keep it in step, and the field is exempt from
       ADR 0010's type-port lock so a typo stays fixable). Device-side only — `slot_offset` is a
       device-side concept
+- [ ] `hostname_purpose` (`CharField(63)`, DNS-safe) and `hostname_sequence`
+      (`PositiveIntegerField`) on `NetworkSwitch` and `NetworkDevice`. **Moved here from phase 18**
+      by ADR 0023 decision 11, which draws the seam at fields-versus-behaviour: this phase is one
+      migration with no logic, phase 18 is logic with almost none. They are independently
+      meaningful the moment they exist — an operator can record `sub` as documentation before
+      anything assembles it. The sequence is an **integer**, which is what makes phase 18's
+      "bump until free" defined; production's non-numeric `01-04` is a *purpose* and reproduces
+      character-for-character there
+- [ ] The importer seeds the **vocabulary only** — two `Owner` rows (`mps`, `bej`), `Rack.owner`,
+      and `Rack.location_slug` from an explicit name→slug constant. No per-device backfill: the
+      sheet carrying the components has no join key to the sheet the importer reads (zero of 52
+      descriptions match, and its `Slot` column is empty), so recovering them would mean committing
+      human inference as data
 - [ ] Tests: the rack-derived owner default and its override; `location_slug` uniqueness ignores
-      blanks; the suffix materializes with the port
+      blanks and is enforced at the **database** level; `hostname_slug` stays editable after
+      instances exist; the suffix materializes with the port; nothing computes a hostname
 
 A Type's identity is `(manufacturer, model, name)` where `name` is the *profile* label (ADR
 0010), so two profiles of one model — "Martin Audio IK-42 — Default" and "— with Dante Card" —
@@ -279,14 +309,18 @@ Assembles phase 17's components at creation, enforces uniqueness, and resolves c
 Computed at materialization and stored — **not** immutable, and never re-derived automatically.
 That is the same rule ADR 0003 gives static addresses, and what #31 already committed to.
 
-- [ ] ADR: hostname computation. It no longer has ADR 0018 to amend — phase 17's ADR 0022
-      superseded it outright, and the Yamaha Device Control interface that forced the question is
-      now a *port* on its console carrying `hostname_suffix="device-control"`, so nothing copies a
-      host's hostname verbatim any more and the uniqueness rule below meets no companion
-- [ ] `hostname_purpose` and `hostname_sequence` stored on `NetworkSwitch`/`NetworkDevice`
-      alongside the existing editable `hostname`. Stored rather than transient like ADR 0013's
-      `port_addressing`, because recomputation is impossible if the parts can't be recovered from
-      the assembled string
+- [x] ADR: **`docs/adr/0023-hostname-scheme.md`**, written in phase 17 and covering both halves. It
+      had no ADR 0018 to amend — ADR 0022 superseded it outright, and the Yamaha Device Control
+      interface that forced the question is now a *port* on its console carrying
+      `hostname_suffix="device-control"`, so nothing copies a host's hostname verbatim any more and
+      the uniqueness rule below meets no companion
+- [ ] Assembly fills a **blank** hostname only and never overwrites a hand-typed one — ADR 0019's
+      suggest-don't-lock applied to names. A helper in `inventory/hostnames.py`, called from the two
+      admin add forms and the recompute action; never from `save()`, `clean()` or the importer,
+      because the advisory messages below need a request that `save()` has not got
+- [ ] Owner and the Type's `hostname_slug` are **blocking** components — absent, no hostname is
+      computed at all. Location, purpose and sequence are skipped when absent. A name whose first
+      component has silently become the location is worse than no name
 - [ ] Cross-table uniqueness across `NetworkSwitch` + `NetworkDevice` together, validated in
       `full_clean()` with a plain-language error, blank exempt. Same shape as the existing
       cross-table static-address check, inheriting its known race (#5) rather than introducing a
@@ -295,8 +329,13 @@ That is the same rule ADR 0003 gives static addresses, and what #31 already comm
 - [ ] A `NetworkDevicePort` hostname as a **derived, read-only property** —
       `<device.hostname>-<hostname_suffix>` — **already shipped by phase 17's ADR 0022 PR 1**. This
       is where `…-sd12-engine` and `…-device-control` live. Ports have no hostname field and gain
-      none. Known gap for this ADR to name: a derived port hostname sits outside the cross-table
-      uniqueness check below, so nothing stops a *device* being hand-named to collide with one
+      none. **Derived port names are inside the uniqueness check**, contrary to what this line used
+      to defer: one `hostname_is_taken()` predicate spans switches, devices and derived port names,
+      and both `full_clean()` and the sequence bump use it. Without that, the claim below that
+      computation always yields a free name is false — a console `mps-avio-sd12` with an `engine`
+      port and a device with purpose `engine` produce the same string, and purpose is free-form.
+      The check is **forward only**: renaming a device shifts its ports' derived names, and that
+      cascade stays a named gap
 - [ ] Collisions bump `hostname_sequence` until the name is free, in physical and virtual racks
       alike, and never block a save. Two advisory messages ride along: recommend assigning `1` to
       a twin that has no sequence, and where the rack has a `location_slug`, note that a purpose
@@ -305,13 +344,26 @@ That is the same rule ADR 0003 gives static addresses, and what #31 already comm
       machinery — the purpose is free-form operator input (`midhi-01-04`, `sub`) that the system
       cannot invent. Likewise *"recommend the existing device be assigned 1"* is a message about
       an already-saved row, not an action
-- [ ] An explicit "recompute hostname" admin action. Moves never rename automatically
-- [ ] Consider #54, filed as the sibling of #28: a rack move leaves a stale `location_slug` baked
-      into a hostname, the same staleness class as an already-static address surviving a slot
-      move. A staleness *indicator* is the cheap answer and would cover both
-- [ ] Tests: assembly with and without each optional component; blank hostnames don't collide
-      with each other; a switch-vs-device collision is caught; sequence auto-bump; a console with a
-      labelled port renders both its own name and the port's derived one
+- [ ] An explicit "recompute hostname" admin action. Moves never rename automatically. It also
+      **fills a blank `owner` from the rack** before computing — the add-form default never fired
+      for imported rows, so without this every production device stays permanently blocked on a
+      null owner. Done in the action rather than in assembly so the value is *stored*, not
+      inherited
+- [ ] `hostname` drops to `CharField(63)` and is stripped and lowercased on write; no
+      `validate_dns_label` on it, because the only illegal values are eight imported switch rows
+      whose hostname is prose the importer had nothing better for. Free today — the longest
+      existing value is 43 characters. Also closes the casing divergence `NetworkDevicePort.
+      hostname`'s docstring defers here: the port property starts yielding `dm7c-1-device-control`
+- [ ] #54: a **stateless** `hostname_diverges` property — every component present, a hostname
+      present, and the two differ. No `hostname_is_computed` boolean, because state that can itself
+      go stale is what the indicator exists to catch. Framed as divergence, not staleness: it says
+      the name differs from what its components produce, not which is right. #28, the address-side
+      sibling, stays open — same staleness *class*, different mechanism (the allocator, not naming)
+- [ ] Tests: assembly with and without each optional component; each blocking component absent
+      yields no name; blank hostnames don't collide with each other; a switch-vs-device collision is
+      caught; a device-vs-derived-port-name collision is caught; sequence auto-bump; a hand-typed
+      hostname survives creation untouched; a console with a labelled port renders both its own name
+      and the port's derived one
 
 Because computation always yields a free name, the `full_clean()` uniqueness error only ever
 fires on a **hand-typed** duplicate — which is exactly when it should.
@@ -432,7 +484,8 @@ work.
 
 - Device-replacement workflow (swapping a spare into an already-addressed slot) — flagged in ADR 0003, design deferred
 - ~~Two *independent* static addresses on one VLAN (a Yamaha console's "For Device Control" interface) — see #42.~~ **Closed by ADR 0022, built in phase 17** as `NetworkDeviceTypePort.address_source`. This entry predicted the outcome exactly — *"if it ever lands, those consoles collapse to one device and their companion links fall away"* — which is what phase 17's PR 2 does, ADR 0018 and all. Still the nearest neighbour of phase 20, which needs the opposite shape: two ports *sharing* one address (#27), not two addresses on one VLAN
-- Slot moves don't re-suggest an already-static device port's address (armed by default now that static materializes by default, ADR 0013; follows from ADR 0003's "stored, not immutable") — see #28, and its hostname sibling #54 (a rack move leaves a stale location baked into a computed hostname). Both are the same problem on two fields, and a single staleness *indicator* would cover both — report, don't enforce, as in phase 19
+- Slot moves don't re-suggest an already-static device port's address (armed by default now that static materializes by default, ADR 0013; follows from ADR 0003's "stored, not immutable") — see #28. Its hostname sibling **#54 is closed by phase 18**, which ships a stateless `hostname_diverges` indicator (ADR 0023). #28 is the same staleness *class* but a different mechanism — it compares a stored address against what the allocator would now suggest, which carries its own decisions about derived, offset and operator-set addresses, so it was deliberately not folded into a naming phase. One UI treatment should eventually serve both — report, don't enforce, as in phase 19
+- **Dante device names and Martin Vu-Net names are separate namespaces** from the hostname — see #64. The production Dante sheet carries both, and they share the hostname vocabulary while differing in shape, case and uniqueness scope: Vu-Net drops owner and model, is uppercase, and is unique only per model (`SPARE-1` appears twice, for the IK42 and IK81 spares). Both are names configured on the hardware itself, like an address, so the interesting behaviour is reconciling what is configured against what the components say — not generating them. Pointless before ADR 0023 lands, since they borrow its component fields
 - Multicast configuration: port-level filtering plus switch-level IGMP snooping — see #22
 - Populated rack templates: slot layouts that materialize equipment (needs Type `PROTECT`, unlike the VLAN-only feature) — see #30. **No longer blocks hostnames** (phase 17); it would *enhance* them by prefilling the purpose component, and it does gate the rack creation wizard
 - Rack *slot* occupancy has no DB-level overlap guarantee once a device spans several ordinals (ADR 0017's known gap) — see #40. `RackSlotAssignmentMixin`'s docstring defers this to phase 3's "Overlap validation", but that item shipped covering rack-range-vs-range and DHCP overlap only — the deferral still has no live home and the pointer is still stale

@@ -184,8 +184,12 @@ a new named profile for every DM7C in the estate. This is the same reasoning
 `PLAN-hostname-ingredients.md` decision 6 applies to `hostname_slug`.
 
 Assembly, collision handling and total-length validation are **not** settled here; they belong to
-the hostname ADR that phase 18 writes. This ADR settles only *where a port label lives*, because
-that was the question blocking phase 17.
+the hostname ADR. This ADR settles only *where a port label lives*, because that was the question
+blocking phase 17.
+
+> **Since written:** that ADR is `docs/adr/0023-hostname-scheme.md`, written in phase 17 rather
+> than 18, and it covers the ingredients as well as the computation. It settles the three items
+> above, and puts derived port hostnames *inside* the uniqueness check rather than outside it.
 
 ### 5. `NetworkDevice.host` and `NetworkDeviceType.is_add_in_card`
 
