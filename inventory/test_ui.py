@@ -51,12 +51,14 @@ from .models import (
     VLAN,
     Department,
     NetworkDevice,
+    NetworkDevicePort,
     NetworkDeviceType,
     NetworkDeviceTypePort,
     NetworkSwitch,
     NetworkSwitchType,
     NetworkSwitchTypePort,
     PortAddressing,
+    PortAddressSource,
     PortMode,
     PortType,
     Rack,
@@ -161,8 +163,20 @@ def _cell_states(row_html: str) -> list[str]:
     """The ``cell-<state>`` class of every VLAN column in one row's
     markup, in column order — lets a test assert *which* column carries
     an encoding, not just that the encoding appears somewhere in the row.
+    The trailing ``[^"]*`` tolerates ``cell-taken`` (issue #60) riding
+    alongside the state class in the same attribute.
     """
-    return re.findall(r'<td class="cell cell-(\w+)"', row_html)
+    return re.findall(r'<td class="cell cell-(\w+)[^"]*"', row_html)
+
+
+def _cell_html(row_html: str, column_index: int) -> str:
+    """The full ``<td class="cell ...">...</td>`` markup for one VLAN
+    column (0-based, in column order) in one elevation row's markup — lets
+    a test assert on a cell's *content* (issue #60's taken-by marker
+    text), not just its state class.
+    """
+    cells = re.findall(r'<td class="cell[^"]*">.*?</td>', row_html, re.DOTALL)
+    return cells[column_index]
 
 
 def _clean_text(raw_html: str) -> str:
@@ -941,6 +955,404 @@ class ElevationEncodingTests(TestCase):
             )
 
 
+class TakenAddressMarkerTests(TestCase):
+    """The elevation's ``taken_by`` marker (issue #60,
+    PLAN-consumed-slot-addresses.md) — "this ordinal's would-be address is
+    already held by somebody", detected across every static address in the
+    rack, not just ``OPERATOR``-sourced ones (decision 3). Both VLAN ranges
+    sit on a non-zero network base (``/27`` at ``.32``, review note 5) so an
+    implementation deriving the ordinal from the address's last octet fails
+    rather than passing by luck.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.admin_user = User.objects.create_user("takenaddr-admin", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="takenaddr-admin", password="testpass123")
+
+        self.vlan_a = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.vlan_b = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+        self.rack = Rack.objects.create(name="Taken", slot_count=20)
+        self.range_a = RackVlanRange.objects.create(
+            rack=self.rack, vlan=self.vlan_a, address_range="10.200.6.32/27"
+        )
+        self.range_b = RackVlanRange.objects.create(
+            rack=self.rack, vlan=self.vlan_b, address_range="10.201.6.32/27"
+        )
+
+    def _make_console_type(self, **kwargs) -> NetworkDeviceType:
+        """A Dante Primary (SLOT) + Device Control (OPERATOR) console type
+        on ``self.vlan_a`` — the exact shape issue #60 was found on
+        (``DM7C-1``/``10.201.6.4`` in production).
+        """
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="Yamaha", model="DM7C", port_count=2, **kwargs
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type,
+            description="Dante Primary",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_a,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type,
+            description="Device Control",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_a,
+            address_source=PortAddressSource.OPERATOR,
+            hostname_suffix="device-control",
+        )
+        return device_type
+
+    def test_slot_marked_on_both_axes_neighbours_and_own_row_untouched(self) -> None:
+        device_type = self._make_console_type(name="Marker Console")
+        held_address = suggest_slot_address(self.range_a.address_range, 4)
+        NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=device_type,
+            rack=self.rack,
+            rack_slot=5,
+            hostname="DM7C-1",
+            operator_addresses={"Device Control": held_address},
+        )
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        content = response.content.decode()
+
+        row4 = _row_html(content, 4)
+        row5 = _row_html(content, 5)
+
+        # Slot 4: marked on both axes — the cell and the row's ordinal marker.
+        self.assertIn("taken-by-label", row4)
+        self.assertIn("DM7C-1", row4)
+        self.assertIn("cell-taken", row4)
+        self.assertIn("tag-address-taken", row4)
+
+        # Slot 5 (the holder's own, occupied ordinal): neither axis marked.
+        self.assertNotIn("taken-by-label", row5)
+        self.assertNotIn("tag-address-taken", row5)
+
+        # Neighbours 1-3 and 6+: neither axis marked.
+        for ordinal in [1, 2, 3, 6, 7, 8, 9, 10]:
+            row = _row_html(content, ordinal)
+            self.assertNotIn("taken-by-label", row, f"ordinal {ordinal}")
+            self.assertNotIn("tag-address-taken", row, f"ordinal {ordinal}")
+
+        # Review note 6 / settled decision 1 — the marked ordinal keeps its
+        # "+ add device" link, stays state == "empty", and still shows its
+        # would_be_address.
+        self.assertIn("add-slot-link", row4)
+        vlan_a_cell = _cell_html(row4, 0)  # columns ordered by vlan__vlan_id: 200 then 201
+        self.assertIn("cell-empty", vlan_a_cell)
+        self.assertIn(held_address, vlan_a_cell)
+
+    def test_two_holders_of_one_address_render_both_labels_sorted(self) -> None:
+        plain_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="Plain Holder")
+        switch_type = _make_switch_type(port_count=0)
+        held_address = suggest_slot_address(self.range_a.address_range, 4)
+
+        # "Zeta" holds slot 4's address on an ordinary hand-moved SLOT
+        # port (ADR 0003 — the port stays editable after creation).
+        zeta = NetworkDevice.objects.create(
+            device_type=plain_type, rack=self.rack, rack_slot=8, hostname="Zeta"
+        )
+        zeta_port = zeta.ports.get()
+        zeta_port.address = held_address
+        zeta_port.save()
+
+        # "Alpha" holds the *same* address on a switch — device-port and
+        # switch-address uniqueness are separate constraints (decision 2),
+        # so both can genuinely hold one address at once.
+        alpha_switch = NetworkSwitch.objects.create(
+            switch_type=switch_type, rack=self.rack, rack_slot=9, hostname="Alpha"
+        )
+        alpha_address = alpha_switch.addresses.get(vlan=self.vlan_a)
+        alpha_address.address = held_address
+        alpha_address.save()
+
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        row4 = _row_html(response.content.decode(), 4)
+        cell = _cell_html(row4, 0)
+        # Sorted regardless of creation order — "Alpha" before "Zeta".
+        self.assertIn("address used by Alpha, Zeta", cell)
+
+    def test_hand_moved_ordinary_slot_address_produces_a_marker(self) -> None:
+        """The positive test for decision 3: an ordinary ``SLOT`` port is
+        not ``OPERATOR``-sourced at all, yet a hand-moved address still
+        consumes another ordinal's would-be address identically.
+        """
+        plain_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="Plain Mover")
+        held_address = suggest_slot_address(self.range_a.address_range, 4)
+        device = NetworkDevice.objects.create(
+            device_type=plain_type, rack=self.rack, rack_slot=8, hostname="Mover-1"
+        )
+        port = device.ports.get()
+        self.assertFalse(port.is_operator_addressed)  # an ordinary SLOT port, not OPERATOR
+        self.assertNotEqual(port.address, held_address)  # sanity: starts on its own ordinal
+        port.address = held_address
+        port.save()
+
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        row4 = _row_html(response.content.decode(), 4)
+        self.assertIn("taken-by-label", row4)
+        self.assertIn("Mover-1", row4)
+
+    def test_no_markers_when_every_address_sits_on_its_own_ordinal(self) -> None:
+        plain_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="Aligned")
+        for slot in [1, 2, 3]:
+            NetworkDevice.objects.create(
+                device_type=plain_type, rack=self.rack, rack_slot=slot, hostname=f"aligned-{slot}"
+            )
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        content = response.content.decode()
+        self.assertNotIn("taken-by-label", content)
+        self.assertNotIn("tag-address-taken", content)
+
+    def test_taken_address_on_a_continuation_ordinal_keeps_its_state_and_no_marker(self) -> None:
+        bracket_type = NetworkDeviceType.objects.create(
+            manufacturer="DiGiCo", model="SD12", name="Continuation Bracket", port_count=2
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=bracket_type,
+            description="Control",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_a,
+            slot_offset=0,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=bracket_type,
+            description="Engine",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_a,
+            slot_offset=1,
+        )
+        NetworkDevice.objects.create(
+            device_type=bracket_type, rack=self.rack, rack_slot=5, hostname="Bracket-1"
+        )  # occupies ordinals 5-6; ordinal 6's Engine address is base_a + 6.
+
+        continuation_address = suggest_slot_address(self.range_a.address_range, 6)
+        switch_type = _make_switch_type(port_count=0)
+        ghost_switch = NetworkSwitch.objects.create(
+            switch_type=switch_type, rack=self.rack, rack_slot=12, hostname="Ghost"
+        )
+        ghost_address = ghost_switch.addresses.get(vlan=self.vlan_a)
+        ghost_address.address = continuation_address
+        ghost_address.save()
+
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        row6 = _row_html(response.content.decode(), 6)
+        self.assertEqual(_cell_states(row6), ["occupied", "absent"])
+        self.assertIn("ordinal-cell--span-continuation", row6)
+        self.assertNotIn("taken-by-label", row6)
+        self.assertNotIn("cell-taken", row6)
+        self.assertNotIn("tag-address-taken", row6)
+
+    def test_taken_address_on_a_blank_cell_keeps_its_state_and_no_marker(self) -> None:
+        """``blank`` (``ElevationCell``'s docstring) is only reachable for a
+        multi-offset device with ports on the same VLAN at *some but not
+        all* of its offsets — a narrower shape than the "occupied"
+        continuation ordinal above, and easy to miss (Codex review of
+        84ffa17, P2). Built here with a span-2 device whose offset-0 port
+        is on ``vlan_a`` and whose offset-1 port is on ``vlan_b``: the
+        continuation ordinal's ``vlan_a`` cell is "blank" — the device
+        does use ``vlan_a``, just not at this offset — not "absent" and
+        not "empty".
+        """
+        # ADR 0017 requires an offset>0 port's VLAN to also carry an
+        # offset-0 port to derive its address from, so vlan_b needs both a
+        # Primary (offset 0) and an Engine (offset 1) — vlan_a's Control
+        # port sits at offset 0 only, with nothing on vlan_a at offset 1.
+        span_type = NetworkDeviceType.objects.create(
+            manufacturer="Test", model="Split VLAN Span", name="Blank Cell Span", port_count=3
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=span_type,
+            description="Control",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_a,
+            slot_offset=0,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=span_type,
+            description="Primary",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_b,
+            slot_offset=0,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=span_type,
+            description="Engine",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_b,
+            slot_offset=1,
+        )
+        NetworkDevice.objects.create(
+            device_type=span_type, rack=self.rack, rack_slot=5, hostname="BlankSpan-1"
+        )  # occupies ordinals 5-6; ordinal 6's vlan_a cell is "blank".
+
+        blank_ordinal_address = suggest_slot_address(self.range_a.address_range, 6)
+        switch_type = _make_switch_type(port_count=0)
+        holder_switch = NetworkSwitch.objects.create(
+            switch_type=switch_type, rack=self.rack, rack_slot=12, hostname="BlankHolder"
+        )
+        holder_address = holder_switch.addresses.get(vlan=self.vlan_a)
+        holder_address.address = blank_ordinal_address
+        holder_address.save()
+
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        row6 = _row_html(response.content.decode(), 6)
+        self.assertEqual(_cell_states(row6), ["blank", "occupied"])
+        self.assertNotIn("taken-by-label", row6)
+        self.assertNotIn("cell-taken", row6)
+        self.assertNotIn("tag-address-taken", row6)
+
+    def test_taken_address_on_a_switch_occupied_ordinal_keeps_its_state_and_no_marker(self) -> None:
+        switch_type = _make_switch_type(port_count=0)
+        switch = NetworkSwitch.objects.create(
+            switch_type=switch_type, rack=self.rack, rack_slot=10, hostname="Switch-1"
+        )
+        switch_address = switch.addresses.get(vlan=self.vlan_a).address
+        assert switch_address is not None
+
+        plain_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="Switch Duplicator")
+        duplicate_device = NetworkDevice.objects.create(
+            device_type=plain_type, rack=self.rack, rack_slot=15, hostname="Duplicator-1"
+        )
+        duplicate_port = duplicate_device.ports.get()
+        duplicate_port.address = switch_address
+        duplicate_port.save()
+
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        row10 = _row_html(response.content.decode(), 10)
+        # A switch materializes an address on every rack VLAN range, so
+        # both columns are "occupied" here — not "absent" the way a
+        # device's unused-VLAN column would be.
+        self.assertEqual(_cell_states(row10), ["occupied", "occupied"])
+        self.assertNotIn("taken-by-label", row10)
+        self.assertNotIn("cell-taken", row10)
+        self.assertNotIn("tag-address-taken", row10)
+
+    def test_taken_address_on_a_conflict_ordinal_keeps_its_state_and_no_marker(self) -> None:
+        plain_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="Conflict Plain")
+        switch_type = _make_switch_type(port_count=0)
+        # Neither call runs full_clean(), so the DB's own unique(rack,
+        # rack_slot) is the only thing checked — both land at ordinal 3.
+        NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=plain_type,
+            rack=self.rack,
+            rack_slot=3,
+            hostname="ConflictDevice",
+            port_addressing="dhcp",
+        )
+        NetworkSwitch.objects.create(
+            switch_type=switch_type, rack=self.rack, rack_slot=3, hostname="ConflictSwitch"
+        )
+
+        conflict_address = suggest_slot_address(self.range_a.address_range, 3)
+        holder_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="Conflict Holder")
+        holder = NetworkDevice.objects.create(
+            device_type=holder_type, rack=self.rack, rack_slot=16, hostname="Holder-1"
+        )
+        holder_port = holder.ports.get()
+        holder_port.address = conflict_address
+        holder_port.save()
+
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        row3 = _row_html(response.content.decode(), 3)
+        self.assertIn("row-conflict", row3)
+        self.assertEqual(_cell_states(row3), ["conflict", "conflict"])
+        self.assertNotIn("taken-by-label", row3)
+        self.assertNotIn("cell-taken", row3)
+        self.assertNotIn("tag-address-taken", row3)
+
+    def test_dhcp_port_marks_nothing(self) -> None:
+        plain_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="Dhcp Marker")
+        device = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=plain_type, rack=self.rack, rack_slot=8, hostname="DhcpDevice", port_addressing="dhcp"
+        )
+        port = device.ports.get()
+        self.assertTrue(port.is_dhcp)
+        self.assertIsNone(port.address)
+
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("taken-by-label", response.content.decode())
+
+    def test_port_on_a_vlan_the_rack_has_no_range_for_marks_nothing(self) -> None:
+        vlan_c = VLAN.objects.create(name="No Range", vlan_id=202, subnet="10.202.0.0/21")
+        # Deliberately equal to vlan_a ordinal 6's would-be address — if
+        # the map ever ignored VLAN identity, this would wrongly mark it.
+        collision_address = suggest_slot_address(self.range_a.address_range, 6)
+        bare_type = NetworkDeviceType.objects.create(
+            manufacturer="Test", model="Bare", name="No Range Bare", port_count=0
+        )
+        device = NetworkDevice.objects.create(
+            device_type=bare_type, rack=self.rack, rack_slot=9, hostname="NoRangeDevice"
+        )
+        NetworkDevicePort.objects.create(
+            device=device, description="Hand Wired", vlan=vlan_c, address=collision_address
+        )
+
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        self.assertEqual(response.status_code, 200)
+        row6 = _row_html(response.content.decode(), 6)
+        self.assertNotIn("taken-by-label", row6)
+
+    def test_address_outside_the_racks_range_marks_nothing(self) -> None:
+        bare_type = NetworkDeviceType.objects.create(
+            manufacturer="Test", model="Bare", name="Outside Range Bare", port_count=0
+        )
+        device = NetworkDevice.objects.create(
+            device_type=bare_type, rack=self.rack, rack_slot=9, hostname="OutsideRangeDevice"
+        )
+        NetworkDevicePort.objects.create(
+            device=device, description="Hand Wired", vlan=self.vlan_a, address="10.250.250.250"
+        )
+
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("taken-by-label", response.content.decode())
+
+    def test_operator_address_equal_to_its_own_ordinal_marks_nothing(self) -> None:
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="Test", model="Solo Operator", name="Solo Operator", port_count=1
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type,
+            description="Solo",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_a,
+            address_source=PortAddressSource.OPERATOR,
+        )
+        own_address = suggest_slot_address(self.range_a.address_range, 7)
+        NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=device_type,
+            rack=self.rack,
+            rack_slot=7,
+            hostname="SoloOperator-1",
+            operator_addresses={"Solo": own_address},
+        )
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("taken-by-label", response.content.decode())
+
+    def test_taken_address_on_one_vlan_does_not_mark_the_same_ordinal_on_another_vlan(self) -> None:
+        plain_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="VlanScoped")
+        held_address_a = suggest_slot_address(self.range_a.address_range, 4)
+        device = NetworkDevice.objects.create(
+            device_type=plain_type, rack=self.rack, rack_slot=5, hostname="VlanScoped-1"
+        )
+        port = device.ports.get()
+        port.address = held_address_a
+        port.save()
+
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        row4 = _row_html(response.content.decode(), 4)
+        vlan_a_cell = _cell_html(row4, 0)
+        vlan_b_cell = _cell_html(row4, 1)
+        self.assertIn("taken-by-label", vlan_a_cell)
+        self.assertNotIn("taken-by-label", vlan_b_cell)
+
+
 class OccupancyConflictTests(TestCase):
     """More than one occupant claiming an ordinal must be surfaced, not
     silently resolved to whichever one the occupancy dict happened to
@@ -1258,6 +1670,18 @@ class QueryBudgetTests(TestCase):
         self.assertEqual(small_response.status_code, 200)
         self.assertEqual(big_response.status_code, 200)
         self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
+        # Issue #60's taken-address map is built entirely from data this
+        # view already prefetches (PLAN-consumed-slot-addresses.md decision
+        # 4) — it must add exactly zero queries. 12 is the absolute count
+        # recorded on the pre-#60 revision of this test (both rack sizes);
+        # an implementation that reaches for a fresh
+        # NetworkDevicePort.objects.filter(...), or that touches
+        # port.source_type_port while building the map (prefetched in
+        # device_detail(), not here — see _build_taken_address_map's
+        # docstring), would pass the equality assertion above while
+        # quietly moving this number.
+        self.assertEqual(len(small_ctx.captured_queries), 12)
+        self.assertEqual(len(big_ctx.captured_queries), 12)
 
     def test_vlan_map_query_count_independent_of_address_count(self) -> None:
         vlan_small = VLAN.objects.create(name="Small", vlan_id=200, subnet="10.200.0.0/21")
@@ -1956,6 +2380,81 @@ class DerivedPortHostnameRenderingTests(TestCase):
         response = self.client.get(f"/devices/{self.device.pk}/")
         cells = _list_row_cells(response.content.decode(), "Control")
         self.assertEqual(cells[0], "Control")  # no parenthetical hostname, unlike the Engine row
+
+
+class OperatorSetTagRenderingTests(TestCase):
+    """ADR 0022 / issue #60 — the canonical device page's operator-set tag
+    tracks ``NetworkDevicePort.is_operator_addressed`` exactly (Property
+    tests mirrored at the rendering layer, PLAN-consumed-slot-addresses.md
+    Tests section): present only for a static ``OPERATOR``-sourced port,
+    absent for every case the property returns ``False`` for.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.admin_user = User.objects.create_user("optag-admin", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="optag-admin", password="testpass123")
+
+        self.vlan = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+        self.rack = Rack.objects.create(name="OpTag Rack", slot_count=10)
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.201.6.0/27")
+        self.device_type = NetworkDeviceType.objects.create(
+            manufacturer="Yamaha", model="DM7C", name="OpTag Console", port_count=2
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=self.device_type,
+            description="Dante Primary",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=self.device_type,
+            description="Device Control",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan,
+            address_source=PortAddressSource.OPERATOR,
+            hostname_suffix="device-control",
+        )
+
+    def test_tag_present_for_static_operator_port_absent_for_ordinary_slot_port(self) -> None:
+        device = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=5,
+            hostname="dm7c-optag",
+            operator_addresses={"Device Control": "10.201.6.4"},
+        )
+        response = self.client.get(f"/devices/{device.pk}/")
+        content = response.content.decode()
+        control_cells = _list_row_cells(content, "Device Control")
+        primary_cells = _list_row_cells(content, "Dante Primary")
+        self.assertIn("operator-set", control_cells[0])
+        self.assertNotIn("operator-set", primary_cells[0])
+
+    def test_tag_absent_for_dhcp_ports_both_slot_and_operator_sourced(self) -> None:
+        # Unracked -> every port materializes DHCP, including the
+        # OPERATOR-sourced one — it typed no address and consumed
+        # nothing, so it must not carry the tag either.
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname="dm7c-optag-dhcp")
+        response = self.client.get(f"/devices/{device.pk}/")
+        content = response.content.decode()
+        control_cells = _list_row_cells(content, "Device Control")
+        primary_cells = _list_row_cells(content, "Dante Primary")
+        self.assertNotIn("operator-set", control_cells[0])
+        self.assertNotIn("operator-set", primary_cells[0])
+
+    def test_tag_absent_for_port_with_no_source_type_port(self) -> None:
+        bare_type = NetworkDeviceType.objects.create(
+            manufacturer="Test", model="Bare", name="OpTag Bare", port_count=0
+        )
+        bare_device = NetworkDevice.objects.create(device_type=bare_type, hostname="optag-bare")
+        NetworkDevicePort.objects.create(
+            device=bare_device, description="Hand Wired", vlan=self.vlan, address="10.201.6.4"
+        )
+        response = self.client.get(f"/devices/{bare_device.pk}/")
+        cells = _list_row_cells(response.content.decode(), "Hand Wired")
+        self.assertNotIn("operator-set", cells[0])
 
 
 class AddInCardRenderingTests(TestCase):

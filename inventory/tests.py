@@ -5811,6 +5811,94 @@ class OperatorSetPortTests(TestCase):
         self.assertEqual(second.operator_addresses, {})
 
 
+class IsOperatorAddressedTests(TestCase):
+    """``NetworkDevicePort.is_operator_addressed`` (issue #60,
+    PLAN-consumed-slot-addresses.md decision 5) — describes the port's
+    *current* address, not its type port's provenance. True only for a
+    non-DHCP port with a non-null address whose ``source_type_port`` is
+    ``OPERATOR``-sourced.
+    """
+
+    def setUp(self) -> None:
+        self.vlan = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=10)
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.201.6.0/27")
+        self.device_type = NetworkDeviceType.objects.create(
+            manufacturer="Yamaha", model="DM7C", name="Operator Addressed", port_count=2
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=self.device_type,
+            description="Dante Primary",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=self.device_type,
+            description="Device Control",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan,
+            address_source=PortAddressSource.OPERATOR,
+            hostname_suffix="device-control",
+        )
+
+    def test_true_for_static_operator_port(self) -> None:
+        device = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=5,
+            hostname="dm7c-1",
+            operator_addresses={"Device Control": "10.201.6.4"},
+        )
+        port = device.ports.get(description="Device Control")
+        self.assertTrue(port.is_operator_addressed)
+
+    def test_false_for_ordinary_static_slot_port(self) -> None:
+        device = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=5,
+            hostname="dm7c-1",
+            operator_addresses={"Device Control": "10.201.6.4"},
+        )
+        port = device.ports.get(description="Dante Primary")
+        self.assertFalse(port.is_dhcp)
+        self.assertIsNotNone(port.address)
+        self.assertFalse(port.is_operator_addressed)
+
+    def test_false_for_slot_dhcp_port(self) -> None:
+        device = NetworkDevice.objects.create(device_type=self.device_type)  # unracked -> DHCP
+        port = device.ports.get(description="Dante Primary")
+        self.assertTrue(port.is_dhcp)
+        self.assertFalse(port.is_operator_addressed)
+
+    def test_false_for_operator_sourced_port_that_materialized_dhcp(self) -> None:
+        """The case that distinguishes provenance from current state: an
+        unracked device materializes DHCP for *every* port, including an
+        OPERATOR-sourced one (ADR 0022's "on an unracked/DHCP device it
+        materializes DHCP like any other port"). Such a port typed no
+        address and consumed nothing.
+        """
+        device = NetworkDevice.objects.create(device_type=self.device_type)  # unracked -> DHCP
+        port = device.ports.get(description="Device Control")
+        self.assertTrue(port.is_dhcp)
+        self.assertIsNone(port.address)
+        self.assertFalse(port.is_operator_addressed)
+
+    def test_false_for_port_with_no_source_type_port(self) -> None:
+        # A directly-constructed port (models.py:3949) — no materialization
+        # involved, so source_type_port is None from the start rather than
+        # cleared after the fact (which _locked_fields() would refuse).
+        bare_type = NetworkDeviceType.objects.create(
+            manufacturer="Test", model="Bare", name="Bare Port Device", port_count=0
+        )
+        bare_device = NetworkDevice.objects.create(device_type=bare_type)
+        port = NetworkDevicePort.objects.create(
+            device=bare_device, description="Hand Wired", vlan=self.vlan, address="10.201.6.4"
+        )
+        self.assertIsNone(port.source_type_port)
+        self.assertFalse(port.is_operator_addressed)
+
+
 class OperatorPortDeriveCascadeIsolationTests(TestCase):
     """Codex review of PR 1, P1 — a profile may legally hold a ``SLOT``
     offset-0 port, an ``OPERATOR`` offset-0 port and a ``SLOT`` offset>0
