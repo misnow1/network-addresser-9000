@@ -361,6 +361,34 @@ a {
   margin-left: 0.25rem;
 }
 
+/* Address already taken — issue #60. The ordinal itself stays "empty"
+ * (nothing occupies the slot); what's taken is the *address* it would
+ * offer, already held by another occupant's static port/address
+ * elsewhere in this rack (ADR 0003's stored-not-immutable addresses let
+ * that happen). Deliberately muted like .tag-derived/.tag-operator-set —
+ * this is information, not the data problem .row-conflict/.cell-conflict
+ * report, so it must not borrow their --danger/--derived-bg language. */
+.tag-operator-set,
+.tag-address-taken {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  padding: 0.05rem 0.35rem;
+  margin-left: 0.4rem;
+}
+
+.cell-taken {
+  border-left: 2px solid var(--border);
+}
+
+.taken-by-label {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  margin-top: 0.15rem;
+}
+
 .add-slot-link {
   font-size: 0.8rem;
   text-decoration: none;

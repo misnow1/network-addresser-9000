@@ -4087,6 +4087,20 @@ class NetworkDevicePort(AuditedModel):
             return None
         return f"{device.hostname}-{source_type_port.hostname_suffix}"
 
+    @property
+    def is_operator_addressed(self) -> bool:
+        """Whether this port is *currently holding* an address an operator
+        typed rather than one computed from its device's ordinal (ADR 0022).
+
+        False for a DHCP port even when its type port is ``OPERATOR``-sourced:
+        such a port materialized DHCP (unracked device) and consumed no
+        address, so nothing about it is operator-set yet. See issue #60.
+        """
+        if self.is_dhcp or self.address is None:
+            return False
+        type_port = self.source_type_port
+        return type_port is not None and type_port.address_source == PortAddressSource.OPERATOR
+
     def _locked_fields(self) -> dict[str, Any]:
         # ``device``/``port_number``/``ordinal``/``source_type_port``/
         # ``slot_offset`` identify which physical port this row represents

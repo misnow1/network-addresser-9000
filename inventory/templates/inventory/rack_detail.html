@@ -33,6 +33,13 @@
               {% endif %}"
               data-occupant-kind="{% if row.conflicts %}conflict{% elif row.occupant %}{{ row.occupant.row_kind }}{% else %}empty{% endif %}">
               {{ row.ordinal }}
+              {% if row.has_taken_address %}
+                {# issue #60 — the ordinal itself is free (state == "empty" on every #}
+                {# marked cell); it's the address this ordinal would offer that's    #}
+                {# already held by someone else in the rack. A quieter marker than   #}
+                {# the conflict badge above: this is information, not a data problem. #}
+                <span class="tag-address-taken" title="This ordinal's would-be address is already held elsewhere in the rack.">address taken</span>
+              {% endif %}
               {% if row.conflicts %}
                 {# More than one occupant claims this ordinal — a state the write path's #}
                 {# clean()-time checks are meant to prevent but can't guarantee at the DB #}
@@ -58,10 +65,16 @@
               {% endif %}
             </th>
             {% for cell in row.cells %}
-              <td class="cell cell-{{ cell.state }}">
+              <td class="cell cell-{{ cell.state }}{% if cell.taken_by %} cell-taken{% endif %}">
                 {% if cell.state == "empty" %}
                   {% if cell.would_be_address %}
                     <span class="would-be-address">{{ cell.would_be_address }}</span>
+                  {% endif %}
+                  {% if cell.taken_by %}
+                    {# issue #60 — this ordinal's address is already held by someone else's port/address, #}
+                    {# entered by hand rather than derived from that holder's own slot (ADR 0003/0022). The #}
+                    {# slot stays genuinely empty: "+ add device" above is untouched by this marker. #}
+                    <div class="taken-by-label">address used by {{ cell.taken_by|join:", " }}</div>
                   {% endif %}
                 {% elif cell.state == "occupied" %}
                   {% for address in cell.addresses %}
