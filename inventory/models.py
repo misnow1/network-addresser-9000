@@ -2480,6 +2480,10 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
         return self.hostname or f"Switch #{self.pk}"
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        # Stripped/lowercased here too, not just clean() — Model.save()
+        # never calls clean() (Department.save()'s reasoning).
+        if self.hostname_purpose:
+            self.hostname_purpose = self.hostname_purpose.strip().lower()
         # ``self.pk is None or self._state.adding``, not either alone:
         # ``_state.adding`` alone is wrong when a pk is pre-assigned
         # (fixtures, scripted inserts) before the row actually exists;
@@ -2487,10 +2491,6 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
         # resets pk to None but leaves ``_state.adding`` False), which would
         # otherwise silently skip materialization on a re-save of the same
         # in-memory instance.
-        # Stripped/lowercased here too, not just clean() — Model.save()
-        # never calls clean() (Department.save()'s reasoning).
-        if self.hostname_purpose:
-            self.hostname_purpose = self.hostname_purpose.strip().lower()
         is_new = self.pk is None or self._state.adding
         with transaction.atomic():
             if not is_new:

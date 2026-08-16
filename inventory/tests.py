@@ -5365,6 +5365,28 @@ class HostnameComputesNothingYetTests(TestCase):
         )
         self.assertEqual(switch.hostname, "Some Prose Hostname")
 
+    def test_device_add_form_leaves_blank_hostname_blank_with_every_component_set(self) -> None:
+        """``objects.create()`` above never exercises the one path ADR 0023
+        decision 5 actually puts phase 18's assembly on: the add forms'
+        ``clean()``. A backward leak of hostname assembly would show up
+        here first, with every component present and the submitted
+        hostname left blank.
+        """
+        form = NetworkDeviceAddForm(
+            data={
+                "device_type": str(self.device_type.pk),
+                "hostname": "",
+                "rack": str(self.rack.pk),
+                "rack_slot": "1",
+                "port_addressing": "dhcp",
+                "owner": str(self.owner.pk),
+                "hostname_purpose": "sub",
+                "hostname_sequence": "1",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.hostname, "")
+
 
 class RackTemplateModelTests(TestCase):
     """ADR 0014 decisions 1-3: name strip/uniqueness, both slot_count

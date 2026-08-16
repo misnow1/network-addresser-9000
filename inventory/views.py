@@ -1026,12 +1026,12 @@ def index(request: HttpRequest) -> HttpResponse:
     since its map route has nothing to show but the L2-only state anyway.
 
     Also the discovery surface for the Stage B parity pages (review note
-    8): an "All records" panel lists all nine ``/models/<slug>/`` lists,
-    each shown only if the viewer holds that entry's own
-    ``list_permissions`` — a partial-privilege user simply sees fewer
-    tiles, the same floor-not-narrowing posture every other view here
-    takes. This keeps the nav bar itself short (one more static link,
-    "Audit", is all it gains) rather than growing it by nine.
+    8): an "All records" panel lists every ``/models/<slug>/`` list, each
+    shown only if the viewer holds that entry's own ``list_permissions``
+    — a partial-privilege user simply sees fewer tiles, the same
+    floor-not-narrowing posture every other view here takes. This keeps
+    the nav bar itself short (one more static link, "Audit", is all it
+    gains) rather than growing it with every registry entry.
     """
     racks = Rack.objects.annotate(
         switch_count=Count("switches", distinct=True),
@@ -1762,8 +1762,8 @@ def registry_permission_required(which: Literal["list", "detail"]) -> Callable[[
 
     Exists because Stage A's ``@permission_required([...])`` binds a
     literal codename list at import time (``views.py`` — see
-    ``rack_detail``'s decorator), and one generic view here serves nine
-    different permission sets, one per slug, resolved only once the
+    ``rack_detail``'s decorator), and one generic view here serves a
+    different permission set per registry entry, resolved only once the
     request names which model it wants.
     """
 

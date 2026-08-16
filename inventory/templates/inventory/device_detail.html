@@ -20,7 +20,7 @@
     <p class="tile__meta">
       Owner: {% if device.owner %}{{ device.owner }}{% else %}—{% endif %}
       · Hostname purpose: {{ device.hostname_purpose|default:"—" }}
-      · Hostname sequence: {{ device.hostname_sequence|default:"—" }}
+      · Hostname sequence: {{ device.hostname_sequence|default_if_none:"—" }}
     </p>
     {% if device.host %}
       {# ADR 0022 — a soft "currently fitted to" pointer, no addressing meaning. #}

@@ -758,12 +758,28 @@ class _Importer:
 
     def _stage5_racks(self, template: RackTemplate) -> None:
         mps = self.owners_by_slug["mps"]
+        # Rack.location_slug is unique=True — a collision would otherwise
+        # surface as a raw IntegrityError with no pointer at the constant
+        # an operator would actually need to fix it. Tracked here rather
+        # than in _rack_location_slug() itself, which is a @staticmethod
+        # with no per-import state.
+        seen_location_slugs: dict[str, str] = {}
         for row in self.rack_offset_rows:
+            location_slug = self._rack_location_slug(row.rack)
+            if location_slug is not None:
+                colliding_rack = seen_location_slugs.get(location_slug)
+                if colliding_rack is not None:
+                    raise CommandError(
+                        f"Rack {row.rack!r} slugifies to {location_slug!r}, which rack "
+                        f"{colliding_rack!r} already uses; add an entry to "
+                        "RACK_LOCATION_SLUG_EXCEPTIONS to disambiguate before importing."
+                    )
+                seen_location_slugs[location_slug] = row.rack
             rack = Rack(
                 name=row.rack,
                 slot_count=30,
                 owner=mps,
-                location_slug=self._rack_location_slug(row.rack),
+                location_slug=location_slug,
                 created_by=self.user,
             )
             if row.rack in MANUAL_RANGE_RACKS:

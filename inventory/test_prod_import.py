@@ -845,7 +845,7 @@ class ImportProdDataIllegalRackNameTests(TestCase):
             _write_csv(data_dir / "MPS Audio Network Standards - IP Calc Lookups.csv", bogus_rows)
             _write_csv(data_dir / "MPS Audio Network Standards - Switch Ports.csv", _switch_ports_rows())
             _write_csv(data_dir / "MPS Audio Network Standards - IP Addressing mk2.csv", _addressing_rows())
-            with self.assertRaises(CommandError):
+            with self.assertRaisesRegex(CommandError, "RACK_LOCATION_SLUG_EXCEPTIONS"):
                 call_command("import_prod_data", data_dir=str(data_dir))
             self.assertFalse(Rack.objects.exists())  # refused before any writes committed — even AMPRACK1
 
