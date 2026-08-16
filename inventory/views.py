@@ -63,6 +63,7 @@ from .models import (
     NetworkSwitchAddress,
     NetworkSwitchPort,
     NetworkSwitchType,
+    Owner,
     Rack,
     RackTemplate,
     RackVlanRange,
@@ -592,6 +593,10 @@ def _build_elevation_rows(
         # implied by view_networkdevice — an earlier revision missed this
         # one too (Codex review round 3, finding 2).
         "inventory.view_networkdevicetypeport",
+        # ADR 0023 — this page now renders the rack's owner/location_slug.
+        # A previous Codex review caught this view under-declaring its
+        # codenames; the rule stands — declare the full set actually read.
+        "inventory.view_owner",
     ],
     raise_exception=True,
 )
@@ -633,7 +638,7 @@ def rack_detail(request: HttpRequest, pk: int) -> HttpResponse:
         Prefetch("ports", queryset=NetworkDevicePort.objects.select_related("vlan")),
     )
     rack = get_object_or_404(
-        Rack.objects.prefetch_related(
+        Rack.objects.select_related("owner").prefetch_related(
             Prefetch("vlan_ranges", queryset=vlan_range_qs),
             Prefetch("switches", queryset=switch_qs),
             Prefetch("devices", queryset=device_qs),
@@ -899,6 +904,8 @@ def vlan_map(request: HttpRequest, pk: int) -> HttpResponse:
         # ADR 0022 — a port's derived hostname reads its
         # ``source_type_port``, which is a Network Device Type Port.
         "inventory.view_networkdevicetypeport",
+        # ADR 0023 — this page now renders the device's owner.
+        "inventory.view_owner",
     ],
     raise_exception=True,
 )
@@ -931,7 +938,7 @@ def device_detail(request: HttpRequest, pk: int) -> HttpResponse:
     review note 8).
     """
     device = get_object_or_404(
-        NetworkDevice.objects.select_related("device_type", "rack", "host").prefetch_related(
+        NetworkDevice.objects.select_related("device_type", "rack", "host", "owner").prefetch_related(
             Prefetch(
                 "ports",
                 # source_type_port (ADR 0022) — port.hostname reads it on
@@ -1200,6 +1207,61 @@ REGISTRY: dict[str, ModelSpec] = {
         list_permissions=("inventory.view_department",),
         detail_permissions=("inventory.view_department", "inventory.view_vlan"),
     ),
+    "owner": ModelSpec(
+        slug="owner",
+        model=Owner,
+        label="Owner",
+        label_plural="Owners",
+        list_columns=(FieldSpec("Name", "name"), FieldSpec("Slug", "slug")),
+        detail_fields=(FieldSpec("Name", "name"), FieldSpec("Slug", "slug")),
+        inlines=(
+            InlineSpec(
+                label="Racks",
+                accessor="racks",
+                columns=(
+                    FieldSpec("Name", "name"),
+                    FieldSpec("Slot count", "slot_count"),
+                ),
+                ordering=("name",),
+                permissions=("inventory.view_rack",),
+            ),
+            InlineSpec(
+                label="Network Switches",
+                accessor="switches",
+                columns=(
+                    FieldSpec("Hostname", "hostname"),
+                    FieldSpec("Type", "switch_type", render="relation"),
+                ),
+                ordering=("hostname",),
+                permissions=("inventory.view_networkswitch",),
+            ),
+            InlineSpec(
+                label="Network Devices",
+                accessor="devices",
+                columns=(
+                    FieldSpec("Hostname", "hostname"),
+                    FieldSpec("Type", "device_type", render="relation"),
+                ),
+                ordering=("hostname",),
+                permissions=("inventory.view_networkdevice",),
+            ),
+        ),
+        ordering=("name",),
+        detail_prefetch_related=("racks", "switches__switch_type", "devices__device_type"),
+        list_permissions=("inventory.view_owner",),
+        # InlineSpec.permissions is declared but read nowhere — _render_inline()
+        # does no permission check and model_detail() renders every inline
+        # unconditionally (review note 4). Enforcement in this registry is
+        # registry_permission_required against the spec's own detail_
+        # permissions, so every inline's codename folds in here, exactly as
+        # "department" does for its own single inline above.
+        detail_permissions=(
+            "inventory.view_owner",
+            "inventory.view_rack",
+            "inventory.view_networkswitch",
+            "inventory.view_networkdevice",
+        ),
+    ),
     "switchportvlanprofile": ModelSpec(
         slug="switchportvlanprofile",
         model=SwitchPortVlanProfile,
@@ -1258,6 +1320,8 @@ REGISTRY: dict[str, ModelSpec] = {
         list_columns=(
             FieldSpec("Name", "name"),
             FieldSpec("Slot count", "slot_count"),
+            FieldSpec("Owner", "owner", render="relation"),
+            FieldSpec("Location", "location_slug"),
         ),
         # Never actually rendered — canonical_detail_view redirects before
         # detail_fields/inlines are consulted (decision 13) — declared
@@ -1266,6 +1330,8 @@ REGISTRY: dict[str, ModelSpec] = {
         detail_fields=(
             FieldSpec("Name", "name"),
             FieldSpec("Slot count", "slot_count"),
+            FieldSpec("Owner", "owner", render="relation"),
+            FieldSpec("Location", "location_slug"),
         ),
         inlines=(
             InlineSpec(
@@ -1281,7 +1347,11 @@ REGISTRY: dict[str, ModelSpec] = {
         ),
         canonical_detail_view="inventory:rack",
         ordering=("name",),
-        list_permissions=("inventory.view_rack",),
+        list_select_related=("owner",),
+        # The codename for the new relation column goes in list_permissions
+        # — the established pattern (networkdevice.list_permissions already
+        # carries view_networkdevicetype/view_rack for its relation columns).
+        list_permissions=("inventory.view_rack", "inventory.view_owner"),
         # Minimal on purpose: model_detail redirects to rack_detail before
         # rendering anything, and rack_detail declares its own — larger —
         # codename set. Requiring that larger set here too would 403 the
@@ -1299,12 +1369,14 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Model", "model"),
             FieldSpec("Name", "name"),
             FieldSpec("Port count", "port_count"),
+            FieldSpec("Hostname slug", "hostname_slug"),
         ),
         detail_fields=(
             FieldSpec("Manufacturer", "manufacturer"),
             FieldSpec("Model", "model"),
             FieldSpec("Name", "name"),
             FieldSpec("Port count", "port_count"),
+            FieldSpec("Hostname slug", "hostname_slug"),
         ),
         inlines=(
             InlineSpec(
@@ -1341,6 +1413,9 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Rack", "rack", render="relation"),
             FieldSpec("Rack slot", "rack_slot"),
             FieldSpec("DHCP server", "dhcp_server_enabled", render="boolean"),
+            FieldSpec("Owner", "owner", render="relation"),
+            FieldSpec("Hostname purpose", "hostname_purpose"),
+            FieldSpec("Hostname sequence", "hostname_sequence"),
         ),
         detail_fields=(
             FieldSpec("Hostname", "hostname"),
@@ -1349,6 +1424,9 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Rack", "rack", render="relation"),
             FieldSpec("Rack slot", "rack_slot"),
             FieldSpec("DHCP server", "dhcp_server_enabled", render="boolean"),
+            FieldSpec("Owner", "owner", render="relation"),
+            FieldSpec("Hostname purpose", "hostname_purpose"),
+            FieldSpec("Hostname sequence", "hostname_sequence"),
         ),
         # NetworkSwitch has no shaped page of its own yet — this is the
         # first genuinely generic detail page in the registry.
@@ -1381,8 +1459,8 @@ REGISTRY: dict[str, ModelSpec] = {
             ),
         ),
         ordering=("hostname",),
-        list_select_related=("switch_type", "rack"),
-        detail_select_related=("switch_type", "rack"),
+        list_select_related=("switch_type", "rack", "owner"),
+        detail_select_related=("switch_type", "rack", "owner"),
         # profile_summary() reads profile.native_vlan and
         # profile.allowed_vlans per port — without these, an N+1 across a
         # switch's ports (admin.py:752-765 carries the identical hint for
@@ -1396,11 +1474,16 @@ REGISTRY: dict[str, ModelSpec] = {
             "inventory.view_networkswitch",
             "inventory.view_networkswitchtype",
             "inventory.view_rack",
+            "inventory.view_owner",
         ),
+        # NetworkSwitch has no shaped page — unlike rack/networkdevice's
+        # "minimal on purpose" detail_permissions, this page really does
+        # render through the registry, so view_owner belongs here too.
         detail_permissions=(
             "inventory.view_networkswitch",
             "inventory.view_networkswitchtype",
             "inventory.view_rack",
+            "inventory.view_owner",
             "inventory.view_networkswitchaddress",
             "inventory.view_vlan",
             "inventory.view_networkswitchport",
@@ -1418,6 +1501,7 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Name", "name"),
             FieldSpec("Port count", "port_count"),
             FieldSpec("Add-in card", "is_add_in_card", render="boolean"),
+            FieldSpec("Hostname slug", "hostname_slug"),
         ),
         detail_fields=(
             FieldSpec("Manufacturer", "manufacturer"),
@@ -1425,6 +1509,7 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Name", "name"),
             FieldSpec("Port count", "port_count"),
             FieldSpec("Add-in card", "is_add_in_card", render="boolean"),
+            FieldSpec("Hostname slug", "hostname_slug"),
         ),
         inlines=(
             InlineSpec(
@@ -1464,6 +1549,7 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Rack", "rack", render="relation"),
             FieldSpec("Rack slot", "rack_slot"),
             FieldSpec("Host", "host", render="relation"),
+            FieldSpec("Owner", "owner", render="relation"),
         ),
         # Never actually rendered — see the Rack entry's identical note.
         detail_fields=(
@@ -1473,6 +1559,7 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Rack", "rack", render="relation"),
             FieldSpec("Rack slot", "rack_slot"),
             FieldSpec("Host", "host", render="relation"),
+            FieldSpec("Owner", "owner", render="relation"),
         ),
         inlines=(
             InlineSpec(
@@ -1495,11 +1582,12 @@ REGISTRY: dict[str, ModelSpec] = {
         ),
         canonical_detail_view="inventory:device",
         ordering=("hostname",),
-        list_select_related=("device_type", "rack", "host"),
+        list_select_related=("device_type", "rack", "host", "owner"),
         list_permissions=(
             "inventory.view_networkdevice",
             "inventory.view_networkdevicetype",
             "inventory.view_rack",
+            "inventory.view_owner",
         ),
         # Minimal — see the Rack entry's identical note; device_detail
         # declares its own larger codename set once the redirect lands.

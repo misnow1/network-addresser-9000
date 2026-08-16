@@ -750,7 +750,11 @@ class RackAddForm(forms.ModelForm):
 
     class Meta:
         model = Rack
-        fields = ["name", "slot_count"]
+        # location_slug/owner (ADR 0023) must be listed here explicitly —
+        # this is an explicit list, not exclude=[], so construct_instance()
+        # silently drops any field left out of it (the same trap
+        # NetworkDeviceAddForm's Meta.fields carries).
+        fields = ["name", "slot_count", "owner", "location_slug"]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)

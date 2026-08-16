@@ -17,6 +17,11 @@
       <p>Spare pool — not racked.</p>
     {% endif %}
     <p class="tile__meta">Serial: {{ device.serial_number|default:"—" }}</p>
+    <p class="tile__meta">
+      Owner: {% if device.owner %}{{ device.owner }}{% else %}—{% endif %}
+      · Hostname purpose: {{ device.hostname_purpose|default:"—" }}
+      · Hostname sequence: {{ device.hostname_sequence|default:"—" }}
+    </p>
     {% if device.host %}
       {# ADR 0022 — a soft "currently fitted to" pointer, no addressing meaning. #}
       <p>Fitted to <a href="{% url 'inventory:device' device.host_id %}">{{ device.host }}</a></p>

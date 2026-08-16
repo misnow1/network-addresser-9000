@@ -5593,6 +5593,22 @@ class RackTemplateAdminTests(TestCase):
         form_class = RackAdmin(Rack, AdminSite()).get_form(RequestFactory().get("/"), obj=rack)
         self.assertNotIn("template", form_class.base_fields)
 
+    def test_owner_and_location_slug_present_on_add_form(self) -> None:
+        # ADR 0023 — RackAddForm.Meta.fields is an explicit list and would
+        # otherwise silently drop these two.
+        form_class = RackAdmin(Rack, AdminSite()).get_form(RequestFactory().get("/"), obj=None)
+        self.assertIn("owner", form_class.base_fields)
+        self.assertIn("location_slug", form_class.base_fields)
+
+    def test_add_form_saves_owner_and_location_slug(self) -> None:
+        owner = Owner.objects.create(slug="mps", name="MPS")
+        form = RackAddForm(
+            data={"name": "Rack 3", "slot_count": "4", "owner": str(owner.pk), "location_slug": "wpcsrl"}
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.owner, owner)
+        self.assertEqual(form.instance.location_slug, "wpcsrl")
+
     def test_blank_slot_count_adopts_template_value(self) -> None:
         template = RackTemplate.objects.create(name="Audio Rack", slot_count=8)
         form = RackAddForm(data={"name": "Rack 2", "slot_count": "", "template": str(template.pk)})
