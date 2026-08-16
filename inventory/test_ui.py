@@ -1146,6 +1146,65 @@ class TakenAddressMarkerTests(TestCase):
         self.assertNotIn("cell-taken", row6)
         self.assertNotIn("tag-address-taken", row6)
 
+    def test_taken_address_on_a_blank_cell_keeps_its_state_and_no_marker(self) -> None:
+        """``blank`` (``ElevationCell``'s docstring) is only reachable for a
+        multi-offset device with ports on the same VLAN at *some but not
+        all* of its offsets — a narrower shape than the "occupied"
+        continuation ordinal above, and easy to miss (Codex review of
+        84ffa17, P2). Built here with a span-2 device whose offset-0 port
+        is on ``vlan_a`` and whose offset-1 port is on ``vlan_b``: the
+        continuation ordinal's ``vlan_a`` cell is "blank" — the device
+        does use ``vlan_a``, just not at this offset — not "absent" and
+        not "empty".
+        """
+        # ADR 0017 requires an offset>0 port's VLAN to also carry an
+        # offset-0 port to derive its address from, so vlan_b needs both a
+        # Primary (offset 0) and an Engine (offset 1) — vlan_a's Control
+        # port sits at offset 0 only, with nothing on vlan_a at offset 1.
+        span_type = NetworkDeviceType.objects.create(
+            manufacturer="Test", model="Split VLAN Span", name="Blank Cell Span", port_count=3
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=span_type,
+            description="Control",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_a,
+            slot_offset=0,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=span_type,
+            description="Primary",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_b,
+            slot_offset=0,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=span_type,
+            description="Engine",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_b,
+            slot_offset=1,
+        )
+        NetworkDevice.objects.create(
+            device_type=span_type, rack=self.rack, rack_slot=5, hostname="BlankSpan-1"
+        )  # occupies ordinals 5-6; ordinal 6's vlan_a cell is "blank".
+
+        blank_ordinal_address = suggest_slot_address(self.range_a.address_range, 6)
+        switch_type = _make_switch_type(port_count=0)
+        holder_switch = NetworkSwitch.objects.create(
+            switch_type=switch_type, rack=self.rack, rack_slot=12, hostname="BlankHolder"
+        )
+        holder_address = holder_switch.addresses.get(vlan=self.vlan_a)
+        holder_address.address = blank_ordinal_address
+        holder_address.save()
+
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        row6 = _row_html(response.content.decode(), 6)
+        self.assertEqual(_cell_states(row6), ["blank", "occupied"])
+        self.assertNotIn("taken-by-label", row6)
+        self.assertNotIn("cell-taken", row6)
+        self.assertNotIn("tag-address-taken", row6)
+
     def test_taken_address_on_a_switch_occupied_ordinal_keeps_its_state_and_no_marker(self) -> None:
         switch_type = _make_switch_type(port_count=0)
         switch = NetworkSwitch.objects.create(
