@@ -2,7 +2,7 @@
 
 High-level phases only — day-to-day task tracking belongs in GitHub Issues once there's code to file issues against. This file exists so it's obvious what phase the project is in and what's next, even after a fresh start.
 
-**Current phase: 17 — scoped, ADR not yet written. Phases 1–6 and 8–16 done; phase 7 scoped but skipped.**
+**Current phase: 18 — hostname computation, designed in ADR 0023 and ready to build. Phases 1–6 and 8–17 done; phase 7 scoped but skipped.**
 
 ## 1. Foundation — done
 
@@ -197,7 +197,7 @@ so scoped and global alignment are identical on real data; and the spreadsheet's
 offset per rack applied to *every* VLAN base. The ADR says so explicitly, so nobody later assumes
 Department implied it.
 
-## 17. The device model rework, then hostname ingredients
+## 17. The device model rework, then hostname ingredients — done
 
 `MORE_MUSINGS.md` specifies a computed hostname as five dash-joined components: owner, location,
 device type, an optional free-form purpose, and an optional sequence. Three of the five have no
