@@ -75,6 +75,7 @@ from .models import (
     NetworkSwitchPort,
     NetworkSwitchType,
     NetworkSwitchTypePort,
+    Owner,
     PortAddressing,
     PortAddressSource,
     PortMode,
@@ -4908,6 +4909,485 @@ class DepartmentAuditTests(TestCase):
         self.assertIn("department", entries.first().changes_dict)
 
 
+class OwnerModelTests(TestCase):
+    """ADR 0023 decision 1 / PLAN-hostname-ingredients.md settled decision 4:
+    ``Owner`` is a slug+name table, both required and unique, ``slug``
+    DNS-validated and lowercased (unlike ``Department.name``, which strips
+    but deliberately doesn't casefold).
+    """
+
+    def test_slug_is_stripped_and_lowercased_on_save(self) -> None:
+        owner = Owner.objects.create(slug="MPS ", name="MPS")
+        self.assertEqual(owner.slug, "mps")
+
+    def test_slug_is_stripped_and_lowercased_by_full_clean(self) -> None:
+        owner = Owner(slug="MPS ", name="MPS")
+        owner.full_clean()
+        self.assertEqual(owner.slug, "mps")
+
+    def test_name_is_stripped_but_not_lowercased_on_save(self) -> None:
+        owner = Owner.objects.create(slug="mps", name="  MPS  ")
+        self.assertEqual(owner.name, "MPS")
+
+    def test_leading_hyphen_slug_rejected(self) -> None:
+        owner = Owner(slug="-mps", name="MPS")
+        with self.assertRaises(ValidationError):
+            owner.full_clean()
+
+    def test_trailing_hyphen_slug_rejected(self) -> None:
+        owner = Owner(slug="mps-", name="MPS")
+        with self.assertRaises(ValidationError):
+            owner.full_clean()
+
+    def test_blank_slug_rejected_by_db_constraint(self) -> None:
+        with self.assertRaises(IntegrityError):
+            Owner.objects.create(slug="", name="MPS")
+
+    def test_blank_name_rejected_by_db_constraint(self) -> None:
+        with self.assertRaises(IntegrityError):
+            Owner.objects.create(slug="mps", name="")
+
+    def test_str_returns_name_and_slug(self) -> None:
+        owner = Owner.objects.create(slug="mps", name="MPS")
+        self.assertEqual(str(owner), "MPS (mps)")
+
+    def test_protect_refuses_delete_of_owner_with_a_rack(self) -> None:
+        owner = Owner.objects.create(slug="mps", name="MPS")
+        rack = Rack.objects.create(name="Rack 1", slot_count=4, owner=owner)
+        with self.assertRaises(ProtectedError) as ctx:
+            owner.delete()
+        self.assertIn(rack, ctx.exception.protected_objects)
+        self.assertTrue(Owner.objects.filter(pk=owner.pk).exists())
+
+    def test_protect_refuses_delete_of_owner_with_a_switch(self) -> None:
+        owner = Owner.objects.create(slug="mps", name="MPS")
+        switch_type = _make_switch_type()
+        switch = NetworkSwitch.objects.create(switch_type=switch_type, hostname="sw1", owner=owner)
+        with self.assertRaises(ProtectedError) as ctx:
+            owner.delete()
+        self.assertIn(switch, ctx.exception.protected_objects)
+
+    def test_protect_refuses_delete_of_owner_with_a_device(self) -> None:
+        owner = Owner.objects.create(slug="mps", name="MPS")
+        device_type = _make_device_type()
+        device = NetworkDevice.objects.create(device_type=device_type, hostname="dev1", owner=owner)
+        with self.assertRaises(ProtectedError) as ctx:
+            owner.delete()
+        self.assertIn(device, ctx.exception.protected_objects)
+
+
+class RackLocationSlugTests(TestCase):
+    """ADR 0023 decision 5 / settled decision 5: ``null=True`` +
+    ``unique=True``, not a conditional ``UniqueConstraint`` — this backend
+    (``supports_partial_indexes = False``) compiles that to no SQL at all.
+    """
+
+    def test_blank_string_stores_none_on_save(self) -> None:
+        rack = Rack.objects.create(name="Rack 1", slot_count=4, location_slug="")
+        self.assertIsNone(rack.location_slug)
+
+    def test_whitespace_only_stores_none_on_save(self) -> None:
+        rack = Rack.objects.create(name="Rack 1", slot_count=4, location_slug="   ")
+        self.assertIsNone(rack.location_slug)
+
+    def test_stripped_and_lowercased_on_save(self) -> None:
+        rack = Rack.objects.create(name="Rack 1", slot_count=4, location_slug=" WPCSRL ")
+        self.assertEqual(rack.location_slug, "wpcsrl")
+
+    def test_stripped_and_lowercased_by_full_clean(self) -> None:
+        rack = Rack(name="Rack 1", slot_count=4, location_slug=" WPCSRL ")
+        rack.full_clean()
+        self.assertEqual(rack.location_slug, "wpcsrl")
+
+    def test_two_racks_may_both_be_blank(self) -> None:
+        Rack.objects.create(name="Rack 1", slot_count=4, location_slug="")
+        Rack.objects.create(name="Rack 2", slot_count=4, location_slug="")  # must not raise
+
+    def test_two_racks_may_not_share_a_location_slug_integrity_error(self) -> None:
+        # Asserted at the database level, not just ValidationError — settled
+        # decision 5 exists precisely because a partial index would have
+        # silently emitted no SQL and left this unenforced.
+        Rack.objects.create(name="Rack 1", slot_count=4, location_slug="wpcsrl")
+        with self.assertRaises(IntegrityError):
+            Rack.objects.create(name="Rack 2", slot_count=4, location_slug="wpcsrl")
+
+    def test_invalid_slug_rejected_by_full_clean(self) -> None:
+        rack = Rack(name="Rack 1", slot_count=4, location_slug="-bad")
+        with self.assertRaises(ValidationError):
+            rack.full_clean()
+
+
+class TypeHostnameSlugTests(TestCase):
+    """ADR 0023 / settled decision 3: ``hostname_slug`` normalises, is not
+    unique across two profiles of one model, and stays editable after
+    instances exist — deliberately outside the ADR 0010 profile lock.
+    """
+
+    def test_switch_type_hostname_slug_normalizes_on_save(self) -> None:
+        switch_type = _make_switch_type(hostname_slug=" SG300-10MP ")
+        self.assertEqual(switch_type.hostname_slug, "sg300-10mp")
+
+    def test_switch_type_hostname_slug_normalizes_by_full_clean(self) -> None:
+        switch_type = NetworkSwitchType(
+            manufacturer="Cisco", model="SG300", name="Default", port_count=0, hostname_slug=" SG300 "
+        )
+        switch_type.full_clean()
+        self.assertEqual(switch_type.hostname_slug, "sg300")
+
+    def test_device_type_hostname_slug_normalizes_on_save(self) -> None:
+        device_type = _make_device_type(hostname_slug=" IK42 ")
+        self.assertEqual(device_type.hostname_slug, "ik42")
+
+    def test_hostname_slug_not_unique_across_two_profiles_of_one_model(self) -> None:
+        _make_device_type(name="Default", hostname_slug="ik42")
+        second = _make_device_type(name="with Dante Card", hostname_slug="ik42")  # must not raise
+        self.assertEqual(second.hostname_slug, "ik42")
+
+    def test_switch_type_hostname_slug_editable_after_instances_exist(self) -> None:
+        switch_type = _make_switch_type(hostname_slug="sg300")
+        NetworkSwitch.objects.create(switch_type=switch_type, hostname="sw1")
+        switch_type.hostname_slug = "sg300-10mp"
+        switch_type.full_clean()
+        switch_type.save()
+        switch_type.refresh_from_db()
+        self.assertEqual(switch_type.hostname_slug, "sg300-10mp")
+
+    def test_switch_type_hostname_slug_not_locked_by_get_readonly_fields(self) -> None:
+        switch_type = _make_switch_type(hostname_slug="sg300")
+        NetworkSwitch.objects.create(switch_type=switch_type, hostname="sw1")
+        admin = NetworkSwitchTypeAdmin(NetworkSwitchType, AdminSite())
+        readonly = admin.get_readonly_fields(RequestFactory().get("/"), switch_type)
+        self.assertIn("manufacturer", readonly)  # sanity — the lock is real
+        self.assertNotIn("hostname_slug", readonly)
+
+    def test_device_type_hostname_slug_editable_after_instances_exist(self) -> None:
+        device_type = _make_device_type(hostname_slug="ik42")
+        NetworkDevice.objects.create(device_type=device_type, hostname="dev1")
+        device_type.hostname_slug = "ik-42"
+        device_type.full_clean()
+        device_type.save()
+        device_type.refresh_from_db()
+        self.assertEqual(device_type.hostname_slug, "ik-42")
+
+    def test_device_type_hostname_slug_not_locked_by_get_readonly_fields(self) -> None:
+        device_type = _make_device_type(hostname_slug="ik42")
+        NetworkDevice.objects.create(device_type=device_type, hostname="dev1")
+        admin = NetworkDeviceTypeAdmin(NetworkDeviceType, AdminSite())
+        readonly = admin.get_readonly_fields(RequestFactory().get("/"), device_type)
+        self.assertIn("manufacturer", readonly)  # sanity — the lock is real
+        self.assertNotIn("hostname_slug", readonly)
+
+    def test_invalid_hostname_slug_rejected(self) -> None:
+        device_type = NetworkDeviceType(
+            manufacturer="M", model="M", name="Default", port_count=0, hostname_slug="-bad"
+        )
+        with self.assertRaises(ValidationError):
+            device_type.full_clean()
+
+
+class HostnamePurposeSequenceTests(TestCase):
+    """ADR 0023 decisions 1/3 — ``hostname_purpose`` normalises and
+    validates; ``hostname_sequence`` accepts ``None`` and rejects a
+    negative via ``full_clean()``, stated at that layer deliberately since
+    settled decision 6 exists because ``save()`` bypasses ``clean()``.
+    """
+
+    def setUp(self) -> None:
+        self.switch_type = _make_switch_type()
+        self.device_type = _make_device_type()
+
+    def test_switch_hostname_purpose_normalizes_on_save(self) -> None:
+        switch = NetworkSwitch.objects.create(
+            switch_type=self.switch_type, hostname="sw1", hostname_purpose=" SUB "
+        )
+        self.assertEqual(switch.hostname_purpose, "sub")
+
+    def test_switch_hostname_purpose_normalizes_by_full_clean(self) -> None:
+        switch = NetworkSwitch(switch_type=self.switch_type, hostname="sw1", hostname_purpose=" SUB ")
+        switch.full_clean()
+        self.assertEqual(switch.hostname_purpose, "sub")
+
+    def test_device_hostname_purpose_normalizes_on_save(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname="dev1", hostname_purpose=" MIDHI-01-04 "
+        )
+        self.assertEqual(device.hostname_purpose, "midhi-01-04")
+
+    def test_invalid_hostname_purpose_rejected(self) -> None:
+        device = NetworkDevice(device_type=self.device_type, hostname="dev1", hostname_purpose="-bad")
+        with self.assertRaises(ValidationError):
+            device.full_clean()
+
+    def test_device_hostname_sequence_accepts_none(self) -> None:
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname="dev1")
+        self.assertIsNone(device.hostname_sequence)
+
+    def test_device_hostname_sequence_negative_rejected_by_full_clean(self) -> None:
+        device = NetworkDevice(device_type=self.device_type, hostname="dev1", hostname_sequence=-1)
+        with self.assertRaises(ValidationError):
+            device.full_clean()
+
+    def test_switch_hostname_sequence_negative_rejected_by_full_clean(self) -> None:
+        switch = NetworkSwitch(switch_type=self.switch_type, hostname="sw1", hostname_sequence=-1)
+        with self.assertRaises(ValidationError):
+            switch.full_clean()
+
+
+class HostnameIngredientFormFieldPresenceTests(TestCase):
+    """The guard rev 1 lacked: ``owner``, ``hostname_purpose`` and
+    ``hostname_sequence`` each appear in the rendered form's
+    ``base_fields`` on both the add and change views, for both device and
+    switch — the ``base_fields`` idiom already used elsewhere in this file.
+    Without this, the owner-default tests below would pass vacuously on a
+    field the form never had (``NetworkDeviceAddForm.Meta.fields`` is an
+    explicit list; ``construct_instance()`` silently drops anything left
+    out of it).
+    """
+
+    def setUp(self) -> None:
+        self.switch_type = _make_switch_type()
+        self.device_type = _make_device_type()
+
+    def test_device_add_form_has_the_three_fields(self) -> None:
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        request = RequestFactory().get("/admin/inventory/networkdevice/add/")
+        form_class = admin.get_form(request, None)
+        for field in ("owner", "hostname_purpose", "hostname_sequence"):
+            self.assertIn(field, form_class.base_fields)
+
+    def test_device_change_form_has_the_three_fields(self) -> None:
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname="dev1")
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        request = RequestFactory().get(f"/admin/inventory/networkdevice/{device.pk}/change/")
+        form_class = admin.get_form(request, device)
+        for field in ("owner", "hostname_purpose", "hostname_sequence"):
+            self.assertIn(field, form_class.base_fields)
+
+    def test_switch_add_form_has_the_three_fields(self) -> None:
+        admin = NetworkSwitchAdmin(NetworkSwitch, AdminSite())
+        request = RequestFactory().get("/admin/inventory/networkswitch/add/")
+        form_class = admin.get_form(request, None)
+        for field in ("owner", "hostname_purpose", "hostname_sequence"):
+            self.assertIn(field, form_class.base_fields)
+
+    def test_switch_change_form_has_the_three_fields(self) -> None:
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, hostname="sw1")
+        admin = NetworkSwitchAdmin(NetworkSwitch, AdminSite())
+        request = RequestFactory().get(f"/admin/inventory/networkswitch/{switch.pk}/change/")
+        form_class = admin.get_form(request, switch)
+        for field in ("owner", "hostname_purpose", "hostname_sequence"):
+            self.assertIn(field, form_class.base_fields)
+
+
+class RackDerivedOwnerDefaultTests(TestCase):
+    """Plan settled decision 2: ``NetworkDeviceAddForm``/
+    ``NetworkSwitchAddForm`` fill a blank ``owner`` from ``rack.owner`` at
+    creation — a default, not inheritance (ADR 0019's suggest-don't-lock).
+    An explicit choice is never overridden; the change form never derives;
+    ``objects.create()`` never derives; a rack with no owner leaves it
+    blank.
+    """
+
+    def setUp(self) -> None:
+        self.owner = Owner.objects.create(slug="mps", name="MPS")
+        self.other_owner = Owner.objects.create(slug="bej", name="BEJ")
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=10, owner=self.owner)
+        self.ownerless_rack = Rack.objects.create(name="Rack 2", slot_count=10)
+        self.switch_type = _make_switch_type()
+        self.device_type = _make_device_type()
+
+    def _device_data(self, **overrides: Any) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "device_type": str(self.device_type.pk),
+            "hostname": "dev",
+            "rack": str(self.rack.pk),
+            "rack_slot": "1",
+            "port_addressing": "dhcp",
+        }
+        data.update(overrides)
+        return data
+
+    def _switch_data(self, **overrides: Any) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "switch_type": str(self.switch_type.pk),
+            "hostname": "sw",
+            "rack": str(self.rack.pk),
+            "rack_slot": "1",
+            "address_materialization": "manual",
+        }
+        data.update(overrides)
+        return data
+
+    def test_device_add_form_fills_blank_owner_from_rack(self) -> None:
+        form = NetworkDeviceAddForm(data=self._device_data())
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.owner, self.owner)
+
+    def test_device_add_form_does_not_override_explicit_owner(self) -> None:
+        form = NetworkDeviceAddForm(data=self._device_data(owner=str(self.other_owner.pk)))
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.owner, self.other_owner)
+
+    def test_device_add_form_leaves_owner_blank_for_ownerless_rack(self) -> None:
+        form = NetworkDeviceAddForm(data=self._device_data(rack=str(self.ownerless_rack.pk)))
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertIsNone(form.instance.owner)
+
+    def test_device_change_form_does_not_derive_owner(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, rack=self.rack, rack_slot=1, hostname="dev1"
+        )
+        self.assertIsNone(device.owner)
+        form = NetworkDeviceChangeForm(
+            instance=device,
+            data={
+                "device_type": str(device.device_type_id),
+                "hostname": device.hostname,
+                "serial_number": device.serial_number,
+                "rack": str(self.rack.pk),
+                "rack_slot": "1",
+            },
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertIsNone(form.instance.owner)
+
+    def test_device_objects_create_does_not_derive_owner(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, rack=self.rack, rack_slot=1, hostname="dev1"
+        )
+        self.assertIsNone(device.owner)
+
+    def test_switch_add_form_fills_blank_owner_from_rack(self) -> None:
+        form = NetworkSwitchAddForm(data=self._switch_data())
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.owner, self.owner)
+
+    def test_switch_add_form_does_not_override_explicit_owner(self) -> None:
+        form = NetworkSwitchAddForm(data=self._switch_data(owner=str(self.other_owner.pk)))
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.owner, self.other_owner)
+
+    def test_switch_objects_create_does_not_derive_owner(self) -> None:
+        switch = NetworkSwitch.objects.create(
+            switch_type=self.switch_type, rack=self.rack, rack_slot=1, hostname="sw1"
+        )
+        self.assertIsNone(switch.owner)
+
+
+class HostnameIngredientAuditTests(TestCase):
+    """ADR 0023 Consequences / review note 6: ``owner``, ``hostname_purpose``
+    and ``hostname_sequence`` join ``NetworkSwitch``/``NetworkDevice``'s
+    existing scoped ``include_fields`` whitelists — without this they'd be
+    silently untracked. ``Owner`` itself is bare-registered. Shape follows
+    ``DepartmentAuditTests``.
+    """
+
+    def test_device_owner_change_produces_update_log_entry_naming_owner(self) -> None:
+        owner = Owner.objects.create(slug="mps", name="MPS")
+        device_type = _make_device_type()
+        device = NetworkDevice.objects.create(device_type=device_type, hostname="dev1")
+        LogEntry.objects.filter(object_pk=str(device.pk)).delete()
+        device.owner = owner
+        device.save()
+        entries = LogEntry.objects.filter(object_pk=str(device.pk), action=LogEntry.Action.UPDATE)
+        self.assertEqual(entries.count(), 1)
+        self.assertIn("owner", entries.first().changes_dict)
+
+    def test_switch_owner_change_produces_update_log_entry_naming_owner(self) -> None:
+        owner = Owner.objects.create(slug="mps", name="MPS")
+        switch_type = _make_switch_type()
+        switch = NetworkSwitch.objects.create(switch_type=switch_type, hostname="sw1")
+        LogEntry.objects.filter(object_pk=str(switch.pk)).delete()
+        switch.owner = owner
+        switch.save()
+        entries = LogEntry.objects.filter(object_pk=str(switch.pk), action=LogEntry.Action.UPDATE)
+        self.assertEqual(entries.count(), 1)
+        self.assertIn("owner", entries.first().changes_dict)
+
+    def test_owner_itself_is_tracked(self) -> None:
+        owner = Owner.objects.create(slug="mps", name="MPS")
+        LogEntry.objects.filter(object_pk=str(owner.pk)).delete()
+        owner.name = "MPS Audio"
+        owner.save()
+        self.assertTrue(
+            LogEntry.objects.filter(object_pk=str(owner.pk), action=LogEntry.Action.UPDATE).exists()
+        )
+
+
+class HostnameComputesNothingYetTests(TestCase):
+    """The phase-18 guard: creating a device/switch with every hostname
+    component set leaves ``hostname`` exactly as submitted — blank
+    included. If this ever fails, hostname assembly has leaked backward
+    into phase 17, which builds fields and computes nothing.
+    """
+
+    def setUp(self) -> None:
+        self.owner = Owner.objects.create(slug="mps", name="MPS")
+        self.rack = Rack.objects.create(
+            name="Rack 1", slot_count=10, owner=self.owner, location_slug="wpcsrl"
+        )
+        self.switch_type = _make_switch_type(hostname_slug="sg300")
+        self.device_type = _make_device_type(hostname_slug="ik42")
+
+    def test_device_hostname_left_exactly_as_submitted(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            hostname="Some Prose Hostname",
+            owner=self.owner,
+            hostname_purpose="sub",
+            hostname_sequence=1,
+        )
+        self.assertEqual(device.hostname, "Some Prose Hostname")
+
+    def test_device_hostname_left_blank_when_submitted_blank(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            hostname="",
+            owner=self.owner,
+            hostname_purpose="sub",
+            hostname_sequence=1,
+        )
+        self.assertEqual(device.hostname, "")
+
+    def test_switch_hostname_left_exactly_as_submitted(self) -> None:
+        switch = NetworkSwitch.objects.create(
+            switch_type=self.switch_type,
+            rack=self.rack,
+            rack_slot=2,
+            hostname="Some Prose Hostname",
+            owner=self.owner,
+            hostname_purpose="sub",
+            hostname_sequence=1,
+        )
+        self.assertEqual(switch.hostname, "Some Prose Hostname")
+
+    def test_device_add_form_leaves_blank_hostname_blank_with_every_component_set(self) -> None:
+        """``objects.create()`` above never exercises the one path ADR 0023
+        decision 5 actually puts phase 18's assembly on: the add forms'
+        ``clean()``. A backward leak of hostname assembly would show up
+        here first, with every component present and the submitted
+        hostname left blank.
+        """
+        form = NetworkDeviceAddForm(
+            data={
+                "device_type": str(self.device_type.pk),
+                "hostname": "",
+                "rack": str(self.rack.pk),
+                "rack_slot": "1",
+                "port_addressing": "dhcp",
+                "owner": str(self.owner.pk),
+                "hostname_purpose": "sub",
+                "hostname_sequence": "1",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.hostname, "")
+
+
 class RackTemplateModelTests(TestCase):
     """ADR 0014 decisions 1-3: name strip/uniqueness, both slot_count
     bounds (Rack's and RackTemplate's — separate fields, separate tests, so
@@ -5134,6 +5614,22 @@ class RackTemplateAdminTests(TestCase):
         rack = Rack.objects.create(name="Rack 1", slot_count=4)
         form_class = RackAdmin(Rack, AdminSite()).get_form(RequestFactory().get("/"), obj=rack)
         self.assertNotIn("template", form_class.base_fields)
+
+    def test_owner_and_location_slug_present_on_add_form(self) -> None:
+        # ADR 0023 — RackAddForm.Meta.fields is an explicit list and would
+        # otherwise silently drop these two.
+        form_class = RackAdmin(Rack, AdminSite()).get_form(RequestFactory().get("/"), obj=None)
+        self.assertIn("owner", form_class.base_fields)
+        self.assertIn("location_slug", form_class.base_fields)
+
+    def test_add_form_saves_owner_and_location_slug(self) -> None:
+        owner = Owner.objects.create(slug="mps", name="MPS")
+        form = RackAddForm(
+            data={"name": "Rack 3", "slot_count": "4", "owner": str(owner.pk), "location_slug": "wpcsrl"}
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.owner, owner)
+        self.assertEqual(form.instance.location_slug, "wpcsrl")
 
     def test_blank_slot_count_adopts_template_value(self) -> None:
         template = RackTemplate.objects.create(name="Audio Rack", slot_count=8)
@@ -6412,7 +6908,7 @@ class OperatorAddressAdminViewTests(TestCase):
 
 
 class ValidateDnsLabelTests(TestCase):
-    """ADR 0022 decision 4 / ``PLAN-hostname-ingredients.md`` decision 7 —
+    """ADR 0022 decision 4 (shipped) / ADR 0023 decision 8 (the 63-cap) —
     ``validate_dns_label``'s spec exactly: ``^[a-z0-9]([a-z0-9-]*[a-z0-9])?$``,
     max 63 characters.
     """

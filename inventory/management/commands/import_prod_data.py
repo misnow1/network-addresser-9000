@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ValidationError
 from django.core.management.base import BaseCommand, CommandError, CommandParser
 from django.db import transaction
 
@@ -45,6 +46,7 @@ from inventory.models import (
     NetworkSwitch,
     NetworkSwitchType,
     NetworkSwitchTypePort,
+    Owner,
     PortAddressSource,
     PortMode,
     PortType,
@@ -55,6 +57,7 @@ from inventory.models import (
     SwitchPortVlanProfile,
     SwitchPortVlanProfileAllowedVlan,
 )
+from inventory.validators import validate_dns_label
 
 from ._prod_import_csv import (
     AddressingRow,
@@ -99,6 +102,30 @@ MANUAL_RANGE_RACKS = frozenset({"SHURE", "CONSOLES"})
 #: (PROD-DATA-ANALYSIS.md §7.7).
 DHCP_SERVER_RACKS = frozenset({"FOH Drive #1", "FOH Drive #2"})
 
+#: ADR 0023 decision 10 / settled decision 9 — every rack this importer
+#: creates is owned by ``mps``. ``bej`` is seeded as vocabulary an operator
+#: will need (the Dante sheet's one BEJ row is an unracked console this
+#: importer never creates), referenced by no rack. Full names are
+#: placeholders an operator edits.
+OWNER_ROWS: tuple[tuple[str, str], ...] = (("mps", "MPS"), ("bej", "BEJ"))
+
+#: ADR 0023 decision 10 / settled decision 8 — ``Rack.location_slug`` is a
+#: rule (slugify the rack name) plus this small constant of exceptions, not
+#: a full enumeration: the importer creates 21 racks and only 14 appear as
+#: a location in the Dante sheet, so enumerating all 21 would mean
+#: inventing five slugs with no production evidence behind them.
+#: ``CONSOLES`` maps to ``None`` deliberately — it carries no location
+#: component (ADR 0023's "what the production data actually shows").
+#: ``verify_prod_import.py`` re-derives this independently rather than
+#: importing it — see that module's docstring.
+RACK_LOCATION_SLUG_EXCEPTIONS: dict[str, str | None] = {
+    "XE300-1": "xe1",
+    "XE300-2": "xe2",
+    "FOH Drive #1": "foh1",
+    "FOH Drive #2": "foh2",
+    "CONSOLES": None,
+}
+
 #: The Netgear switch's addressing-sheet description — deferred, not
 #: created, since "Managed Switch" is not a model (PLAN-prod-import.md §6).
 NETGEAR_DESCRIPTION = "Netgear Managed Switch (For W8LM Rack)"
@@ -142,6 +169,22 @@ SWITCH_DESCRIPTION_TO_TABLE: dict[str, str] = {
     "Spare SG300-26P": "Cisco SG300-26P",
 }
 _TLSG108E_RE = re.compile(r"^mps-tlsg108e-\d+$")
+
+#: Any run of characters that isn't a lowercase letter or digit collapses to
+#: a single hyphen — the mechanical half of ADR 0023 decision 10's "slugify
+#: the rack name" rule. Re-declared identically in ``verify_prod_import.py``
+#: (that module's docstring forbids importing this one).
+_RACK_SLUG_COLLAPSE_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _slugify_rack_name(name: str) -> str:
+    """Lowercase, then collapse every run of non-alphanumeric characters to
+    a single hyphen, then strip leading/trailing hyphens — e.g.
+    ``"AMPRACK1"`` -> ``"amprack1"``, ``"XE300-1"`` -> ``"xe300-1"``. Always
+    produces a value ``validate_dns_label`` accepts, except when ``name``
+    has no alphanumeric characters at all (empty result).
+    """
+    return _RACK_SLUG_COLLAPSE_RE.sub("-", name.lower()).strip("-")
 
 
 @dataclass(frozen=True)
@@ -534,6 +577,7 @@ class _Importer:
         self.switch_port_tables = switch_port_tables
 
         self.user: Any = None
+        self.owners_by_slug: dict[str, Owner] = {}
         self.vlans_by_function: dict[str, VLAN] = {}
         self.profiles_by_name: dict[str, SwitchPortVlanProfile] = {}
         self.racks_by_name: dict[str, Rack] = {}
@@ -545,6 +589,7 @@ class _Importer:
 
     def run(self) -> None:
         self._stage1_import_user()
+        self._seed_owners()
         self._stage2_vlans()
         self._stage3_switch_port_profiles()
         template = self._stage4_rack_template()
@@ -589,6 +634,20 @@ class _Importer:
                     "before importing, so this run doesn't attribute every row to it."
                 )
         self.user = user
+
+    def _seed_owners(self) -> None:
+        """Two ``Owner`` rows (ADR 0023 decision 10 / settled decision 9) —
+        not a numbered "stage" of PLAN-prod-import.md's original sequence,
+        since this is a phase 17 addition to that command: ``mps``, which
+        every imported rack will point at (stage 5), and ``bej``, seeded as
+        vocabulary an operator will need even though no rack here points at
+        it (the Dante sheet's one BEJ row is an unracked console).
+        """
+        for slug, name in OWNER_ROWS:
+            owner = Owner(slug=slug, name=name, created_by=self.user)
+            owner.full_clean()
+            owner.save()
+            self.owners_by_slug[slug] = owner
 
     # -- Stage 2: VLANs -----------------------------------------------------------
 
@@ -698,8 +757,31 @@ class _Importer:
     # -- Stage 5: racks, in ascending Address Offset order ---------------------------
 
     def _stage5_racks(self, template: RackTemplate) -> None:
+        mps = self.owners_by_slug["mps"]
+        # Rack.location_slug is unique=True — a collision would otherwise
+        # surface as a raw IntegrityError with no pointer at the constant
+        # an operator would actually need to fix it. Tracked here rather
+        # than in _rack_location_slug() itself, which is a @staticmethod
+        # with no per-import state.
+        seen_location_slugs: dict[str, str] = {}
         for row in self.rack_offset_rows:
-            rack = Rack(name=row.rack, slot_count=30, created_by=self.user)
+            location_slug = self._rack_location_slug(row.rack)
+            if location_slug is not None:
+                colliding_rack = seen_location_slugs.get(location_slug)
+                if colliding_rack is not None:
+                    raise CommandError(
+                        f"Rack {row.rack!r} slugifies to {location_slug!r}, which rack "
+                        f"{colliding_rack!r} already uses; add an entry to "
+                        "RACK_LOCATION_SLUG_EXCEPTIONS to disambiguate before importing."
+                    )
+                seen_location_slugs[location_slug] = row.rack
+            rack = Rack(
+                name=row.rack,
+                slot_count=30,
+                owner=mps,
+                location_slug=location_slug,
+                created_by=self.user,
+            )
             if row.rack in MANUAL_RANGE_RACKS:
                 rack.full_clean()
                 rack.save()
@@ -722,6 +804,27 @@ class _Importer:
         network = ipaddress.IPv4Network(vlan.subnet, strict=True)
         base = network.network_address + offset
         return f"{base}/27"
+
+    @staticmethod
+    def _rack_location_slug(rack_name: str) -> str | None:
+        """ADR 0023 decision 10 / settled decision 8: ``RACK_LOCATION_SLUG_
+        EXCEPTIONS`` first, then slugify. Raises — rather than silently
+        importing a null slug — only when a name is neither in the constant
+        nor slugifies to a legal DNS label; ordinary synthetic names like
+        ``AMPRACK1``/``W8LMTEST`` slugify cleanly and are never refused.
+        """
+        if rack_name in RACK_LOCATION_SLUG_EXCEPTIONS:
+            return RACK_LOCATION_SLUG_EXCEPTIONS[rack_name]
+        slug = _slugify_rack_name(rack_name)
+        try:
+            validate_dns_label(slug)
+        except ValidationError as exc:
+            raise CommandError(
+                f"Rack {rack_name!r} has no RACK_LOCATION_SLUG_EXCEPTIONS entry and does not "
+                f"slugify to a legal DNS label ({slug!r}: {exc.messages[0]}); add it to that "
+                "constant before importing."
+            ) from exc
+        return slug
 
     # -- Stage 6: switch types --------------------------------------------------------
 

@@ -57,6 +57,7 @@ from .models import (
     NetworkSwitch,
     NetworkSwitchType,
     NetworkSwitchTypePort,
+    Owner,
     PortAddressing,
     PortAddressSource,
     PortMode,
@@ -321,6 +322,7 @@ class ParityFixtureMixin:
         self.department = Department.objects.create(
             name="StageB Grillework", description="StageB Grillework Description"
         )
+        self.owner = Owner.objects.create(slug="stageb-owner", name="StageB Ownership")
         self.vlan_native = VLAN.objects.create(
             name="StageB Native",
             vlan_id=4077,
@@ -345,13 +347,19 @@ class ParityFixtureMixin:
         self.rack_template = RackTemplate.objects.create(name="StageB Template", slot_count=12)
         self.rack_template.vlans.set([self.vlan_allowed_1, self.vlan_allowed_2])
 
-        self.rack = Rack.objects.create(name="StageB Rack", slot_count=10)
+        self.rack = Rack.objects.create(
+            name="StageB Rack", slot_count=10, owner=self.owner, location_slug="stageb-location"
+        )
         self.rack_vlan_range = RackVlanRange.objects.create(
             rack=self.rack, vlan=self.vlan_native, address_range="10.210.1.0/27"
         )
 
         self.switch_type = NetworkSwitchType.objects.create(
-            manufacturer="StageB Switch Mfr", model="SBSwitchModel", name="StageB Switch Type", port_count=1
+            manufacturer="StageB Switch Mfr",
+            model="SBSwitchModel",
+            name="StageB Switch Type",
+            port_count=1,
+            hostname_slug="sbswtype",
         )
         NetworkSwitchTypePort.objects.create(
             switch_type=self.switch_type,
@@ -371,12 +379,19 @@ class ParityFixtureMixin:
             hostname="stageb-switch1",
             serial_number="SBSW001",
             dhcp_server_enabled=True,
+            owner=self.owner,
+            hostname_purpose="stageb-switch-purpose",
+            hostname_sequence=42,
         )
         self.switch_port = self.switch.ports.get()
         self.switch_address = self.switch.addresses.get()
 
         self.device_type = NetworkDeviceType.objects.create(
-            manufacturer="StageB Device Mfr", model="SBDeviceModel", name="StageB Device Type", port_count=1
+            manufacturer="StageB Device Mfr",
+            model="SBDeviceModel",
+            name="StageB Device Type",
+            port_count=1,
+            hostname_slug="sbdevtype",
         )
         NetworkDeviceTypePort.objects.create(
             device_type=self.device_type,
@@ -392,6 +407,7 @@ class ParityFixtureMixin:
             rack_slot=5,
             hostname="stageb-device1",
             serial_number="SBDEV001",
+            owner=self.owner,
         )
         self.device_port = self.device.ports.get()
         self.device_port.switch_port = self.switch_port
@@ -424,6 +440,7 @@ class ParityFixtureMixin:
         self.pk_by_slug = {
             "vlan": self.vlan_native.pk,
             "department": self.department.pk,
+            "owner": self.owner.pk,
             "switchportvlanprofile": self.profile.pk,
             "racktemplate": self.rack_template.pk,
             "rack": self.rack.pk,
@@ -662,6 +679,7 @@ class PartialGrantAccessTests(TestCase):
                 "view_networkswitchaddress",
                 "view_networkdeviceport",
                 "view_networkdevicetypeport",
+                "view_owner",
             ],
         )
 
@@ -696,6 +714,7 @@ class PartialGrantAccessTests(TestCase):
                 # ADR 0022 — a port's derived hostname reads its
                 # source_type_port, a Network Device Type Port.
                 "view_networkdevicetypeport",
+                "view_owner",
             ],
         )
 
@@ -747,12 +766,13 @@ class WritesNothingTests(TestCase):
         self.spare_device = NetworkDevice.objects.create(device_type=self.device_type, hostname="spare1")
 
         # Stage B fixtures — one of every other registered model, so the
-        # sweep below actually exercises all nine /models/<slug>/ list
-        # pages and the seven non-redirecting detail pages, not just the
+        # sweep below actually exercises every /models/<slug>/ list page
+        # and every non-redirecting detail page, not just the
         # four models Stage A already had fixtures for.
         self.profile = SwitchPortVlanProfile.objects.create(name="WN Profile", native_vlan=self.vlan)
         self.rack_template = RackTemplate.objects.create(name="WN Template", slot_count=5)
         self.department = Department.objects.create(name="WN Department")
+        self.owner = Owner.objects.create(slug="wn-owner", name="WN Owner")
 
         self.admin_user = User.objects.create_user("adminrole", password="testpass123", is_staff=True)
         self.admin_user.groups.add(Group.objects.get(name="Admin"))
@@ -776,6 +796,8 @@ class WritesNothingTests(TestCase):
             f"/models/vlan/{self.vlan.pk}/",
             "/models/department/",
             f"/models/department/{self.department.pk}/",
+            "/models/owner/",
+            f"/models/owner/{self.owner.pk}/",
             "/models/switchportvlanprofile/",
             f"/models/switchportvlanprofile/{self.profile.pk}/",
             "/models/racktemplate/",
@@ -803,7 +825,7 @@ class WritesNothingTests(TestCase):
         # tables — ContentType.objects.get_for_model() (and, transitively,
         # auditlog's LogEntry.objects.get_for_object(), which the Stage B
         # audit panel used to call) is documented to create the row on a
-        # cache miss. A row-count sweep over just the nine inventory
+        # cache miss. A row-count sweep over just the registered inventory
         # models and LogEntry — the original shape of this test — could
         # not have caught that: every registered model's ContentType row
         # already exists by the time any test runs (Django's post_migrate
@@ -1713,7 +1735,7 @@ class QueryBudgetTests(TestCase):
         self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
 
     def test_model_list_query_count_independent_of_row_count(self) -> None:
-        """Stage B: every one of the nine ``/models/<slug>/`` list pages
+        """Stage B: every one of the ``/models/<slug>/`` list pages
         must cost the same number of queries whether it lists 2 rows or
         50 — proof the declared ``list_select_related``/
         ``list_prefetch_related`` hints actually eliminate the N+1 a naive
@@ -1737,6 +1759,7 @@ class QueryBudgetTests(TestCase):
             ),
             "racktemplate": lambda i: RackTemplate.objects.create(name=f"QB Template {i}"),
             "department": lambda i: Department.objects.create(name=f"QB Department {i}"),
+            "owner": lambda i: Owner.objects.create(slug=f"qb-owner-{i}", name=f"QB Owner {i}"),
             "rack": lambda i: Rack.objects.create(name=f"QB Rack {i}", slot_count=1),
             "networkswitchtype": lambda i: NetworkSwitchType.objects.create(
                 manufacturer="QB", model="M", name=f"QB SwitchType {i}", port_count=0
@@ -2074,6 +2097,23 @@ class PartialGrantParityAccessTests(ParityFixtureMixin, TestCase):
                 self.client.logout()
 
 
+class OwnerAccessTests(ParityFixtureMixin, TestCase):
+    """Plan PR2 Tests: a Viewer with ``view_owner`` sees the Owners list and
+    detail; without it, both 403.
+    """
+
+    def test_viewer_with_view_owner_sees_list_and_detail(self) -> None:
+        self.client.login(username="stageb-viewer", password="testpass123")
+        self.assertEqual(self.client.get(self._list_url("owner")).status_code, 200)
+        self.assertEqual(self.client.get(self._detail_url("owner")).status_code, 200)
+
+    def test_user_without_view_owner_403s_on_list_and_detail(self) -> None:
+        user = _user_missing_codename("inventory.view_owner")
+        self.client.login(username=user.username, password="testpass123")
+        self.assertEqual(self.client.get(self._list_url("owner")).status_code, 403)
+        self.assertEqual(self.client.get(self._detail_url("owner")).status_code, 403)
+
+
 class ParityContentTests(ParityFixtureMixin, TestCase):
     """Read-parity content, asserted with distinctive fixture values
     (review note 7) — never a bare ``assertContains(response, "VLAN")``.
@@ -2152,6 +2192,18 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         self.assertNotIn("StageB Allowed One", content)
         self.assertNotIn("StageB Allowed Two", content)
 
+    def test_owner_renders_every_declared_column(self) -> None:
+        list_response = self.client.get(self._list_url("owner"))
+        self.assertEqual(
+            _list_row_cells(list_response.content.decode(), "StageB Ownership"),
+            ["StageB Ownership", "stageb-owner", "Details"],
+        )
+
+        detail_response = self.client.get(self._detail_url("owner"))
+        content = detail_response.content.decode()
+        self.assertEqual(_detail_field_text(content, "Name"), "StageB Ownership")
+        self.assertEqual(_detail_field_text(content, "Slug"), "stageb-owner")
+
     def test_switchportvlanprofile_renders_every_declared_column(self) -> None:
         # The value a naive `_meta.fields` walk would have dropped
         # entirely — allowed_vlans is a form field in the admin, not a
@@ -2192,7 +2244,7 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         list_response = self.client.get(self._list_url("rack"))
         self.assertEqual(
             _list_row_cells(list_response.content.decode(), "StageB Rack"),
-            ["StageB Rack", "10", "Details"],
+            ["StageB Rack", "10", "StageB Ownership (stageb-owner)", "stageb-location", "Details"],
         )
         detail_response = self.client.get(self._detail_url("rack"))
         self.assertEqual(detail_response.status_code, 301)
@@ -2201,7 +2253,7 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         list_response = self.client.get(self._list_url("networkswitchtype"))
         self.assertEqual(
             _list_row_cells(list_response.content.decode(), "StageB Switch Type"),
-            ["StageB Switch Mfr", "SBSwitchModel", "StageB Switch Type", "1", "Details"],
+            ["StageB Switch Mfr", "SBSwitchModel", "StageB Switch Type", "1", "sbswtype", "Details"],
         )
 
         detail_response = self.client.get(self._detail_url("networkswitchtype"))
@@ -2210,6 +2262,7 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         self.assertEqual(_detail_field_text(content, "Model"), "SBSwitchModel")
         self.assertEqual(_detail_field_text(content, "Name"), "StageB Switch Type")
         self.assertEqual(_detail_field_text(content, "Port count"), "1")
+        self.assertEqual(_detail_field_text(content, "Hostname slug"), "sbswtype")
         self.assertEqual(
             _inline_row_cells(content, "Type ports", "StageB Switch Port Desc"),
             ["1", "StageB Switch Port Desc", "1GbE RJ45 (copper)", "StageB Profile"],
@@ -2220,7 +2273,18 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         list_response = self.client.get(self._list_url("networkswitch"))
         self.assertEqual(
             _list_row_cells(list_response.content.decode(), "stageb-switch1"),
-            ["stageb-switch1", switch_type_text, "SBSW001", "StageB Rack", "3", "Yes", "Details"],
+            [
+                "stageb-switch1",
+                switch_type_text,
+                "SBSW001",
+                "StageB Rack",
+                "3",
+                "Yes",
+                "StageB Ownership (stageb-owner)",
+                "stageb-switch-purpose",
+                "42",
+                "Details",
+            ],
         )
 
         detail_response = self.client.get(self._detail_url("networkswitch"))
@@ -2231,6 +2295,9 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         self.assertEqual(_detail_field_text(content, "Rack"), "StageB Rack")
         self.assertEqual(_detail_field_text(content, "Rack slot"), "3")
         self.assertEqual(_detail_field_text(content, "DHCP server"), "Yes")
+        self.assertEqual(_detail_field_text(content, "Owner"), "StageB Ownership (stageb-owner)")
+        self.assertEqual(_detail_field_text(content, "Hostname purpose"), "stageb-switch-purpose")
+        self.assertEqual(_detail_field_text(content, "Hostname sequence"), "42")
 
         # Addresses inline — the switch's materialized static address on the racked VLAN.
         assert self.switch_address.address is not None  # materialized (rack + RackVlanRange), never DHCP
@@ -2250,7 +2317,7 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         list_response = self.client.get(self._list_url("networkdevicetype"))
         self.assertEqual(
             _list_row_cells(list_response.content.decode(), "StageB Device Type"),
-            ["StageB Device Mfr", "SBDeviceModel", "StageB Device Type", "1", "No", "Details"],
+            ["StageB Device Mfr", "SBDeviceModel", "StageB Device Type", "1", "No", "sbdevtype", "Details"],
         )
 
         detail_response = self.client.get(self._detail_url("networkdevicetype"))
@@ -2260,6 +2327,7 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         self.assertEqual(_detail_field_text(content, "Name"), "StageB Device Type")
         self.assertEqual(_detail_field_text(content, "Port count"), "1")
         self.assertEqual(_detail_field_text(content, "Add-in card"), "No")
+        self.assertEqual(_detail_field_text(content, "Hostname slug"), "sbdevtype")
         self.assertEqual(
             _inline_row_cells(content, "Type ports", "StageB Device Port"),
             [
@@ -2278,7 +2346,16 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         list_response = self.client.get(self._list_url("networkdevice"))
         self.assertEqual(
             _list_row_cells(list_response.content.decode(), "stageb-device1"),
-            ["stageb-device1", device_type_text, "SBDEV001", "StageB Rack", "5", "—", "Details"],
+            [
+                "stageb-device1",
+                device_type_text,
+                "SBDEV001",
+                "StageB Rack",
+                "5",
+                "—",
+                "StageB Ownership (stageb-owner)",
+                "Details",
+            ],
         )
         detail_response = self.client.get(self._detail_url("networkdevice"))
         self.assertEqual(detail_response.status_code, 301)
@@ -2340,6 +2417,51 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         )
         response = self.client.get("/spares/")
         self.assertContains(response, f'href="/models/networkswitch/{spare_switch.pk}/"')
+
+
+class HostnameIngredientCanonicalPageTests(TestCase):
+    """ADR 0023 / plan PR2 "the canonical_detail_view trap": rack_detail.html
+    renders location_slug and owner; device_detail.html renders owner,
+    hostname_purpose and hostname_sequence — checked through the shaped
+    view URLs, since the registry's own detail_fields never render for
+    either model (decision 13's redirect). ``PartialGrantAccessTests``
+    already proves a Viewer without ``view_owner`` is 403'd on both — that
+    codename lives in both views' own declared codename lists — so this
+    class does not duplicate that check.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.owner = Owner.objects.create(slug="hi-owner", name="HI Owner")
+        self.rack = Rack.objects.create(
+            name="HI Rack", slot_count=4, owner=self.owner, location_slug="hi-location"
+        )
+        self.device_type = _make_device_type()
+        self.device = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            hostname="hi-device",
+            owner=self.owner,
+            hostname_purpose="hi-purpose",
+            hostname_sequence=7,
+        )
+        self.admin_user = User.objects.create_user("hi-admin", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="hi-admin", password="testpass123")
+
+    def test_rack_detail_renders_owner_and_location_slug(self) -> None:
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "HI Owner")
+        self.assertContains(response, "hi-location")
+
+    def test_device_detail_renders_owner_purpose_and_sequence(self) -> None:
+        response = self.client.get(f"/devices/{self.device.pk}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "HI Owner")
+        self.assertContains(response, "hi-purpose")
+        self.assertContains(response, "Hostname sequence: 7")
 
 
 class DerivedPortHostnameRenderingTests(TestCase):
@@ -2846,6 +2968,8 @@ class AdminLockoutTests(ParityFixtureMixin, TestCase):
             self._detail_url("vlan"): "StageB Native",
             self._list_url("department"): "StageB Grillework",
             self._detail_url("department"): "StageB Grillework",
+            self._list_url("owner"): "StageB Ownership",
+            self._detail_url("owner"): "StageB Ownership",
             self._list_url("switchportvlanprofile"): "StageB Profile",
             self._detail_url("switchportvlanprofile"): "StageB Profile",
             self._list_url("racktemplate"): "StageB Template",

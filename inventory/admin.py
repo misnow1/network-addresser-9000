@@ -28,6 +28,7 @@ from .models import (
     NetworkSwitchPort,
     NetworkSwitchType,
     NetworkSwitchTypePort,
+    Owner,
     PortAddressing,
     PortAddressSource,
     PortMode,
@@ -372,6 +373,20 @@ class NetworkSwitchPortForm(forms.ModelForm):
             self.fields["profile"].disabled = True
 
 
+def _fill_rack_derived_owner_default(cleaned_data: dict[str, Any], rack: Any) -> None:
+    """Fills a blank ``owner`` from ``rack.owner`` (ADR 0023, plan settled
+    decision 2) — a creation-time *default*, not inheritance: an explicit
+    choice is never overwritten, a rack with no owner leaves the field
+    blank, and this only ever runs from an add form's ``clean()`` — the
+    change forms and ``objects.create()`` never call it, so neither
+    derives. Shared by ``NetworkDeviceAddForm``/``NetworkSwitchAddForm``,
+    the same shape as the ``rack_slot`` lowest-free-ordinal fill (ADR 0019)
+    a few lines away in each.
+    """
+    if rack is not None and not cleaned_data.get("owner"):
+        cleaned_data["owner"] = rack.owner
+
+
 class NetworkDeviceAddForm(forms.ModelForm):
     """Carries the creation-time-only ``port_addressing`` choice (ADR 0013)
     — not a model field, so it can't be expressed via ``Meta.fields``
@@ -433,7 +448,21 @@ class NetworkDeviceAddForm(forms.ModelForm):
 
     class Meta:
         model = NetworkDevice
-        fields = ["device_type", "hostname", "serial_number", "rack", "rack_slot"]
+        # owner/hostname_purpose/hostname_sequence (ADR 0023, plan settled
+        # decision 2) must be listed here explicitly — this is an explicit
+        # list, not exclude=[], so construct_instance() silently drops any
+        # field left out of it, including the rack-derived owner default
+        # clean() below computes.
+        fields = [
+            "device_type",
+            "hostname",
+            "serial_number",
+            "rack",
+            "rack_slot",
+            "owner",
+            "hostname_purpose",
+            "hostname_sequence",
+        ]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -553,6 +582,7 @@ class NetworkDeviceAddForm(forms.ModelForm):
         """
         cleaned_data = super().clean() or {}
         rack = cleaned_data.get("rack")
+        _fill_rack_derived_owner_default(cleaned_data, rack)
         device_type = cleaned_data.get("device_type")
         if rack is None or device_type is None:
             return cleaned_data
@@ -629,7 +659,16 @@ class NetworkDeviceChangeForm(forms.ModelForm):
 
     class Meta:
         model = NetworkDevice
-        fields = ["device_type", "hostname", "serial_number", "rack", "rack_slot"]
+        fields = [
+            "device_type",
+            "hostname",
+            "serial_number",
+            "rack",
+            "rack_slot",
+            "owner",
+            "hostname_purpose",
+            "hostname_sequence",
+        ]
 
 
 class NetworkSwitchAddForm(forms.ModelForm):
@@ -663,6 +702,7 @@ class NetworkSwitchAddForm(forms.ModelForm):
     def clean(self) -> dict[str, Any]:
         cleaned_data = super().clean() or {}
         rack = cleaned_data.get("rack")
+        _fill_rack_derived_owner_default(cleaned_data, rack)
         if rack is not None and cleaned_data.get("rack_slot") is None:
             slot = lowest_free_run(occupied_rack_slot_ranges(rack), 1, rack.slot_count)
             if slot is None:
@@ -710,7 +750,11 @@ class RackAddForm(forms.ModelForm):
 
     class Meta:
         model = Rack
-        fields = ["name", "slot_count"]
+        # location_slug/owner (ADR 0023) must be listed here explicitly —
+        # this is an explicit list, not exclude=[], so construct_instance()
+        # silently drops any field left out of it (the same trap
+        # NetworkDeviceAddForm's Meta.fields carries).
+        fields = ["name", "slot_count", "owner", "location_slug"]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -972,6 +1016,13 @@ class DepartmentAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.M
     show_auditlog_history_link = True
 
 
+@admin.register(Owner)
+class OwnerAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
+    list_display = ["name", "slug"]
+    search_fields = ["name", "slug"]
+    show_auditlog_history_link = True
+
+
 @admin.register(VLAN)
 class VLANAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
     list_display = [
@@ -1063,8 +1114,13 @@ class RackTemplateAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin
 
 @admin.register(Rack)
 class RackAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
-    list_display = ["name", "slot_count"]
-    search_fields = ["name"]
+    list_display = ["name", "slot_count", "owner", "location_slug"]
+    search_fields = ["name", "location_slug"]
+    list_filter = ["owner"]
+    # A declarative attribute, not relying on Django's auto-select_related()
+    # — owner is nullable, so the auto-apply path doesn't descend it (see
+    # VLANAdmin's identical comment above for the mechanism).
+    list_select_related = ["owner"]
     inlines = [RackVlanRangeInline]
     show_auditlog_history_link = True
 
@@ -1081,7 +1137,7 @@ class RackAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAd
 
 @admin.register(NetworkSwitchType)
 class NetworkSwitchTypeAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
-    list_display = ["manufacturer", "model", "name", "port_count"]
+    list_display = ["manufacturer", "model", "name", "port_count", "hostname_slug"]
     search_fields = ["manufacturer", "model", "name"]
     inlines = [NetworkSwitchTypePortInline]
     show_auditlog_history_link = True
@@ -1129,9 +1185,23 @@ def delete_selected(modeladmin: "NetworkSwitchAdmin", request: HttpRequest, quer
 
 @admin.register(NetworkSwitch)
 class NetworkSwitchAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
-    list_display = ["hostname", "switch_type", "serial_number", "rack", "rack_slot", "dhcp_server_enabled"]
+    list_display = [
+        "hostname",
+        "switch_type",
+        "serial_number",
+        "rack",
+        "rack_slot",
+        "dhcp_server_enabled",
+        "owner",
+        "hostname_purpose",
+        "hostname_sequence",
+    ]
     search_fields = ["hostname", "serial_number"]
-    list_filter = ["rack", "switch_type"]
+    list_filter = ["rack", "switch_type", "owner"]
+    # Declarative, not relied-on auto-select_related() — owner/rack/switch_type
+    # are all nullable-or-not-descended the same way VLANAdmin's comment
+    # above explains.
+    list_select_related = ["switch_type", "rack", "owner"]
     inlines = [NetworkSwitchAddressInline, NetworkSwitchPortInline]
     show_auditlog_history_link = True
     actions = [delete_selected]
@@ -1171,7 +1241,7 @@ class NetworkSwitchAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
 
 @admin.register(NetworkDeviceType)
 class NetworkDeviceTypeAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
-    list_display = ["manufacturer", "model", "name", "port_count", "is_add_in_card"]
+    list_display = ["manufacturer", "model", "name", "port_count", "is_add_in_card", "hostname_slug"]
     list_filter = ["is_add_in_card"]
     search_fields = ["manufacturer", "model", "name"]
     inlines = [NetworkDeviceTypePortInline]
@@ -1191,13 +1261,23 @@ class NetworkDeviceTypeAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, 
 
 @admin.register(NetworkDevice)
 class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
-    list_display = ["hostname", "device_type", "serial_number", "rack", "rack_slot", "host"]
+    list_display = [
+        "hostname",
+        "device_type",
+        "serial_number",
+        "rack",
+        "rack_slot",
+        "host",
+        "owner",
+        "hostname_purpose",
+        "hostname_sequence",
+    ]
     search_fields = ["hostname", "serial_number"]
     # ("host", EmptyFieldListFilter) gives fitted/unfitted as the filter
     # choices (ADR 0022 PR 3) — a plain "host" filter would instead list
     # every individual host, which isn't the question this filter answers.
-    list_filter = ["rack", "device_type", ("host", admin.EmptyFieldListFilter)]
-    list_select_related = ["device_type", "rack", "host"]
+    list_filter = ["rack", "device_type", ("host", admin.EmptyFieldListFilter), "owner"]
+    list_select_related = ["device_type", "rack", "host", "owner"]
     inlines = [NetworkDevicePortInline]
     show_auditlog_history_link = True
     actions = ["pull_cards"]

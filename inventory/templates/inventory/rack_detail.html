@@ -6,6 +6,10 @@
 {% block content %}
   <h1>{{ rack.name }}</h1>
   <p class="tile__meta">{{ rack.slot_count }} slot{{ rack.slot_count|pluralize }}</p>
+  <p class="tile__meta">
+    Owner: {% if rack.owner %}{{ rack.owner }}{% else %}—{% endif %}
+    · Location: {{ rack.location_slug|default:"—" }}
+  </p>
 
   <div class="panel elevation-scroll">
     <table class="elevation">
