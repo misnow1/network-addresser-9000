@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from django.core.management.base import BaseCommand, CommandError, CommandParser
+from django.db.models import Q
 
 from inventory.models import (
     VLAN,
@@ -35,6 +36,7 @@ from inventory.models import (
     NetworkSwitch,
     NetworkSwitchAddress,
     NetworkSwitchType,
+    Owner,
     PortAddressSource,
     Rack,
 )
@@ -72,6 +74,35 @@ FUNCTION_TO_PORT_DESCRIPTION: dict[str, str] = {
 MANUAL_RANGE_RACKS = frozenset({"SHURE", "CONSOLES"})
 DHCP_SERVER_RACKS = frozenset({"FOH Drive #1", "FOH Drive #2"})
 NETGEAR_DESCRIPTION = "Netgear Managed Switch (For W8LM Rack)"
+
+#: Re-declared independently of ``import_prod_data.OWNER_ROWS`` — same
+#: source knowledge (ADR 0023 decision 10), separately typed in.
+OWNER_ROWS: tuple[tuple[str, str], ...] = (("mps", "MPS"), ("bej", "BEJ"))
+
+#: Re-declared independently of ``import_prod_data.RACK_LOCATION_SLUG_
+#: EXCEPTIONS`` — this module's own docstring forbids importing that
+#: module, on the grounds that a check sharing the importer's helper proves
+#: nothing.
+RACK_LOCATION_SLUG_EXCEPTIONS: dict[str, str | None] = {
+    "XE300-1": "xe1",
+    "XE300-2": "xe2",
+    "FOH Drive #1": "foh1",
+    "FOH Drive #2": "foh2",
+    "CONSOLES": None,
+}
+
+_RACK_SLUG_COLLAPSE_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _expected_location_slug(rack_name: str) -> str | None:
+    """Re-derives ADR 0023 decision 10's slugify-plus-exceptions rule
+    independently of ``import_prod_data._slugify_rack_name``/
+    ``_rack_location_slug`` — same mechanical rule, separately typed in.
+    """
+    if rack_name in RACK_LOCATION_SLUG_EXCEPTIONS:
+        return RACK_LOCATION_SLUG_EXCEPTIONS[rack_name]
+    return _RACK_SLUG_COLLAPSE_RE.sub("-", rack_name.lower()).strip("-")
+
 
 #: Pinned, not derived — re-declared independently of
 #: ``import_prod_data.DMI_DANTE_RACK``/``DMI_DANTE_SLOT``. PLAN-prod-import.md
@@ -340,6 +371,8 @@ class Command(BaseCommand):
 
         findings = _Findings()
         _check_rack_ranges(findings, rack_offset_rows, vlan_rows)
+        _check_owner_seeding(findings, rack_offset_rows)
+        _check_no_equipment_hostname_seeding(findings)
         _check_hostnames_and_types_and_addresses(
             findings,
             addressing_rows,
@@ -422,6 +455,72 @@ def _check_rack_ranges(findings: _Findings, rack_offset_rows: list[Any], vlan_ro
                     f"{rack.name}/{function}: expected {expected_cidr}, got {actual.address_range}.",
                 )
     findings.count("rack_ranges_checked", checked)
+
+
+# -- Owner seeding (ADR 0023 decision 10) ---------------------------------------------
+
+
+def _check_owner_seeding(findings: _Findings, rack_offset_rows: list[Any]) -> None:
+    """Both ``Owner`` rows exist with the expected name; every imported
+    rack's ``owner`` is ``mps``; every rack's ``location_slug`` matches the
+    independently re-derived slugify-plus-exceptions rule, ``CONSOLES``
+    null.
+    """
+    for slug, name in OWNER_ROWS:
+        try:
+            owner = Owner.objects.get(slug=slug)
+        except Owner.DoesNotExist:
+            findings.fail("owner_seeding", f"No Owner with slug {slug!r} exists.")
+            continue
+        if owner.name != name:
+            findings.fail("owner_seeding", f"Owner {slug!r}: expected name {name!r}, got {owner.name!r}.")
+    findings.count("owners_checked", len(OWNER_ROWS))
+
+    mps = Owner.objects.filter(slug="mps").first()
+    if mps is None:
+        return  # already reported above; nothing further to check against a missing mps
+
+    checked = 0
+    for rack_row in rack_offset_rows:
+        try:
+            rack = Rack.objects.get(name=rack_row.rack)
+        except Rack.DoesNotExist:
+            continue  # already reported by _check_rack_ranges
+        checked += 1
+        if rack.owner_id != mps.pk:
+            actual_slug = rack.owner.slug if rack.owner else None
+            findings.fail("owner_seeding", f"{rack.name}: expected owner 'mps', got {actual_slug!r}.")
+        expected_slug = _expected_location_slug(rack_row.rack)
+        if rack.location_slug != expected_slug:
+            findings.fail(
+                "owner_seeding",
+                f"{rack.name}: expected location_slug {expected_slug!r}, got {rack.location_slug!r}.",
+            )
+    findings.count("rack_owners_and_locations_checked", checked)
+
+
+def _check_no_equipment_hostname_seeding(findings: _Findings) -> None:
+    """ADR 0023 decision 10's negative half: no ``NetworkDevice`` or
+    ``NetworkSwitch`` carries an ``owner``, ``hostname_purpose`` or
+    ``hostname_sequence`` — this seeding boundary is what's most likely to
+    drift under a well-meaning future backfill, so asserting its absence
+    catches that rather than assuming it.
+    """
+    seeded_something = Q(owner__isnull=False) | ~Q(hostname_purpose="") | Q(hostname_sequence__isnull=False)
+    for switch in NetworkSwitch.objects.filter(seeded_something):
+        findings.fail(
+            "no_equipment_hostname_seeding",
+            f"NetworkSwitch {switch}: unexpectedly carries owner/hostname_purpose/hostname_sequence.",
+        )
+    for device in NetworkDevice.objects.filter(seeded_something):
+        findings.fail(
+            "no_equipment_hostname_seeding",
+            f"NetworkDevice {device}: unexpectedly carries owner/hostname_purpose/hostname_sequence.",
+        )
+    findings.count(
+        "equipment_checked_for_no_hostname_seeding",
+        NetworkSwitch.objects.count() + NetworkDevice.objects.count(),
+    )
 
 
 # -- Device Control pairs (ADR 0022) -------------------------------------------------

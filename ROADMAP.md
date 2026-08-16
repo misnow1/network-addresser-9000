@@ -288,7 +288,7 @@ in three PRs.
       anything assembles it. The sequence is an **integer**, which is what makes phase 18's
       "bump until free" defined; production's non-numeric `01-04` is a *purpose* and reproduces
       character-for-character there
-- [ ] The importer seeds the **vocabulary only** — two `Owner` rows (`mps`, `bej`), `Rack.owner`,
+- [x] The importer seeds the **vocabulary only** — two `Owner` rows (`mps`, `bej`), `Rack.owner`,
       and `Rack.location_slug` from an explicit name→slug constant. No per-device backfill: the
       sheet carrying the components has no join key to the sheet the importer reads (zero of 52
       descriptions match, and its `Slot` column is empty), so recovering them would mean committing

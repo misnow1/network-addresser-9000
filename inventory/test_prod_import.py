@@ -50,6 +50,7 @@ from .models import (
     NetworkSwitch,
     NetworkSwitchAddress,
     NetworkSwitchType,
+    Owner,
     PortAddressSource,
     Rack,
     RackVlanRange,
@@ -675,6 +676,64 @@ class ImportProdDataTests(TestCase):
         with self.assertRaises(CommandError):
             call_command("verify_prod_import", data_dir=str(self.data_dir))
 
+    # -- ADR 0023 decision 10: owner/location_slug seeding -----------------------------
+
+    def test_owner_rows_seeded(self) -> None:
+        mps = Owner.objects.get(slug="mps")
+        self.assertEqual(mps.name, "MPS")
+        bej = Owner.objects.get(slug="bej")
+        self.assertEqual(bej.name, "BEJ")
+
+    def test_every_rack_owner_is_mps(self) -> None:
+        mps = Owner.objects.get(slug="mps")
+        for rack_name, _offset in RACKS:
+            self.assertEqual(Rack.objects.get(name=rack_name).owner_id, mps.pk, rack_name)
+
+    def test_rack_location_slugs_match_the_slugify_plus_exceptions_rule(self) -> None:
+        # AMPRACK1/W8LMTEST are the fabricated names settled decision 8
+        # exists to keep working; XE300-1/CONSOLES are real production
+        # names exercising the exceptions constant itself.
+        expected = {
+            "AMPRACK1": "amprack1",
+            "XE300-1": "xe1",
+            "AVIO": "avio",
+            "W8LMTEST": "w8lmtest",
+            "SHURE": "shure",
+            "CONSOLES": None,
+        }
+        for rack_name, expected_slug in expected.items():
+            self.assertEqual(Rack.objects.get(name=rack_name).location_slug, expected_slug, rack_name)
+
+    def test_no_device_or_switch_carries_owner_or_hostname_purpose_or_sequence(self) -> None:
+        # ADR 0023 decision 10's negative half: the importer seeds only
+        # Owner rows and Rack.owner/location_slug — never per-equipment.
+        for device in NetworkDevice.objects.all():
+            self.assertIsNone(device.owner_id, device)
+            self.assertEqual(device.hostname_purpose, "", device)
+            self.assertIsNone(device.hostname_sequence, device)
+        for switch in NetworkSwitch.objects.all():
+            self.assertIsNone(switch.owner_id, switch)
+            self.assertEqual(switch.hostname_purpose, "", switch)
+            self.assertIsNone(switch.hostname_sequence, switch)
+
+    def test_verify_catches_a_rack_with_the_wrong_owner(self) -> None:
+        bej = Owner.objects.get(slug="bej")
+        Rack.objects.filter(name="AMPRACK1").update(owner=bej)
+        with self.assertRaises(CommandError):
+            call_command("verify_prod_import", data_dir=str(self.data_dir))
+
+    def test_verify_catches_a_rack_with_the_wrong_location_slug(self) -> None:
+        Rack.objects.filter(name="AMPRACK1").update(location_slug="wrong-slug")
+        with self.assertRaises(CommandError):
+            call_command("verify_prod_import", data_dir=str(self.data_dir))
+
+    def test_verify_catches_equipment_that_unexpectedly_carries_an_owner(self) -> None:
+        mps = Owner.objects.get(slug="mps")
+        device = NetworkDevice.objects.get(rack__name="AVIO", rack_slot=1)
+        NetworkDevice.objects.filter(pk=device.pk).update(owner=mps)
+        with self.assertRaises(CommandError):
+            call_command("verify_prod_import", data_dir=str(self.data_dir))
+
 
 class ImportProdDataMalformedDmiDanteTests(TestCase):
     """The DMI-DANTE card's rack/slot is pinned (PLAN-prod-import.md §9),
@@ -763,6 +822,32 @@ class ImportProdDataMalformedDmiDanteTests(TestCase):
             with self.assertRaises(CommandError):
                 call_command("import_prod_data", data_dir=str(data_dir))
             self.assertFalse(Rack.objects.exists())  # refused before any writes committed
+
+
+class ImportProdDataIllegalRackNameTests(TestCase):
+    """ADR 0023 decision 10 / settled decision 8: a rack name that neither
+    appears in ``RACK_LOCATION_SLUG_EXCEPTIONS`` nor slugifies to a legal
+    DNS label is refused outright — not silently imported with a null
+    ``location_slug``. Exercised against its own one-off fixture (an extra
+    rack-offset row appended to the shared scheme) rather than the shared
+    fixture above, which uses only names that are known to slugify legally
+    (that's the whole point of settled decision 8 — see
+    ``test_rack_location_slugs_match_the_slugify_plus_exceptions_rule``
+    above for the proof that ordinary names, including the fabricated
+    ``AMPRACK1``/``W8LMTEST``, are never refused).
+    """
+
+    def test_refuses_when_rack_name_neither_maps_nor_slugs_legally(self) -> None:
+        bogus_rows = [*_calc_lookups_rows(), ["", "", "", "", "###", "999", "", "", "", ""]]
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            data_dir.mkdir(parents=True, exist_ok=True)
+            _write_csv(data_dir / "MPS Audio Network Standards - IP Calc Lookups.csv", bogus_rows)
+            _write_csv(data_dir / "MPS Audio Network Standards - Switch Ports.csv", _switch_ports_rows())
+            _write_csv(data_dir / "MPS Audio Network Standards - IP Addressing mk2.csv", _addressing_rows())
+            with self.assertRaises(CommandError):
+                call_command("import_prod_data", data_dir=str(data_dir))
+            self.assertFalse(Rack.objects.exists())  # refused before any writes committed — even AMPRACK1
 
 
 class ImportProdDataMalformedDeviceControlTests(TestCase):
