@@ -40,6 +40,13 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import TestCase
 
+from .management.commands.import_prod_data import (
+    DEVICE_TYPES,
+    PRIMARY_SWITCH_TABLES,
+    SECONDARY_DERIVED_TABLES,
+)
+from .management.commands.import_prod_data import HOSTNAME_SLUGS as IMPORTER_HOSTNAME_SLUGS
+from .management.commands.verify_prod_import import HOSTNAME_SLUGS as VERIFIER_HOSTNAME_SLUGS
 from .management.commands.verify_prod_import import _check_cross_vlan_alignment, _Findings
 from .models import (
     VLAN,
@@ -545,6 +552,30 @@ class ImportProdDataTests(TestCase):
         self.assertEqual(
             NetworkDevice.objects.get(rack__name="AVIO", rack_slot=1).hostname, "mps-avio-radial-tx"
         )
+
+    def test_import_applies_hostname_slugs_to_created_types(self) -> None:
+        """ADR 0023 decision 10, amended (phase 18 PR 4) — every Type this
+        import creates gets its ``hostname_slug`` from ``HOSTNAME_SLUGS``,
+        including a switch type (0 of which carried one on the live
+        database, unlike the device side) and one two-profile device
+        model (``IK-42`` — both profiles must agree).
+        """
+        primary = NetworkSwitchType.objects.get(
+            manufacturer="Cisco", model="SG300-10MP", name="For 3xAmp Rack Primary"
+        )
+        secondary = NetworkSwitchType.objects.get(
+            manufacturer="Cisco", model="SG300-10MP", name="For 3xAmp Rack Secondary"
+        )
+        self.assertEqual(primary.hostname_slug, "sg300-10mp")
+        self.assertEqual(secondary.hostname_slug, "sg300-10mp")
+        with_card = NetworkDeviceType.objects.get(
+            manufacturer="Martin Audio", model="IK-42", name="with Dante Card"
+        )
+        without_card = NetworkDeviceType.objects.get(
+            manufacturer="Martin Audio", model="IK-42", name="without Dante Card"
+        )
+        self.assertEqual(with_card.hostname_slug, "ik42")
+        self.assertEqual(without_card.hostname_slug, "ik42")
 
     def test_dm7c_and_dm3_device_control_ports(self) -> None:
         # ADR 0022: the importer's Device Control pre-pass folds each
@@ -1074,3 +1105,31 @@ class ImportUserIdentityTests(TestCase):
         with self.assertRaises(CommandError):
             call_command("import_prod_data", data_dir=str(self.data_dir))
         self.assertFalse(Rack.objects.exists())  # refused before any writes committed
+
+
+class HostnameSlugsConstantTests(TestCase):
+    """PLAN-hostname-computation.md PR 4 "Seeding" — ``HOSTNAME_SLUGS``
+    covers every ``(manufacturer, model)`` the importer's own catalog
+    actually creates (set equality, the shape ``test_ui.py``'s query-
+    budget test uses), and the importer's and verifier's independently
+    re-declared copies (neither imports the other, on purpose) agree.
+    """
+
+    def test_every_importer_type_pair_has_a_hostname_slugs_entry(self) -> None:
+        device_pairs = {(spec.manufacturer, spec.model) for spec in DEVICE_TYPES}
+        switch_pairs = {
+            (manufacturer, model) for manufacturer, model, _name in PRIMARY_SWITCH_TABLES.values()
+        } | {(manufacturer, model) for manufacturer, model, _name in SECONDARY_DERIVED_TABLES.values()}
+        self.assertEqual(device_pairs | switch_pairs, set(IMPORTER_HOSTNAME_SLUGS))
+
+    def test_importer_and_verifier_copies_agree(self) -> None:
+        self.assertEqual(IMPORTER_HOSTNAME_SLUGS, VERIFIER_HOSTNAME_SLUGS)
+
+    def test_amphenol_entries_are_corrected_not_the_live_typo(self) -> None:
+        """Settled with Mike: the live ``rdj…`` slugs against models
+        spelled ``RJD…`` are a typo. The constant carries the correction,
+        not the typo.
+        """
+        for model in ("RJD1212-0050", "RJD2203-0050", "RJD32A3-0050", "RJD32U1-0050"):
+            slug = IMPORTER_HOSTNAME_SLUGS[("Amphenol", model)]
+            self.assertTrue(slug.startswith("rjd"), f"{model}: {slug!r} does not start with 'rjd'")

@@ -5900,6 +5900,176 @@ class HostnameWriteAuditTests(TestCase):
         self.assertIn("hostname", entries.first().changes_dict)
 
 
+class HostnameDivergesTests(TestCase):
+    """PLAN-hostname-computation.md PR 4 — ``hostname_diverges``: stateless,
+    no new field, no collision query. False when a blocking component is
+    missing (assembly can't even produce a name to compare against), false
+    when the stored name matches, true when it differs.
+    """
+
+    def setUp(self) -> None:
+        self.owner = Owner.objects.create(slug="mps", name="MPS")
+        self.rack = Rack.objects.create(
+            name="Rack 1", slot_count=10, owner=self.owner, location_slug="wpcsrl"
+        )
+        self.device_type = _make_device_type(hostname_slug="ik42")
+        self.switch_type = _make_switch_type(hostname_slug="sg300")
+
+    def test_false_when_owner_missing(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, rack=self.rack, rack_slot=1, hostname="anything"
+        )
+        self.assertIsNone(device.owner)
+        self.assertFalse(device.hostname_diverges)
+
+    def test_false_when_type_slug_missing(self) -> None:
+        no_slug_type = _make_device_type(hostname_slug="", name="No Slug")
+        device = NetworkDevice.objects.create(
+            device_type=no_slug_type, rack=self.rack, rack_slot=1, owner=self.owner, hostname="anything"
+        )
+        self.assertFalse(device.hostname_diverges)
+
+    def test_false_when_hostname_blank(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, rack=self.rack, rack_slot=1, owner=self.owner
+        )
+        self.assertEqual(device.hostname, "")
+        self.assertFalse(device.hostname_diverges)
+
+    def test_false_when_stored_name_matches(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=self.owner,
+            hostname="mps-wpcsrl-ik42",
+        )
+        self.assertFalse(device.hostname_diverges)
+
+    def test_true_when_stored_name_differs(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=self.owner,
+            hostname="hand-typed-name",
+        )
+        self.assertTrue(device.hostname_diverges)
+
+    def test_true_after_a_rack_move_leaves_the_old_location_baked_in(self) -> None:
+        """#54's motivating case."""
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=self.owner,
+            hostname="mps-wpcsrl-ik42",
+        )
+        self.assertFalse(device.hostname_diverges)
+        other_rack = Rack.objects.create(name="Rack 2", slot_count=10, location_slug="foh")
+        device.rack = other_rack
+        device.rack_slot = 1
+        device.save()
+        self.assertTrue(device.hostname_diverges)
+
+    def test_switch_matches_the_same_shape(self) -> None:
+        switch = NetworkSwitch.objects.create(
+            switch_type=self.switch_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=self.owner,
+            hostname="hand-typed-name",
+        )
+        self.assertTrue(switch.hostname_diverges)
+        switch.hostname = "mps-wpcsrl-sg300"
+        switch.save()
+        self.assertFalse(switch.hostname_diverges)
+
+
+class HostnameDivergesAdminFilterTests(TestCase):
+    """PLAN-hostname-computation.md PR 4 — the ``SimpleListFilter``
+    (``hostname_diverges`` can't be an ordinary ``list_filter`` string
+    entry; it's a property, not a column) selects the right rows on both
+    admins.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.owner = Owner.objects.create(slug="mps", name="MPS")
+        self.rack = Rack.objects.create(
+            name="Rack 1", slot_count=10, owner=self.owner, location_slug="wpcsrl"
+        )
+        self.device_type = _make_device_type(hostname_slug="ik42")
+        self.switch_type = _make_switch_type(hostname_slug="sg300")
+        self.admin_user = User.objects.create_user("filter-admin", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.force_login(self.admin_user)
+
+    def test_device_filter_yes_selects_only_diverging_rows(self) -> None:
+        diverging = NetworkDevice.objects.create(
+            device_type=self.device_type, rack=self.rack, rack_slot=1, owner=self.owner, hostname="hand-typed"
+        )
+        matching = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=2,
+            owner=self.owner,
+            hostname="mps-wpcsrl-ik42",
+        )
+        response = self.client.get("/admin/inventory/networkdevice/", {"hostname_diverges": "yes"})
+        content = response.content.decode()
+        self.assertIn(diverging.hostname, content)
+        self.assertNotIn(matching.hostname, content)
+
+    def test_device_filter_no_selects_only_matching_rows(self) -> None:
+        diverging = NetworkDevice.objects.create(
+            device_type=self.device_type, rack=self.rack, rack_slot=1, owner=self.owner, hostname="hand-typed"
+        )
+        matching = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=2,
+            owner=self.owner,
+            hostname="mps-wpcsrl-ik42",
+        )
+        response = self.client.get("/admin/inventory/networkdevice/", {"hostname_diverges": "no"})
+        content = response.content.decode()
+        self.assertIn(matching.hostname, content)
+        self.assertNotIn(diverging.hostname, content)
+
+    def test_switch_filter_yes_selects_only_diverging_rows(self) -> None:
+        diverging = NetworkSwitch.objects.create(
+            switch_type=self.switch_type, rack=self.rack, rack_slot=1, owner=self.owner, hostname="hand-typed"
+        )
+        matching = NetworkSwitch.objects.create(
+            switch_type=self.switch_type,
+            rack=self.rack,
+            rack_slot=2,
+            owner=self.owner,
+            hostname="mps-wpcsrl-sg300",
+        )
+        response = self.client.get("/admin/inventory/networkswitch/", {"hostname_diverges": "yes"})
+        content = response.content.decode()
+        self.assertIn(diverging.hostname, content)
+        self.assertNotIn(matching.hostname, content)
+
+    def test_unfiltered_shows_both(self) -> None:
+        NetworkDevice.objects.create(
+            device_type=self.device_type, rack=self.rack, rack_slot=1, owner=self.owner, hostname="hand-typed"
+        )
+        NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=2,
+            owner=self.owner,
+            hostname="mps-wpcsrl-ik42",
+        )
+        response = self.client.get("/admin/inventory/networkdevice/")
+        content = response.content.decode()
+        self.assertIn("hand-typed", content)
+        self.assertIn("mps-wpcsrl-ik42", content)
+
+
 class HostnameNormaliseMigrationTests(TransactionTestCase):
     """``0017_hostname_normalise`` (PLAN-hostname-computation.md PR 1) —
     reconstructs the schema as of ``0016_hostname_ingredients`` (immediately
@@ -5972,6 +6142,129 @@ class HostnameNormaliseMigrationTests(TransactionTestCase):
         NetworkDevice = self.apps.get_model("inventory", "NetworkDevice")
         NetworkDevice.objects.create(device_type=self.device_type, hostname="a" * 63)
         self._migration_module._check_hostname_lengths(self.apps, self.schema_editor)  # must not raise
+
+
+class SeedHostnameSlugsMigrationTests(TransactionTestCase):
+    """``0018_seed_hostname_slugs`` (PLAN-hostname-computation.md PR 4) —
+    reconstructs the schema as of ``0017_hostname_normalise`` (immediately
+    before this migration) via ``MigrationExecutor``, same shape as
+    ``HostnameNormaliseMigrationTests``/``RetireCompanionsMigrationTests``.
+    """
+
+    apps: Any
+    _migration_module: Any
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        executor = MigrationExecutor(connection)
+        executor.migrate([("inventory", "0017_hostname_normalise")])
+        executor.loader.build_graph()
+        cls.apps = executor.loader.project_state(("inventory", "0017_hostname_normalise")).apps
+        cls._migration_module = importlib.import_module("inventory.migrations.0018_seed_hostname_slugs")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        call_command("migrate", "inventory", verbosity=0)
+        super().tearDownClass()
+
+    def setUp(self) -> None:
+        self.schema_editor = _FakeSchemaEditor(connection.alias)
+
+    def _run(self) -> None:
+        self._migration_module.seed_hostname_slugs(self.apps, self.schema_editor)
+
+    def test_blank_switch_type_gets_seeded(self) -> None:
+        NetworkSwitchType = self.apps.get_model("inventory", "NetworkSwitchType")
+        switch_type = NetworkSwitchType.objects.create(
+            manufacturer="Cisco", model="SG300-10MP", name="For 3xAmp Rack Primary", port_count=0
+        )
+        self._run()
+        switch_type.refresh_from_db()
+        self.assertEqual(switch_type.hostname_slug, "sg300-10mp")
+
+    def test_blank_na2_dline_gets_seeded(self) -> None:
+        NetworkDeviceType = self.apps.get_model("inventory", "NetworkDeviceType")
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="Neutrik", model="NA2-DLINE", name="Default", port_count=0
+        )
+        self._run()
+        device_type.refresh_from_db()
+        self.assertEqual(device_type.hostname_slug, "na2dline")
+
+    def test_operator_set_slug_is_not_overwritten(self) -> None:
+        """A Type an operator already hand-set a slug on — even a value
+        the constant would not itself have produced — must survive
+        unchanged. Only the four Amphenol rows are ever corrected, and
+        only from their specific known-typo value.
+        """
+        NetworkSwitchType = self.apps.get_model("inventory", "NetworkSwitchType")
+        switch_type = NetworkSwitchType.objects.create(
+            manufacturer="Cisco",
+            model="SG300-10MP",
+            name="For 3xAmp Rack Primary",
+            port_count=0,
+            hostname_slug="operator-chosen",
+        )
+        self._run()
+        switch_type.refresh_from_db()
+        self.assertEqual(switch_type.hostname_slug, "operator-chosen")
+
+    def test_amphenol_rows_are_corrected(self) -> None:
+        NetworkDeviceType = self.apps.get_model("inventory", "NetworkDeviceType")
+        cases = [
+            ("RJD1212-0050", "rdj1212", "rjd1212"),
+            ("RJD2203-0050", "rdj2203", "rjd2203"),
+            ("RJD32A3-0050", "rdj32a3", "rjd32a3"),
+            ("RJD32U1-0050", "rdj32u1", "rjd32u1"),
+        ]
+        rows = {
+            model: NetworkDeviceType.objects.create(
+                manufacturer="Amphenol", model=model, name="Default", port_count=0, hostname_slug=typo
+            )
+            for model, typo, _expected in cases
+        }
+        self._run()
+        for model, _typo, expected in cases:
+            rows[model].refresh_from_db()
+            self.assertEqual(rows[model].hostname_slug, expected, model)
+
+    def test_amphenol_row_with_a_different_operator_value_is_left_alone(self) -> None:
+        """The correction targets the specific known-typo value only — an
+        Amphenol row an operator has already retyped to something else
+        entirely (not the ``rdj…`` typo) is not touched either.
+        """
+        NetworkDeviceType = self.apps.get_model("inventory", "NetworkDeviceType")
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="Amphenol",
+            model="RJD1212-0050",
+            name="Default",
+            port_count=0,
+            hostname_slug="something-else",
+        )
+        self._run()
+        device_type.refresh_from_db()
+        self.assertEqual(device_type.hostname_slug, "something-else")
+
+    def test_idempotent(self) -> None:
+        NetworkSwitchType = self.apps.get_model("inventory", "NetworkSwitchType")
+        NetworkDeviceType = self.apps.get_model("inventory", "NetworkDeviceType")
+        switch_type = NetworkSwitchType.objects.create(
+            manufacturer="Cisco", model="SG300-10MP", name="For 3xAmp Rack Primary", port_count=0
+        )
+        amphenol = NetworkDeviceType.objects.create(
+            manufacturer="Amphenol",
+            model="RJD1212-0050",
+            name="Default",
+            port_count=0,
+            hostname_slug="rdj1212",
+        )
+        self._run()
+        self._run()  # must not raise, and must not change anything further
+        switch_type.refresh_from_db()
+        amphenol.refresh_from_db()
+        self.assertEqual(switch_type.hostname_slug, "sg300-10mp")
+        self.assertEqual(amphenol.hostname_slug, "rjd1212")
 
 
 class AssembleHostnameTests(TestCase):

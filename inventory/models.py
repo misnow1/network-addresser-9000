@@ -583,6 +583,44 @@ def _validate_hostname_unique(
         )
 
 
+def _assemble_hostname_stem(
+    *,
+    owner_slug: str | None,
+    location_slug: str | None,
+    type_slug: str | None,
+    purpose: str,
+    sequence: int | None,
+) -> str | None:
+    """The same pure dash-join as ``inventory.hostnames.assemble_hostname()``
+    — duplicated rather than imported, for the identical circular-import
+    reason ``_validate_hostname_unique()`` duplicates ``hostname_is_taken()``'s
+    shape above rather than calling it: ``inventory.hostnames`` imports
+    ``NetworkSwitch``/``NetworkDevice``/``NetworkDevicePort`` from this
+    module, so the reverse import is impossible, and this module never
+    reaches up into a module built on top of it.
+
+    ``hostname_diverges`` (ADR 0023 decision 9, corrected in phase 18 PR 4)
+    is this function's one call site. If a third ever needs the exact same
+    formula, that is the signal to extract it into a genuinely shared,
+    import-free module instead of a third copy — not to reach for either
+    existing copy from the other's module.
+
+    ``None`` when a blocking component (``owner_slug``/``type_slug``) is
+    missing; otherwise the non-blank components dash-joined, exactly
+    matching ``assemble_hostname()``'s own contract.
+    """
+    if not owner_slug or not type_slug:
+        return None
+    parts = [
+        owner_slug,
+        location_slug or None,
+        type_slug,
+        purpose or None,
+        None if sequence is None else str(sequence),
+    ]
+    return "-".join(part for part in parts if part)
+
+
 class AuditedModel(models.Model):
     """Abstract base recording who created a row and when.
 
@@ -2646,6 +2684,41 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
                 _validate_hostname_unique(self.hostname, exclude_switch_pk=self.pk, exclude_device_pk=None)
 
     @property
+    def hostname_diverges(self) -> bool:
+        """Stateless indicator (ADR 0023 decision 9, corrected in phase 18
+        PR 4): a stored ``hostname`` exists, ``assemble_hostname()``'s
+        equivalent join over this row's current components produces a
+        name, and the two differ. No new field — recomputed on every
+        access — and no collision query: this uses only the pure-join
+        half (``_assemble_hostname_stem()``), never
+        ``choose_sequence()``/``hostname_is_taken()``, so rendering it
+        costs no query beyond the three relation reads (``owner``,
+        ``rack``, ``switch_type``) a caller must already have
+        ``select_related`` for its own sake.
+
+        Narrower than ADR 0023's original "every component present"
+        wording, which would make divergence unreachable in practice —
+        no live device has both a purpose and a sequence. The operative
+        test is just: does the stored name still match what its own
+        components would produce right now? A rack move that leaves the
+        previous rack's location baked into a name is exactly what this
+        is for (#54); it says nothing about which reading is *right*.
+        """
+        if not self.hostname:
+            return False
+        owner = _get_related(self, "owner")
+        rack = _get_related(self, "rack")
+        switch_type = _get_related(self, "switch_type")
+        computed = _assemble_hostname_stem(
+            owner_slug=owner.slug if owner is not None else None,
+            location_slug=rack.location_slug if rack is not None else None,
+            type_slug=switch_type.hostname_slug if switch_type is not None else None,
+            purpose=self.hostname_purpose,
+            sequence=self.hostname_sequence,
+        )
+        return computed is not None and computed != self.hostname
+
+    @property
     def address_materialization(self) -> str:
         """Creation-time-only choice of whether this switch's VLAN
         addresses materialize (ADR 0016). Never stored — the materialized
@@ -3632,6 +3705,25 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
             if stored_hostname is not None and self.hostname != stored_hostname:
                 _validate_hostname_unique(self.hostname, exclude_switch_pk=None, exclude_device_pk=self.pk)
         self._check_host_invariants()
+
+    @property
+    def hostname_diverges(self) -> bool:
+        """See ``NetworkSwitch.hostname_diverges`` — identical shape, over
+        ``device_type`` rather than ``switch_type``.
+        """
+        if not self.hostname:
+            return False
+        owner = _get_related(self, "owner")
+        rack = _get_related(self, "rack")
+        device_type = _get_related(self, "device_type")
+        computed = _assemble_hostname_stem(
+            owner_slug=owner.slug if owner is not None else None,
+            location_slug=rack.location_slug if rack is not None else None,
+            type_slug=device_type.hostname_slug if device_type is not None else None,
+            purpose=self.hostname_purpose,
+            sequence=self.hostname_sequence,
+        )
+        return computed is not None and computed != self.hostname
 
     @property
     def port_addressing(self) -> str:

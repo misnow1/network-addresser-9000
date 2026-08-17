@@ -2288,6 +2288,10 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
                 "StageB Ownership (stageb-owner)",
                 "stageb-switch-purpose",
                 "42",
+                # #54 — this fixture's hostname is hand-typed ("stageb-switch1"),
+                # unrelated to its own owner/location/type/purpose/sequence, so
+                # it genuinely diverges.
+                "Yes",
                 "Details",
             ],
         )
@@ -2303,6 +2307,7 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         self.assertEqual(_detail_field_text(content, "Owner"), "StageB Ownership (stageb-owner)")
         self.assertEqual(_detail_field_text(content, "Hostname purpose"), "stageb-switch-purpose")
         self.assertEqual(_detail_field_text(content, "Hostname sequence"), "42")
+        self.assertEqual(_detail_field_text(content, "Diverges"), "Yes")
 
         # Addresses inline — the switch's materialized static address on the racked VLAN.
         assert self.switch_address.address is not None  # materialized (rack + RackVlanRange), never DHCP
@@ -2359,6 +2364,8 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
                 "5",
                 "—",
                 "StageB Ownership (stageb-owner)",
+                # #54 — hand-typed hostname, unrelated to its own components.
+                "Yes",
                 "Details",
             ],
         )
@@ -2467,6 +2474,131 @@ class HostnameIngredientCanonicalPageTests(TestCase):
         self.assertContains(response, "HI Owner")
         self.assertContains(response, "hi-purpose")
         self.assertContains(response, "Hostname sequence: 7")
+
+
+class HostnameDivergesMarkerTests(TestCase):
+    """PLAN-hostname-computation.md PR 4 "Surfacing" — the #54 marker
+    renders through the canonical redirect for Rack and Device, and
+    through the registry for Switch (which has no canonical page of its
+    own). Also proves the query budget stays flat with a mix of
+    diverging and non-diverging occupants, and covers the explicit
+    decision that spare_pool.html carries the marker too.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.owner = Owner.objects.create(slug="mps", name="MPS")
+        self.rack = Rack.objects.create(
+            name="Diverge Rack", slot_count=10, owner=self.owner, location_slug="wpcsrl"
+        )
+        self.device_type = _make_device_type(hostname_slug="ik42", name="Diverge Device Type")
+        self.switch_type = _make_switch_type(hostname_slug="sg300", name="Diverge Switch Type")
+        self.admin_user = User.objects.create_user("diverge-admin", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="diverge-admin", password="testpass123")
+
+    def test_rack_detail_marks_a_diverging_device(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=self.owner,
+            hostname="hand-typed",
+        )
+        self.assertTrue(device.hostname_diverges)
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        row1 = _row_html(response.content.decode(), 1)
+        self.assertIn("badge--diverges", row1)
+
+    def test_rack_detail_does_not_mark_a_matching_switch(self) -> None:
+        NetworkSwitch.objects.create(
+            switch_type=self.switch_type,
+            rack=self.rack,
+            rack_slot=2,
+            owner=self.owner,
+            hostname="mps-wpcsrl-sg300",
+        )
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        row2 = _row_html(response.content.decode(), 2)
+        self.assertNotIn("badge--diverges", row2)
+
+    def test_device_detail_marks_a_diverging_device(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=self.owner,
+            hostname="hand-typed",
+        )
+        response = self.client.get(f"/devices/{device.pk}/")
+        self.assertContains(response, "badge--diverges")
+
+    def test_switch_registry_list_marks_a_diverging_switch(self) -> None:
+        """NetworkSwitch has no canonical page — the registry list is the
+        only place a Viewer can see this at all.
+        """
+        NetworkSwitch.objects.create(
+            switch_type=self.switch_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=self.owner,
+            hostname="hand-typed",
+        )
+        response = self.client.get("/models/networkswitch/")
+        self.assertContains(response, "Yes")  # the "Diverges" column's boolean render
+
+    def test_switch_registry_detail_marks_a_diverging_switch(self) -> None:
+        switch = NetworkSwitch.objects.create(
+            switch_type=self.switch_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=self.owner,
+            hostname="hand-typed",
+        )
+        response = self.client.get(f"/models/networkswitch/{switch.pk}/")
+        self.assertEqual(_detail_field_text(response.content.decode(), "Diverges"), "Yes")
+
+    def test_spare_pool_marks_a_diverging_unracked_device(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, owner=self.owner, hostname="hand-typed"
+        )
+        self.assertIsNone(device.rack)
+        self.assertTrue(device.hostname_diverges)
+        response = self.client.get("/spares/")
+        self.assertContains(response, "badge--diverges")
+
+    def test_spare_pool_does_not_mark_a_matching_switch(self) -> None:
+        NetworkSwitch.objects.create(switch_type=self.switch_type, owner=self.owner, hostname="mps-sg300")
+        response = self.client.get("/spares/")
+        self.assertNotContains(response, "badge--diverges")
+
+    def test_elevation_query_count_independent_of_divergence_mix(self) -> None:
+        """The marker itself must not turn the elevation's flat query
+        budget into an N+1 across occupants — some diverging, some not.
+        """
+        for slot in range(1, 3):
+            NetworkDevice.objects.create(
+                device_type=self.device_type,
+                rack=self.rack,
+                rack_slot=slot,
+                owner=self.owner,
+                hostname="hand-typed" if slot % 2 else "mps-wpcsrl-ik42",
+            )
+        with CaptureQueriesContext(connection) as small_ctx:
+            small_response = self.client.get(f"/racks/{self.rack.pk}/")
+        for slot in range(3, 10):
+            NetworkDevice.objects.create(
+                device_type=self.device_type,
+                rack=self.rack,
+                rack_slot=slot,
+                owner=self.owner,
+                hostname="hand-typed" if slot % 2 else "mps-wpcsrl-ik42",
+            )
+        with CaptureQueriesContext(connection) as big_ctx:
+            big_response = self.client.get(f"/racks/{self.rack.pk}/")
+        self.assertEqual(small_response.status_code, 200)
+        self.assertEqual(big_response.status_code, 200)
+        self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
 
 
 class DerivedPortHostnameRenderingTests(TestCase):

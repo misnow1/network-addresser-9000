@@ -1390,6 +1390,49 @@ def delete_selected(modeladmin: "NetworkSwitchAdmin", request: HttpRequest, quer
     return response
 
 
+class _HostnameDivergesFilterBase(admin.SimpleListFilter):
+    """#54 / ADR 0023 phase 18 PR 4 — ``hostname_diverges`` is a Python
+    property, not a database column, so it can't be an ordinary
+    ``list_filter`` string entry (this repo has no existing
+    ``SimpleListFilter`` to copy; this is the first). ``queryset()`` scans
+    in Python rather than filtering in SQL — 84 equipment rows today, and
+    every relation the property reads (``owner``, ``rack``, the Type) is
+    ``select_related`` here so the scan itself stays one query rather than
+    an N+1 across the changelist's own row count.
+
+    ``_type_field`` names the Type FK, since that differs between the two
+    concrete subclasses below (``switch_type``/``device_type``); everything
+    else is identical.
+    """
+
+    title = "hostname divergence"
+    parameter_name = "hostname_diverges"
+    _type_field: str = ""
+
+    def lookups(self, request: HttpRequest, model_admin: Any) -> list[tuple[str, str]]:
+        return [("yes", "Diverges"), ("no", "Matches")]
+
+    def queryset(self, request: HttpRequest, queryset: QuerySet) -> QuerySet:
+        value = self.value()
+        if value not in ("yes", "no"):
+            return queryset
+        wants_diverging = value == "yes"
+        matching_pks = [
+            obj.pk
+            for obj in queryset.select_related("owner", "rack", self._type_field)
+            if obj.hostname_diverges == wants_diverging
+        ]
+        return queryset.filter(pk__in=matching_pks)
+
+
+class NetworkSwitchHostnameDivergesFilter(_HostnameDivergesFilterBase):
+    _type_field = "switch_type"
+
+
+class NetworkDeviceHostnameDivergesFilter(_HostnameDivergesFilterBase):
+    _type_field = "device_type"
+
+
 @admin.register(NetworkSwitch)
 class NetworkSwitchAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
     list_display = [
@@ -1404,7 +1447,7 @@ class NetworkSwitchAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
         "hostname_sequence",
     ]
     search_fields = ["hostname", "serial_number"]
-    list_filter = ["rack", "switch_type", "owner"]
+    list_filter = ["rack", "switch_type", "owner", NetworkSwitchHostnameDivergesFilter]
     # Declarative, not relied-on auto-select_related() — owner/rack/switch_type
     # are all nullable-or-not-descended the same way VLANAdmin's comment
     # above explains.
@@ -1532,7 +1575,13 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
     # ("host", EmptyFieldListFilter) gives fitted/unfitted as the filter
     # choices (ADR 0022 PR 3) — a plain "host" filter would instead list
     # every individual host, which isn't the question this filter answers.
-    list_filter = ["rack", "device_type", ("host", admin.EmptyFieldListFilter), "owner"]
+    list_filter = [
+        "rack",
+        "device_type",
+        ("host", admin.EmptyFieldListFilter),
+        "owner",
+        NetworkDeviceHostnameDivergesFilter,
+    ]
     list_select_related = ["device_type", "rack", "host", "owner"]
     inlines = [NetworkDevicePortInline]
     show_auditlog_history_link = True

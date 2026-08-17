@@ -2,7 +2,7 @@
 
 High-level phases only — day-to-day task tracking belongs in GitHub Issues once there's code to file issues against. This file exists so it's obvious what phase the project is in and what's next, even after a fresh start.
 
-**Current phase: 18 — hostname computation, designed in ADR 0023 and ready to build. Phases 1–6 and 8–17 done; phase 7 scoped but skipped.**
+**Current phase: 19 — aligned rack allocation. Phases 1–6 and 8–18 done; phase 7 scoped but skipped.**
 
 ## 1. Foundation — done
 
@@ -385,7 +385,7 @@ about the system.
       versus 40 unattributable surprises. It refuses rather than truncates if any row exceeds 63.
       Its fallout is larger than it looks: `verify_prod_import.py` compares hostnames to the raw CSV
       case-sensitively, and eight existing assertions do the same
-- [ ] **Seed the remaining `hostname_slug`s** (ADR 0023 decision 10, amended), via a
+- [x] **Seed the remaining `hostname_slug`s** (ADR 0023 decision 10, amended), via a
       `{(manufacturer, model): slug}` constant applied by both the importer and a data migration.
       Mostly **already done by hand** — 24 of 33 Types now carry a slug; the 8 switch Types and
       `NA2-DLINE` remain. The constant must be *derived from* those live values rather than invented,
@@ -393,12 +393,12 @@ about the system.
       backfill decision 10 refuses — that one has no join key, whereas Types already come from a
       constant in the importer. Not `slugify()` either: `IK-42` → `ik-42` where the name in use is
       `ik42`
-- [ ] #54: a **stateless** `hostname_diverges` property — every component present, a hostname
+- [x] #54: a **stateless** `hostname_diverges` property — every component present, a hostname
       present, and the two differ. No `hostname_is_computed` boolean, because state that can itself
       go stale is what the indicator exists to catch. Framed as divergence, not staleness: it says
       the name differs from what its components produce, not which is right. #28, the address-side
       sibling, stays open — same staleness *class*, different mechanism (the allocator, not naming)
-- [ ] Tests: assembly with and without each optional component; each blocking component absent
+- [x] Tests: assembly with and without each optional component; each blocking component absent
       yields no name; blank hostnames don't collide with each other; a switch-vs-device collision is
       caught; a device-vs-derived-port-name collision is caught; sequence auto-bump; a hand-typed
       hostname survives creation untouched; a console with a labelled port renders both its own name

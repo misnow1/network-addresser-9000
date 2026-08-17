@@ -126,6 +126,64 @@ RACK_LOCATION_SLUG_EXCEPTIONS: dict[str, str | None] = {
     "CONSOLES": None,
 }
 
+#: ADR 0023 decision 10, amended (phase 18 PR 4) — ``(manufacturer, model)``
+#: -> ``NetworkSwitchType``/``NetworkDeviceType.hostname_slug``. Keyed on
+#: the model, not the profile, so both ``IK-42`` profiles get ``ik42``
+#: (ADR 0023 decision 1's own requirement).
+#:
+#: Every device-side entry (all but ``Neutrik``/``NA2-DLINE``) is copied
+#: verbatim from the live database's already hand-set values, not
+#: invented — several are not what a naive ``slugify()`` would produce:
+#: ``PLM20000Q`` -> ``plm20q`` (not ``plm20000q``), ``AVIO-AO2`` ->
+#: ``avioao2`` (dash dropped), ``DiNET DAN-TX``/``DiNET DAN-RX`` ->
+#: ``dantx``/``danrx``. The four Amphenol entries are corrected here, not
+#: copied: the live rows read ``rdj1212``/``rdj2203``/``rdj32a3``/
+#: ``rdj32u1`` against models spelled ``RJD…`` — a transposition typo,
+#: settled with Mike as exactly that. ``Neutrik``/``NA2-DLINE`` is new:
+#: the live row is still blank, and ``na2dline`` (not ``na2-dline``)
+#: matches the dash-dropping convention ADR 0023 decision 10's amendment
+#: already documents for this exact model.
+#:
+#: The four ``Cisco``/``TP-Link`` switch entries have no live value to
+#: copy at all — 0 of the importer's switch types carry a slug yet, on
+#: the live database or anywhere else — so these are new, following the
+#: one convention ``ROADMAP.md``/ADR 0023 already establish by example
+#: (component 3's own worked example is ``"sg300-10mp"``, dash kept): a
+#: Cisco/TP-Link catalog number's dash is a genuine series/variant
+#: separator, not decorative catalog styling the way ``IK-42``'s is, so
+#: it survives here where it doesn't for the device-side entries above.
+#:
+#: ``verify_prod_import.py`` re-derives its own copy rather than
+#: importing this one — see that module's docstring.
+HOSTNAME_SLUGS: dict[tuple[str, str], str] = {
+    ("Allen & Heath", "SQ-5"): "sq5",
+    ("Amphenol", "RJD1212-0050"): "rjd1212",
+    ("Amphenol", "RJD2203-0050"): "rjd2203",
+    ("Amphenol", "RJD32A3-0050"): "rjd32a3",
+    ("Amphenol", "RJD32U1-0050"): "rjd32u1",
+    ("Audinate", "AVIO-AO2"): "avioao2",
+    ("DiGiCo", "DMI-DANTE"): "dmidante",
+    ("DiGiCo", "SD11"): "sd11",
+    ("DiGiCo", "SD12"): "sd12",
+    ("DiGiCo", "SD9"): "sd9",
+    ("Lab.Gruppen", "LM26"): "lm26",
+    ("Lab.Gruppen", "LM44"): "lm44",
+    ("Lab.Gruppen", "PLM20000Q"): "plm20q",
+    ("Martin Audio", "IK-42"): "ik42",
+    ("Martin Audio", "IK-81"): "ik81",
+    ("Neutrik", "NA2-DLINE"): "na2dline",
+    ("Radial", "DiNET DAN-RX"): "danrx",
+    ("Radial", "DiNET DAN-TX"): "dantx",
+    ("Yamaha", "DM3"): "dm3",
+    ("Yamaha", "DM7-EX"): "dm7ex",
+    ("Yamaha", "DM7C"): "dm7c",
+    ("Yamaha", "Tio1608-D2"): "tio1608d2",
+    ("Cisco", "SG300-10MP"): "sg300-10mp",
+    ("Cisco", "SG300-26P"): "sg300-26p",
+    ("Cisco", "SG350-10"): "sg350-10",
+    ("TP-Link", "TL-SG108E"): "tl-sg108e",
+}
+
 #: The Netgear switch's addressing-sheet description — deferred, not
 #: created, since "Managed Switch" is not a model (PLAN-prod-import.md §6).
 NETGEAR_DESCRIPTION = "Netgear Managed Switch (For W8LM Rack)"
@@ -848,6 +906,7 @@ class _Importer:
             model=model,
             name=name,
             port_count=len(table.ports),
+            hostname_slug=HOSTNAME_SLUGS.get((manufacturer, model), ""),
             created_by=self.user,
         )
         switch_type.full_clean()
@@ -874,6 +933,7 @@ class _Importer:
             model=model,
             name=name,
             port_count=len(primary_table.ports),
+            hostname_slug=HOSTNAME_SLUGS.get((manufacturer, model), ""),
             created_by=self.user,
         )
         switch_type.full_clean()
@@ -936,6 +996,7 @@ class _Importer:
                 name=spec.name,
                 port_count=len(spec.ports),
                 is_add_in_card=spec.is_add_in_card,
+                hostname_slug=HOSTNAME_SLUGS.get((spec.manufacturer, spec.model), ""),
                 created_by=self.user,
             )
             device_type.full_clean()

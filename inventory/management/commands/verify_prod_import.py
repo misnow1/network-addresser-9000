@@ -91,6 +91,39 @@ RACK_LOCATION_SLUG_EXCEPTIONS: dict[str, str | None] = {
     "CONSOLES": None,
 }
 
+#: Re-declared independently of ``import_prod_data.HOSTNAME_SLUGS`` — this
+#: module's own docstring forbids importing that module, on the grounds
+#: that a check sharing the importer's helper proves nothing. See that
+#: module's own constant for the citation of where each value comes from.
+HOSTNAME_SLUGS: dict[tuple[str, str], str] = {
+    ("Allen & Heath", "SQ-5"): "sq5",
+    ("Amphenol", "RJD1212-0050"): "rjd1212",
+    ("Amphenol", "RJD2203-0050"): "rjd2203",
+    ("Amphenol", "RJD32A3-0050"): "rjd32a3",
+    ("Amphenol", "RJD32U1-0050"): "rjd32u1",
+    ("Audinate", "AVIO-AO2"): "avioao2",
+    ("DiGiCo", "DMI-DANTE"): "dmidante",
+    ("DiGiCo", "SD11"): "sd11",
+    ("DiGiCo", "SD12"): "sd12",
+    ("DiGiCo", "SD9"): "sd9",
+    ("Lab.Gruppen", "LM26"): "lm26",
+    ("Lab.Gruppen", "LM44"): "lm44",
+    ("Lab.Gruppen", "PLM20000Q"): "plm20q",
+    ("Martin Audio", "IK-42"): "ik42",
+    ("Martin Audio", "IK-81"): "ik81",
+    ("Neutrik", "NA2-DLINE"): "na2dline",
+    ("Radial", "DiNET DAN-RX"): "danrx",
+    ("Radial", "DiNET DAN-TX"): "dantx",
+    ("Yamaha", "DM3"): "dm3",
+    ("Yamaha", "DM7-EX"): "dm7ex",
+    ("Yamaha", "DM7C"): "dm7c",
+    ("Yamaha", "Tio1608-D2"): "tio1608d2",
+    ("Cisco", "SG300-10MP"): "sg300-10mp",
+    ("Cisco", "SG300-26P"): "sg300-26p",
+    ("Cisco", "SG350-10"): "sg350-10",
+    ("TP-Link", "TL-SG108E"): "tl-sg108e",
+}
+
 _RACK_SLUG_COLLAPSE_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -372,6 +405,7 @@ class Command(BaseCommand):
         findings = _Findings()
         _check_rack_ranges(findings, rack_offset_rows, vlan_rows)
         _check_owner_seeding(findings, rack_offset_rows)
+        _check_hostname_slugs(findings)
         _check_no_equipment_hostname_seeding(findings)
         _check_hostnames_and_types_and_addresses(
             findings,
@@ -497,6 +531,35 @@ def _check_owner_seeding(findings: _Findings, rack_offset_rows: list[Any]) -> No
                 f"{rack.name}: expected location_slug {expected_slug!r}, got {rack.location_slug!r}.",
             )
     findings.count("rack_owners_and_locations_checked", checked)
+
+
+def _check_hostname_slugs(findings: _Findings) -> None:
+    """ADR 0023 decision 10, amended (phase 18 PR 4) — every
+    ``(manufacturer, model)`` this independently re-declared
+    ``HOSTNAME_SLUGS`` names has a matching Type row (of either
+    hierarchy) carrying exactly that ``hostname_slug`` — both profiles of
+    a two-profile model included, since the constant is keyed on the
+    model, not the profile.
+    """
+    checked = 0
+    for (manufacturer, model), expected_slug in HOSTNAME_SLUGS.items():
+        switch_matches = list(NetworkSwitchType.objects.filter(manufacturer=manufacturer, model=model))
+        device_matches = list(NetworkDeviceType.objects.filter(manufacturer=manufacturer, model=model))
+        matches = switch_matches + device_matches
+        if not matches:
+            findings.fail(
+                "hostname_slugs", f"{manufacturer!r}/{model!r}: no Type found for a HOSTNAME_SLUGS entry."
+            )
+            continue
+        for type_row in matches:
+            checked += 1
+            if type_row.hostname_slug != expected_slug:
+                findings.fail(
+                    "hostname_slugs",
+                    f"{manufacturer!r}/{model!r} ({type_row.name}): expected hostname_slug "
+                    f"{expected_slug!r}, got {type_row.hostname_slug!r}.",
+                )
+    findings.count("hostname_slugs_checked", checked)
 
 
 def _check_no_equipment_hostname_seeding(findings: _Findings) -> None:
