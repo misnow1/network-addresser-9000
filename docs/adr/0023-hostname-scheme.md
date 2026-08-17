@@ -24,12 +24,20 @@ This ADR does not need to amend ADR 0018 — the companion whose hostname copied
 no longer exists. ADR 0022 superseded it outright, and the Yamaha Device Control interface that
 forced the original question is now a *port* on its console carrying `hostname_suffix`.
 
-> **Amended 2026-08-16, while planning phase 18.** Four decisions below are corrected in place,
-> each marked **Amendment**: decision 6 (uniqueness is enforced on *change*, not asserted as an
-> invariant), decision 7 (bump-until-free is underspecified and wrong in two reachable cases),
-> decision 8 (on-write normalisation cannot close the casing divergence on its own — a backfill is
-> required), and decision 10 (`hostname_slug` *is* seeded after all). All four were found by
-> grilling this ADR against the live database rather than the CSVs.
+> **Amended 2026-08-16, while planning and reviewing phase 18.** Six blocks below are corrected in
+> place, each marked **Amendment**:
+>
+> - **Decision 6** — uniqueness is **rename-only**: enforced when an existing row's hostname
+>   changes, not asserted as an invariant and not enforced on creation
+> - **Decision 7** — bump-until-free is underspecified, and wrong in two reachable cases
+> - **Decision 8** — on-write normalisation cannot close the casing divergence on its own; a
+>   backfill is required. Its no-validator half survives on new reasoning
+> - **Decision 10** — `hostname_slug` *is* seeded after all, and has since largely been set by hand
+> - **Consequences** — "those tests need no change" is wrong; lowercasing breaks eight assertions
+>   and the production verifier
+>
+> Every one was found by measuring the **live database** rather than the CSVs this ADR was written
+> from — three of them only after an independent review of the phase 18 plan.
 >
 > **Health warning on the evidence below.** Every number in the next section was measured against
 > `prod/*.csv`. The deployment database has since diverged — 49 hostnames have been renamed by hand
@@ -191,10 +199,17 @@ something else; that cascade is not validated. See "Known gaps".
 > on `hostname_slug`, which **no** Type carries. The estate would be duplicated *and* frozen, with
 > nothing in the product able to resolve it.
 >
-> So `full_clean()` runs the check **only when `hostname` is being set or changed** from its stored
-> value. Renaming *into* a duplicate is refused; creating a new duplicate is refused; the computed
-> path still never collides, because the bump uses the same predicate. Editing any other field on an
-> already-duplicated row saves cleanly.
+> So `full_clean()` runs the check **only when an existing row's `hostname` changes** — that is,
+> when `pk is not None` and the value differs from what is stored. Renaming *into* a duplicate is
+> refused; the computed path still never collides, because the bump uses the same predicate; editing
+> any other field on an already-duplicated row saves cleanly.
+>
+> **Creation is deliberately exempt**, which is narrower than this amendment first claimed. The
+> importer creates duplicates by design — `import_prod_data.py` commits every row to
+> `construct → full_clean() → save()` and writes `hostname = row.description`, and the addressing
+> CSV repeats `IK42` eighteen times — so enforcing on new rows would break a rebuild and every test
+> in `test_prod_import.py` with it. The guard loses little: the computed path cannot collide, so a
+> hand-typed **rename** is the realistic way to create a duplicate, and that is still refused.
 >
 > The honest consequence: **hostnames are not unique in the database, and no code may assume they
 > are.** Nothing branches on a hostname, so nothing does. All 32 are amps and processors still
@@ -281,7 +296,7 @@ sheet, instead of `DM7C-1-device-control`.
 > rewrites existing rows.
 >
 > **The migration backfills**: strip and lowercase every non-blank `NetworkSwitch.hostname` and
-> `NetworkDevice.hostname`. **40 of 82 live rows change.** Safe to run — no two hostnames collide
+> `NetworkDevice.hostname`. **40 of 83 live rows change.** Safe to run — no two hostnames collide
 > once lowercased, and nothing is near the 63 cap. Irreversible in practice, since the original
 > casing is unrecoverable; the reverse operation is a no-op.
 >
@@ -357,7 +372,7 @@ action.
 > **Amendment — `hostname_slug` *is* seeded, in phase 18.**
 >
 > Leaving it blank makes the whole scheme inert. It is a blocking component (decision 1), and **0
-> of 32 Types carry one**, so phase 18 as originally specified would ship a feature that computes
+> of 33 Types carried one at the time this was written**, so phase 18 as originally specified would ship a feature that computes
 > nothing whatsoever on the live estate — every recompute reporting "no type slug" and doing
 > nothing.
 >
@@ -376,10 +391,19 @@ action.
 > Not `slugify()`: it is wrong for exactly the cases this ADR already documents — `IK-42` → `ik-42`
 > where the name in use is `ik42`, and likewise `SQ-5`, `DM7-EX`, `NA2-DLINE`.
 >
-> Expect `hostname_diverges` to fire widely the moment this lands: 49 hostnames have been renamed
-> by hand into scheme shape, and any that do not match what computation produces will be flagged.
-> That is the indicator working — it becomes the reconciliation surface between the manual renaming
-> and the scheme — but it is not a quiet rollout.
+> **Since amended:** most of this seeding has since been done by hand. 24 of 25 device Types now
+> carry a slug; the 8 switch Types and `Neutrik NA2-DLINE` remain blank. Phase 18's constant must
+> therefore be *derived from* the live values rather than invented, or a rebuild would silently
+> produce a different estate from the one running — several hand-set values are not what a naive
+> constant would hold (`plm20q`, `avioao2`, `rio3224d3`). Four Amphenol slugs were entered as
+> `rdj…` against models spelled `RJD…`; that transposition is a typo and phase 18 corrects both the
+> constant and the four live rows.
+>
+> `hostname_diverges` will **not** fire widely, contrary to what this amendment first assumed.
+> Owner blocks, and phase 17 seeded no per-equipment owner — only 9 of 84 equipment rows have one,
+> so 6 rows diverge today. The estate becomes visible to the indicator only as operators run
+> recompute, which sets the owner *and* the name in one step, so a recomputed row does not diverge
+> either.
 
 ### 11. The phase seam is fields versus behaviour
 
@@ -492,7 +516,16 @@ the name in use is `ik42`. A wrong component nobody read is worse than a missing
 
 - **`NetworkDevicePort.hostname` changes case**, from `DM7C-1-device-control` to
   `dm7c-1-device-control`. ADR 0022 PR 1 anticipated this and forbade case-sensitive assertions on
-  that property; those tests need no change.
+  that property.
+
+  > **Amendment — "those tests need no change" is wrong.** ADR 0022's forbearance covered only that
+  > one property, and was not honoured even there: `test_prod_import.py:560` asserts
+  > `"DM7C-1-device-control"` exactly. Lowercasing changes *stored* values, so eight existing
+  > case-sensitive assertions fail across `test_prod_import.py` and `test_ui.py`, and — worse —
+  > `verify_prod_import.py` compares `hostname != description` against the raw CSV (`:624`, `:760`),
+  > so it would report a failure for nearly every row. Phase 18 must make those two comparisons
+  > case-insensitive and update the eight assertions; the verifier may do this without breaking its
+  > independence contract, since it imports nothing from the importer.
 
 - **`sync_roles` must be re-run after migrating**, for the same reason ADR 0021 records: permission
   rows for `Owner` are created by `post_migrate`, and until then no role holds `view_owner` and the

@@ -1,19 +1,28 @@
+> **Revision 2** — incorporates review notes from an independent plan review.
+> See "Review response" for the mapping. Two findings hit the escalation gate and were settled with
+> Mike: uniqueness is now **rename-only** (creation is exempt, because the importer creates
+> duplicates by design), and the four Amphenol `rdj…` slugs are a typo to be corrected to `rjd…`.
+>
+> The reviewer was a **same-model-family** agent, not `codex` — no OpenAI budget. Correlated blind
+> spots are possible in a way the usual chain avoids.
+
 # Implement ROADMAP phase 18 — hostname computation
 
 ## Context
 
 Phase 17 shipped the five components as fields and computed nothing. This phase makes them do
-something: assemble a hostname, refuse a hand-typed duplicate, resolve collisions, and surface
-divergence.
+something: assemble a hostname, refuse a hand-typed rename into a duplicate, resolve collisions, and
+surface divergence.
 
-`docs/adr/0023-hostname-scheme.md` settles the design and needs no successor. It carries **four
-amendments** made while planning this phase, each found by grilling the ADR against the **live
-database** rather than the CSVs it was written from — decisions 6, 7, 8 and 10. Read the amendments
-first; three of them change what this phase builds.
+`docs/adr/0023-hostname-scheme.md` settles the design and needs no successor. It carries **six
+amendments**, all made while planning this phase and all found by measuring the **live database**
+rather than the CSVs the ADR was written from. Read them first; they override the decisions they sit
+under.
 
-**The CSVs are stale as a source of truth.** 49 hostnames have been renamed by hand into scheme
-shape since the import, and every prose value is gone. Numbers below are measured against the
-deployment database (`network-addresser-9000-db-1`), not `prod/*.csv`.
+**Measure before implementing. Do not trust the table below.** These figures have moved three times
+during planning — once because the database had drifted from the CSVs, once because a duplicate
+hostname was fixed by hand mid-plan, and once because 24 Types were given slugs by hand *after*
+revision 1 was written.
 
 | | live |
 |---|---|
@@ -21,13 +30,12 @@ deployment database (`network-addresser-9000-db-1`), not `prod/*.csv`.
 | rows that change under lowercasing | 40 |
 | rows longer than 63 chars | 0 (longest is 22) |
 | duplicated hostnames | 5, covering 32 rows — all bare model names |
-| Types carrying a `hostname_slug` | **0 of 32** |
+| equipment rows with an `owner` | **9 of 84** |
+| Types carrying a `hostname_slug` | **24 of 33** — all 8 switch Types and `NA2-DLINE` blank |
 
-Re-measure before implementing rather than trusting these: they moved twice during planning, once
-because the database had drifted from the CSVs and once because a duplicate was fixed by hand
-mid-plan.
-
-That last row is why decision 10 was amended: without seeding, this phase ships inert.
+The last two rows drive two decisions. Owner blocks assembly, so almost nothing computes yet and
+`hostname_diverges` will fire on ~6 rows, not the estate. And seeding is now mostly *already done*
+by hand, which changes what PR 4 has left to do.
 
 ## Decisions this plan settles (ADR 0023 left them to the build)
 
@@ -35,37 +43,43 @@ That last row is why decision 10 was amended: without seeding, this phase ships 
 
    | PR | Contents | Why separate |
    |---|---|---|
-   | 1 | `hostname` → `CharField(63)`, strip+lowercase, **backfill migration** | The only PR that rewrites live data; must be revertible on its own |
-   | 2 | `inventory/hostnames.py` — `compute_hostname()`, `hostname_is_taken()`, the numbering rule | Pure functions, no call sites; reviewable in isolation |
-   | 3 | Uniqueness in `full_clean()`, add-form assembly, the recompute action, the advisories | The write paths, all of which depend on PR 2 |
-   | 4 | `hostname_diverges` + read-only UI marker + admin filter, and the `hostname_slug` seeding | Seeding lands last so the indicator has something to compare against |
+   | 1 | `hostname` → `CharField(63)`, strip+lowercase, **backfill migration**, and the case-sensitivity fallout | The only PR that rewrites live data; must be revertible on its own |
+   | 2 | `inventory/hostnames.py` — `assemble_hostname()`, `choose_sequence()`, `hostname_is_taken()` | Pure functions, no call sites; reviewable in isolation |
+   | 3 | Rename-only uniqueness, add-form assembly, the recompute action, the advisories, audit | The write paths, all of which depend on PR 2 |
+   | 4 | `hostname_diverges` + UI surfacing, and seeding the 9 remaining `hostname_slug`s | Smallest, and the only PR that is now largely already done by hand |
 
-   PR 2 is inert by construction — nothing calls it — which is what makes PR 3's diff readable.
+2. **Two functions, not one** (review note 4). `assemble_hostname(obj)` is a pure join over stored
+   components — no collision queries — and `choose_sequence(stem, *, exclude)` is the numbering rule
+   plus the free-check loop. `hostname_diverges` uses **only** `assemble_hostname()`, so rendering it
+   costs no queries beyond the three relation reads. Merging them would put a three-table collision
+   query behind a property rendered once per row, which is the objection ADR 0023's rejected
+   alternatives already raise against assembly in `save()`.
 
-2. **`hostname_slug` seeding rides in PR 4, not PR 3.** Seeding is what makes `hostname_diverges`
-   fire across the estate, so the indicator and its trigger should land together and be revertible
-   together. Landing seeding earlier would make PR 3's recompute action start renaming equipment
-   before anyone can see what diverged.
+3. **Everything that computes excludes the object being computed**, by pk and by model — both the
+   sibling scan and `hostname_is_taken()`. Without this the recompute action renames a device on
+   every run: a device stored as `…-2` sees itself as a numbered sibling and goes to `-3`, then `-4`.
+   Recompute must be **idempotent**.
 
-3. **The backfill migration refuses rather than truncates.** A pre-check raises with the offending
-   hostnames listed if any exceeds 63. None does today; the guard exists because MySQL's own error
-   at `ALTER` time names a column and a row number rather than the problem, and because silent
-   truncation of a hostname is data loss.
+4. **An explicitly-set `hostname_sequence` is honoured**, not overridden. Assembly joins it as-is and
+   only bumps if `hostname_is_taken()` says that exact name is occupied. The starting-value table
+   applies only when the field is null. Otherwise the first advisory is self-defeating: it tells the
+   operator to assign `1` to the bare twin, and the next recompute would ignore it.
 
-4. **`hostname_is_taken()` relies on the collation, not `__iexact`.** The database's utf8mb4
-   collation is case-insensitive, which is what `Department` already leans on
-   (`PLAN-hostname-ingredients.md` decision 7). `__iexact` would force a `LOWER()` and lose the
-   index.
+5. **The chosen sequence is stored back** on the object alongside the name. It is in all four forms'
+   `Meta.fields`, so it can be — and if it is not, every newly-created device diverges the moment
+   PR 4 lands.
 
-5. **The advisories fire from the admin layer only.** They are `messages.info()` calls needing a
-   request, which is why ADR 0023 decision 5 puts assembly on the add-form and action paths.
-   `compute_hostname()` itself returns the name and the advisory *reasons*; the caller decides
-   whether it has a request to show them on.
+6. **The backfill migration refuses rather than truncates**, via a pre-check that runs *before* the
+   `AlterField` — MySQL cannot roll back DDL, so a failure afterwards would leave the schema changed.
 
-6. **The recompute action is available on both hierarchies** and to anyone holding the model's
-   change permission — `@admin.action(permissions=["change"])`, matching `pull_cards`
-   (`inventory/admin.py:1315`). An Editor can already rename a device by hand; doing it by action
-   is not a greater power.
+7. **`hostname_is_taken()` relies on the collation**, confirmed as `utf8mb4_uca1400_ai_ci` on both
+   hostname columns. Note that this argument does **not** extend to the derived-port-name branch: an
+   annotation over `CONCAT_WS` cannot use an index at all. Accepted — the table is small.
+
+8. **The recompute action is available on both hierarchies**, to anyone holding the model's change
+   permission — `@admin.action(permissions=["change"])`, matching `pull_cards`
+   (`inventory/admin.py:1315`). Its name must be **appended to both admins' explicit `actions`
+   lists** (`:1207`, `:1283`) or it never renders, however it is decorated.
 
 ## PR 1 — normalise and cap `hostname`
 
@@ -73,188 +87,221 @@ That last row is why decision 10 was amended: without seeding, this phase ships 
 
 `NetworkSwitch.hostname` (`:2427`) and `NetworkDevice.hostname` (`:3337`) drop from
 `CharField(max_length=255, blank=True)` to `max_length=63`, and gain strip-and-lowercase in
-`clean_fields()`, `clean()` and `save()` — the three-place pattern phase 17 established for every
-component field, and for the same reason: `save()` never calls `clean()`, and `clean_fields()` runs
-before field validators.
+`clean_fields()`, `clean()` and `save()` — the three-place pattern phase 17 established, for the same
+reason: `save()` never calls `clean()`, and `clean_fields()` runs before field validators.
 
-**No `validate_dns_label`.** See ADR 0023 decision 8 as amended: the importer commits every row to
-`construct → full_clean() → save()` and writes `hostname = row.description`, which is still prose in
-the CSVs, so a validator would break a rebuild — and a switch's hostname is the only human-readable
-label it has.
+**No `validate_dns_label`** — see ADR 0023 decision 8 as amended.
 
 ### Migration `0017_hostname_normalise`
 
-1. A `RunPython` pre-check that raises `RuntimeError` listing any hostname longer than 63
-   characters, before anything is altered.
-2. `AlterField` × 2 for the `max_length` change.
-3. A `RunPython` backfill stripping and lowercasing every non-blank hostname on both models —
-   **40 of 83 live rows change**. Reverse is a no-op with a comment saying why: the original casing
-   is unrecoverable, and re-uppercasing would be a guess.
+1. `RunPython` pre-check raising with any hostname longer than 63 characters listed, **before** the
+   `AlterField`.
+2. `AlterField` × 2 for `max_length`.
+3. `RunPython` backfill stripping and lowercasing every non-blank hostname on both models —
+   **40 of 83 live rows change**. Reverse is a no-op, commented: the original casing is
+   unrecoverable and re-uppercasing would be a guess.
 
-Use `apps.get_model()`, not the real model, so the migration does not run `save()`'s normalisation
-and is a pure data operation.
+`apps.get_model()`, not the real model, so the migration does not re-run `save()`'s normalisation.
+Deliberately **not** audited — it is a historical-model data fix, not an operator action.
+
+### The case-sensitivity fallout — the part revision 1 missed entirely
+
+Lowercasing changes stored values that existing code compares exactly.
+
+- **`verify_prod_import.py:624` and `:760`** compare `hostname != description` against the raw CSV.
+  Left alone, the verifier fails for nearly every row from this PR onward. Make both comparisons
+  case-insensitive (`.strip().lower()` both sides). This does not breach its independence contract —
+  it imports nothing from the importer.
+- **Eight case-sensitive assertions** must be updated: `test_prod_import.py:455`, `:539`, `:541`,
+  `:553`, `:560` (this one *is* the port property ADR 0022 believed it had protected), and
+  `test_ui.py:1048`, `:1098`, `:1119`.
 
 ### Tests
 
-- A row stored as `DM7C-1` normalises to `dm7c-1` through `objects.create()`, `full_clean()`, and
-  the admin form — all three paths, since settled decision 6 of phase 17 exists precisely because
-  they differ.
+- `DM7C-1` normalises to `dm7c-1` through `objects.create()`, `full_clean()`, and the admin form.
 - `NetworkDevicePort.hostname` yields `dm7c-1-device-control` for a device whose stored hostname was
-  `DM7C-1` before the migration — the concrete divergence `models.py:4303`'s docstring defers here.
-  This is the test that proves the backfill, not merely the on-write path.
-- The migration's length guard raises on a 64-character hostname and names it.
-- A migration test asserting the backfill actually ran (build a row with `bulk_create` to bypass
-  `save()`, run the migration, assert lowercase).
+  `DM7C-1` **before** the migration — this is what proves the backfill rather than the on-write path.
+- The length guard raises on a 64-character hostname and names it.
+- A migration test: insert via `bulk_create` to bypass `save()`, migrate, assert lowercase.
+- `test_prod_import.py` passes unchanged apart from the listed assertion updates.
 
 ## PR 2 — `inventory/hostnames.py`
 
-Pure functions. Nothing imports them yet.
+Pure functions. Nothing imports them yet, which is what keeps PR 3's diff readable.
 
-### `compute_hostname(obj) -> HostnameResult | None`
+### `assemble_hostname(components) -> str | None`
 
-Returns `None` when a **blocking** component is missing — `obj.owner` or
-`obj.<type>.hostname_slug` (ADR 0023 decision 1). Otherwise joins the non-blank components with
-`-`:
+Returns `None` when a **blocking** component is missing — owner or the Type's `hostname_slug`.
+Otherwise joins the non-blank components with `-`:
 
 ```
-owner.slug  ·  obj.rack.location_slug  ·  type.hostname_slug  ·  hostname_purpose  ·  hostname_sequence
+owner.slug · rack.location_slug · type.hostname_slug · hostname_purpose · hostname_sequence
 ```
 
-Location is read through the rack (`obj.rack.location_slug`) and is simply absent for spare-pool
-equipment, which has no rack. `compute_hostname()` **never** reads through to `rack.owner` — that
-fallback belongs to the recompute action alone (ADR 0023 decision 5), so the value is stored rather
-than inherited.
+**Takes components, not an object** (review note 7): on an add form, `self.instance` is still empty
+because `ModelForm._post_clean()` runs `construct_instance()` *after* `clean()`, so the submitted
+values live in `cleaned_data`. A small adapter builds the component tuple from either source, the
+same way `_fill_rack_derived_owner_default()` takes `cleaned_data` explicitly.
 
-The return carries the assembled name, the chosen sequence, and a list of advisory reasons; the
-caller decides whether it has a request to render them on.
+No queries beyond the three relation reads. Location is read through the rack and is simply absent
+for spare-pool equipment. Never reads through to `rack.owner` — that fallback belongs to the
+recompute action alone, so the value is stored rather than inherited.
+
+### `choose_sequence(stem, *, exclude_switch_pk=None, exclude_device_pk=None) -> int | None`
+
+| State of the stem | Start at |
+|---|---|
+| nothing exists | `None` — take the bare name |
+| bare name exists, no numbered siblings | **2**, leaving `1` for the advisory |
+| any numbered sibling exists | **highest + 1** |
+
+Then increment until `hostname_is_taken()` says free. Highest + 1, never lowest-free, so a gap left
+by a deleted device is not reused. Sibling detection matches stored hostnames equal to the stem or
+`stem-<digits>`, whatever their origin — **excluding the object being computed**.
+
+Skipped entirely when `hostname_sequence` is already set (settled decision 4).
 
 ### `hostname_is_taken(name, *, exclude_switch_pk=None, exclude_device_pk=None) -> bool`
 
-Three tables, per ADR 0023 decision 6:
-
 ```python
-NetworkSwitch.objects.filter(hostname=name)
-NetworkDevice.objects.filter(hostname=name)
-NetworkDevicePort.objects.filter(source_type_port__hostname_suffix__gt="")
+NetworkSwitch.objects.filter(hostname=name).exclude(pk=exclude_switch_pk)
+NetworkDevice.objects.filter(hostname=name).exclude(pk=exclude_device_pk)
+NetworkDevicePort.objects
+    .filter(source_type_port__hostname_suffix__gt="")
+    .exclude(device__hostname="")            # Concat would yield "-suffix"; the property returns None
+    .exclude(device_id=exclude_device_pk)    # a rename must not be blocked by its own ports
     .annotate(derived=Concat("device__hostname", Value("-"), "source_type_port__hostname_suffix"))
     .filter(derived=name)
 ```
 
-Plain `=`, not `__iexact` (settled decision 4). Blank names are never taken — blank is exempt
-throughout.
-
-### The numbering rule
-
-Per ADR 0023 decision 7 as amended. Choose a starting sequence, *then* increment until free:
-
-| State of the stem | Start at |
-|---|---|
-| nothing exists | no sequence — take the bare name |
-| bare name exists, no numbered siblings | **2**, leaving `1` for the advisory |
-| any numbered sibling exists | **highest + 1** |
-
-Highest + 1, never lowest-free, so a gap left by a deleted device is never reused — a retired
-hostname is referenced by DNS, switch configs and physical labels this system cannot see.
-
-Sibling detection is a query for stored hostnames matching the stem exactly or `stem-<digits>`,
-regardless of how they were created; a hand-typed `mps-avio-aes-9` occupies the namespace as surely
-as a computed one.
+Plain `=`, not `__iexact`. Blank names are never taken.
 
 ### Tests
 
-Table-driven over the numbering rule, one case per row above plus: a stem with a gap
-(`-1`, `-3` present → `-4`, not `-2`); a hand-typed sibling counted; a device colliding with a
-*derived port* name; each blocking component absent yielding `None`; every optional component
-absent yielding a bare `owner-typeslug`.
+Table-driven over the numbering rule, one case per row, plus: a gap (`-1`, `-3` present → `-4`); a
+hand-typed sibling counted; a device colliding with a derived *port* name; each blocking component
+absent → `None`; every optional component absent → bare `owner-typeslug`; **self-exclusion**
+(computing for an object that already holds a name in its own stem returns that same name).
 
 ## PR 3 — the write paths
 
-### Uniqueness — `full_clean()`
+### Uniqueness — rename-only
 
-A `_validate_hostname_unique()` on both models, shaped like `_validate_static_address()`
-(`inventory/models.py:463`) including its `exclude_*_pk` parameters, and inheriting its known race
-(#5) rather than introducing a stricter mechanism for names.
+`_validate_hostname_unique()` on both models, shaped like `_validate_static_address()`
+(`inventory/models.py:463`) including its `exclude_*_pk` parameters, inheriting its known race (#5).
 
-**Enforced only when `hostname` is being set or changed** — ADR 0023 decision 6 as amended. Compare
-against the stored value; if unchanged, skip. This grandfathers the 32 already-duplicated rows,
-which would otherwise be unsaveable with no way out, while still refusing a rename *into* a
-duplicate or a new duplicate. Blank exempt.
+**Enforced only when `pk is not None` and `hostname` differs from the stored value** — ADR 0023
+decision 6 as twice amended. Creation is exempt because the importer creates duplicates by design
+(`import_prod_data.py:1226` calls `full_clean()` with a CSV hostname; the CSV repeats `IK42`
+eighteen times), so enforcing there would break every rebuild. Blank exempt.
 
-Record in the docstring that **hostnames are not unique in the database and no code may assume they
-are.**
+Docstring must record that **hostnames are not unique in the database and no code may assume it.**
 
 ### Add-form assembly — `inventory/admin.py`
 
-`NetworkDeviceAddForm.clean()` and `NetworkSwitchAddForm.clean()`, beside
-`_fill_rack_derived_owner_default()` (`:376`, called at `:585` and `:705`): if `hostname` is blank,
-assemble and fill it. A typed value is never overwritten. Add-only — the change form neither
-assembles nor re-derives.
+In `NetworkDeviceAddForm.clean()` and `NetworkSwitchAddForm.clean()`, **immediately after the
+`_fill_rack_derived_owner_default()` call at `:585` / `:705` and before the device form's
+`rack is None` early return at `:587`** — otherwise every spare-pool device silently skips assembly,
+which is exactly the case ADR 0023 says must still work. The switch form has no such early return;
+that asymmetry is the same class of trap phase 17 documented for `Meta.fields`.
+
+Blank hostname only. A typed value is never overwritten. The change form neither assembles nor
+re-derives.
 
 ### The recompute action
 
-`@admin.action(permissions=["change"], description="Recompute hostname")` on both admins, following
-`pull_cards` (`:1315`):
+Appended to `NetworkDeviceAdmin.actions` and `NetworkSwitchAdmin.actions` (settled decision 8):
 
 1. If `owner` is blank and the object has a rack, set `owner = rack.owner` and store it.
-2. Assemble. If blocked, skip and report which component was missing.
-3. Bump per the numbering rule until free.
-4. Store, overwriting whatever was there — that is the point of an explicit action, unlike the
-   creation path.
-5. Report per object: renamed, unchanged, or skipped with a reason.
+2. `assemble_hostname()`. If blocked, skip and report which component was missing.
+3. `choose_sequence()` if the sequence is null; store it back.
+4. Store the name, overwriting whatever was there.
+5. Report per object: renamed, **unchanged**, or skipped with a reason.
+
+Saved per row, like `pull_cards` (`:1330-1339`), so each rename is audited. Objects are processed
+sequentially, each saved before the next is computed, so selecting 17 identical amps yields 17
+distinct names.
 
 ### The advisories
 
-Both are `messages.info()`, both about already-saved rows, neither an action:
+`ModelForm.clean()` has **no request**, so the messages cannot be emitted there (review note 6).
+`clean()` stashes them on the form (`self._hostname_advisories`); `ModelAdmin.save_model()` emits
+them, having both. The action emits its own directly.
 
-- Where the bump started at 2 because the colliding twin has no sequence: name that twin and
-  recommend assigning it `1`.
-- Where the rack has a `location_slug` and a sequence was assigned: note that a purpose reads
-  better than a number.
+- Where the bump started at 2 because the colliding twin has no sequence: name that twin, recommend
+  assigning it `1`.
+- Where the rack has a `location_slug` and a sequence was assigned: note that a purpose reads better
+  than a number.
+
+### Audit — `config/settings.py`
+
+`"hostname"` is in **neither** `include_fields` whitelist. As it stands an Editor could rename any
+selection of equipment with no trace. Add it to both, and add an audit test in the shape of
+`DepartmentAuditTests`.
 
 ### Tests
 
-A hand-typed hostname survives creation; a blank one is filled; the change form does not assemble;
-`objects.create()` does not; the recompute action fills a blank owner from the rack and stores it;
-a device with no rack and no owner is skipped with a reason; recompute overwrites a hand-typed
-name; renaming into a duplicate is refused; **editing an unrelated field on one of the 34
-duplicated rows saves cleanly** (the regression the amendment exists to prevent); the advisories
-fire on the right conditions and not otherwise.
+A hand-typed hostname survives creation; a blank one is filled; **a spare-pool device with no rack
+still assembles**; the change form does not assemble; `objects.create()` does not; the action fills a
+blank owner from the rack and stores it; **recompute twice yields the same name** and reports
+"unchanged" the second time; an explicitly-set sequence is honoured, so the advisory's own remedy
+works (twin assigned `1` by hand → recompute yields `…-1`, not `…-3`); recompute over 17 identical
+devices yields 17 distinct names; renaming into a duplicate is refused; **creating** a duplicate is
+allowed; editing an unrelated field on one of the 32 duplicated rows saves cleanly; the advisories
+fire through the admin **add view**, not the bare form; **`test_prod_import.py` passes unchanged**.
 
-## PR 4 — divergence and seeding
+## PR 4 — divergence and the remaining seeding
 
 ### `hostname_diverges`
 
-A read-only property on both models: `compute_hostname()` returns a name, a stored hostname exists,
-and they differ. No `hostname_is_computed` field — state that can itself go stale is what the
-indicator exists to catch (ADR 0023 decision 9).
+Read-only property on both models: `assemble_hostname()` returns a name, a stored hostname exists,
+and they differ. No new field. Uses `assemble_hostname()` only, so it runs no collision query.
 
-Surfaced as a marker on `rack_detail.html` and `device_detail.html` (which `model_detail` redirects
-to, so the registry `detail_fields` never render — the trap phase 17 documented), and as an admin
-list filter on both equipment admins.
+Reconcile with ADR 0023 decision 9, whose wording is "every component present" — that is stricter
+than intended and would make divergence unreachable, since no live device has both a purpose and a
+sequence. The operative definition is the one above.
 
-### `hostname_slug` seeding
+**Surfacing, with the query budget in mind** (review note 8). The read-only UI asserts an *identical*
+query count for a 2-row and a 50-row page (`test_ui.py:1777-1791`), and `FieldSpec`'s docstring
+forbids an accessor that queries per row. So:
 
-A `HOSTNAME_SLUGS: dict[tuple[str, str], str]` constant keyed on `(manufacturer, model)` — not on
-the profile, so `IK-42 — with Dante Card` and `— without Dante Card` both get `ik42`. Applied by:
+- `rack_detail.html` and `device_detail.html` get the marker, and **their own querysets** gain
+  `select_related("owner", "rack", "device_type")` — the registry hints never reach these two views.
+- `networkswitch`'s registry spec gets it as a `FieldSpec`, since `NetworkSwitch` has no canonical
+  view and would otherwise be the one model with the property and no way to see it. Decide
+  explicitly whether `spare_pool.html` carries it.
+- The admin filter is a **`SimpleListFilter`** — a property cannot be a `list_filter` entry, and this
+  repo has no existing one to copy. Its `queryset()` scans in Python with `select_related`; 84 rows
+  today.
+- Flat query budgets are an acceptance criterion, not an afterthought.
 
-- `import_prod_data.py`, for rebuilds
-- a data migration matching on `(manufacturer, model)`, for the database that already exists and
-  will not be rebuilt to pick these up
+### Seeding the remaining `hostname_slug`s
 
-Not `slugify()`: it is wrong for `IK-42` → `ik-42`, `SQ-5`, `DM7-EX`, `NA2-DLINE`, which is the trap
-ADR 0023 already documents. A Type whose `(manufacturer, model)` is absent from the constant is left
-blank, not guessed at.
+**Mostly already done by hand.** 24 of 25 device Types carry a slug; what remains is the 8 switch
+Types and `Neutrik NA2-DLINE`.
 
-`verify_prod_import.py` re-derives its own copy rather than importing the constant, per its
-independence contract.
+`HOSTNAME_SLUGS: dict[tuple[str, str], str]` is **derived from the live values**, not invented —
+several are not what a naive constant would hold (`plm20q`, `avioao2`, `rio3224d3`, `dantx`/`danrx`).
+Getting this wrong means a rebuild silently produces a different estate from the one running.
+
+The four Amphenol entries were entered as `rdj1212` / `rdj2203` / `rdj32a3` / `rdj32u1` against models
+`RJD1212-0050` etc. **Settled with Mike: a typo.** The constant carries `rjd…`, and PR 4 includes a
+one-off correction of the four live rows.
+
+Applied by the importer (rebuilds) and a data migration matching on `(manufacturer, model)` that
+**does not overwrite a non-blank slug** — except for the four Amphenol corrections, which are
+explicit. Keyed on the model, not the profile, so both `IK-42` profiles get `ik42`. Not `slugify()`.
+
+`verify_prod_import.py` re-derives its own copy rather than importing the constant.
 
 ### Tests
 
-`hostname_diverges` is `False` when components are missing (the common case today), `False` when the
-stored name matches, `True` when it differs; the marker renders through the canonical redirect, not
-the registry view; the admin filter selects the right rows; seeding sets `ik42` on both IK-42
-profiles; an unlisted Type is left blank; the data migration is idempotent and does not overwrite an
-operator-set slug.
+`hostname_diverges` is `False` when components are missing, `False` when the stored name matches,
+`True` when it differs; the marker renders through the canonical redirect for Rack and Device and
+through the registry for Switch; **query budgets stay flat**; the `SimpleListFilter` selects the right
+rows; **every `(manufacturer, model)` the importer creates has a `HOSTNAME_SLUGS` entry** (set
+equality, the shape `test_ui.py:1777` uses); a Type with an operator-set slug is not overwritten; the
+four Amphenol rows are corrected; the data migration is idempotent.
 
 ## Verification
 
@@ -263,15 +310,31 @@ set -a; source .env; set +a
 python manage.py test inventory
 ```
 
-Record the baseline before touching code. PR 4 additionally rebuilds from the CSVs and runs
-`verify_prod_import.py`.
+Record the baseline first. PR 4 rebuilds from the CSVs and runs `verify_prod_import.py`.
 
-**Expect `hostname_diverges` to fire widely once PR 4 lands.** 49 hostnames were renamed by hand
-into scheme shape, and any that do not match what computation produces will be flagged. That is the
-indicator working, and it is the reconciliation surface between the manual renaming and the scheme —
-but it is not a quiet rollout, and the PR description should say so.
+**`hostname_diverges` will be near-silent at first — about 6 rows, not the estate.** Owner blocks
+assembly and only 9 of 84 equipment rows have one. The estate becomes visible to the indicator as
+operators run recompute, which sets the owner *and* the name in one step, so a recomputed row does
+not diverge either. Revision 1 of this plan predicted a noisy rollout; that was wrong.
 
-Found while measuring this phase and **already fixed by hand**: two switches in WPM1SR slots 1 and 2
-were both named `mps-wpm1sr-sg350-1`. A data error rather than an import artifact, and correcting it
-dropped the grandfathered set from 34 rows to 32. All 32 that remain are equipment still carrying
-the bare model name the importer gave it, which is exactly what PR 3's recompute action is for.
+## Review response
+
+| Note | Resolution | Section |
+|---|---|---|
+| 1 (P0) | **Escalated and settled with Mike.** Verified `import_prod_data.py:1226` calls `full_clean()` with a CSV hostname and that the CSV repeats `IK42` ×18 — enforcing uniqueness on creation would break every rebuild and the whole `test_prod_import` module. Uniqueness is now rename-only (`pk is not None`). ADR 0023 decision 6 amended a second time. | PR 3 "Uniqueness"; ADR 0023 decision 6 |
+| 2 (P0) | Accepted — verified `verify_prod_import.py:624`/`:760` compare against the raw CSV case-sensitively, and that `test_prod_import.py:560` asserts the very port-property string ADR 0022 believed it had protected. PR 1 now owns the case-sensitivity fallout, and ADR 0023's "those tests need no change" bullet is corrected. | PR 1 "case-sensitivity fallout"; ADR 0023 Consequences |
+| 3 (P1) | Accepted. Self-exclusion is now a settled decision, and idempotence is a named test — without it recompute renamed a device on every run, which no listed test would have caught. | Settled decision 3; PR 2/3 Tests |
+| 4 (P1) | Accepted. Split into `assemble_hostname()` and `choose_sequence()`; `hostname_diverges` uses only the former, so it runs no collision query. PR 4's definition reconciled against ADR 0023 decision 9, whose "every component present" wording is unreachable in practice. | Settled decision 2; PR 2; PR 4 |
+| 5 (P1) | Accepted — verified both admins declare explicit `actions` lists (`:1207`, `:1283`), so a decorated-but-unlisted method never renders. Registration is now a settled decision and is tested through the admin URL. | Settled decision 8; PR 3 |
+| 6 (P1) | Accepted — no admin here passes a request into its forms, so `messages.info()` cannot fire in `clean()`. The `save_model()` hand-off is now named explicitly. | PR 3 "The advisories" |
+| 7 (P1) | Accepted, both halves. `assemble_hostname()` takes components rather than an object, because `construct_instance()` runs after `clean()`; and assembly is placed before the device form's `rack is None` early return at `:587`, which would otherwise skip every spare-pool device. | PR 2; PR 3 "Add-form assembly" |
+| 8 (P1) | Accepted. Named the querysets that gain `select_related`, and made flat query budgets an acceptance criterion. This is a second reason to keep the numbering rule out of the property. | PR 4 "Surfacing" |
+| 9 (P1) | Accepted — verified against the live database: 24 of 25 device Types now carry hand-set slugs, entered after revision 1 was written; 8 switch Types and `NA2-DLINE` remain; 33 Types, not 32. The constant is now derived from live values rather than invented, and settled decision 2's rationale is rewritten. The `rdj`/`RJD` transposition was escalated; Mike settled it as a typo. | Context; PR 4 "Seeding" |
+| 10 (P2) | Accepted — measured: 9 of 84 rows have an owner, so 6 diverge, not 49. The "noisy rollout" warning was wrong and is replaced with the measured figure and its cause. | Verification; ADR 0023 decision 10 |
+| 11 (P2) | Accepted. An explicitly-set sequence is honoured; the starting table applies only when null. Without this the first advisory's own remedy was unreachable, which is a good catch. | Settled decision 4; PR 3 Tests |
+| 12 (P2) | Accepted — verified `"hostname"` is in neither `include_fields` whitelist, so a mass rename would leave no audit trail. Added in PR 3; the PR 1 backfill stays deliberately unaudited. | PR 3 "Audit" |
+| 13 (P2) | Accepted — a property cannot be a `list_filter` entry and this repo has no `SimpleListFilter` to copy. Named explicitly, with its cost. | PR 4 "Surfacing" |
+| 14 (P2) | Accepted, both halves, plus the observation that settled decision 7's index argument does not extend to a `CONCAT_WS` annotation — recorded as accepted rather than quietly implied. | Settled decision 7; PR 2 |
+| 15 (P2) | Accepted. `NetworkSwitch` has no canonical view, so it gets the marker through its registry spec; `spare_pool.html` is called out as an explicit decision. | PR 4 "Surfacing" |
+| 16 (P2) | Accepted, both. A set-equality test that the seeding constant covers every Type the importer creates, and a batch-recompute test asserting N distinct names. | PR 4 Tests; PR 3 Tests |
+| 17 (P3) | Accepted. All counts reconciled to the live measurements (83, 32, 33, 9 of 84), in this plan, ADR 0023 and `ROADMAP.md`. | Throughout |

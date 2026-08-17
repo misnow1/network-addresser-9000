@@ -332,12 +332,15 @@ about the system.
       `full_clean()` with a plain-language error, blank exempt. Same shape as the existing
       cross-table static-address check, inheriting its known race (#5) rather than introducing a
       second, stricter mechanism for names; blank-exempt means the spare pool and every existing
-      row need no backfill. **Enforced only when `hostname` is set or changed** (ADR 0023 decision 6,
-      amended): the live database holds 34 rows across 6 duplicated hostnames — `IK42` alone names
-      17 amps — so unconditional validation would freeze them all, with recompute unable to help
-      because it is blocked on `hostname_slug`, which no Type carries. Renaming *into* a duplicate is
-      still refused. Hostnames are therefore **not** unique in the database and no code may assume
-      they are
+      row need no backfill. **Rename-only** (ADR 0023 decision 6, amended twice): enforced when
+      `pk is not None` and `hostname` changes. The live database holds 32 rows across 5 duplicated
+      hostnames — `IK42` alone names 17 amps — so unconditional validation would freeze them all,
+      with recompute unable to help because it is blocked on `hostname_slug`. **Creation is exempt
+      too**, because the importer creates duplicates by design: it commits every row to
+      `full_clean()` and the addressing CSV repeats `IK42` eighteen times, so enforcing there would
+      break every rebuild. Little is lost — the computed path cannot collide, so a hand-typed
+      *rename* is the realistic way to make a duplicate, and that is refused. Hostnames are therefore
+      **not** unique in the database and no code may assume they are
 - [ ] A `NetworkDevicePort` hostname as a **derived, read-only property** —
       `<device.hostname>-<hostname_suffix>` — **already shipped by phase 17's ADR 0022 PR 1**. This
       is where `…-sd12-engine` and `…-device-control` live. Ports have no hostname field and gain
@@ -377,15 +380,19 @@ about the system.
 - [ ] **The migration backfills** (ADR 0023 decision 8, amended). On-write normalisation cannot
       close the casing divergence on its own — a row nobody saves is never normalised, so `DM7C-1`
       would sit there indefinitely and `NetworkDevicePort.hostname` would keep yielding
-      `DM7C-1-device-control`. 40 of 82 live rows change. Those rows get rewritten *anyway*, one at
+      `DM7C-1-device-control`. 40 of 83 live rows change. Those rows get rewritten *anyway*, one at
       a time, whenever someone saves an unrelated field — so the choice is one reviewable migration
-      versus 40 unattributable surprises. It refuses rather than truncates if any row exceeds 63
-- [ ] **Seed `hostname_slug` on the ~32 imported Types** (ADR 0023 decision 10, amended), via a
+      versus 40 unattributable surprises. It refuses rather than truncates if any row exceeds 63.
+      Its fallout is larger than it looks: `verify_prod_import.py` compares hostnames to the raw CSV
+      case-sensitively, and eight existing assertions do the same
+- [ ] **Seed the remaining `hostname_slug`s** (ADR 0023 decision 10, amended), via a
       `{(manufacturer, model): slug}` constant applied by both the importer and a data migration.
-      Without it this phase ships **inert**: the slug is a blocking component and 0 of 32 Types carry
-      one, so every recompute would report "no type slug" and do nothing. Not the per-device backfill
-      decision 10 refuses — that one has no join key, whereas Types already come from a constant in
-      the importer. Not `slugify()` either: `IK-42` → `ik-42` where the name in use is `ik42`
+      Mostly **already done by hand** — 24 of 33 Types now carry a slug; the 8 switch Types and
+      `NA2-DLINE` remain. The constant must be *derived from* those live values rather than invented,
+      or a rebuild silently produces a different estate from the one running. Not the per-device
+      backfill decision 10 refuses — that one has no join key, whereas Types already come from a
+      constant in the importer. Not `slugify()` either: `IK-42` → `ik-42` where the name in use is
+      `ik42`
 - [ ] #54: a **stateless** `hostname_diverges` property — every component present, a hostname
       present, and the two differ. No `hostname_is_computed` boolean, because state that can itself
       go stale is what the indicator exists to catch. Framed as divergence, not staleness: it says
