@@ -60,6 +60,7 @@ from .admin import (
     SwitchPortVlanProfileForm,
     VLANAdmin,
 )
+from .hostnames import HostnameComponents, assemble_hostname, choose_sequence, hostname_is_taken
 from .models import (
     DEFAULT_PROFILE_NAME,
     DEFAULT_VLAN_ID,
@@ -5593,6 +5594,184 @@ class HostnameNormaliseMigrationTests(TransactionTestCase):
         NetworkDevice = self.apps.get_model("inventory", "NetworkDevice")
         NetworkDevice.objects.create(device_type=self.device_type, hostname="a" * 63)
         self._migration_module._check_hostname_lengths(self.apps, self.schema_editor)  # must not raise
+
+
+class AssembleHostnameTests(TestCase):
+    """PLAN-hostname-computation.md PR 2 — ``assemble_hostname()`` is a
+    pure join, no queries, no object: ``HostnameComponents`` carries
+    already-resolved plain values (owner slug, location slug, type slug,
+    purpose, sequence).
+    """
+
+    def _components(self, **overrides: Any) -> HostnameComponents:
+        defaults: dict[str, Any] = {
+            "owner_slug": "mps",
+            "location_slug": "wpcsrl",
+            "type_slug": "ik42",
+            "purpose": "sub",
+            "sequence": 1,
+        }
+        defaults.update(overrides)
+        return HostnameComponents(**defaults)
+
+    def test_every_component_present(self) -> None:
+        self.assertEqual(assemble_hostname(self._components()), "mps-wpcsrl-ik42-sub-1")
+
+    def test_owner_absent_blocks(self) -> None:
+        self.assertIsNone(assemble_hostname(self._components(owner_slug=None)))
+
+    def test_owner_blank_blocks(self) -> None:
+        self.assertIsNone(assemble_hostname(self._components(owner_slug="")))
+
+    def test_type_slug_absent_blocks(self) -> None:
+        self.assertIsNone(assemble_hostname(self._components(type_slug=None)))
+
+    def test_type_slug_blank_blocks(self) -> None:
+        self.assertIsNone(assemble_hostname(self._components(type_slug="")))
+
+    def test_location_skipped_when_none(self) -> None:
+        self.assertEqual(assemble_hostname(self._components(location_slug=None)), "mps-ik42-sub-1")
+
+    def test_purpose_skipped_when_blank(self) -> None:
+        self.assertEqual(assemble_hostname(self._components(purpose="")), "mps-wpcsrl-ik42-1")
+
+    def test_sequence_skipped_when_none(self) -> None:
+        self.assertEqual(assemble_hostname(self._components(sequence=None)), "mps-wpcsrl-ik42-sub")
+
+    def test_every_optional_component_absent_yields_bare_owner_typeslug(self) -> None:
+        components = self._components(location_slug=None, purpose="", sequence=None)
+        self.assertEqual(assemble_hostname(components), "mps-ik42")
+
+
+class HostnameIsTakenTests(TestCase):
+    """PLAN-hostname-computation.md PR 2 — ``hostname_is_taken()`` spans
+    ``NetworkSwitch``, ``NetworkDevice`` and the derived
+    ``NetworkDevicePort.hostname`` (ADR 0022 decision 4), plain ``=``, and
+    excludes the object being computed by pk.
+    """
+
+    def setUp(self) -> None:
+        self.device_type = _make_device_type()
+        self.switch_type = _make_switch_type()
+
+    def test_blank_never_taken(self) -> None:
+        self.assertFalse(hostname_is_taken(""))
+
+    def test_not_taken_when_nothing_matches(self) -> None:
+        self.assertFalse(hostname_is_taken("mps-ik42-1"))
+
+    def test_switch_hostname_taken(self) -> None:
+        NetworkSwitch.objects.create(switch_type=self.switch_type, hostname="mps-sg300")
+        self.assertTrue(hostname_is_taken("mps-sg300"))
+
+    def test_switch_excluded_by_pk(self) -> None:
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, hostname="mps-sg300")
+        self.assertFalse(hostname_is_taken("mps-sg300", exclude_switch_pk=switch.pk))
+
+    def test_device_hostname_taken(self) -> None:
+        NetworkDevice.objects.create(device_type=self.device_type, hostname="mps-ik42")
+        self.assertTrue(hostname_is_taken("mps-ik42"))
+
+    def test_device_excluded_by_pk(self) -> None:
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname="mps-ik42")
+        self.assertFalse(hostname_is_taken("mps-ik42", exclude_device_pk=device.pk))
+
+    def test_derived_port_name_taken(self) -> None:
+        device_type = _make_console_type_for_hostname_suffix()
+        NetworkDevice.objects.create(device_type=device_type, hostname="mps-avio-sd12")
+        self.assertTrue(hostname_is_taken("mps-avio-sd12-device-control"))
+
+    def test_derived_port_name_not_blocked_by_own_device_exclusion(self) -> None:
+        """A rename must not be blocked by its own ports' derived names,
+        which shift together with it.
+        """
+        device_type = _make_console_type_for_hostname_suffix()
+        device = NetworkDevice.objects.create(device_type=device_type, hostname="mps-avio-sd12")
+        self.assertFalse(hostname_is_taken("mps-avio-sd12-device-control", exclude_device_pk=device.pk))
+
+    def test_blank_device_hostname_never_yields_a_port_collision(self) -> None:
+        """A device with no hostname of its own derives no port hostname
+        at all (the property returns ``None``, never ``"-suffix"``) — so a
+        blank-hostname device must never register as a false collision
+        against a bare ``"-suffix"``-shaped name.
+        """
+        device_type = _make_console_type_for_hostname_suffix()
+        NetworkDevice.objects.create(device_type=device_type, hostname="")
+        self.assertFalse(hostname_is_taken("-device-control"))
+
+
+class ChooseSequenceTests(TestCase):
+    """PLAN-hostname-computation.md PR 2 — the numbering rule (ADR 0023
+    decision 7, amended): table-driven over the starting value, plus the
+    free-check loop's own guarantees.
+    """
+
+    def setUp(self) -> None:
+        self.device_type = _make_device_type()
+
+    def _device(self, hostname: str) -> NetworkDevice:
+        return NetworkDevice.objects.create(device_type=self.device_type, hostname=hostname)
+
+    def test_nothing_exists_returns_none(self) -> None:
+        self.assertIsNone(choose_sequence("mps-ik42"))
+
+    def test_bare_exists_no_numbered_siblings_returns_2(self) -> None:
+        self._device("mps-ik42")
+        self.assertEqual(choose_sequence("mps-ik42"), 2)
+
+    def test_numbered_sibling_exists_returns_highest_plus_one(self) -> None:
+        self._device("mps-ik42-1")
+        self._device("mps-ik42-2")
+        self.assertEqual(choose_sequence("mps-ik42"), 3)
+
+    def test_gap_left_by_a_deleted_device_is_never_reused(self) -> None:
+        self._device("mps-ik42-1")
+        self._device("mps-ik42-3")
+        self.assertEqual(choose_sequence("mps-ik42"), 4)
+
+    def test_hand_typed_sibling_is_counted(self) -> None:
+        # No different from a computed one, as far as the sibling scan is
+        # concerned — "whatever their origin".
+        self._device("mps-ik42-7")
+        self.assertEqual(choose_sequence("mps-ik42"), 8)
+
+    def test_numbered_sibling_beats_bare_existing_too(self) -> None:
+        """Both a bare stem *and* a numbered sibling exist — the numbered-
+        sibling branch wins (highest + 1), not the bare-only branch (2).
+        """
+        self._device("mps-ik42")
+        self._device("mps-ik42-5")
+        self.assertEqual(choose_sequence("mps-ik42"), 6)
+
+    def test_collision_with_derived_port_name_is_bumped_past(self) -> None:
+        """Nothing in the sibling scan sees this collision at all — the
+        bare stem matches no switch/device hostname — but the free-check
+        loop must still catch it via ``hostname_is_taken()``.
+        """
+        console_type = _make_console_type_for_hostname_suffix()
+        NetworkDevice.objects.create(device_type=console_type, hostname="mps-ik42")
+        # mps-ik42's Device Control port now derives "mps-ik42-device-control".
+        self.assertEqual(choose_sequence("mps-ik42-device-control"), 2)
+
+    def test_self_exclusion_is_idempotent(self) -> None:
+        """Computing for an object that already holds a name in its own
+        stem returns that same name — otherwise recompute renames a device
+        on every run (settled decision 3): without exclusion, the target
+        below (already ``-3``) would see *itself* as the highest numbered
+        sibling and be bumped to ``-4``.
+        """
+        self._device("mps-ik42-2")  # a genuine other sibling
+        target = self._device("mps-ik42-3")
+        # Without self-exclusion: target counts itself, highest becomes 3,
+        # runaway to 4.
+        self.assertEqual(choose_sequence("mps-ik42"), 4)
+        # With self-exclusion: only the other sibling (2) remains visible,
+        # reproducing target's own already-stored sequence (3).
+        self.assertEqual(choose_sequence("mps-ik42", exclude_device_pk=target.pk), 3)
+
+    def test_self_exclusion_on_bare_name(self) -> None:
+        device = self._device("mps-ik42")
+        self.assertIsNone(choose_sequence("mps-ik42", exclude_device_pk=device.pk))
 
 
 class RackTemplateModelTests(TestCase):
