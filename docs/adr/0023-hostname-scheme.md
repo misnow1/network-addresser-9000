@@ -24,6 +24,18 @@ This ADR does not need to amend ADR 0018 — the companion whose hostname copied
 no longer exists. ADR 0022 superseded it outright, and the Yamaha Device Control interface that
 forced the original question is now a *port* on its console carrying `hostname_suffix`.
 
+> **Amended 2026-08-16, while planning phase 18.** Three decisions below are corrected in place,
+> each marked **Amendment**: decision 6 (uniqueness is enforced on *change*, not asserted as an
+> invariant), decision 8 (on-write normalisation cannot close the casing divergence on its own — a
+> backfill is required), and decision 10 (`hostname_slug` *is* seeded after all). All three were
+> found by grilling this ADR against the live database rather than the CSVs.
+>
+> **Health warning on the evidence below.** Every number in the next section was measured against
+> `prod/*.csv`. The deployment database has since diverged — 48 hostnames have been renamed by hand
+> into scheme shape and every prose value is gone — so re-deriving these figures from the CSVs
+> gives answers that are right about the export and wrong about the system. Where a decision turns
+> on a count, the live figure is given alongside.
+
 ## What the production data actually shows
 
 Every decision below was tested against `prod/MPS Audio Network Standards - Dante Devices.csv`,
@@ -166,6 +178,29 @@ spare pool and every existing row need no backfill.
 **Forward only.** Renaming a device changes its ports' derived names, which could collide with
 something else; that cascade is not validated. See "Known gaps".
 
+> **Amendment — uniqueness is enforced on *change*, not asserted as an invariant.**
+>
+> As written above this decision is unshippable. The live database holds **34 equipment rows across
+> 6 duplicated hostnames** — `IK42` alone names 17 amps, because the importer gave every instance of
+> a model the same bare model name. Validating unconditionally in `full_clean()` would make all 34
+> unsaveable, so an operator editing one amp's serial number would be refused over a hostname they
+> did not create.
+>
+> The escape hatch does not exist either: the fix is decision 5's recompute action, which is blocked
+> on `hostname_slug`, which **no** Type carries. The estate would be duplicated *and* frozen, with
+> nothing in the product able to resolve it.
+>
+> So `full_clean()` runs the check **only when `hostname` is being set or changed** from its stored
+> value. Renaming *into* a duplicate is refused; creating a new duplicate is refused; the computed
+> path still never collides, because the bump uses the same predicate. Editing any other field on an
+> already-duplicated row saves cleanly.
+>
+> The honest consequence: **hostnames are not unique in the database, and no code may assume they
+> are.** Nothing branches on a hostname, so nothing does. The 32 amps are exactly what recompute is
+> for once slugs are seeded (decision 10 as amended); the 33rd and 34th are a pair of switches in
+> WPM1SR slots 1 and 2 both named `mps-wpm1sr-sg350-1`, which is a data error rather than an import
+> artifact.
+
 ### 7. Collisions bump the sequence, and two advisories ride along
 
 The computed path increments `hostname_sequence` until `hostname_is_taken()` says the name is free,
@@ -184,6 +219,37 @@ Production already follows the first of these by hand — `mps-spare-ik42-1` and
 singletons that were given `1` anyway — which is why it is worth saying out loud rather than
 enforcing.
 
+> **Amendment — "increment until free" is underspecified, and wrong in two reachable cases.**
+>
+> Bump-until-free picks the lowest free value, which gives the wrong answer where
+> `MORE_MUSINGS.md` is explicit: *"If this is the first collision, and the first device does not
+> have a 5th field assigned, set the new device's value to **2** and recommend to the user that the
+> existing device be assigned 1."* Naively, `…-1` is free, so the new device would take it —
+> producing a bare/`-1` pair that reads as two unrelated devices, where production is uniformly
+> `-1`/`-2`.
+>
+> It is also silent about the case where the bare stem is free but numbered siblings exist. Once an
+> operator takes the first advisory and numbers the original `1`, a *third* identical device
+> computes the bare stem, finds it free, and takes it — leaving `-1`, `-2` and a bare name. Ordinary
+> hardware reaches this: production has four Amphenol outputs numbered `1`–`4` and three NA2
+> D-lines numbered `1`–`3`.
+>
+> The starting value is therefore chosen before the free-check loop runs:
+>
+> | State of the stem | Start at |
+> |---|---|
+> | nothing exists | no sequence — take the bare name |
+> | bare name exists, no numbered siblings | **2**, leaving `1` for the advisory |
+> | any numbered sibling exists | **highest + 1** |
+>
+> then increment until `hostname_is_taken()` says free, which remains the correctness guarantee —
+> the table only decides where to start.
+>
+> **Highest + 1, never lowest-free**, so a gap left by a deleted device is not reused. A hostname
+> that has been in service is referenced by things this system cannot see — DNS, switch configs,
+> the label on the box, someone's notes — and handing it to different hardware makes all of them
+> silently wrong. A gap in the numbering is cosmetic; resurrection is a fault.
+
 ### 8. `hostname` is normalised on write and capped at 63
 
 `NetworkSwitch.hostname` and `NetworkDevice.hostname` drop from `CharField(255)` to
@@ -199,12 +265,41 @@ they were changing. Those rows are exactly what phase 18 exists to replace.
 
 The 63 cap closes the hole `PLAN-hostname-ingredients.md` decision 7 identified: five components
 each capped at 63 can assemble to over 300, and `mps-wpcsrl-ik42-sub-1` is a single label with no
-dots. It is free today — the longest existing value is 43 characters, so the migration touches no
-data.
+dots. It is free — the longest live value is 22 characters.
 
 Lowercasing also closes the divergence `models.py`'s `NetworkDevicePort.hostname` docstring defers
 to this phase: the port property starts yielding `dm7c-1-device-control`, matching the addressing
 sheet, instead of `DM7C-1-device-control`.
+
+> **Amendment — on-write normalisation cannot close that divergence on its own.**
+>
+> The paragraph above is wrong as stated. `clean()` and `save()` normalise on **write**, and a row
+> nobody writes to is never normalised — so `DM7C-1` sits in the database indefinitely and the port
+> property keeps yielding `DM7C-1-device-control`. The divergence closes only if the migration
+> rewrites existing rows.
+>
+> **The migration backfills**: strip and lowercase every non-blank `NetworkSwitch.hostname` and
+> `NetworkDevice.hostname`. **40 of 82 live rows change.** Safe to run — no two hostnames collide
+> once lowercased, and nothing is near the 63 cap. Irreversible in practice, since the original
+> casing is unrecoverable; the reverse operation is a no-op.
+>
+> The decisive argument is not tidiness. Those 40 rows are going to be rewritten *anyway*, one at a
+> time, whenever somebody happens to save an unrelated field on them — so the choice is not whether
+> they change but whether they change as one reviewable migration or as 40 unattributable surprises
+> spread over months.
+>
+> The migration must **refuse rather than truncate** if any row exceeds 63 characters. None does
+> today, but a silent truncation is data loss and MySQL's error at `ALTER` time names a column and a
+> row number rather than the problem.
+>
+> **Amendment — the no-validator justification has changed, though the decision has not.** The
+> eight prose rows cited above no longer exist: every live hostname is a legal DNS label once
+> lowercased. The reason to keep `hostname` unvalidated is now the **importer**, whose docstring
+> commits every row to `construct → full_clean() → save()` and which writes
+> `hostname = row.description` — still prose in the CSVs. A validator would break a rebuild, and a
+> switch's hostname is the only human-readable label it has, there being no description field on
+> `NetworkSwitch`. Every *input* to computation stays DNS-validated; only the output field is
+> permissive.
 
 ### 9. `hostname_diverges` — a stateless indicator
 
@@ -256,6 +351,33 @@ that a check sharing the importer's helper proves nothing.
 `NetworkDevice.owner`, `NetworkSwitch.owner`, `hostname_purpose`, `hostname_sequence` and
 `hostname_slug` are **not** seeded and stay blank until an operator fills them or runs the recompute
 action.
+
+> **Amendment — `hostname_slug` *is* seeded, in phase 18.**
+>
+> Leaving it blank makes the whole scheme inert. It is a blocking component (decision 1), and **0
+> of 32 Types carry one**, so phase 18 as originally specified would ship a feature that computes
+> nothing whatsoever on the live estate — every recompute reporting "no type slug" and doing
+> nothing.
+>
+> This is not the backfill decision 10 refuses. That refusal is about *per-device* components,
+> and it stands: the sheet carrying them has no join key to the sheet the importer reads. A Type's
+> abbreviation has no such problem — Types are already created from a hand-written constant in the
+> importer, and the abbreviations are visible in the Dante sheet's `Model` column and in
+> `ROADMAP.md`'s own `sg300-10mp` example.
+>
+> A `{(manufacturer, model): slug}` constant — `("Martin Audio", "IK-42"): "ik42"`, `("Cisco",
+> "SG300-10MP"): "sg300-10mp"` — applied by **both** the importer (for rebuilds) and a data
+> migration matching on `(manufacturer, model)` (for the database that already exists, which will
+> not be rebuilt just to pick these up). Keyed on the model, not the profile, so `IK-42 — with
+> Dante Card` and `— without Dante Card` both get `ik42`, as this ADR already requires.
+>
+> Not `slugify()`: it is wrong for exactly the cases this ADR already documents — `IK-42` → `ik-42`
+> where the name in use is `ik42`, and likewise `SQ-5`, `DM7-EX`, `NA2-DLINE`.
+>
+> Expect `hostname_diverges` to fire widely the moment this lands: 48 hostnames have been renamed
+> by hand into scheme shape, and any that do not match what computation produces will be flagged.
+> That is the indicator working — it becomes the reconciliation surface between the manual renaming
+> and the scheme — but it is not a quiet rollout.
 
 ### 11. The phase seam is fields versus behaviour
 

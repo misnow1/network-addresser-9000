@@ -309,6 +309,13 @@ Assembles phase 17's components at creation, enforces uniqueness, and resolves c
 Computed at materialization and stored — **not** immutable, and never re-derived automatically.
 That is the same rule ADR 0003 gives static addresses, and what #31 already committed to.
 
+`docs/plans/PLAN-hostname-computation.md` is the build, in four PRs. ADR 0023 needed **no
+successor** but carries four amendments made while planning this phase — decisions 6, 7, 8 and 10 —
+every one of them found by measuring the **live database** rather than `prod/*.csv`. The CSVs are
+now stale as a source of truth: 48 hostnames have been renamed by hand into scheme shape and every
+prose value is gone, so figures re-derived from the export are right about the export and wrong
+about the system.
+
 - [x] ADR: **`docs/adr/0023-hostname-scheme.md`**, written in phase 17 and covering both halves. It
       had no ADR 0018 to amend — ADR 0022 superseded it outright, and the Yamaha Device Control
       interface that forced the question is now a *port* on its console carrying
@@ -325,7 +332,12 @@ That is the same rule ADR 0003 gives static addresses, and what #31 already comm
       `full_clean()` with a plain-language error, blank exempt. Same shape as the existing
       cross-table static-address check, inheriting its known race (#5) rather than introducing a
       second, stricter mechanism for names; blank-exempt means the spare pool and every existing
-      row need no backfill
+      row need no backfill. **Enforced only when `hostname` is set or changed** (ADR 0023 decision 6,
+      amended): the live database holds 34 rows across 6 duplicated hostnames — `IK42` alone names
+      17 amps — so unconditional validation would freeze them all, with recompute unable to help
+      because it is blocked on `hostname_slug`, which no Type carries. Renaming *into* a duplicate is
+      still refused. Hostnames are therefore **not** unique in the database and no code may assume
+      they are
 - [ ] A `NetworkDevicePort` hostname as a **derived, read-only property** —
       `<device.hostname>-<hostname_suffix>` — **already shipped by phase 17's ADR 0022 PR 1**. This
       is where `…-sd12-engine` and `…-device-control` live. Ports have no hostname field and gain
@@ -340,6 +352,14 @@ That is the same rule ADR 0003 gives static addresses, and what #31 already comm
       alike, and never block a save. Two advisory messages ride along: recommend assigning `1` to
       a twin that has no sequence, and where the rack has a `location_slug`, note that a purpose
       reads better than a number
+- [ ] The **starting** sequence is chosen before that loop runs (ADR 0023 decision 7, amended),
+      because bump-until-free is wrong in two reachable cases. Nothing exists → bare name. Bare name
+      exists with no numbered siblings → start at **2**, leaving `1` for the advisory, which is what
+      `MORE_MUSINGS.md` specifies and what production's uniform `-1`/`-2` pairs look like. Any
+      numbered sibling exists → **highest + 1**, which also stops a third device taking the free bare
+      stem beside `-1` and `-2`. Highest + 1 rather than lowest-free so a gap left by a deleted
+      device is never reused — a retired hostname is referenced by DNS, switch configs and the label
+      on the box, none of which this system can see
 - [ ] *"In a physical rack, the 4th field should be used to avoid collisions"* is guidance, not
       machinery — the purpose is free-form operator input (`midhi-01-04`, `sub`) that the system
       cannot invent. Likewise *"recommend the existing device be assigned 1"* is a message about
@@ -350,10 +370,22 @@ That is the same rule ADR 0003 gives static addresses, and what #31 already comm
       null owner. Done in the action rather than in assembly so the value is *stored*, not
       inherited
 - [ ] `hostname` drops to `CharField(63)` and is stripped and lowercased on write; no
-      `validate_dns_label` on it, because the only illegal values are eight imported switch rows
-      whose hostname is prose the importer had nothing better for. Free today — the longest
-      existing value is 43 characters. Also closes the casing divergence `NetworkDevicePort.
-      hostname`'s docstring defers here: the port property starts yielding `dm7c-1-device-control`
+      `validate_dns_label` on it, because the importer commits every row to
+      `construct → full_clean() → save()` and writes prose descriptions from the CSVs, so a
+      validator would break a rebuild — and a switch's hostname is the only human-readable label it
+      has. Free today; the longest live value is 22 characters
+- [ ] **The migration backfills** (ADR 0023 decision 8, amended). On-write normalisation cannot
+      close the casing divergence on its own — a row nobody saves is never normalised, so `DM7C-1`
+      would sit there indefinitely and `NetworkDevicePort.hostname` would keep yielding
+      `DM7C-1-device-control`. 40 of 82 live rows change. Those rows get rewritten *anyway*, one at
+      a time, whenever someone saves an unrelated field — so the choice is one reviewable migration
+      versus 40 unattributable surprises. It refuses rather than truncates if any row exceeds 63
+- [ ] **Seed `hostname_slug` on the ~32 imported Types** (ADR 0023 decision 10, amended), via a
+      `{(manufacturer, model): slug}` constant applied by both the importer and a data migration.
+      Without it this phase ships **inert**: the slug is a blocking component and 0 of 32 Types carry
+      one, so every recompute would report "no type slug" and do nothing. Not the per-device backfill
+      decision 10 refuses — that one has no join key, whereas Types already come from a constant in
+      the importer. Not `slugify()` either: `IK-42` → `ik-42` where the name in use is `ik42`
 - [ ] #54: a **stateless** `hostname_diverges` property — every component present, a hostname
       present, and the two differ. No `hostname_is_computed` boolean, because state that can itself
       go stale is what the indicator exists to catch. Framed as divergence, not staleness: it says
