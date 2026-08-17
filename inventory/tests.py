@@ -5339,7 +5339,11 @@ class HostnameComputesNothingYetTests(TestCase):
             hostname_purpose="sub",
             hostname_sequence=1,
         )
-        self.assertEqual(device.hostname, "Some Prose Hostname")
+        # Stripped/lowercased, not left byte-identical — ADR 0023 decision 8
+        # (amended, phase 18) normalises casing on every write; this test's
+        # guard is that no *component assembly* has leaked backward, not
+        # that casing survives untouched.
+        self.assertEqual(device.hostname, "some prose hostname")
 
     def test_device_hostname_left_blank_when_submitted_blank(self) -> None:
         device = NetworkDevice.objects.create(
@@ -5363,7 +5367,8 @@ class HostnameComputesNothingYetTests(TestCase):
             hostname_purpose="sub",
             hostname_sequence=1,
         )
-        self.assertEqual(switch.hostname, "Some Prose Hostname")
+        # See the device test above — normalised, not byte-identical.
+        self.assertEqual(switch.hostname, "some prose hostname")
 
     def test_device_add_form_leaves_blank_hostname_blank_with_every_component_set(self) -> None:
         """``objects.create()`` above never exercises the one path ADR 0023
@@ -5386,6 +5391,208 @@ class HostnameComputesNothingYetTests(TestCase):
         )
         self.assertTrue(form.is_valid(), form.errors)
         self.assertEqual(form.instance.hostname, "")
+
+
+class HostnameNormalisationTests(TestCase):
+    """PLAN-hostname-computation.md PR 1 — hostname drops to CharField(63)
+    and is stripped/lowercased in ``clean_fields()``/``clean()``/``save()``,
+    the same three-place pattern phase 17 already established for
+    ``hostname_purpose`` (ADR 0023 decision 8, amended).
+    """
+
+    def setUp(self) -> None:
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=10)
+        self.switch_type = _make_switch_type()
+        self.device_type = _make_device_type()
+
+    def test_device_hostname_normalises_through_objects_create(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, rack=self.rack, rack_slot=1, hostname="  DM7C-1  "
+        )
+        self.assertEqual(device.hostname, "dm7c-1")
+
+    def test_device_hostname_normalises_through_full_clean(self) -> None:
+        device = NetworkDevice(
+            device_type=self.device_type, rack=self.rack, rack_slot=1, hostname="  DM7C-1  "
+        )
+        device.full_clean()
+        self.assertEqual(device.hostname, "dm7c-1")
+
+    def test_device_hostname_normalises_through_admin_form(self) -> None:
+        form = NetworkDeviceAddForm(
+            data={
+                "device_type": str(self.device_type.pk),
+                "hostname": "DM7C-1",
+                "rack": str(self.rack.pk),
+                "rack_slot": "1",
+                "port_addressing": "dhcp",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        obj = form.save()
+        self.assertEqual(obj.hostname, "dm7c-1")
+
+    def test_switch_hostname_normalises_through_objects_create(self) -> None:
+        switch = NetworkSwitch.objects.create(
+            switch_type=self.switch_type, rack=self.rack, rack_slot=1, hostname="  DM7C-1  "
+        )
+        self.assertEqual(switch.hostname, "dm7c-1")
+
+    def test_switch_hostname_normalises_through_full_clean(self) -> None:
+        switch = NetworkSwitch(
+            switch_type=self.switch_type, rack=self.rack, rack_slot=1, hostname="  DM7C-1  "
+        )
+        switch.full_clean()
+        self.assertEqual(switch.hostname, "dm7c-1")
+
+    def test_switch_hostname_normalises_through_admin_form(self) -> None:
+        form = NetworkSwitchAddForm(
+            data={
+                "switch_type": str(self.switch_type.pk),
+                "hostname": "DM7C-1",
+                "rack": str(self.rack.pk),
+                "rack_slot": "1",
+                "address_materialization": "manual",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        obj = form.save()
+        self.assertEqual(obj.hostname, "dm7c-1")
+
+    def test_derived_port_hostname_reflects_backfilled_lowercase(self) -> None:
+        """Proves the *backfill*, not the on-write path: a hostname stored
+        as ``DM7C-1`` before the migration — simulated here by writing
+        through the historical shape via ``update()``, which (unlike
+        ``save()``) never normalises — still yields a lowercase derived
+        port name once ``NetworkDevicePort.hostname`` reads it back,
+        exactly as it would after ``0017_hostname_normalise`` runs.
+        """
+        device_type = _make_console_type_for_hostname_suffix()
+        # Unracked (spare pool) — materializes DHCP regardless of the type
+        # port's OPERATOR address_source, so no operator_addresses input is
+        # needed; this test only cares about the derived hostname property.
+        device = NetworkDevice.objects.create(device_type=device_type, hostname="dm7c-1")
+        # Bypass save()'s normalisation entirely — this row now sits in the
+        # database exactly as an un-migrated pre-PR-1 row would.
+        NetworkDevice.objects.filter(pk=device.pk).update(hostname="DM7C-1")
+        # Fetched through the *base* manager, not device.ports — the
+        # reverse-FK manager primes a "known related object" cache that
+        # would hand the port's .device accessor the stale, already-loaded
+        # ``device`` instance instead of re-reading the row this test just
+        # rewrote underneath it.
+        port = NetworkDevicePort.objects.get(
+            device_id=device.pk, source_type_port__hostname_suffix="device-control"
+        )
+        self.assertEqual(port.hostname, "DM7C-1-device-control")  # not yet migrated — raw casing
+        # Now apply the migration's own backfill logic directly.
+        NetworkDevice.objects.filter(pk=device.pk).update(hostname="dm7c-1")
+        port = NetworkDevicePort.objects.get(pk=port.pk)
+        self.assertEqual(port.hostname, "dm7c-1-device-control")
+
+    def test_length_guard_raises_on_64_char_hostname(self) -> None:
+        overlong = "a" * 64
+        device = NetworkDevice(device_type=self.device_type, rack=self.rack, rack_slot=1)
+        # save() lowercases but does not truncate or validate length before
+        # clean_fields() runs the field's own MaxLengthValidator.
+        device.hostname = overlong
+        with self.assertRaises(ValidationError) as ctx:
+            device.full_clean()
+        self.assertIn("hostname", ctx.exception.message_dict)
+
+
+def _make_console_type_for_hostname_suffix() -> NetworkDeviceType:
+    """A one-port device type whose sole port is OPERATOR-sourced and
+    carries ``hostname_suffix="device-control"`` — the minimal shape
+    ``NetworkDevicePort.hostname`` needs to derive a name at all.
+    """
+    vlan = VLAN.objects.create(name="Control HN", vlan_id=6011, subnet="10.202.0.0/27")
+    device_type = NetworkDeviceType.objects.create(
+        manufacturer="Test", model="Console-HN", name="Default", port_count=1
+    )
+    NetworkDeviceTypePort.objects.create(
+        device_type=device_type,
+        description="Device Control",
+        port_type=PortType.GBE_RJ45,
+        vlan=vlan,
+        ordinal=1,
+        address_source=PortAddressSource.OPERATOR,
+        hostname_suffix="device-control",
+    )
+    return device_type
+
+
+class HostnameNormaliseMigrationTests(TransactionTestCase):
+    """``0017_hostname_normalise`` (PLAN-hostname-computation.md PR 1) —
+    reconstructs the schema as of ``0016_hostname_ingredients`` (immediately
+    before this migration, hostname still ``CharField(255)``) via
+    ``MigrationExecutor``, the same shape ``RetireCompanionsMigrationTests``
+    uses, since the length guard specifically needs a hostname the *live*
+    (already-narrowed) schema could no longer store at all.
+
+    Rows are inserted with ``bulk_create()`` against the historical model,
+    bypassing ``save()`` entirely — the only way to prove the *backfill*
+    runs, as opposed to the on-write normalisation PR 1 also adds.
+    """
+
+    apps: Any
+    _migration_module: Any
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        executor = MigrationExecutor(connection)
+        executor.migrate([("inventory", "0016_hostname_ingredients")])
+        executor.loader.build_graph()
+        cls.apps = executor.loader.project_state(("inventory", "0016_hostname_ingredients")).apps
+        cls._migration_module = importlib.import_module("inventory.migrations.0017_hostname_normalise")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        call_command("migrate", "inventory", verbosity=0)
+        super().tearDownClass()
+
+    def setUp(self) -> None:
+        self.schema_editor = _FakeSchemaEditor(connection.alias)
+        NetworkDeviceType = self.apps.get_model("inventory", "NetworkDeviceType")
+        self.device_type = NetworkDeviceType.objects.create(
+            manufacturer="Test", model="Migration", name="Default", port_count=0
+        )
+
+    def test_backfill_lowercases_bulk_created_rows(self) -> None:
+        NetworkDevice = self.apps.get_model("inventory", "NetworkDevice")
+        # bulk_create, not save() — proves the *backfill* runs rather than
+        # the live model's on-write normalisation, which bulk_create skips
+        # entirely even on the real model.
+        (device,) = NetworkDevice.objects.bulk_create(
+            [NetworkDevice(device_type=self.device_type, hostname="  DM7C-1  ")]
+        )
+        self._migration_module._backfill_hostname_casing(self.apps, self.schema_editor)
+        device.refresh_from_db()
+        self.assertEqual(device.hostname, "dm7c-1")
+
+    def test_backfill_leaves_blank_hostname_alone(self) -> None:
+        NetworkDevice = self.apps.get_model("inventory", "NetworkDevice")
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname="")
+        self._migration_module._backfill_hostname_casing(self.apps, self.schema_editor)
+        device.refresh_from_db()
+        self.assertEqual(device.hostname, "")
+
+    def test_length_guard_raises_and_names_the_overlong_row(self) -> None:
+        NetworkDevice = self.apps.get_model("inventory", "NetworkDevice")
+        overlong = "a" * 64
+        device = NetworkDevice.objects.create(device_type=self.device_type)
+        NetworkDevice.objects.filter(pk=device.pk).update(hostname=overlong)
+        with self.assertRaises(RuntimeError) as ctx:
+            self._migration_module._check_hostname_lengths(self.apps, self.schema_editor)
+        message = str(ctx.exception)
+        self.assertIn("NetworkDevice", message)
+        self.assertIn(str(device.pk), message)
+        self.assertIn(overlong, message)
+
+    def test_length_guard_passes_when_nothing_exceeds_63(self) -> None:
+        NetworkDevice = self.apps.get_model("inventory", "NetworkDevice")
+        NetworkDevice.objects.create(device_type=self.device_type, hostname="a" * 63)
+        self._migration_module._check_hostname_lengths(self.apps, self.schema_editor)  # must not raise
 
 
 class RackTemplateModelTests(TestCase):
@@ -6209,7 +6416,9 @@ class OperatorSetPortTests(TestCase):
         self.assertEqual(ports["Dante Primary"].address, "10.201.6.5")
         self.assertEqual(ports["Dante Secondary"].address, "10.202.6.5")
         self.assertEqual(ports["Device Control"].address, "10.201.6.4")
-        self.assertEqual(ports["Device Control"].hostname, "DM7C-1-device-control")
+        # Lowercase — ADR 0023 decision 8 (amended): hostname is normalised
+        # on write, even though "DM7C-1" was typed above.
+        self.assertEqual(ports["Device Control"].hostname, "dm7c-1-device-control")
 
     def test_two_slot_ports_one_vlan_still_refused(self) -> None:
         """The exemption is narrow — two *SLOT* ports on one VLAN are

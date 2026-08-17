@@ -2424,7 +2424,7 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
     """
 
     switch_type = models.ForeignKey(NetworkSwitchType, on_delete=models.PROTECT, related_name="switches")
-    hostname = models.CharField(max_length=255, blank=True)
+    hostname = models.CharField(max_length=63, blank=True)
     serial_number = models.CharField(max_length=100, blank=True)
     rack = models.ForeignKey(Rack, on_delete=models.PROTECT, null=True, blank=True, related_name="switches")
     rack_slot = models.PositiveIntegerField(null=True, blank=True, validators=[MinValueValidator(1)])
@@ -2481,7 +2481,14 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
         # Stripped/lowercased here too, not just clean() — Model.save()
-        # never calls clean() (Department.save()'s reasoning).
+        # never calls clean() (Department.save()'s reasoning). hostname
+        # joins hostname_purpose here (ADR 0023 decision 8, amended): the
+        # importer's construct -> full_clean() -> save() path already goes
+        # through clean_fields()/clean() below, but a bare objects.create()
+        # or bulk write that skips full_clean() must still not persist raw
+        # casing.
+        if self.hostname:
+            self.hostname = self.hostname.strip().lower()
         if self.hostname_purpose:
             self.hostname_purpose = self.hostname_purpose.strip().lower()
         # ``self.pk is None or self._state.adding``, not either alone:
@@ -2511,12 +2518,16 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
     def clean_fields(self, exclude=None) -> None:
         # Normalize *before* the field validators run — see
         # Owner.clean_fields() for why this can't wait for clean().
+        if self.hostname:
+            self.hostname = self.hostname.strip().lower()
         if self.hostname_purpose:
             self.hostname_purpose = self.hostname_purpose.strip().lower()
         super().clean_fields(exclude=exclude)
 
     def clean(self) -> None:
         super().clean()
+        if self.hostname:
+            self.hostname = self.hostname.strip().lower()
         if self.hostname_purpose:
             self.hostname_purpose = self.hostname_purpose.strip().lower()
         if self.pk is None or self._state.adding:
@@ -3334,7 +3345,7 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
     """
 
     device_type = models.ForeignKey(NetworkDeviceType, on_delete=models.PROTECT, related_name="devices")
-    hostname = models.CharField(max_length=255, blank=True)
+    hostname = models.CharField(max_length=63, blank=True)
     serial_number = models.CharField(max_length=100, blank=True)
     rack = models.ForeignKey(Rack, on_delete=models.PROTECT, null=True, blank=True, related_name="devices")
     rack_slot = models.PositiveIntegerField(null=True, blank=True, validators=[MinValueValidator(1)])
@@ -3447,7 +3458,11 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
         # Stripped/lowercased here too, not just clean() — Model.save()
-        # never calls clean() (Department.save()'s reasoning).
+        # never calls clean() (Department.save()'s reasoning). hostname
+        # joins hostname_purpose here (ADR 0023 decision 8, amended) — see
+        # NetworkSwitch.save()'s identical comment.
+        if self.hostname:
+            self.hostname = self.hostname.strip().lower()
         if self.hostname_purpose:
             self.hostname_purpose = self.hostname_purpose.strip().lower()
         # ``self.pk is None or self._state.adding`` — see NetworkSwitch.save().
@@ -3499,12 +3514,16 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
     def clean_fields(self, exclude=None) -> None:
         # Normalize *before* the field validators run — see
         # Owner.clean_fields() for why this can't wait for clean().
+        if self.hostname:
+            self.hostname = self.hostname.strip().lower()
         if self.hostname_purpose:
             self.hostname_purpose = self.hostname_purpose.strip().lower()
         super().clean_fields(exclude=exclude)
 
     def clean(self) -> None:
         super().clean()
+        if self.hostname:
+            self.hostname = self.hostname.strip().lower()
         if self.hostname_purpose:
             self.hostname_purpose = self.hostname_purpose.strip().lower()
         if self.pk is None or self._state.adding:
@@ -4309,13 +4328,14 @@ class NetworkDevicePort(AuditedModel):
         an empty string would render as a stray ``-``. Stored nowhere;
         recomputed on every access.
 
-        Casing is **not** normalised on this half: the suffix is already
-        lowercased (``NetworkDeviceTypePort.save()``/``clean()``), but
-        ``device.hostname`` is whatever the operator typed — production
-        stores ``DM7C-1``, so this yields ``DM7C-1-device-control`` where
-        the addressing sheet spells it ``dm7c-1-device-control``. Phase 18
-        owns hostname casing; no test here may compare this property
-        case-sensitively.
+        Casing is **not** normalised on this half — there is nothing left
+        to normalise: the suffix is already lowercased
+        (``NetworkDeviceTypePort.save()``/``clean()``), and phase 18 (ADR
+        0023 decision 8, amended) now lowercases ``device.hostname`` itself
+        on write *and* backfills every existing row, so this consistently
+        yields ``dm7c-1-device-control``, matching the addressing sheet. No
+        test here may compare this property case-sensitively regardless —
+        the guarantee lives on ``hostname``, not here.
         """
         source_type_port = _get_related(self, "source_type_port")
         if source_type_port is None or not source_type_port.hostname_suffix:

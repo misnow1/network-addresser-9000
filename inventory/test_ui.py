@@ -1045,7 +1045,9 @@ class TakenAddressMarkerTests(TestCase):
 
         # Slot 4: marked on both axes — the cell and the row's ordinal marker.
         self.assertIn("taken-by-label", row4)
-        self.assertIn("DM7C-1", row4)
+        # Lowercase — ADR 0023 decision 8 (amended): hostname is normalised
+        # on write, even though "DM7C-1" was typed above.
+        self.assertIn("dm7c-1", row4)
         self.assertIn("cell-taken", row4)
         self.assertIn("tag-address-taken", row4)
 
@@ -1095,7 +1097,9 @@ class TakenAddressMarkerTests(TestCase):
         row4 = _row_html(response.content.decode(), 4)
         cell = _cell_html(row4, 0)
         # Sorted regardless of creation order — "Alpha" before "Zeta".
-        self.assertIn("address used by Alpha, Zeta", cell)
+        # Lowercase — ADR 0023 decision 8 (amended); still Alpha-before-Zeta
+        # sort order.
+        self.assertIn("address used by alpha, zeta", cell)
 
     def test_hand_moved_ordinary_slot_address_produces_a_marker(self) -> None:
         """The positive test for decision 3: an ordinary ``SLOT`` port is
@@ -1116,7 +1120,8 @@ class TakenAddressMarkerTests(TestCase):
         response = self.client.get(f"/racks/{self.rack.pk}/")
         row4 = _row_html(response.content.decode(), 4)
         self.assertIn("taken-by-label", row4)
-        self.assertIn("Mover-1", row4)
+        # Lowercase — ADR 0023 decision 8 (amended).
+        self.assertIn("mover-1", row4)
 
     def test_no_markers_when_every_address_sits_on_its_own_ordinal(self) -> None:
         plain_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="Aligned")

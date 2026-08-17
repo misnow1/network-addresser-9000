@@ -621,7 +621,13 @@ def _check_device_control_pairs(
             )
             continue
 
-        if host.hostname != host_row.description:
+        # Case-insensitive (ADR 0023 decision 8, amended) — phase 18
+        # lowercases hostname on write and backfills it, but this verifier
+        # compares against the raw CSV, which is still whatever case the
+        # sheet happened to use. Independence intact: nothing here imports
+        # from the importer, this just stops comparing casing the importer
+        # never controlled anyway.
+        if host.hostname.strip().lower() != host_row.description.strip().lower():
             findings.fail(
                 "hostnames",
                 f"{host_row.rack} slot {host_row.slot}: hostname {host.hostname!r} != "
@@ -757,7 +763,8 @@ def _check_hostnames_and_types_and_addresses(
                     f"{row.rack} slot {row.slot}: expected switch {row.description!r}, none found.",
                 )
                 continue
-            if switch.hostname != row.description:
+            # Case-insensitive — see the identical comparison above for why.
+            if switch.hostname.strip().lower() != row.description.strip().lower():
                 findings.fail(
                     "hostnames",
                     f"{row.rack} slot {row.slot}: hostname {switch.hostname!r} != {row.description!r}.",
@@ -834,7 +841,11 @@ def _check_hostnames_and_types_and_addresses(
                         "devices", f"{row.rack} slot {row.slot}: expected SD12 device {stem!r}, none found."
                     )
                     continue
-                if device.hostname != stem:
+                # Case-insensitive — see the SD12 host comparison above for
+                # why (ADR 0023 decision 8, amended). Not one of the two
+                # comparisons the plan named at PR-planning time, but the
+                # same casing divergence reaches this one too.
+                if device.hostname.strip().lower() != stem.strip().lower():
                     findings.fail(
                         "hostnames", f"{row.rack} slot {row.slot}: hostname {device.hostname!r} != {stem!r}."
                     )
@@ -874,7 +885,8 @@ def _check_hostnames_and_types_and_addresses(
                 "devices", f"{row.rack} slot {row.slot}: expected device {row.description!r}, none found."
             )
             continue
-        if device.hostname != row.description:
+        # Case-insensitive — see the SD12 host comparison above for why.
+        if device.hostname.strip().lower() != row.description.strip().lower():
             findings.fail(
                 "hostnames",
                 f"{row.rack} slot {row.slot}: hostname {device.hostname!r} != {row.description!r}.",

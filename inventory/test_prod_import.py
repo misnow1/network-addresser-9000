@@ -452,7 +452,9 @@ class ImportProdDataTests(TestCase):
 
     def test_sd12_slot_offset_and_dmi_dante_card(self) -> None:
         console = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=1)
-        self.assertEqual(console.hostname, "SD12-TEST-1")
+        # Lowercase — ADR 0023 decision 8 (amended): hostname is normalised
+        # on write.
+        self.assertEqual(console.hostname, "sd12-test-1")
         self.assertEqual(console.device_type.model, "SD12")
         control_port = console.ports.get(slot_offset=0)
         engine_port = console.ports.get(slot_offset=1)
@@ -534,11 +536,12 @@ class ImportProdDataTests(TestCase):
             self.assertEqual(device.ports.get().vlan.vlan_id, dp_id)
 
     def test_hostnames_from_device_description(self) -> None:
+        # Lowercase — ADR 0023 decision 8 (amended).
         self.assertEqual(
             NetworkSwitch.objects.get(rack__name="AMPRACK1", rack_slot=1).hostname,
-            "Cisco SG300-10MP (For 3xAmp Rack Primary)",
+            "cisco sg300-10mp (for 3xamp rack primary)",
         )
-        self.assertEqual(NetworkDevice.objects.get(rack__name="W8LMTEST", rack_slot=2).hostname, "LM26")
+        self.assertEqual(NetworkDevice.objects.get(rack__name="W8LMTEST", rack_slot=2).hostname, "lm26")
         self.assertEqual(
             NetworkDevice.objects.get(rack__name="AVIO", rack_slot=1).hostname, "mps-avio-radial-tx"
         )
@@ -550,14 +553,18 @@ class ImportProdDataTests(TestCase):
         # device — in both directions, DM7C's sits below its host, DM3's
         # sits above.
         dm7c_host = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=6)
-        self.assertEqual(dm7c_host.hostname, "DM7C-1")
+        # Lowercase — ADR 0023 decision 8 (amended).
+        self.assertEqual(dm7c_host.hostname, "dm7c-1")
         self.assertEqual(dm7c_host.device_type.name, "Default")
         self.assertEqual(dm7c_host.ports.count(), 4)
         dm7c_device_control = dm7c_host.ports.get(description="Device Control")
         assert dm7c_device_control.source_type_port is not None  # materialized ports always set this
         self.assertEqual(dm7c_device_control.source_type_port.address_source, PortAddressSource.OPERATOR)
         self.assertEqual(dm7c_device_control.address, addr(FN_DANTE_PRIMARY, "CONSOLES", 5))
-        self.assertEqual(dm7c_device_control.hostname, "DM7C-1-device-control")
+        # Lowercase — the very property ADR 0022 believed it had protected
+        # from case-sensitive assertions; ADR 0023 decision 8 (amended)
+        # settles the casing this depends on.
+        self.assertEqual(dm7c_device_control.hostname, "dm7c-1-device-control")
         # Slot 5 — the interface's own row in the sheet — releases entirely;
         # no device sits there at all (#42).
         self.assertFalse(NetworkDevice.objects.filter(rack__name="CONSOLES", rack_slot=5).exists())

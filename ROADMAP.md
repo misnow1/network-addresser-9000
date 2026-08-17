@@ -372,12 +372,12 @@ about the system.
       for imported rows, so without this every production device stays permanently blocked on a
       null owner. Done in the action rather than in assembly so the value is *stored*, not
       inherited
-- [ ] `hostname` drops to `CharField(63)` and is stripped and lowercased on write; no
+- [x] `hostname` drops to `CharField(63)` and is stripped and lowercased on write; no
       `validate_dns_label` on it, because the importer commits every row to
       `construct → full_clean() → save()` and writes prose descriptions from the CSVs, so a
       validator would break a rebuild — and a switch's hostname is the only human-readable label it
       has. Free today; the longest live value is 22 characters
-- [ ] **The migration backfills** (ADR 0023 decision 8, amended). On-write normalisation cannot
+- [x] **The migration backfills** (ADR 0023 decision 8, amended). On-write normalisation cannot
       close the casing divergence on its own — a row nobody saves is never normalised, so `DM7C-1`
       would sit there indefinitely and `NetworkDevicePort.hostname` would keep yielding
       `DM7C-1-device-control`. 40 of 83 live rows change. Those rows get rewritten *anyway*, one at
