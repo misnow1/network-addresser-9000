@@ -321,14 +321,14 @@ about the system.
       interface that forced the question is now a *port* on its console carrying
       `hostname_suffix="device-control"`, so nothing copies a host's hostname verbatim any more and
       the uniqueness rule below meets no companion
-- [ ] Assembly fills a **blank** hostname only and never overwrites a hand-typed one — ADR 0019's
+- [x] Assembly fills a **blank** hostname only and never overwrites a hand-typed one — ADR 0019's
       suggest-don't-lock applied to names. A helper in `inventory/hostnames.py`, called from the two
       admin add forms and the recompute action; never from `save()`, `clean()` or the importer,
       because the advisory messages below need a request that `save()` has not got
-- [ ] Owner and the Type's `hostname_slug` are **blocking** components — absent, no hostname is
+- [x] Owner and the Type's `hostname_slug` are **blocking** components — absent, no hostname is
       computed at all. Location, purpose and sequence are skipped when absent. A name whose first
       component has silently become the location is worse than no name
-- [ ] Cross-table uniqueness across `NetworkSwitch` + `NetworkDevice` together, validated in
+- [x] Cross-table uniqueness across `NetworkSwitch` + `NetworkDevice` together, validated in
       `full_clean()` with a plain-language error, blank exempt. Same shape as the existing
       cross-table static-address check, inheriting its known race (#5) rather than introducing a
       second, stricter mechanism for names; blank-exempt means the spare pool and every existing
@@ -341,7 +341,7 @@ about the system.
       break every rebuild. Little is lost — the computed path cannot collide, so a hand-typed
       *rename* is the realistic way to make a duplicate, and that is refused. Hostnames are therefore
       **not** unique in the database and no code may assume they are
-- [ ] A `NetworkDevicePort` hostname as a **derived, read-only property** —
+- [x] A `NetworkDevicePort` hostname as a **derived, read-only property** —
       `<device.hostname>-<hostname_suffix>` — **already shipped by phase 17's ADR 0022 PR 1**. This
       is where `…-sd12-engine` and `…-device-control` live. Ports have no hostname field and gain
       none. **Derived port names are inside the uniqueness check**, contrary to what this line used
@@ -351,11 +351,11 @@ about the system.
       port and a device with purpose `engine` produce the same string, and purpose is free-form.
       The check is **forward only**: renaming a device shifts its ports' derived names, and that
       cascade stays a named gap
-- [ ] Collisions bump `hostname_sequence` until the name is free, in physical and virtual racks
+- [x] Collisions bump `hostname_sequence` until the name is free, in physical and virtual racks
       alike, and never block a save. Two advisory messages ride along: recommend assigning `1` to
       a twin that has no sequence, and where the rack has a `location_slug`, note that a purpose
       reads better than a number
-- [ ] The **starting** sequence is chosen before that loop runs (ADR 0023 decision 7, amended),
+- [x] The **starting** sequence is chosen before that loop runs (ADR 0023 decision 7, amended),
       because bump-until-free is wrong in two reachable cases. Nothing exists → bare name. Bare name
       exists with no numbered siblings → start at **2**, leaving `1` for the advisory, which is what
       `MORE_MUSINGS.md` specifies and what production's uniform `-1`/`-2` pairs look like. Any
@@ -363,11 +363,11 @@ about the system.
       stem beside `-1` and `-2`. Highest + 1 rather than lowest-free so a gap left by a deleted
       device is never reused — a retired hostname is referenced by DNS, switch configs and the label
       on the box, none of which this system can see
-- [ ] *"In a physical rack, the 4th field should be used to avoid collisions"* is guidance, not
+- [x] *"In a physical rack, the 4th field should be used to avoid collisions"* is guidance, not
       machinery — the purpose is free-form operator input (`midhi-01-04`, `sub`) that the system
       cannot invent. Likewise *"recommend the existing device be assigned 1"* is a message about
       an already-saved row, not an action
-- [ ] An explicit "recompute hostname" admin action. Moves never rename automatically. It also
+- [x] An explicit "recompute hostname" admin action. Moves never rename automatically. It also
       **fills a blank `owner` from the rack** before computing — the add-form default never fired
       for imported rows, so without this every production device stays permanently blocked on a
       null owner. Done in the action rather than in assembly so the value is *stored*, not

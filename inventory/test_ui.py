@@ -2729,21 +2729,24 @@ class AuditTrailTests(TestCase):
         self.assertContains(response, "A Ghost Object")
 
     def test_field_scoped_model_shows_only_tracked_fields_and_coverage_note(self) -> None:
-        # NetworkSwitch is tracked with include_fields=["rack", "rack_slot",
-        # "created_at"] (settings.py:263) — hostname/serial_number changes
-        # are simply not tracked at all, which the page must say plainly.
+        # NetworkSwitch is tracked with include_fields=["hostname", "rack",
+        # "rack_slot", "owner", "hostname_purpose", "hostname_sequence",
+        # "created_at"] (settings.py) — hostname joined this list in ADR
+        # 0023/phase 18 PR 3, but serial_number never did, and a
+        # serial_number-only edit is still not tracked at all, which the
+        # page must say plainly.
         switch_type = _make_switch_type(port_count=0)
-        switch = NetworkSwitch.objects.create(switch_type=switch_type, hostname="Audit Switch Original")
+        switch = NetworkSwitch.objects.create(switch_type=switch_type, serial_number="SN-ORIGINAL")
         switch_content_type = ContentType.objects.get_for_model(NetworkSwitch)
         count_after_create = LogEntry.objects.filter(
             content_type=switch_content_type, object_id=switch.pk
         ).count()
 
-        switch.hostname = "Audit Switch Renamed"
+        switch.serial_number = "SN-RENAMED"
         switch.save()
 
-        # hostname isn't in NetworkSwitch's include_fields, so this rename
-        # produces no *new* LogEntry at all (auditlog only writes an
+        # serial_number isn't in NetworkSwitch's include_fields, so this
+        # edit produces no *new* LogEntry at all (auditlog only writes an
         # UPDATE row when a tracked field actually changed) — the coverage
         # note on the page is what keeps that silence from reading as
         # "nothing changed" rather than "this field isn't tracked".
