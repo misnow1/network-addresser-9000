@@ -148,6 +148,38 @@ def hostname_is_taken(
     return ports.exists()
 
 
+def _exact_digit_suffix(suffix: str) -> int | None:
+    """Parses ``suffix`` (the text after a hostname's trailing ``-``) as
+    the integer it must be to safely stand for a ``hostname_sequence``,
+    or ``None`` if it isn't one — used everywhere a ``stem-<suffix>``
+    hostname's trailing text gets turned into an int (code review round
+    2, finding 2). Two hazards, both closed here:
+
+    - ``str.isdigit()`` is ``True`` for non-ASCII digit characters (e.g.
+      ``"²"``) that ``int()`` then raises on — ``isascii()`` first closes
+      that.
+    - ``int()`` is not a round-trip: ``int("03")`` is ``3``, but
+      re-assembling ``f"{stem}-{3}"`` from that produces a *different*
+      string (``stem-3``) than the one being validated (``stem-03``),
+      and nothing re-checks the reassembled string against what's
+      actually stored — so a row holding ``stem-03`` could be "honoured"
+      as sequence ``3`` and, if something else already holds ``stem-3``,
+      persist a silent, uncaught duplicate; the whole point of
+      ``hostname_is_taken()`` checks elsewhere in this module. Requiring
+      ``str(value) == suffix`` closes that: only an exact, canonical
+      round-trip (no leading zero, no leading ``+``, ordinary ASCII
+      digits) is accepted as a numbered sibling or an honourable current
+      name at all — a non-canonical suffix like ``"03"`` is treated the
+      same as any other non-numeric one.
+    """
+    if not suffix.isascii() or not suffix.isdigit():
+        return None
+    value = int(suffix)
+    if str(value) != suffix:
+        return None
+    return value
+
+
 def _sibling_state(
     stem: str, *, exclude_switch_pk: int | None, exclude_device_pk: int | None
 ) -> tuple[bool, int | None]:
@@ -162,8 +194,8 @@ def _sibling_state(
     Filters candidates with an indexed ``startswith`` and does the actual
     digit check in Python, rather than a database regex — this repo's
     columns are small (ADR 0023 decision 7's own argument for accepting an
-    unindexed scan elsewhere) and a Python ``str.isdigit()`` check avoids
-    relying on MySQL/MariaDB's regex dialect matching Python's.
+    unindexed scan elsewhere) and a Python check (``_exact_digit_suffix()``)
+    avoids relying on MySQL/MariaDB's regex dialect matching Python's.
     """
     bare_exists = False
     highest: int | None = None
@@ -176,11 +208,9 @@ def _sibling_state(
             if hostname == stem:
                 bare_exists = True
                 continue
-            suffix = hostname[len(prefix) :]
-            if suffix.isdigit():
-                value = int(suffix)
-                if highest is None or value > highest:
-                    highest = value
+            value = _exact_digit_suffix(hostname[len(prefix) :])
+            if value is not None and (highest is None or value > highest):
+                highest = value
     return bare_exists, highest
 
 
@@ -259,11 +289,11 @@ def choose_sequence(
             ):
                 return None
         elif current_name.startswith(f"{stem}-"):
-            suffix = current_name[len(stem) + 1 :]
-            if suffix.isdigit() and not hostname_is_taken(
+            value = _exact_digit_suffix(current_name[len(stem) + 1 :])
+            if value is not None and not hostname_is_taken(
                 current_name, exclude_switch_pk=exclude_switch_pk, exclude_device_pk=exclude_device_pk
             ):
-                return int(suffix)
+                return value
 
     bare_exists, highest = _sibling_state(
         stem, exclude_switch_pk=exclude_switch_pk, exclude_device_pk=exclude_device_pk

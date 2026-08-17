@@ -31,6 +31,7 @@ below is fabricated for this suite and appears in no CSV under ``prod/``.
 """
 
 import csv
+import importlib
 import ipaddress
 import tempfile
 from pathlib import Path
@@ -62,6 +63,16 @@ from .models import (
     Rack,
     RackVlanRange,
 )
+
+# A migration module's name isn't a valid Python identifier ("0018_..."
+# starts with a digit), so importlib rather than a plain `from ... import` —
+# same reasoning tests.py's migration-reconstruction test classes already
+# use. Importing it is safe and does nothing to the database; only actually
+# *applying* a migration (via MigrationExecutor) runs its RunPython
+# functions.
+MIGRATION_HOSTNAME_SLUGS = importlib.import_module(
+    "inventory.migrations.0018_seed_hostname_slugs"
+).HOSTNAME_SLUGS
 
 # -- Synthetic VLAN/rack scheme -----------------------------------------------------
 
@@ -1110,9 +1121,14 @@ class ImportUserIdentityTests(TestCase):
 class HostnameSlugsConstantTests(TestCase):
     """PLAN-hostname-computation.md PR 4 "Seeding" — ``HOSTNAME_SLUGS``
     covers every ``(manufacturer, model)`` the importer's own catalog
-    actually creates (set equality, the shape ``test_ui.py``'s query-
-    budget test uses), and the importer's and verifier's independently
-    re-declared copies (neither imports the other, on purpose) agree.
+    actually creates (a subset check, code review round 2, finding 4b —
+    the importer pairs must be **covered**, but the constant is allowed
+    to carry more than that; the migration's own separate copy does, by
+    design, for a live-only pair the current importer no longer creates
+    at all), and the importer's and verifier's independently re-declared
+    copies (neither imports the other, on purpose) agree with each other
+    exactly (still equality — the two are meant to describe the same
+    rebuild-time catalog).
     """
 
     def test_every_importer_type_pair_has_a_hostname_slugs_entry(self) -> None:
@@ -1135,6 +1151,28 @@ class HostnameSlugsConstantTests(TestCase):
 
     def test_importer_and_verifier_copies_agree(self) -> None:
         self.assertEqual(IMPORTER_HOSTNAME_SLUGS, VERIFIER_HOSTNAME_SLUGS)
+
+    def test_migration_copy_covers_every_importer_pair(self) -> None:
+        """Not asked for by either review round, but noted and left to
+        judgement: relaxing the importer-catalog check (above) to a
+        subset removed the last structural pressure keeping the
+        migration's *own* separate copy (0018_seed_hostname_slugs.py,
+        deliberately not shared code — see that module's own docstring)
+        in step with the importer's. This restores it cheaply: every
+        pair the importer creates must also appear, with the same slug,
+        in the migration's copy — which is free to carry more (the
+        live-only ("Cisco", "SG350-10P") pair, currently), just not less.
+        """
+        self.assertTrue(
+            set(IMPORTER_HOSTNAME_SLUGS) <= set(MIGRATION_HOSTNAME_SLUGS),
+            set(IMPORTER_HOSTNAME_SLUGS) - set(MIGRATION_HOSTNAME_SLUGS),
+        )
+        mismatched = {
+            pair: (slug, MIGRATION_HOSTNAME_SLUGS[pair])
+            for pair, slug in IMPORTER_HOSTNAME_SLUGS.items()
+            if MIGRATION_HOSTNAME_SLUGS.get(pair) != slug
+        }
+        self.assertEqual(mismatched, {})
 
     def test_amphenol_entries_are_corrected_not_the_live_typo(self) -> None:
         """Settled with Mike: the live ``rdj…`` slugs against models

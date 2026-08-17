@@ -5745,6 +5745,8 @@ class HostnameAddFormAssemblyTests(TestCase):
         self.assertTrue(form.is_valid(), form.errors)
         self.assertEqual(form.instance.hostname, "mps-wpcsrl-ik42-2")
         self.assertEqual(form.instance.hostname_sequence, 2)
+        # Code review round 2, finding 3 — the rewrite is not silent.
+        self.assertTrue(any("hostname_sequence 1 was already in use" in a for a in form._hostname_advisories))
 
 
 class RecomputeHostnameActionTests(TestCase):
@@ -5840,12 +5842,17 @@ class RecomputeHostnameActionTests(TestCase):
             hostname_sequence=1,
         )
         admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
-        admin.recompute_hostnames(self._request(), NetworkDevice.objects.filter(pk=twin.pk))
+        request = self._request()
+        admin.recompute_hostnames(request, NetworkDevice.objects.filter(pk=twin.pk))
         twin.refresh_from_db()
         first.refresh_from_db()
         self.assertNotEqual(twin.hostname, first.hostname)
         self.assertEqual(twin.hostname, "mps-wpcsrl-ik42-2")
         self.assertEqual(twin.hostname_sequence, 2)
+        # Code review round 2, finding 3 — the rewrite is not silent.
+        self.assertTrue(
+            any("hostname_sequence 1 was already in use" in str(m) for m in get_messages(request))
+        )
 
     def test_recompute_over_17_identical_devices_yields_17_distinct_names(self) -> None:
         devices = [
@@ -6274,17 +6281,55 @@ class HostnameNormaliseMigrationTests(TransactionTestCase):
         NetworkDevice.objects.create(device_type=self.device_type, hostname="a" * 63)
         self._migration_module._check_hostname_lengths(self.apps, self.schema_editor)  # must not raise
 
-    def test_length_guard_measures_after_stripping(self) -> None:
-        """Code review finding 5a — the backfill strips before storing, so
-        the pre-check must measure the *stripped* length too. A value
-        that only exceeds 63 characters counting leading/trailing
-        whitespace would fit fine after backfill; measuring the raw
-        value would abort the migration over a row that was never
-        actually a problem.
+    def test_length_guard_measures_the_stripped_length(self) -> None:
+        """``_check_hostname_lengths()`` on its own, called directly, with
+        no backfill run first — it measures ``len(hostname.strip())``
+        regardless of when it's called, which is what makes running it
+        *after* the backfill (below) redundant-but-safe rather than
+        load-bearing. This does **not** by itself prove the real
+        migration is safe against a whitespace-padded overlong value —
+        that claim depends on the operations *order*, which
+        ``test_backfill_before_length_guard_matches_the_real_migration_
+        order`` below exercises against both ``RunPython`` steps together.
         """
         NetworkDevice = self.apps.get_model("inventory", "NetworkDevice")
         NetworkDevice.objects.create(device_type=self.device_type, hostname="  " + "a" * 63 + "  ")
         self._migration_module._check_hostname_lengths(self.apps, self.schema_editor)  # must not raise
+
+    def test_backfill_before_length_guard_matches_the_real_migration_order(self) -> None:
+        """Code review round 2, finding 1 — the real migration's
+        ``operations`` list runs the backfill *before* the pre-check (and
+        before the ``AlterField``s), not the reverse. An earlier revision
+        of this migration got that backwards: the pre-check measured the
+        stripped length but ran *before* the backfill had stripped
+        anything, so a raw value like the one below (67 characters, 63
+        once stripped) would pass the pre-check on its stripped length
+        and then reach the ``AlterField`` still 67 characters wide —
+        MariaDB's ``STRICT_TRANS_TABLES`` raises 1406 mid-``ALTER``,
+        exactly the opaque failure the pre-check exists to prevent. This
+        test calls both ``RunPython`` functions in the real migration's
+        order and asserts the whole sequence is safe, not just the
+        pre-check in isolation.
+        """
+        NetworkDevice = self.apps.get_model("inventory", "NetworkDevice")
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname="  " + "a" * 63 + "  ")
+        self._migration_module._backfill_hostname_casing(self.apps, self.schema_editor)
+        self._migration_module._check_hostname_lengths(self.apps, self.schema_editor)  # must not raise
+        device.refresh_from_db()
+        self.assertEqual(device.hostname, "a" * 63)
+
+    def test_length_guard_still_catches_a_genuinely_overlong_row_after_backfill(self) -> None:
+        """The reorder must not turn the guard into a no-op — a row that
+        is still too long even after stripping is caught, whether or not
+        the backfill already ran over it.
+        """
+        NetworkDevice = self.apps.get_model("inventory", "NetworkDevice")
+        overlong = "a" * 70
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname=f"  {overlong}  ")
+        self._migration_module._backfill_hostname_casing(self.apps, self.schema_editor)
+        with self.assertRaises(RuntimeError) as ctx:
+            self._migration_module._check_hostname_lengths(self.apps, self.schema_editor)
+        self.assertIn(str(device.pk), str(ctx.exception))
 
 
 class SeedHostnameSlugsMigrationTests(TransactionTestCase):
@@ -6648,6 +6693,37 @@ class ChooseSequenceTests(TestCase):
         self.assertEqual(
             choose_sequence("mps-ik42", current_name="mps-ik42-5", exclude_device_pk=target.pk), 6
         )
+
+    def test_current_name_with_a_non_canonical_suffix_is_not_honoured(self) -> None:
+        """Code review round 2, finding 2 — ``int()`` is not a round-trip:
+        ``"03"`` parses to ``3``, but ``"03" != str(3)``. Honouring
+        ``current_name="…-03"`` as sequence 3 without re-checking the
+        *reassembled* string ``"…-3"`` would silently produce a duplicate
+        here, since a different device genuinely holds that exact name.
+        """
+        self._device("mps-ik42-3")  # genuine other sibling holding the round-tripped value
+        target = self._device("mps-ik42-03")
+        self.assertEqual(
+            choose_sequence("mps-ik42", current_name="mps-ik42-03", exclude_device_pk=target.pk), 4
+        )
+
+    def test_non_canonical_numeric_suffix_is_invisible_to_the_sibling_scan(self) -> None:
+        """The same round-trip guard applies inside ``_sibling_state()``
+        (code review round 2, finding 2) — a stored ``…-03`` is not
+        counted as a numbered sibling at all, the same as any other
+        non-numeric suffix would be.
+        """
+        self._device("mps-ik42-03")
+        self.assertIsNone(choose_sequence("mps-ik42"))
+
+    def test_non_ascii_digit_suffix_does_not_raise(self) -> None:
+        """``"²".isdigit()`` is ``True`` but ``int("²")`` raises — a
+        hostname carrying a non-ASCII "digit" suffix must be treated as
+        non-numeric, not crash the numbering rule (code review round 2,
+        finding 2).
+        """
+        self._device("mps-ik42-²")
+        self.assertIsNone(choose_sequence("mps-ik42"))  # must not raise
 
 
 class ResolveExplicitSequenceTests(TestCase):

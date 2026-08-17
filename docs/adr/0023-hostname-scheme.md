@@ -39,6 +39,12 @@ forced the original question is now a *port* on its console carrying `hostname_s
 > Every one was found by measuring the **live database** rather than the CSVs this ADR was written
 > from — three of them only after an independent review of the phase 18 plan.
 >
+> **A seventh, made 2026-08-17, during phase 18's implementation rather than its planning.**
+> Decision 7's starting-value table gained a zeroth row after an independent code review of the
+> built code (not the plan) found that self-exclusion alone does not make recompute idempotent for
+> the bare-named member of a numbered group — see that decision's second amendment block, below the
+> first.
+>
 > **Health warning on the evidence below.** Every number in the next section was measured against
 > `prod/*.csv`. The deployment database has since diverged — 49 hostnames have been renamed by hand
 > into scheme shape and every prose value is gone — so re-deriving these figures from the CSVs
@@ -266,6 +272,32 @@ enforcing.
 > that has been in service is referenced by things this system cannot see — DNS, switch configs,
 > the label on the box, someone's notes — and handing it to different hardware makes all of them
 > silently wrong. A gap in the numbering is cosmetic; resurrection is a fault.
+
+> **Amendment — the table above needs a zeroth row, or recompute is not idempotent for the
+> bare-named member of a numbered group.**
+>
+> Self-exclusion (decision 3 of the plan's settled decisions) removes the object being computed
+> from the sibling scan, which is right for a *numbered* device — excluding a device already named
+> `…-3` stops it from counting its own suffix as evidence. It is not enough for the *bare*-named
+> device in the same group: with it excluded, the highest **remaining** sibling looks like the
+> group's own top, so the bare device is started at `highest + 1` and renamed to a numbered suffix
+> — then, on the next recompute, excluded again, sees a new "highest remaining" one lower, and is
+> renamed again. Seventeen identical devices recomputed twice is enough to reach this: the bare one
+> is bumped to `…-18` on the second pass, a name nothing held before.
+>
+> | State of the stem | Start at |
+> |---|---|
+> | the object's own current hostname already fits this stem (bare, or `stem-<digits>`) and, excluding the object itself, nothing else holds it | **that name, unchanged** |
+> | nothing exists | no sequence — take the bare name |
+> | bare name exists, no numbered siblings | **2**, leaving `1` for the advisory |
+> | any numbered sibling exists | **highest + 1** |
+>
+> The zeroth row is checked first and short-circuits the rest of the table when it applies — the
+> other three rows are otherwise unchanged, including the free-check loop that follows. It is
+> reachable only when the caller already found `hostname_sequence` null (decision 6 already
+> exempts a non-null one from this whole table) but the *hostname text* nonetheless still matches
+> the stem — exactly the bare-name case, since a numbered name normally carries its own number in
+> the field too. Found by an independent code review of the implementation, not the plan.
 
 ### 8. `hostname` is normalised on write and capped at 63
 

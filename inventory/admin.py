@@ -451,6 +451,10 @@ def _fill_computed_hostname(cleaned_data: dict[str, Any], rack: Any, type_obj: A
         # name is already occupied (code review finding 3).
         resolved = resolve_explicit_sequence(stem, sequence, exclude_switch_pk=None, exclude_device_pk=None)
         if resolved != sequence:
+            # Silently rewriting the operator's own typed value with no
+            # explanation would be exactly the kind of surprise ADR 0019's
+            # suggest-don't-lock exists to avoid (code review finding 3).
+            advisories.append(f"hostname_sequence {sequence} was already in use; used {resolved} instead.")
             cleaned_data["hostname_sequence"] = resolved
         sequence = resolved
     if rack is not None and rack.location_slug and sequence is not None and not stem_components.purpose:
@@ -569,12 +573,18 @@ def _recompute_hostname(
     else:
         # Explicit — honoured as-is, only bumped forward if that exact
         # name is already taken (code review finding 3).
+        original_sequence = obj.hostname_sequence
         obj.hostname_sequence = resolve_explicit_sequence(
             stem,
             obj.hostname_sequence,
             exclude_switch_pk=exclude_switch_pk,
             exclude_device_pk=exclude_device_pk,
         )
+        if obj.hostname_sequence != original_sequence:
+            advisories.append(
+                f"hostname_sequence {original_sequence} was already in use; used "
+                f"{obj.hostname_sequence} instead."
+            )
     if (
         rack is not None
         and rack.location_slug
