@@ -11,17 +11,21 @@ amendments** made while planning this phase, each found by grilling the ADR agai
 database** rather than the CSVs it was written from — decisions 6, 7, 8 and 10. Read the amendments
 first; three of them change what this phase builds.
 
-**The CSVs are stale as a source of truth.** 48 hostnames have been renamed by hand into scheme
+**The CSVs are stale as a source of truth.** 49 hostnames have been renamed by hand into scheme
 shape since the import, and every prose value is gone. Numbers below are measured against the
 deployment database (`network-addresser-9000-db-1`), not `prod/*.csv`.
 
 | | live |
 |---|---|
-| equipment rows with a non-blank hostname | 82 |
+| equipment rows with a non-blank hostname | 83 |
 | rows that change under lowercasing | 40 |
 | rows longer than 63 chars | 0 (longest is 22) |
-| duplicated hostnames | 6, covering 34 rows |
+| duplicated hostnames | 5, covering 32 rows — all bare model names |
 | Types carrying a `hostname_slug` | **0 of 32** |
+
+Re-measure before implementing rather than trusting these: they moved twice during planning, once
+because the database had drifted from the CSVs and once because a duplicate was fixed by hand
+mid-plan.
 
 That last row is why decision 10 was amended: without seeding, this phase ships inert.
 
@@ -84,7 +88,7 @@ label it has.
    characters, before anything is altered.
 2. `AlterField` × 2 for the `max_length` change.
 3. A `RunPython` backfill stripping and lowercasing every non-blank hostname on both models —
-   **40 of 82 live rows change**. Reverse is a no-op with a comment saying why: the original casing
+   **40 of 83 live rows change**. Reverse is a no-op with a comment saying why: the original casing
    is unrecoverable, and re-uppercasing would be a guess.
 
 Use `apps.get_model()`, not the real model, so the migration does not run `save()`'s normalisation
@@ -172,7 +176,7 @@ A `_validate_hostname_unique()` on both models, shaped like `_validate_static_ad
 (#5) rather than introducing a stricter mechanism for names.
 
 **Enforced only when `hostname` is being set or changed** — ADR 0023 decision 6 as amended. Compare
-against the stored value; if unchanged, skip. This grandfathers the 34 already-duplicated rows,
+against the stored value; if unchanged, skip. This grandfathers the 32 already-duplicated rows,
 which would otherwise be unsaveable with no way out, while still refusing a rename *into* a
 duplicate or a new duplicate. Blank exempt.
 
@@ -262,12 +266,12 @@ python manage.py test inventory
 Record the baseline before touching code. PR 4 additionally rebuilds from the CSVs and runs
 `verify_prod_import.py`.
 
-**Expect `hostname_diverges` to fire widely once PR 4 lands.** 48 hostnames were renamed by hand
+**Expect `hostname_diverges` to fire widely once PR 4 lands.** 49 hostnames were renamed by hand
 into scheme shape, and any that do not match what computation produces will be flagged. That is the
 indicator working, and it is the reconciliation surface between the manual renaming and the scheme —
 but it is not a quiet rollout, and the PR description should say so.
 
-Unrelated to this phase but found while measuring it: **`NetworkSwitch` pk=12 and pk=13, in WPM1SR
-slots 1 and 2, are both named `mps-wpm1sr-sg350-1`.** A data error, not an import artifact — the
-secondary is presumably `-2`. Worth fixing before PR 3, since it is one of the 34 rows the
-uniqueness amendment grandfathers, and fixing it removes it from that set.
+Found while measuring this phase and **already fixed by hand**: two switches in WPM1SR slots 1 and 2
+were both named `mps-wpm1sr-sg350-1`. A data error rather than an import artifact, and correcting it
+dropped the grandfathered set from 34 rows to 32. All 32 that remain are equipment still carrying
+the bare model name the importer gave it, which is exactly what PR 3's recompute action is for.

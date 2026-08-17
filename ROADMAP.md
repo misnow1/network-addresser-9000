@@ -312,7 +312,7 @@ That is the same rule ADR 0003 gives static addresses, and what #31 already comm
 `docs/plans/PLAN-hostname-computation.md` is the build, in four PRs. ADR 0023 needed **no
 successor** but carries four amendments made while planning this phase — decisions 6, 7, 8 and 10 —
 every one of them found by measuring the **live database** rather than `prod/*.csv`. The CSVs are
-now stale as a source of truth: 48 hostnames have been renamed by hand into scheme shape and every
+now stale as a source of truth: 49 hostnames have been renamed by hand into scheme shape and every
 prose value is gone, so figures re-derived from the export are right about the export and wrong
 about the system.
 

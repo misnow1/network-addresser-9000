@@ -24,14 +24,15 @@ This ADR does not need to amend ADR 0018 — the companion whose hostname copied
 no longer exists. ADR 0022 superseded it outright, and the Yamaha Device Control interface that
 forced the original question is now a *port* on its console carrying `hostname_suffix`.
 
-> **Amended 2026-08-16, while planning phase 18.** Three decisions below are corrected in place,
+> **Amended 2026-08-16, while planning phase 18.** Four decisions below are corrected in place,
 > each marked **Amendment**: decision 6 (uniqueness is enforced on *change*, not asserted as an
-> invariant), decision 8 (on-write normalisation cannot close the casing divergence on its own — a
-> backfill is required), and decision 10 (`hostname_slug` *is* seeded after all). All three were
-> found by grilling this ADR against the live database rather than the CSVs.
+> invariant), decision 7 (bump-until-free is underspecified and wrong in two reachable cases),
+> decision 8 (on-write normalisation cannot close the casing divergence on its own — a backfill is
+> required), and decision 10 (`hostname_slug` *is* seeded after all). All four were found by
+> grilling this ADR against the live database rather than the CSVs.
 >
 > **Health warning on the evidence below.** Every number in the next section was measured against
-> `prod/*.csv`. The deployment database has since diverged — 48 hostnames have been renamed by hand
+> `prod/*.csv`. The deployment database has since diverged — 49 hostnames have been renamed by hand
 > into scheme shape and every prose value is gone — so re-deriving these figures from the CSVs
 > gives answers that are right about the export and wrong about the system. Where a decision turns
 > on a count, the live figure is given alongside.
@@ -180,9 +181,9 @@ something else; that cascade is not validated. See "Known gaps".
 
 > **Amendment — uniqueness is enforced on *change*, not asserted as an invariant.**
 >
-> As written above this decision is unshippable. The live database holds **34 equipment rows across
-> 6 duplicated hostnames** — `IK42` alone names 17 amps, because the importer gave every instance of
-> a model the same bare model name. Validating unconditionally in `full_clean()` would make all 34
+> As written above this decision is unshippable. The live database holds **32 equipment rows across
+> 5 duplicated hostnames** — `IK42` alone names 17 amps, because the importer gave every instance of
+> a model the same bare model name. Validating unconditionally in `full_clean()` would make all 32
 > unsaveable, so an operator editing one amp's serial number would be refused over a hostname they
 > did not create.
 >
@@ -196,10 +197,11 @@ something else; that cascade is not validated. See "Known gaps".
 > already-duplicated row saves cleanly.
 >
 > The honest consequence: **hostnames are not unique in the database, and no code may assume they
-> are.** Nothing branches on a hostname, so nothing does. The 32 amps are exactly what recompute is
-> for once slugs are seeded (decision 10 as amended); the 33rd and 34th are a pair of switches in
-> WPM1SR slots 1 and 2 both named `mps-wpm1sr-sg350-1`, which is a data error rather than an import
-> artifact.
+> are.** Nothing branches on a hostname, so nothing does. All 32 are amps and processors still
+> carrying the bare model name the importer gave them, and they are exactly what recompute is for
+> once slugs are seeded (decision 10 as amended). A sixth duplicate — two switches in WPM1SR slots 1
+> and 2 both named `mps-wpm1sr-sg350-1` — was a data error rather than an import artifact, and was
+> corrected by hand before this phase started.
 
 ### 7. Collisions bump the sequence, and two advisories ride along
 
@@ -374,7 +376,7 @@ action.
 > Not `slugify()`: it is wrong for exactly the cases this ADR already documents — `IK-42` → `ik-42`
 > where the name in use is `ik42`, and likewise `SQ-5`, `DM7-EX`, `NA2-DLINE`.
 >
-> Expect `hostname_diverges` to fire widely the moment this lands: 48 hostnames have been renamed
+> Expect `hostname_diverges` to fire widely the moment this lands: 49 hostnames have been renamed
 > by hand into scheme shape, and any that do not match what computation produces will be flagged.
 > That is the indicator working — it becomes the reconciliation surface between the manual renaming
 > and the scheme — but it is not a quiet rollout.
