@@ -43,8 +43,15 @@ def _check_hostname_lengths(apps, schema_editor):
     overlong = []
     for model in (NetworkSwitch, NetworkDevice):
         for pk, hostname in model.objects.using(alias).filter(hostname__gt="").values_list("pk", "hostname"):
-            if len(hostname) > 63:
-                overlong.append(f"{model.__name__} pk={pk} ({len(hostname)} chars): {hostname!r}")
+            # .strip() before measuring (code review finding 5a) — the
+            # backfill below strips too, so a value that only exceeds 63
+            # characters including leading/trailing whitespace would have
+            # fit fine after backfill; measuring the raw value here would
+            # abort the migration over a row that was never actually a
+            # problem.
+            stripped_length = len(hostname.strip())
+            if stripped_length > 63:
+                overlong.append(f"{model.__name__} pk={pk} ({stripped_length} chars): {hostname!r}")
     if overlong:
         raise RuntimeError(
             "Cannot shrink hostname to max_length=63 — the following row(s) already exceed it:\n"

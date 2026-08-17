@@ -13,7 +13,7 @@ from django.shortcuts import get_object_or_404, redirect
 from django.template.response import TemplateResponse
 from django.urls import URLPattern, path
 
-from .hostnames import HostnameComponents, assemble_hostname, choose_sequence
+from .hostnames import HostnameComponents, assemble_hostname, choose_sequence, resolve_explicit_sequence
 from .models import (
     _PROFILE_IN_USE_LOCKED_FIELDS,
     _PROFILE_SYSTEM_LOCKED_FIELDS,
@@ -400,8 +400,12 @@ def _fill_computed_hostname(cleaned_data: dict[str, Any], rack: Any, type_obj: A
 
     An explicitly-typed ``hostname_sequence`` is honoured, not overridden
     (settled decision 4/6) — ``choose_sequence()`` only runs when it's
-    still blank, and the chosen value is written back into
-    ``cleaned_data`` either way, since it's in every add form's
+    still blank; a typed value instead goes through
+    ``resolve_explicit_sequence()``, which only ever bumps *forward* from
+    it if that exact name is already taken (code review finding 3 — two
+    operators independently typing the same sequence on twin devices
+    must not both compute the same name). Either way the resulting value
+    is written back into ``cleaned_data``, since it's in every add form's
     ``Meta.fields`` and a newly-created device would otherwise diverge
     from its own name the moment it exists.
 
@@ -442,6 +446,13 @@ def _fill_computed_hostname(cleaned_data: dict[str, Any], rack: Any, type_obj: A
                 "it hostname_sequence=1."
             )
         cleaned_data["hostname_sequence"] = sequence
+    else:
+        # Explicit — honoured as typed, only bumped forward if that exact
+        # name is already occupied (code review finding 3).
+        resolved = resolve_explicit_sequence(stem, sequence, exclude_switch_pk=None, exclude_device_pk=None)
+        if resolved != sequence:
+            cleaned_data["hostname_sequence"] = resolved
+        sequence = resolved
     if rack is not None and rack.location_slug and sequence is not None and not stem_components.purpose:
         advisories.append(
             "A purpose reads better than a bare number here — consider setting hostname_purpose."
@@ -509,7 +520,9 @@ def _recompute_hostname(
        is missing, and nothing else below runs.
     3. ``choose_sequence()`` only when ``hostname_sequence`` is still
        null — an explicitly-set value is honoured, never overridden
-       (settled decision 4/6).
+       (settled decision 4/6), though still passed through
+       ``resolve_explicit_sequence()`` to bump forward if that exact name
+       is already taken (code review finding 3).
     4. The final name overwrites whatever ``hostname`` held, unconditionally.
     """
     rack = obj.rack  # None for a spare-pool object; one query either way, needed for location below
@@ -537,14 +550,31 @@ def _recompute_hostname(
         bare_twin = _bare_twin_without_sequence(
             stem, exclude_switch_pk=exclude_switch_pk, exclude_device_pk=exclude_device_pk
         )
+        # current_name=obj.hostname (code review finding 1) — without this,
+        # the bare-named member of a numbered group is not idempotent:
+        # excluding itself from the sibling scan makes the highest
+        # *remaining* sibling look like the group's own top, so it gets
+        # bumped to a numbered suffix on every subsequent recompute.
         obj.hostname_sequence = choose_sequence(
-            stem, exclude_switch_pk=exclude_switch_pk, exclude_device_pk=exclude_device_pk
+            stem,
+            current_name=obj.hostname,
+            exclude_switch_pk=exclude_switch_pk,
+            exclude_device_pk=exclude_device_pk,
         )
         if obj.hostname_sequence == 2 and bare_twin is not None:
             advisories.append(
                 f"{bare_twin} shares this hostname with no sequence of its own — consider giving "
                 "it hostname_sequence=1."
             )
+    else:
+        # Explicit — honoured as-is, only bumped forward if that exact
+        # name is already taken (code review finding 3).
+        obj.hostname_sequence = resolve_explicit_sequence(
+            stem,
+            obj.hostname_sequence,
+            exclude_switch_pk=exclude_switch_pk,
+            exclude_device_pk=exclude_device_pk,
+        )
     if (
         rack is not None
         and rack.location_slug

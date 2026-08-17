@@ -19,6 +19,13 @@ and by model, in both ``choose_sequence()`` and ``hostname_is_taken()``.
 Without that a recompute would treat a device's own stored name as a
 sibling of itself and rename it on every run — settled decision 3,
 recompute must be idempotent.
+
+Self-exclusion alone is not sufficient for the *bare*-named member of a
+numbered group, though (code review finding 1): excluding that object
+from the sibling scan makes the highest *remaining* sibling look like
+the group's own top, so ``choose_sequence()`` also takes the object's
+current ``hostname`` (``current_name``) and honours it outright when it
+already fits the stem being computed and nothing else holds it.
 """
 
 from typing import NamedTuple
@@ -177,8 +184,35 @@ def _sibling_state(
     return bare_exists, highest
 
 
+def _bump_until_free(
+    stem: str, sequence: int | None, *, exclude_switch_pk: int | None, exclude_device_pk: int | None
+) -> int | None:
+    """Increments ``sequence`` (``None`` meaning the bare stem) until
+    ``hostname_is_taken()`` says the assembled name is free. Shared tail
+    for both ``choose_sequence()`` (which computes the *starting* value
+    from the sibling scan) and ``resolve_explicit_sequence()`` (which
+    starts from whatever the operator already set) — the free-check loop
+    itself is identical either way.
+    """
+    while True:
+        candidate = stem if sequence is None else f"{stem}-{sequence}"
+        if not hostname_is_taken(
+            candidate, exclude_switch_pk=exclude_switch_pk, exclude_device_pk=exclude_device_pk
+        ):
+            return sequence
+        # Restart at 2 (the same "first bump" value a colliding bare
+        # sibling gets, not 1 — reserved for the advisory an operator acts
+        # on by hand) only coming *from* the bare stem; an already-numbered
+        # start just keeps counting up from itself.
+        sequence = 2 if sequence is None else sequence + 1
+
+
 def choose_sequence(
-    stem: str, *, exclude_switch_pk: int | None = None, exclude_device_pk: int | None = None
+    stem: str,
+    *,
+    current_name: str | None = None,
+    exclude_switch_pk: int | None = None,
+    exclude_device_pk: int | None = None,
 ) -> int | None:
     """The numbering rule (ADR 0023 decision 7, amended): where to *start*
     ``hostname_sequence``, chosen before any free-check runs, then bumped
@@ -200,11 +234,37 @@ def choose_sequence(
     this function's, since this function has no way to know whether a
     given integer came from an operator or a previous computation.
 
-    Self-exclusion (``exclude_switch_pk``/``exclude_device_pk``) applies
-    throughout, including the free-check loop — computing for an object
-    that already holds a name in its own stem must return that same name,
-    not bump past it (settled decision 3, idempotence).
+    ``current_name`` — the object's own currently-stored ``hostname``, if
+    any (code review finding 1). Self-exclusion alone is not enough to
+    make recompute idempotent for the *bare*-named member of a numbered
+    group: excluding that object from the sibling scan makes the highest
+    *remaining* sibling look like the group's top, so a bare device would
+    be bumped to a numbered suffix on every subsequent run, then bumped
+    again past whatever it was bumped to the time before. Before
+    deriving a start from the sibling scan at all, this checks whether
+    ``current_name`` already fits this exact stem's shape (bare, or
+    ``stem-<digits>``) and — excluding this object itself — is not held
+    by anything else; if so, it is honoured as-is (the bare name stays
+    ``None``, a numbered one yields its own suffix) rather than
+    re-derived. Only reachable when the caller already found
+    ``hostname_sequence`` null (settled decision 6) but the *hostname
+    text* nonetheless already matches this stem — exactly the bare-name
+    case, since a numbered name normally carries its number in the field
+    too.
     """
+    if current_name is not None:
+        if current_name == stem:
+            if not hostname_is_taken(
+                stem, exclude_switch_pk=exclude_switch_pk, exclude_device_pk=exclude_device_pk
+            ):
+                return None
+        elif current_name.startswith(f"{stem}-"):
+            suffix = current_name[len(stem) + 1 :]
+            if suffix.isdigit() and not hostname_is_taken(
+                current_name, exclude_switch_pk=exclude_switch_pk, exclude_device_pk=exclude_device_pk
+            ):
+                return int(suffix)
+
     bare_exists, highest = _sibling_state(
         stem, exclude_switch_pk=exclude_switch_pk, exclude_device_pk=exclude_device_pk
     )
@@ -214,15 +274,39 @@ def choose_sequence(
         sequence = 2
     else:
         sequence = None
-    while True:
-        candidate = stem if sequence is None else f"{stem}-{sequence}"
-        if not hostname_is_taken(
-            candidate, exclude_switch_pk=exclude_switch_pk, exclude_device_pk=exclude_device_pk
-        ):
-            return sequence
-        # Only reachable if the sibling scan above missed a collision —
-        # e.g. the bare stem is taken by a *derived port name* rather than
-        # a sibling switch/device. Restart at 2, the same "first bump"
-        # value the table gives a colliding bare sibling, rather than 1
-        # (reserved for the advisory an operator acts on by hand).
-        sequence = 2 if sequence is None else sequence + 1
+    return _bump_until_free(
+        stem, sequence, exclude_switch_pk=exclude_switch_pk, exclude_device_pk=exclude_device_pk
+    )
+
+
+def resolve_explicit_sequence(
+    stem: str,
+    sequence: int,
+    *,
+    exclude_switch_pk: int | None = None,
+    exclude_device_pk: int | None = None,
+) -> int:
+    """An explicitly-set ``hostname_sequence`` is honoured, not overridden
+    (settled decision 4/6): assembly joins it as-is and only bumps if
+    ``hostname_is_taken()`` says that exact name is occupied (ADR 0023
+    decision 7; code review finding 3) — never asserted as unique
+    outright, since "the computed path cannot collide" is the load-
+    bearing argument for exempting *creation* from uniqueness at all
+    (ADR 0023 decision 6's amendment), and two operators independently
+    typing the same ``hostname_sequence`` on twin devices is exactly a
+    case that argument has to cover.
+
+    Unlike ``choose_sequence()``, this never consults the sibling-scan
+    starting-value table — the operator's own value already *is* the
+    starting point; bumping only ever moves forward from it, using the
+    same free-check loop.
+    """
+    resolved = _bump_until_free(
+        stem, sequence, exclude_switch_pk=exclude_switch_pk, exclude_device_pk=exclude_device_pk
+    )
+    # _bump_until_free()'s "None" case is the bare-stem candidate, only
+    # ever reached by starting it at None — this function always starts
+    # it at the caller's own (non-None) int, so that branch is
+    # unreachable here; the assert just satisfies mypy about it.
+    assert resolved is not None
+    return resolved

@@ -4,6 +4,18 @@
 # constant; the database that already exists needs this migration instead,
 # since it will not be rebuilt just to pick them up.
 #
+# Code review finding 2 — this migration's own copy also carries
+# ("Cisco", "SG350-10P"): "sg350-10p", which import_prod_data.py's copy
+# does not. That pair exists on the live database (one switch, profile
+# "For Drive Rack Primary") but the current importer catalog no longer
+# creates it at all — a rebuild would never produce this row, so putting
+# it in the importer's constant would be dead weight there, but leaving
+# it out of *this* migration's constant would leave that one live switch
+# permanently uncomputable. This migration's job is the live database,
+# not the importer's catalog, so the two copies are allowed to diverge
+# here — see HostnameSlugsConstantTests' subset (not equality) check
+# against the importer's own pairs.
+#
 # Matches on (manufacturer, model), not the profile — a Type's
 # hostname_slug depends only on its hardware, and this migration must give
 # both IK-42 profiles (etc.) the same value, exactly as ADR 0023 decision 1
@@ -57,6 +69,9 @@ HOSTNAME_SLUGS: dict[tuple[str, str], str] = {
     ("Cisco", "SG300-26P"): "sg300-26p",
     ("Cisco", "SG350-10"): "sg350-10",
     ("TP-Link", "TL-SG108E"): "tl-sg108e",
+    # Live-only — see the module docstring above. Not in
+    # import_prod_data.HOSTNAME_SLUGS, on purpose.
+    ("Cisco", "SG350-10P"): "sg350-10p",
 }
 
 #: The four Amphenol corrections (see HOSTNAME_SLUGS's docstring above) —

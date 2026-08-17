@@ -1756,6 +1756,20 @@ class QueryBudgetTests(TestCase):
         device_type = NetworkDeviceType.objects.create(
             manufacturer="QB", model="M", name="QB Device Type", port_count=0
         )
+        # A non-null owner and rack for the switch/device rows below (code
+        # review finding 5c) — hostname_diverges (#54) reads both, and a
+        # null FK short-circuits with no query at all regardless of
+        # list_select_related, so rows with neither set would let this
+        # budget test pass even if "owner" were dropped from
+        # list_select_related entirely. slot_count=50 covers the biggest
+        # batch either factory below creates.
+        qb_relations_owner = Owner.objects.create(slug="qb-relations-owner", name="QB Relations Owner")
+        qb_relations_rack = Rack.objects.create(
+            name="QB Relations Rack",
+            slot_count=50,
+            owner=qb_relations_owner,
+            location_slug="qb-relations-loc",
+        )
 
         factories = {
             "vlan": lambda i: VLAN.objects.create(name=f"QB VLAN {i}", vlan_id=2000 + i),
@@ -1770,13 +1784,21 @@ class QueryBudgetTests(TestCase):
                 manufacturer="QB", model="M", name=f"QB SwitchType {i}", port_count=0
             ),
             "networkswitch": lambda i: NetworkSwitch.objects.create(
-                switch_type=switch_type, hostname=f"qb-switch-{i}"
+                switch_type=switch_type,
+                hostname=f"qb-switch-{i}",
+                owner=qb_relations_owner,
+                rack=qb_relations_rack,
+                rack_slot=i + 1,
             ),
             "networkdevicetype": lambda i: NetworkDeviceType.objects.create(
                 manufacturer="QB", model="M", name=f"QB DeviceType {i}", port_count=0
             ),
             "networkdevice": lambda i: NetworkDevice.objects.create(
-                device_type=device_type, hostname=f"qb-device-{i}"
+                device_type=device_type,
+                hostname=f"qb-device-{i}",
+                owner=qb_relations_owner,
+                rack=qb_relations_rack,
+                rack_slot=i + 1,
             ),
         }
         self.assertEqual(set(factories), set(REGISTRY), "every registry slug needs a query-budget factory")
@@ -2536,6 +2558,12 @@ class HostnameDivergesMarkerTests(TestCase):
     def test_switch_registry_list_marks_a_diverging_switch(self) -> None:
         """NetworkSwitch has no canonical page — the registry list is the
         only place a Viewer can see this at all.
+
+        Asserted on the specific row/column (code review finding 5b), not
+        a bare ``assertContains(response, "Yes")`` — the list also has a
+        "DHCP server" boolean column, so a page-wide "Yes" search would
+        pass even if the "Diverges" column rendered nothing at all, as
+        long as some *other* row's DHCP server happened to be enabled.
         """
         NetworkSwitch.objects.create(
             switch_type=self.switch_type,
@@ -2545,7 +2573,10 @@ class HostnameDivergesMarkerTests(TestCase):
             hostname="hand-typed",
         )
         response = self.client.get("/models/networkswitch/")
-        self.assertContains(response, "Yes")  # the "Diverges" column's boolean render
+        cells = _list_row_cells(response.content.decode(), "hand-typed")
+        # ... Hostname, Type, Serial number, Rack, Rack slot, DHCP server,
+        # Owner, Hostname purpose, Hostname sequence, Diverges, Details.
+        self.assertEqual(cells[-2], "Yes")  # "Diverges" — the second-to-last column, before "Details"
 
     def test_switch_registry_detail_marks_a_diverging_switch(self) -> None:
         switch = NetworkSwitch.objects.create(

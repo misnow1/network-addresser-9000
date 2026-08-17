@@ -1116,11 +1116,22 @@ class HostnameSlugsConstantTests(TestCase):
     """
 
     def test_every_importer_type_pair_has_a_hostname_slugs_entry(self) -> None:
+        """A subset check (code review finding 2), not equality — the
+        importer's own HOSTNAME_SLUGS must cover every pair the importer
+        actually creates, but is allowed to carry no more than that (the
+        migration's *separate* copy carries one additional, live-only
+        pair — ("Cisco", "SG350-10P") — that the current importer catalog
+        no longer creates at all; equality here would force that pair
+        into a constant where it would be dead weight).
+        """
         device_pairs = {(spec.manufacturer, spec.model) for spec in DEVICE_TYPES}
         switch_pairs = {
             (manufacturer, model) for manufacturer, model, _name in PRIMARY_SWITCH_TABLES.values()
         } | {(manufacturer, model) for manufacturer, model, _name in SECONDARY_DERIVED_TABLES.values()}
-        self.assertEqual(device_pairs | switch_pairs, set(IMPORTER_HOSTNAME_SLUGS))
+        self.assertTrue(
+            (device_pairs | switch_pairs) <= set(IMPORTER_HOSTNAME_SLUGS),
+            (device_pairs | switch_pairs) - set(IMPORTER_HOSTNAME_SLUGS),
+        )
 
     def test_importer_and_verifier_copies_agree(self) -> None:
         self.assertEqual(IMPORTER_HOSTNAME_SLUGS, VERIFIER_HOSTNAME_SLUGS)
