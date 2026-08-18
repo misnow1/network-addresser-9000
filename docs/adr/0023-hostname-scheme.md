@@ -45,6 +45,13 @@ forced the original question is now a *port* on its console carrying `hostname_s
 > the bare-named member of a numbered group — see that decision's second amendment block, below the
 > first.
 >
+> **An eighth, made 2026-08-17, from a live-admin report after phase 18 shipped.** Decision 7's
+> starting-value table gained a `hostname_purpose` column: a blank purpose now starts numbering at
+> **1** unconditionally rather than reserving 1 for the twin advisory, which raises the production
+> reproduction rate from 42/52 to 49/52. The two advisory messages were also reworded — Django
+> admin's `capfirst` was capitalising a lowercase hostname at the front of every advisory string,
+> and neither message named the row it was about — see decision 7's third amendment block.
+>
 > **Health warning on the evidence below.** Every number in the next section was measured against
 > `prod/*.csv`. The deployment database has since diverged — 49 hostnames have been renamed by hand
 > into scheme shape and every prose value is gone — so re-deriving these figures from the CSVs
@@ -298,6 +305,70 @@ enforcing.
 > exempts a non-null one from this whole table) but the *hostname text* nonetheless still matches
 > the stem — exactly the bare-name case, since a numbered name normally carries its own number in
 > the field too. Found by an independent code review of the implementation, not the plan.
+
+> **Amendment — a blank `hostname_purpose` starts numbering at 1, not 2, and the two advisories
+> were reworded.** Reported from the live admin after phase 18 shipped, not found in planning.
+>
+> **The measurement.** Against all 52 production hostnames, the table above (start at 2 when a bare
+> name exists, leaving 1 "for the advisory") reproduces 42. Numbering from 1 unconditionally
+> reproduces **49**. Every one of the 10 misses under the old rule is the same shape — a
+> purpose-less group such as `mps-avio-amph-output`, whose first member production names
+> `mps-avio-amph-output-1`, never bare. Production's own convention, in other words, is that a
+> purpose-less name is *always* numbered, starting from 1, whether or not it turns out to have
+> siblings — not that the first member of a group is left bare until a second one shows up.
+>
+> **The rule is conditional on `hostname_purpose`, not a wholesale replacement.** Applying "start
+> at 1" regardless of purpose would turn `mps-wpc1sru-ik42-sub` into `mps-wpc1sru-ik42-sub-1` and
+> break the 30 purpose-carrying production rows that are correctly bare today — decision 1's
+> "purpose and sequence are independently meaningful" already established that a purpose-carrying
+> name has no need of a number. So the starting-value table above gains a column:
+>
+> | State of the stem | `hostname_purpose` blank | `hostname_purpose` set |
+> |---|---|---|
+> | current hostname already fits this stem and nothing else holds it | *(see below — the bare half of this row no longer applies when blank)* | that name, unchanged |
+> | nothing exists | **1** | no sequence — take the bare name |
+> | bare name exists, no numbered siblings | **1** | 2, leaving 1 for the advisory |
+> | any numbered sibling exists | highest + 1 | highest + 1 |
+>
+> The blank-purpose column collapses to one rule in practice: **1 unless a numbered sibling already
+> exists, in which case highest + 1** — a bare twin existing doesn't change the answer, because
+> nothing yet holds the literal `stem-1` string, so 1 is genuinely free. Highest + 1 is kept rather
+> than always taking the lowest free value for the same reason decision 7's first amendment gives:
+> a gap left by a deleted device must not be handed to different hardware.
+>
+> **The zeroth row's bare half is now conditional on purpose too, or existing bare names would
+> never renumber.** The zeroth row above exists so a device's own numbered name survives
+> self-exclusion (settled decision 3's idempotence requirement) unchanged. Left unconditional, it
+> would do the same for a *bare* name — but the new blank-purpose rule says a bare, purpose-less
+> stem should carry `1`, not stay bare, so honouring it as "unchanged" would permanently preserve
+> exactly the shape this amendment exists to renumber. **Settled: existing bare names renumber.**
+> The bare half of the zeroth row therefore only fires when `hostname_purpose` is set — a
+> legitimate answer there, unchanged — and falls through to the ordinary derivation when blank. The
+> *numbered* half is unconditional either way, which is what keeps a blank-purpose row that has
+> already taken `-1` idempotent on its next recompute: `mps-avio-aes` computes to `mps-avio-aes-1`
+> on the first run, and the second run reproduces it rather than excluding it from the sibling scan
+> and deriving a new, higher number.
+>
+> **The two advisories were reworded, for a reason unrelated to the numbering rule.** Django admin
+> renders every message through `capfirst`
+> (`django/contrib/admin/templates/admin/base.html`), which uppercases the message's first
+> *letter* — wrong for a hostname, a DNS label that is always lowercase, so the twin advisory was
+> rendering as `"Mps-danrx shares this hostname…"`. Both advisories, plus the explicit-sequence
+> advisory (decision 7's original text, "increment the sequence" section), now open with an
+> ordinary word `capfirst` may safely capitalise and, per decision 7's own original wording, name
+> the row they are about — the purpose advisory names the row being computed, the twin advisory
+> names the *other*, already-saved row. This had shipped with no test asserting the purpose
+> advisory's text at all.
+>
+> **The twin advisory's own trigger condition needed the same purpose qualifier.** It used to fire
+> whenever the starting value came out to 2 with a bare twin on record. Under the new rule that
+> only still happens when `hostname_purpose` is set — for a blank purpose, the bare-name branch
+> that used to produce 2 now produces 1 directly, so recommending "assign it 1" is no longer
+> reachable through that path, and the only remaining way to reach 2 for a blank purpose is a
+> numbered sibling already holding 1 — a case where the advice would be *wrong*, since 1 is already
+> taken by something else. The advisory is gated on `hostname_purpose` being set accordingly; kept
+> rather than removed, since it is still correct advice for a purpose-carrying stem, but is now
+> near-moot for the blank-purpose case it used to exist for.
 
 ### 8. `hostname` is normalised on write and capped at 63
 
