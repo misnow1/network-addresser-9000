@@ -5901,10 +5901,29 @@ class RecomputeHostnameActionTests(TestCase):
         purpose_advisories = [
             str(m) for m in get_messages(request) if "A purpose reads better than a bare number" in str(m)
         ]
-        self.assertEqual(len(purpose_advisories), 5)
-        self.assertEqual(len(set(purpose_advisories)), 5)  # each names a different row
+        # Four, not five: the first device takes the default sequence 1,
+        # which is the ordinary outcome rather than a collision, so it is
+        # deliberately silent. Only 2-5 were forced up by a collision the
+        # purpose field could have avoided.
+        self.assertEqual(len(purpose_advisories), 4)
+        self.assertEqual(len(set(purpose_advisories)), 4)  # each names a different row
         for advisory in purpose_advisories:
             self.assertEqual(capfirst(advisory), advisory)
+
+    def test_default_sequence_of_1_raises_no_purpose_advisory(self) -> None:
+        """The purpose advisory is about avoiding a *collision*
+        (MORE_MUSINGS: "in a physical rack, the 4th field should be used
+        to avoid collisions"). Once hostname_sequence defaults to 1, a
+        bare 1 means nothing collided, so advising on it would fire for
+        every purposeless racked device and drown the cases that matter.
+        """
+        device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=1)
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        request = self._request()
+        admin.recompute_hostnames(request, NetworkDevice.objects.filter(pk=device.pk))
+        device.refresh_from_db()
+        self.assertEqual(device.hostname_sequence, 1)
+        self.assertFalse([m for m in get_messages(request) if "A purpose reads better" in str(m)])
 
     def test_recompute_over_17_identical_devices_twice_is_idempotent(self) -> None:
         """Code review finding 1 — the single-device idempotence test

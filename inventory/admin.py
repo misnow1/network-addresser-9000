@@ -473,7 +473,18 @@ def _fill_computed_hostname(cleaned_data: dict[str, Any], rack: Any, type_obj: A
             f"Requested hostname_sequence {sequence_conflict} was already taken for {final_name} — "
             f"using {sequence} instead."
         )
-    if rack is not None and rack.location_slug and sequence is not None and not stem_components.purpose:
+    # `> 1`, not `is not None`: since hostname_sequence defaults to 1
+    # (ADR 0023 decision 7's purpose amendment), a bare 1 is the ordinary
+    # outcome rather than a disambiguator, and advising on it would fire
+    # for every purposeless racked device. MORE_MUSINGS' rule is about
+    # *avoiding collisions* — only a number forced above 1 represents one.
+    if (
+        rack is not None
+        and rack.location_slug
+        and sequence is not None
+        and sequence > 1
+        and not stem_components.purpose
+    ):
         advisories.append(
             f"A purpose reads better than a bare number for {final_name} — consider setting hostname_purpose."
         )
@@ -618,6 +629,10 @@ def _recompute_hostname(
         rack is not None
         and rack.location_slug
         and obj.hostname_sequence is not None
+        # See the matching comment on the add-form path above: a bare 1 is
+        # now the default, so only a number forced above it means a
+        # collision the purpose field could have avoided.
+        and obj.hostname_sequence > 1
         and not obj.hostname_purpose
     ):
         advisories.append(
