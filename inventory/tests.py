@@ -31,6 +31,7 @@ from django.db import IntegrityError, connection, transaction
 from django.db.migrations.executor import MigrationExecutor
 from django.db.models import ProtectedError
 from django.forms import inlineformset_factory
+from django.template.defaultfilters import capfirst
 from django.test import RequestFactory, TestCase, TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
@@ -5746,7 +5747,9 @@ class HostnameAddFormAssemblyTests(TestCase):
         self.assertEqual(form.instance.hostname, "mps-wpcsrl-ik42-2")
         self.assertEqual(form.instance.hostname_sequence, 2)
         # Code review round 2, finding 3 — the rewrite is not silent.
-        self.assertTrue(any("hostname_sequence 1 was already in use" in a for a in form._hostname_advisories))
+        self.assertTrue(
+            any("Requested hostname_sequence 1 was already taken" in a for a in form._hostname_advisories)
+        )
 
 
 class RecomputeHostnameActionTests(TestCase):
@@ -5851,7 +5854,7 @@ class RecomputeHostnameActionTests(TestCase):
         self.assertEqual(twin.hostname_sequence, 2)
         # Code review round 2, finding 3 — the rewrite is not silent.
         self.assertTrue(
-            any("hostname_sequence 1 was already in use" in str(m) for m in get_messages(request))
+            any("Requested hostname_sequence 1 was already taken" in str(m) for m in get_messages(request))
         )
 
     def test_recompute_over_17_identical_devices_yields_17_distinct_names(self) -> None:
@@ -5959,14 +5962,16 @@ class HostnameAdvisoryEmissionTests(TestCase):
             name="Rack 1", slot_count=10, owner=self.owner, location_slug="wpcsrl"
         )
         self.device_type = _make_device_type(hostname_slug="ik42")
-        # A bare twin with no sequence of its own — computing a second
-        # identical device should bump to 2 and advise assigning this one 1.
+        # A bare, purpose-carrying twin with no sequence of its own —
+        # computing a second device with the same purpose should bump to 2
+        # and advise assigning this one 1.
         self.twin = NetworkDevice.objects.create(
             device_type=self.device_type,
             rack=self.rack,
             rack_slot=1,
             owner=self.owner,
-            hostname="mps-wpcsrl-ik42",
+            hostname="mps-wpcsrl-ik42-sub",
+            hostname_purpose="sub",
         )
         self.editor = User.objects.create_user("advisory-editor", password="testpass123", is_staff=True)
         self.editor.groups.add(Group.objects.get(name="Editor"))
@@ -5976,6 +5981,7 @@ class HostnameAdvisoryEmissionTests(TestCase):
             data={
                 "device_type": str(self.device_type.pk),
                 "hostname": "",
+                "hostname_purpose": "sub",  # shares the twin's stem+purpose
                 "rack": str(self.rack.pk),
                 "rack_slot": "2",
                 "port_addressing": "dhcp",
@@ -5993,6 +5999,7 @@ class HostnameAdvisoryEmissionTests(TestCase):
             {
                 "device_type": str(self.device_type.pk),
                 "hostname": "",
+                "hostname_purpose": "sub",  # shares the twin's stem+purpose
                 "serial_number": "",
                 "rack": str(self.rack.pk),
                 "rack_slot": "2",
@@ -6006,6 +6013,111 @@ class HostnameAdvisoryEmissionTests(TestCase):
         errors = response.context["adminform"].errors if response.context else None
         self.assertEqual(response.status_code, 302, errors)
         self.assertTrue(any("hostname_sequence=1" in str(m) for m in get_messages(response.wsgi_request)))
+
+    def test_twin_advisory_does_not_lead_with_the_hostname_and_names_it(self) -> None:
+        """Django admin renders every message through ``capfirst``
+        (``django/contrib/admin/templates/admin/base.html``), which
+        uppercases the message's first *letter* — wrong for a hostname,
+        which is a DNS label and always lowercase. The advisory must open
+        with an ordinary word ``capfirst`` may safely capitalise, and must
+        still say which row it's about: the *twin*, a different,
+        already-saved row from the one being computed.
+        """
+        form = NetworkDeviceAddForm(
+            data={
+                "device_type": str(self.device_type.pk),
+                "hostname": "",
+                "hostname_purpose": "sub",
+                "rack": str(self.rack.pk),
+                "rack_slot": "2",
+                "port_addressing": "dhcp",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        (advisory,) = form._hostname_advisories
+        self.assertEqual(
+            advisory,
+            "Hostname mps-wpcsrl-ik42-sub shares this name with no sequence of its own — consider "
+            "giving it hostname_sequence=1.",
+        )
+        # The root-cause regression check: capfirst() must be a no-op.
+        self.assertEqual(capfirst(advisory), advisory)
+        self.assertFalse(advisory.startswith("mps-"))
+
+    def test_purpose_advisory_names_the_row_being_computed(self) -> None:
+        """The purpose advisory's subject is the row *being recomputed*
+        (change 2) — distinct from the twin advisory's subject, which is
+        the *other*, already-saved row. Also not test-covered before this
+        change (the brief's own diagnosis: grepping for its text returned
+        nothing). A numbered sibling (rather than a nothing-exists or
+        bare-twin stem) keeps this scenario's expected sequence the same
+        regardless of the ``hostname_purpose`` numbering rule.
+        """
+        NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=3,
+            owner=self.owner,
+            hostname="mps-wpcsrl-ik42-1",
+            hostname_sequence=1,
+        )
+        form = NetworkDeviceAddForm(
+            data={
+                "device_type": str(self.device_type.pk),
+                "hostname": "",
+                "rack": str(self.rack.pk),
+                "rack_slot": "4",
+                "port_addressing": "dhcp",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.hostname, "mps-wpcsrl-ik42-2")
+        self.assertEqual(
+            form._hostname_advisories,
+            [
+                "A purpose reads better than a bare number for mps-wpcsrl-ik42-2 — consider setting "
+                "hostname_purpose."
+            ],
+        )
+        for advisory in form._hostname_advisories:
+            self.assertEqual(capfirst(advisory), advisory)
+            self.assertFalse(advisory.startswith("mps-"))
+
+    def test_explicit_sequence_conflict_advisory_names_the_row_and_does_not_lead_with_a_field_name(
+        self,
+    ) -> None:
+        """``hostname_sequence`` (a field name, not a hostname) used to
+        lead the message and get mangled to ``Hostname_sequence`` by
+        ``capfirst`` — reworded alongside the other two for the same
+        reason, and identifies which row ended up with which value.
+        """
+        NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=5,
+            owner=self.owner,
+            hostname="mps-wpcsrl-ik42-1",
+            hostname_sequence=1,
+        )
+        form = NetworkDeviceAddForm(
+            data={
+                "device_type": str(self.device_type.pk),
+                "hostname": "",
+                "rack": str(self.rack.pk),
+                "rack_slot": "6",
+                "port_addressing": "dhcp",
+                "owner": str(self.owner.pk),
+                "hostname_sequence": "1",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.hostname, "mps-wpcsrl-ik42-2")
+        (advisory,) = [a for a in form._hostname_advisories if "Requested hostname_sequence" in a]
+        self.assertEqual(
+            advisory,
+            "Requested hostname_sequence 1 was already taken for mps-wpcsrl-ik42-2 — using 2 instead.",
+        )
+        self.assertEqual(capfirst(advisory), advisory)
 
 
 class HostnameWriteAuditTests(TestCase):
