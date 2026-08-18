@@ -33,7 +33,8 @@ from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models, transaction
-from django.db.models.functions import Coalesce
+from django.db.models import Value
+from django.db.models.functions import Coalesce, Concat
 
 from .suggestions import (
     dhcp_range_overlaps_cidr,
@@ -498,6 +499,126 @@ def _validate_static_address(
         raise ValidationError(
             {"address": f"{address} is already assigned to {device_conflict.device} on {vlan}."}
         )
+
+
+def _stored_hostname(model_cls: type[models.Model], pk: int) -> str | None:
+    """The persisted ``hostname`` for ``pk``, or ``None`` if the row isn't
+    visible (mirrors ``_check_locked_fields_unchanged()``'s identical
+    guard) — what each model's ``clean()`` compares its in-memory value
+    against to decide whether this save is a rename at all.
+    """
+    return model_cls._default_manager.filter(pk=pk).values_list("hostname", flat=True).first()
+
+
+def _validate_hostname_unique(
+    hostname: str,
+    *,
+    exclude_switch_pk: int | None,
+    exclude_device_pk: int | None,
+) -> None:
+    """Cross-table hostname uniqueness (ADR 0023 decision 6, amended
+    twice) — ``NetworkSwitch.hostname``, ``NetworkDevice.hostname`` and
+    the derived ``NetworkDevicePort.hostname`` (ADR 0022 decision 4) all
+    share one namespace. Same shape as ``_validate_static_address()``: a
+    ``full_clean()``-time-only guard, since no database constraint can
+    span three tables, and it inherits that check's known cross-table
+    race (#5) rather than introducing a second, stricter mechanism.
+
+    Deliberately **not** reused from ``inventory.hostnames.
+    hostname_is_taken()`` — that module imports from this one
+    (``NetworkSwitch``/``NetworkDevice``/``NetworkDevicePort``), so the
+    reverse import would be circular. The two checks share the same
+    three-table shape by construction, not by call-sharing.
+
+    **Callers, not this function, decide when to call it** — rename-only
+    (ADR 0023 decision 6, amended twice): only when an existing row's
+    ``hostname`` differs from what is stored, never on creation. The live
+    database holds 32 equipment rows across 5 duplicated hostnames (bare
+    model names the importer gave every instance of a model — ``IK42``
+    alone names 17 amps), so validating unconditionally would make all 32
+    unsaveable, and the importer's ``construct -> full_clean() -> save()``
+    path writes duplicate CSV descriptions by design (the addressing CSV
+    repeats ``IK42`` eighteen times) — enforcing on creation would break
+    every rebuild. Little is lost: the computed path
+    (``inventory.hostnames.choose_sequence()``) checks against this same
+    predicate before it ever proposes a name, so it cannot collide either
+    way; a hand-typed rename is the realistic route to a duplicate, and
+    that is exactly what this refuses.
+
+    **The honest consequence: hostnames are not unique in the database,
+    and no code may assume they are.** Blank is exempt — the spare pool
+    and every pre-phase-18 row need no backfill.
+    """
+    if not hostname:
+        return
+    switch_conflicts = NetworkSwitch.objects.filter(hostname=hostname)
+    if exclude_switch_pk is not None:
+        switch_conflicts = switch_conflicts.exclude(pk=exclude_switch_pk)
+    switch_conflict = switch_conflicts.first()
+    if switch_conflict is not None:
+        raise ValidationError({"hostname": f"{hostname!r} is already in use by {switch_conflict}."})
+
+    device_conflicts = NetworkDevice.objects.filter(hostname=hostname)
+    if exclude_device_pk is not None:
+        device_conflicts = device_conflicts.exclude(pk=exclude_device_pk)
+    device_conflict = device_conflicts.first()
+    if device_conflict is not None:
+        raise ValidationError({"hostname": f"{hostname!r} is already in use by {device_conflict}."})
+
+    port_conflicts = NetworkDevicePort.objects.filter(source_type_port__hostname_suffix__gt="").exclude(
+        device__hostname=""  # Concat would yield "-suffix"; the property returns None, never that
+    )
+    if exclude_device_pk is not None:
+        port_conflicts = port_conflicts.exclude(device_id=exclude_device_pk)
+    port_conflict = (
+        port_conflicts.annotate(
+            derived=Concat("device__hostname", Value("-"), "source_type_port__hostname_suffix")
+        )
+        .filter(derived=hostname)
+        .first()
+    )
+    if port_conflict is not None:
+        raise ValidationError(
+            {"hostname": f"{hostname!r} is already in use as a derived port name on {port_conflict.device}."}
+        )
+
+
+def _assemble_hostname_stem(
+    *,
+    owner_slug: str | None,
+    location_slug: str | None,
+    type_slug: str | None,
+    purpose: str,
+    sequence: int | None,
+) -> str | None:
+    """The same pure dash-join as ``inventory.hostnames.assemble_hostname()``
+    — duplicated rather than imported, for the identical circular-import
+    reason ``_validate_hostname_unique()`` duplicates ``hostname_is_taken()``'s
+    shape above rather than calling it: ``inventory.hostnames`` imports
+    ``NetworkSwitch``/``NetworkDevice``/``NetworkDevicePort`` from this
+    module, so the reverse import is impossible, and this module never
+    reaches up into a module built on top of it.
+
+    ``hostname_diverges`` (ADR 0023 decision 9, corrected in phase 18 PR 4)
+    is this function's one call site. If a third ever needs the exact same
+    formula, that is the signal to extract it into a genuinely shared,
+    import-free module instead of a third copy — not to reach for either
+    existing copy from the other's module.
+
+    ``None`` when a blocking component (``owner_slug``/``type_slug``) is
+    missing; otherwise the non-blank components dash-joined, exactly
+    matching ``assemble_hostname()``'s own contract.
+    """
+    if not owner_slug or not type_slug:
+        return None
+    parts = [
+        owner_slug,
+        location_slug or None,
+        type_slug,
+        purpose or None,
+        None if sequence is None else str(sequence),
+    ]
+    return "-".join(part for part in parts if part)
 
 
 class AuditedModel(models.Model):
@@ -2424,7 +2545,7 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
     """
 
     switch_type = models.ForeignKey(NetworkSwitchType, on_delete=models.PROTECT, related_name="switches")
-    hostname = models.CharField(max_length=255, blank=True)
+    hostname = models.CharField(max_length=63, blank=True)
     serial_number = models.CharField(max_length=100, blank=True)
     rack = models.ForeignKey(Rack, on_delete=models.PROTECT, null=True, blank=True, related_name="switches")
     rack_slot = models.PositiveIntegerField(null=True, blank=True, validators=[MinValueValidator(1)])
@@ -2481,7 +2602,14 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
         # Stripped/lowercased here too, not just clean() — Model.save()
-        # never calls clean() (Department.save()'s reasoning).
+        # never calls clean() (Department.save()'s reasoning). hostname
+        # joins hostname_purpose here (ADR 0023 decision 8, amended): the
+        # importer's construct -> full_clean() -> save() path already goes
+        # through clean_fields()/clean() below, but a bare objects.create()
+        # or bulk write that skips full_clean() must still not persist raw
+        # casing.
+        if self.hostname:
+            self.hostname = self.hostname.strip().lower()
         if self.hostname_purpose:
             self.hostname_purpose = self.hostname_purpose.strip().lower()
         # ``self.pk is None or self._state.adding``, not either alone:
@@ -2511,12 +2639,16 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
     def clean_fields(self, exclude=None) -> None:
         # Normalize *before* the field validators run — see
         # Owner.clean_fields() for why this can't wait for clean().
+        if self.hostname:
+            self.hostname = self.hostname.strip().lower()
         if self.hostname_purpose:
             self.hostname_purpose = self.hostname_purpose.strip().lower()
         super().clean_fields(exclude=exclude)
 
     def clean(self) -> None:
         super().clean()
+        if self.hostname:
+            self.hostname = self.hostname.strip().lower()
         if self.hostname_purpose:
             self.hostname_purpose = self.hostname_purpose.strip().lower()
         if self.pk is None or self._state.adding:
@@ -2541,6 +2673,50 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
             _check_locked_fields_unchanged(
                 NetworkSwitch, self.pk, {"switch_type": self.switch_type_id}, update_fields=None
             )
+            # Rename-only (ADR 0023 decision 6, amended twice) — only when
+            # an existing row's hostname differs from what's stored, never
+            # on creation (the branch above). _stored_hostname() mirrors
+            # _check_locked_fields_unchanged()'s own guard: a row that
+            # isn't visible (mid-delete elsewhere) has nothing to compare
+            # against, so this is silently skipped rather than raising.
+            stored_hostname = _stored_hostname(NetworkSwitch, self.pk)
+            if stored_hostname is not None and self.hostname != stored_hostname:
+                _validate_hostname_unique(self.hostname, exclude_switch_pk=self.pk, exclude_device_pk=None)
+
+    @property
+    def hostname_diverges(self) -> bool:
+        """Stateless indicator (ADR 0023 decision 9, corrected in phase 18
+        PR 4): a stored ``hostname`` exists, ``assemble_hostname()``'s
+        equivalent join over this row's current components produces a
+        name, and the two differ. No new field — recomputed on every
+        access — and no collision query: this uses only the pure-join
+        half (``_assemble_hostname_stem()``), never
+        ``choose_sequence()``/``hostname_is_taken()``, so rendering it
+        costs no query beyond the three relation reads (``owner``,
+        ``rack``, ``switch_type``) a caller must already have
+        ``select_related`` for its own sake.
+
+        Narrower than ADR 0023's original "every component present"
+        wording, which would make divergence unreachable in practice —
+        no live device has both a purpose and a sequence. The operative
+        test is just: does the stored name still match what its own
+        components would produce right now? A rack move that leaves the
+        previous rack's location baked into a name is exactly what this
+        is for (#54); it says nothing about which reading is *right*.
+        """
+        if not self.hostname:
+            return False
+        owner = _get_related(self, "owner")
+        rack = _get_related(self, "rack")
+        switch_type = _get_related(self, "switch_type")
+        computed = _assemble_hostname_stem(
+            owner_slug=owner.slug if owner is not None else None,
+            location_slug=rack.location_slug if rack is not None else None,
+            type_slug=switch_type.hostname_slug if switch_type is not None else None,
+            purpose=self.hostname_purpose,
+            sequence=self.hostname_sequence,
+        )
+        return computed is not None and computed != self.hostname
 
     @property
     def address_materialization(self) -> str:
@@ -3334,7 +3510,7 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
     """
 
     device_type = models.ForeignKey(NetworkDeviceType, on_delete=models.PROTECT, related_name="devices")
-    hostname = models.CharField(max_length=255, blank=True)
+    hostname = models.CharField(max_length=63, blank=True)
     serial_number = models.CharField(max_length=100, blank=True)
     rack = models.ForeignKey(Rack, on_delete=models.PROTECT, null=True, blank=True, related_name="devices")
     rack_slot = models.PositiveIntegerField(null=True, blank=True, validators=[MinValueValidator(1)])
@@ -3447,7 +3623,11 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
         # Stripped/lowercased here too, not just clean() — Model.save()
-        # never calls clean() (Department.save()'s reasoning).
+        # never calls clean() (Department.save()'s reasoning). hostname
+        # joins hostname_purpose here (ADR 0023 decision 8, amended) — see
+        # NetworkSwitch.save()'s identical comment.
+        if self.hostname:
+            self.hostname = self.hostname.strip().lower()
         if self.hostname_purpose:
             self.hostname_purpose = self.hostname_purpose.strip().lower()
         # ``self.pk is None or self._state.adding`` — see NetworkSwitch.save().
@@ -3499,12 +3679,16 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
     def clean_fields(self, exclude=None) -> None:
         # Normalize *before* the field validators run — see
         # Owner.clean_fields() for why this can't wait for clean().
+        if self.hostname:
+            self.hostname = self.hostname.strip().lower()
         if self.hostname_purpose:
             self.hostname_purpose = self.hostname_purpose.strip().lower()
         super().clean_fields(exclude=exclude)
 
     def clean(self) -> None:
         super().clean()
+        if self.hostname:
+            self.hostname = self.hostname.strip().lower()
         if self.hostname_purpose:
             self.hostname_purpose = self.hostname_purpose.strip().lower()
         if self.pk is None or self._state.adding:
@@ -3515,7 +3699,31 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                     self._check_static_materialization_possible()
         else:
             _check_locked_fields_unchanged(NetworkDevice, self.pk, self._locked_fields(), update_fields=None)
+            # Rename-only (ADR 0023 decision 6, amended twice) — see
+            # NetworkSwitch.clean()'s identical comment.
+            stored_hostname = _stored_hostname(NetworkDevice, self.pk)
+            if stored_hostname is not None and self.hostname != stored_hostname:
+                _validate_hostname_unique(self.hostname, exclude_switch_pk=None, exclude_device_pk=self.pk)
         self._check_host_invariants()
+
+    @property
+    def hostname_diverges(self) -> bool:
+        """See ``NetworkSwitch.hostname_diverges`` — identical shape, over
+        ``device_type`` rather than ``switch_type``.
+        """
+        if not self.hostname:
+            return False
+        owner = _get_related(self, "owner")
+        rack = _get_related(self, "rack")
+        device_type = _get_related(self, "device_type")
+        computed = _assemble_hostname_stem(
+            owner_slug=owner.slug if owner is not None else None,
+            location_slug=rack.location_slug if rack is not None else None,
+            type_slug=device_type.hostname_slug if device_type is not None else None,
+            purpose=self.hostname_purpose,
+            sequence=self.hostname_sequence,
+        )
+        return computed is not None and computed != self.hostname
 
     @property
     def port_addressing(self) -> str:
@@ -4309,13 +4517,14 @@ class NetworkDevicePort(AuditedModel):
         an empty string would render as a stray ``-``. Stored nowhere;
         recomputed on every access.
 
-        Casing is **not** normalised on this half: the suffix is already
-        lowercased (``NetworkDeviceTypePort.save()``/``clean()``), but
-        ``device.hostname`` is whatever the operator typed — production
-        stores ``DM7C-1``, so this yields ``DM7C-1-device-control`` where
-        the addressing sheet spells it ``dm7c-1-device-control``. Phase 18
-        owns hostname casing; no test here may compare this property
-        case-sensitively.
+        Casing is **not** normalised on this half — there is nothing left
+        to normalise: the suffix is already lowercased
+        (``NetworkDeviceTypePort.save()``/``clean()``), and phase 18 (ADR
+        0023 decision 8, amended) now lowercases ``device.hostname`` itself
+        on write *and* backfills every existing row, so this consistently
+        yields ``dm7c-1-device-control``, matching the addressing sheet. No
+        test here may compare this property case-sensitively regardless —
+        the guarantee lives on ``hostname``, not here.
         """
         source_type_port = _get_related(self, "source_type_port")
         if source_type_port is None or not source_type_port.hostname_suffix:

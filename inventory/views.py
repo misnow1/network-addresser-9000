@@ -257,6 +257,11 @@ class Occupant:
     row_kind: str  # "start" | "continuation" — this row's position within the occupant's span
     span: int  # 1 for a switch or an ordinary device; > 1 only for an ADR 0017 offset device
     is_span_end: bool  # True on the last ordinal of a multi-ordinal span
+    #: #54 — read straight off the model property (no query of its own,
+    #: see NetworkSwitch/NetworkDevice.hostname_diverges); carried onto
+    #: Occupant rather than read from the template so the marker needs no
+    #: extra select_related beyond what this view already declares.
+    hostname_diverges: bool = False
 
     @property
     def bracketed(self) -> bool:
@@ -466,6 +471,7 @@ def _switch_row(columns: list[RackVlanRange], switch: NetworkSwitch) -> tuple[Oc
         row_kind="start",
         span=1,
         is_span_end=True,
+        hostname_diverges=switch.hostname_diverges,
     )
     return occupant, cells
 
@@ -513,6 +519,7 @@ def _device_row(
         row_kind=entry.row_kind,
         span=span,
         is_span_end=(offset == span - 1),
+        hostname_diverges=device.hostname_diverges,
     )
     return occupant, cells
 
@@ -631,10 +638,15 @@ def rack_detail(request: HttpRequest, pk: int) -> HttpResponse:
     ``auditlog.view_logentry``.
     """
     vlan_range_qs = RackVlanRange.objects.select_related("vlan").order_by("vlan__vlan_id")
-    switch_qs = NetworkSwitch.objects.select_related("switch_type").prefetch_related(
+    # owner (and rack, below) join switch_type/device_type here for
+    # hostname_diverges (#54, ADR 0023 phase 18 PR 4) — the registry's own
+    # select_related hints never reach this shaped view, so its query
+    # budget has to declare them itself or the marker is an N+1 across the
+    # rack's occupants.
+    switch_qs = NetworkSwitch.objects.select_related("switch_type", "owner", "rack").prefetch_related(
         Prefetch("addresses", queryset=NetworkSwitchAddress.objects.select_related("vlan"))
     )
-    device_qs = NetworkDevice.objects.select_related("device_type").prefetch_related(
+    device_qs = NetworkDevice.objects.select_related("device_type", "owner", "rack").prefetch_related(
         Prefetch("ports", queryset=NetworkDevicePort.objects.select_related("vlan")),
     )
     rack = get_object_or_404(
@@ -993,11 +1005,17 @@ def spare_pool(request: HttpRequest) -> HttpResponse:
     than serial number and hostname until it's racked.
     """
     context = {
+        # owner joins switch_type/device_type here for hostname_diverges
+        # (#54, ADR 0023 phase 18 PR 4) — explicitly decided to carry the
+        # marker on this page too: spare-pool equipment has no rack, but
+        # it can still have an owner and a Type hostname_slug, so
+        # divergence is still a meaningful question here (rack is never
+        # read for these rows — a null FK short-circuits with no query).
         "spare_switches": NetworkSwitch.objects.filter(rack__isnull=True)
-        .select_related("switch_type")
+        .select_related("switch_type", "owner")
         .order_by("hostname"),
         "spare_devices": NetworkDevice.objects.filter(rack__isnull=True)
-        .select_related("device_type")
+        .select_related("device_type", "owner")
         .order_by("hostname"),
     }
     return render(request, "inventory/spare_pool.html", context)
@@ -1416,6 +1434,12 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Owner", "owner", render="relation"),
             FieldSpec("Hostname purpose", "hostname_purpose"),
             FieldSpec("Hostname sequence", "hostname_sequence"),
+            # #54 — NetworkSwitch has no shaped view of its own (unlike
+            # Rack/NetworkDevice's canonical_detail_view), so this registry
+            # entry is the only place the marker can reach it at all. Costs
+            # no extra query: list_select_related already covers every
+            # relation hostname_diverges reads.
+            FieldSpec("Diverges", "hostname_diverges", render="boolean"),
         ),
         detail_fields=(
             FieldSpec("Hostname", "hostname"),
@@ -1427,6 +1451,7 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Owner", "owner", render="relation"),
             FieldSpec("Hostname purpose", "hostname_purpose"),
             FieldSpec("Hostname sequence", "hostname_sequence"),
+            FieldSpec("Diverges", "hostname_diverges", render="boolean"),
         ),
         # NetworkSwitch has no shaped page of its own yet — this is the
         # first genuinely generic detail page in the registry.
@@ -1550,6 +1575,12 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Rack slot", "rack_slot"),
             FieldSpec("Host", "host", render="relation"),
             FieldSpec("Owner", "owner", render="relation"),
+            # #54 — costs no extra query: list_select_related already
+            # covers every relation hostname_diverges reads. NetworkDevice
+            # has its own canonical page (device_detail.html) with its own
+            # marker; this is what the /models/networkdevice/ *list* page
+            # (not the detail redirect) shows instead.
+            FieldSpec("Diverges", "hostname_diverges", render="boolean"),
         ),
         # Never actually rendered — see the Rack entry's identical note.
         detail_fields=(
@@ -1560,6 +1591,7 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Rack slot", "rack_slot"),
             FieldSpec("Host", "host", render="relation"),
             FieldSpec("Owner", "owner", render="relation"),
+            FieldSpec("Diverges", "hostname_diverges", render="boolean"),
         ),
         inlines=(
             InlineSpec(

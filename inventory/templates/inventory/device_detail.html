@@ -4,7 +4,14 @@
 {% block title %}{{ device }} — Network Addresser 9000{% endblock %}
 
 {% block content %}
-  <h1>{{ device }}</h1>
+  <h1>
+    {{ device }}
+    {% if device.hostname_diverges %}
+      {# #54 — this stored name no longer matches what its own components #}
+      {# would compute right now. Says nothing about which reading is right. #}
+      <span class="badge badge--diverges" title="This name no longer matches its owner/location/type/purpose/sequence.">name diverges</span>
+    {% endif %}
+  </h1>
   <p class="tile__meta">{{ device.device_type }}</p>
 
   <div class="panel">

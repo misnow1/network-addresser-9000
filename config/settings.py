@@ -292,10 +292,14 @@ AUDITLOG_INCLUDE_TRACKING_MODELS = (
     # ADR 0023 — owner/hostname_purpose/hostname_sequence join the existing
     # scoped include_fields lists below; a whitelist doesn't pick up new
     # fields automatically (unlike Rack/the two Type models above, which
-    # are registered bare).
+    # are registered bare). hostname itself joins here in phase 18 (PR 3)
+    # — it's writable (the add forms, the recompute action, an ordinary
+    # hand edit) and was in neither list, so an Editor could rename any
+    # selection of equipment with no audit trail at all.
     {
         "model": "inventory.NetworkSwitch",
         "include_fields": [
+            "hostname",
             "rack",
             "rack_slot",
             "owner",
@@ -309,6 +313,7 @@ AUDITLOG_INCLUDE_TRACKING_MODELS = (
     {
         "model": "inventory.NetworkDevice",
         "include_fields": [
+            "hostname",
             "rack",
             "rack_slot",
             "host",

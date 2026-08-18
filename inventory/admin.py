@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, NamedTuple
 
 from auditlog.mixins import AuditlogHistoryAdminMixin
 from django import forms
@@ -13,6 +13,7 @@ from django.shortcuts import get_object_or_404, redirect
 from django.template.response import TemplateResponse
 from django.urls import URLPattern, path
 
+from .hostnames import HostnameComponents, assemble_hostname, choose_sequence, resolve_explicit_sequence
 from .models import (
     _PROFILE_IN_USE_LOCKED_FIELDS,
     _PROFILE_SYSTEM_LOCKED_FIELDS,
@@ -387,6 +388,240 @@ def _fill_rack_derived_owner_default(cleaned_data: dict[str, Any], rack: Any) ->
         cleaned_data["owner"] = rack.owner
 
 
+def _fill_computed_hostname(cleaned_data: dict[str, Any], rack: Any, type_obj: Any) -> list[str]:
+    """Fills a blank ``hostname`` via ``assemble_hostname()``/
+    ``choose_sequence()`` (ADR 0023 decisions 5 and 7) — a creation-time
+    suggestion, never overwriting a typed value. Shared by
+    ``NetworkDeviceAddForm``/``NetworkSwitchAddForm``, the same shape as
+    ``_fill_rack_derived_owner_default()`` a few lines above, and must run
+    before each form's own early return (the trap the plan review
+    caught): a spare-pool device has no ``rack`` at all, and ADR 0023
+    requires that assembly still work for exactly that case.
+
+    An explicitly-typed ``hostname_sequence`` is honoured, not overridden
+    (settled decision 4/6) — ``choose_sequence()`` only runs when it's
+    still blank; a typed value instead goes through
+    ``resolve_explicit_sequence()``, which only ever bumps *forward* from
+    it if that exact name is already taken (code review finding 3 — two
+    operators independently typing the same sequence on twin devices
+    must not both compute the same name). Either way the resulting value
+    is written back into ``cleaned_data``, since it's in every add form's
+    ``Meta.fields`` and a newly-created device would otherwise diverge
+    from its own name the moment it exists.
+
+    Returns the advisory messages ``choose_sequence()``'s bump produced,
+    if any (ADR 0023 decision 7's two messages) — the caller's ``clean()``
+    stashes these on ``self._hostname_advisories`` rather than emitting
+    them directly, since ``ModelForm.clean()`` has no ``request``
+    (review note 6); ``ModelAdmin.save_model()`` emits them once it has
+    both.
+
+    ``type_obj`` is ``device_type``/``switch_type`` — whichever the
+    calling form's own field is — passed in explicitly rather than read
+    by a fixed key, since the two forms don't share a field name for it.
+    """
+    if cleaned_data.get("hostname"):
+        return []  # a typed value is never overwritten, and gets no advisories either
+    owner = cleaned_data.get("owner")
+    type_slug = type_obj.hostname_slug if type_obj is not None else None
+    stem_components = HostnameComponents(
+        owner_slug=owner.slug if owner is not None else None,
+        location_slug=rack.location_slug if rack is not None else None,
+        type_slug=type_slug,
+        purpose=cleaned_data.get("hostname_purpose") or "",
+        sequence=None,
+    )
+    stem = assemble_hostname(stem_components)
+    if stem is None:
+        return []  # blocked — nothing to fill, nothing to advise about
+
+    sequence = cleaned_data.get("hostname_sequence")
+    advisories: list[str] = []
+    if sequence is None:
+        bare_twin = _bare_twin_without_sequence(stem, exclude_switch_pk=None, exclude_device_pk=None)
+        sequence = choose_sequence(stem, exclude_switch_pk=None, exclude_device_pk=None)
+        if sequence == 2 and bare_twin is not None:
+            advisories.append(
+                f"{bare_twin} shares this hostname with no sequence of its own — consider giving "
+                "it hostname_sequence=1."
+            )
+        cleaned_data["hostname_sequence"] = sequence
+    else:
+        # Explicit — honoured as typed, only bumped forward if that exact
+        # name is already occupied (code review finding 3).
+        resolved = resolve_explicit_sequence(stem, sequence, exclude_switch_pk=None, exclude_device_pk=None)
+        if resolved != sequence:
+            # Silently rewriting the operator's own typed value with no
+            # explanation would be exactly the kind of surprise ADR 0019's
+            # suggest-don't-lock exists to avoid (code review finding 3).
+            advisories.append(f"hostname_sequence {sequence} was already in use; used {resolved} instead.")
+            cleaned_data["hostname_sequence"] = resolved
+        sequence = resolved
+    if rack is not None and rack.location_slug and sequence is not None and not stem_components.purpose:
+        advisories.append(
+            "A purpose reads better than a bare number here — consider setting hostname_purpose."
+        )
+
+    final_name = assemble_hostname(stem_components._replace(sequence=sequence))
+    if final_name:
+        cleaned_data["hostname"] = final_name
+    return advisories
+
+
+class _HostnameRecomputeResult(NamedTuple):
+    """One row's outcome from the "Recompute hostname" action — enough for
+    ``recompute_hostnames()`` to both report and, for ``skipped``, say why.
+    """
+
+    status: str  #: "renamed" | "unchanged" | "skipped"
+    reason: str | None  #: populated only for "skipped"
+    advisories: list[str]
+
+
+def _bare_twin_without_sequence(
+    stem: str, *, exclude_switch_pk: int | None, exclude_device_pk: int | None
+) -> "NetworkSwitch | NetworkDevice | None":
+    """The first row (switch or device) whose stored ``hostname`` is
+    exactly ``stem`` and whose ``hostname_sequence`` is null, if any —
+    what the first advisory (ADR 0023 decision 7, amended) names: *"a
+    twin exists with no sequence, recommend assigning it 1."* A message
+    about an already-saved row, not an action on it — this never writes
+    anything.
+    """
+    switches = NetworkSwitch.objects.filter(hostname=stem, hostname_sequence__isnull=True)
+    if exclude_switch_pk is not None:
+        switches = switches.exclude(pk=exclude_switch_pk)
+    found = switches.first()
+    if found is not None:
+        return found
+    devices = NetworkDevice.objects.filter(hostname=stem, hostname_sequence__isnull=True)
+    if exclude_device_pk is not None:
+        devices = devices.exclude(pk=exclude_device_pk)
+    return devices.first()
+
+
+def _recompute_hostname(
+    obj: "NetworkSwitch | NetworkDevice",
+    *,
+    type_slug: str | None,
+    exclude_switch_pk: int | None,
+    exclude_device_pk: int | None,
+) -> _HostnameRecomputeResult:
+    """The "Recompute hostname" action's per-object logic (ADR 0023
+    decision 5), shared by both admins — mutates ``obj`` in place
+    (``owner``, ``hostname_sequence``, ``hostname``) and leaves saving it
+    to the caller, exactly as ``pull_cards`` leaves its own ``save()`` to
+    the per-row loop that calls it.
+
+    1. A blank ``owner`` is filled from ``obj.rack.owner`` when this
+       object has a rack — the add-form default never fired for
+       already-imported rows, so without this every production device
+       stays permanently blocked on a null owner (ADR 0023 decision 5).
+       Stored regardless of what happens next, unlike ``assemble_hostname()``
+       itself, which never reads through to the rack for owner.
+    2. ``assemble_hostname()`` over the stem (every component but
+       sequence). Blocked (``None``) is reported, naming which component
+       is missing, and nothing else below runs.
+    3. ``choose_sequence()`` only when ``hostname_sequence`` is still
+       null — an explicitly-set value is honoured, never overridden
+       (settled decision 4/6), though still passed through
+       ``resolve_explicit_sequence()`` to bump forward if that exact name
+       is already taken (code review finding 3).
+    4. The final name overwrites whatever ``hostname`` held, unconditionally.
+    """
+    rack = obj.rack  # None for a spare-pool object; one query either way, needed for location below
+    if obj.owner_id is None and rack is not None:
+        obj.owner = rack.owner  # rack.owner may itself be None; still "stored" (assigned in memory)
+    owner = obj.owner
+    stem_components = HostnameComponents(
+        owner_slug=owner.slug if owner is not None else None,
+        location_slug=rack.location_slug if rack is not None else None,
+        type_slug=type_slug,
+        purpose=obj.hostname_purpose,
+        sequence=None,
+    )
+    stem = assemble_hostname(stem_components)
+    if stem is None:
+        missing = [
+            name
+            for name, present in (("owner", stem_components.owner_slug), ("type's hostname_slug", type_slug))
+            if not present
+        ]
+        return _HostnameRecomputeResult("skipped", f"missing {' and '.join(missing)}", [])
+
+    advisories: list[str] = []
+    if obj.hostname_sequence is None:
+        bare_twin = _bare_twin_without_sequence(
+            stem, exclude_switch_pk=exclude_switch_pk, exclude_device_pk=exclude_device_pk
+        )
+        # current_name=obj.hostname (code review finding 1) — without this,
+        # the bare-named member of a numbered group is not idempotent:
+        # excluding itself from the sibling scan makes the highest
+        # *remaining* sibling look like the group's own top, so it gets
+        # bumped to a numbered suffix on every subsequent recompute.
+        obj.hostname_sequence = choose_sequence(
+            stem,
+            current_name=obj.hostname,
+            exclude_switch_pk=exclude_switch_pk,
+            exclude_device_pk=exclude_device_pk,
+        )
+        if obj.hostname_sequence == 2 and bare_twin is not None:
+            advisories.append(
+                f"{bare_twin} shares this hostname with no sequence of its own — consider giving "
+                "it hostname_sequence=1."
+            )
+    else:
+        # Explicit — honoured as-is, only bumped forward if that exact
+        # name is already taken (code review finding 3).
+        original_sequence = obj.hostname_sequence
+        obj.hostname_sequence = resolve_explicit_sequence(
+            stem,
+            obj.hostname_sequence,
+            exclude_switch_pk=exclude_switch_pk,
+            exclude_device_pk=exclude_device_pk,
+        )
+        if obj.hostname_sequence != original_sequence:
+            advisories.append(
+                f"hostname_sequence {original_sequence} was already in use; used "
+                f"{obj.hostname_sequence} instead."
+            )
+    if (
+        rack is not None
+        and rack.location_slug
+        and obj.hostname_sequence is not None
+        and not obj.hostname_purpose
+    ):
+        advisories.append(
+            "A purpose reads better than a bare number here — consider setting hostname_purpose."
+        )
+
+    final_name = assemble_hostname(stem_components._replace(sequence=obj.hostname_sequence))
+    # stem (owner + type_slug at minimum) already assembled above; adding a
+    # sequence on top of already-present components can't newly block.
+    assert final_name is not None
+    if obj.hostname == final_name:
+        return _HostnameRecomputeResult("unchanged", None, advisories)
+    obj.hostname = final_name
+    return _HostnameRecomputeResult("renamed", None, advisories)
+
+
+def _emit_hostname_advisories(request: HttpRequest, form: object) -> None:
+    """Emits whatever ``_fill_computed_hostname()`` stashed on ``form.
+    _hostname_advisories`` (ADR 0023 decision 7's two messages) — called
+    from each admin's ``save_model()``, which is the first place both a
+    ``request`` and the form exist together (review note 6).
+
+    ``getattr(..., [])`` covers every form that never stashed anything at
+    all — the change form (never assembles), a bare ``ModelForm``
+    constructed directly rather than through the admin (no ``save_model()``
+    call reaches it either, so this never even runs for one), and an add
+    form whose ``clean()`` bailed before reaching
+    ``_fill_computed_hostname()``.
+    """
+    for advisory in getattr(form, "_hostname_advisories", []):
+        messages.info(request, advisory)
+
+
 class NetworkDeviceAddForm(forms.ModelForm):
     """Carries the creation-time-only ``port_addressing`` choice (ADR 0013)
     — not a model field, so it can't be expressed via ``Meta.fields``
@@ -584,6 +819,13 @@ class NetworkDeviceAddForm(forms.ModelForm):
         rack = cleaned_data.get("rack")
         _fill_rack_derived_owner_default(cleaned_data, rack)
         device_type = cleaned_data.get("device_type")
+        # Must run before the "rack is None" bail immediately below (Codex
+        # review of the plan, note 7) — a spare-pool device has no rack at
+        # all, and ADR 0023 requires that assembly still work for exactly
+        # that case (location is simply absent, not blocking). Stashed
+        # rather than emitted — clean() has no request (review note 6);
+        # save_model() emits these once it has one.
+        self._hostname_advisories = _fill_computed_hostname(cleaned_data, rack, device_type)
         if rack is None or device_type is None:
             return cleaned_data
         host_slot = cleaned_data.get("rack_slot")
@@ -703,6 +945,11 @@ class NetworkSwitchAddForm(forms.ModelForm):
         cleaned_data = super().clean() or {}
         rack = cleaned_data.get("rack")
         _fill_rack_derived_owner_default(cleaned_data, rack)
+        # Stashed rather than emitted — see NetworkDeviceAddForm.clean()'s
+        # identical comment.
+        self._hostname_advisories = _fill_computed_hostname(
+            cleaned_data, rack, cleaned_data.get("switch_type")
+        )
         if rack is not None and cleaned_data.get("rack_slot") is None:
             slot = lowest_free_run(occupied_rack_slot_ranges(rack), 1, rack.slot_count)
             if slot is None:
@@ -1183,6 +1430,49 @@ def delete_selected(modeladmin: "NetworkSwitchAdmin", request: HttpRequest, quer
     return response
 
 
+class _HostnameDivergesFilterBase(admin.SimpleListFilter):
+    """#54 / ADR 0023 phase 18 PR 4 — ``hostname_diverges`` is a Python
+    property, not a database column, so it can't be an ordinary
+    ``list_filter`` string entry (this repo has no existing
+    ``SimpleListFilter`` to copy; this is the first). ``queryset()`` scans
+    in Python rather than filtering in SQL — 84 equipment rows today, and
+    every relation the property reads (``owner``, ``rack``, the Type) is
+    ``select_related`` here so the scan itself stays one query rather than
+    an N+1 across the changelist's own row count.
+
+    ``_type_field`` names the Type FK, since that differs between the two
+    concrete subclasses below (``switch_type``/``device_type``); everything
+    else is identical.
+    """
+
+    title = "hostname divergence"
+    parameter_name = "hostname_diverges"
+    _type_field: str = ""
+
+    def lookups(self, request: HttpRequest, model_admin: Any) -> list[tuple[str, str]]:
+        return [("yes", "Diverges"), ("no", "Matches")]
+
+    def queryset(self, request: HttpRequest, queryset: QuerySet) -> QuerySet:
+        value = self.value()
+        if value not in ("yes", "no"):
+            return queryset
+        wants_diverging = value == "yes"
+        matching_pks = [
+            obj.pk
+            for obj in queryset.select_related("owner", "rack", self._type_field)
+            if obj.hostname_diverges == wants_diverging
+        ]
+        return queryset.filter(pk__in=matching_pks)
+
+
+class NetworkSwitchHostnameDivergesFilter(_HostnameDivergesFilterBase):
+    _type_field = "switch_type"
+
+
+class NetworkDeviceHostnameDivergesFilter(_HostnameDivergesFilterBase):
+    _type_field = "device_type"
+
+
 @admin.register(NetworkSwitch)
 class NetworkSwitchAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
     list_display = [
@@ -1197,14 +1487,16 @@ class NetworkSwitchAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
         "hostname_sequence",
     ]
     search_fields = ["hostname", "serial_number"]
-    list_filter = ["rack", "switch_type", "owner"]
+    list_filter = ["rack", "switch_type", "owner", NetworkSwitchHostnameDivergesFilter]
     # Declarative, not relied-on auto-select_related() — owner/rack/switch_type
     # are all nullable-or-not-descended the same way VLANAdmin's comment
     # above explains.
     list_select_related = ["switch_type", "rack", "owner"]
     inlines = [NetworkSwitchAddressInline, NetworkSwitchPortInline]
     show_auditlog_history_link = True
-    actions = [delete_selected]
+    # "recompute_hostnames" must be named here explicitly (settled decision
+    # 8) — a decorated-but-unlisted admin.action() method never renders.
+    actions = [delete_selected, "recompute_hostnames"]
 
     def get_readonly_fields(self, request: HttpRequest, obj: Any = None) -> list[str]:
         # switch_type is fixed at creation (ADR 0010) — editable on Add,
@@ -1212,6 +1504,10 @@ class NetworkSwitchAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
         if obj is not None:
             return ["switch_type"]
         return []
+
+    def save_model(self, request: HttpRequest, obj: Any, form: object, change: bool) -> None:
+        super().save_model(request, obj, form, change)
+        _emit_hostname_advisories(request, form)
 
     def get_form(self, request: HttpRequest, obj: Any = None, change: bool = False, **kwargs: Any) -> Any:
         # address_materialization (ADR 0016) only makes sense at creation —
@@ -1237,6 +1533,49 @@ class NetworkSwitchAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
                 NetworkSwitch.objects.filter(pk=switch.pk)
             )
         return super().delete_view(request, object_id, extra_context)
+
+    # -- Recompute hostname (ADR 0023) -----------------------------------------
+
+    @admin.action(permissions=["change"], description="Recompute hostname")
+    def recompute_hostnames(self, request: HttpRequest, queryset: QuerySet) -> None:
+        """Saved per row, like ``pull_cards`` — each row is locked,
+        recomputed and saved on its own, sequentially, so a batch of
+        identical switches gets that many distinct names rather than one
+        query's worth of stale sibling data (settled decision, PR 3
+        Tests: 17 identical amps -> 17 distinct names, mirrored here for
+        switches). ``permissions=["change"]`` restricts this to holders of
+        ``inventory.change_networkswitch`` — Django's own
+        ``_filter_actions_by_permissions``, not a hand-rolled check.
+        """
+        renamed = 0
+        unchanged = 0
+        skipped: list[str] = []
+        for switch in queryset:
+            with transaction.atomic():
+                current = NetworkSwitch.objects.select_for_update().filter(pk=switch.pk).first()
+                if current is None:
+                    continue
+                result = _recompute_hostname(
+                    current,
+                    type_slug=current.switch_type.hostname_slug,
+                    exclude_switch_pk=current.pk,
+                    exclude_device_pk=None,
+                )
+                current.save()
+                if result.status == "skipped":
+                    skipped.append(f"{current} ({result.reason})")
+                elif result.status == "renamed":
+                    renamed += 1
+                else:
+                    unchanged += 1
+                for advisory in result.advisories:
+                    messages.info(request, advisory)
+        if renamed:
+            messages.success(request, f"Recomputed {renamed} hostname(s).")
+        if unchanged:
+            messages.info(request, f"{unchanged} hostname(s) already up to date.")
+        if skipped:
+            messages.warning(request, f"Skipped {len(skipped)}: {'; '.join(skipped)}.")
 
 
 @admin.register(NetworkDeviceType)
@@ -1276,11 +1615,20 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
     # ("host", EmptyFieldListFilter) gives fitted/unfitted as the filter
     # choices (ADR 0022 PR 3) — a plain "host" filter would instead list
     # every individual host, which isn't the question this filter answers.
-    list_filter = ["rack", "device_type", ("host", admin.EmptyFieldListFilter), "owner"]
+    list_filter = [
+        "rack",
+        "device_type",
+        ("host", admin.EmptyFieldListFilter),
+        "owner",
+        NetworkDeviceHostnameDivergesFilter,
+    ]
     list_select_related = ["device_type", "rack", "host", "owner"]
     inlines = [NetworkDevicePortInline]
     show_auditlog_history_link = True
-    actions = ["pull_cards"]
+    # "recompute_hostnames" must be named here explicitly (settled decision
+    # 8, matching "pull_cards" already here) — a decorated-but-unlisted
+    # admin.action() method never renders.
+    actions = ["pull_cards", "recompute_hostnames"]
 
     def get_readonly_fields(self, request: HttpRequest, obj: Any = None) -> list[str]:
         # device_type is fixed at creation (ADR 0010) — editable on Add,
@@ -1288,6 +1636,10 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
         if obj is None:
             return []
         return ["device_type"]
+
+    def save_model(self, request: HttpRequest, obj: Any, form: object, change: bool) -> None:
+        super().save_model(request, obj, form, change)
+        _emit_hostname_advisories(request, form)
 
     def get_form(self, request: HttpRequest, obj: Any = None, change: bool = False, **kwargs: Any) -> Any:
         # port_addressing/operator-address inputs (ADR 0013/0022) only
@@ -1341,6 +1693,49 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
             messages.success(request, f"Pulled {pulled} card(s) from their host.")
         if skipped:
             messages.info(request, f"{skipped} selected device(s) had no host to pull.")
+
+    # -- Recompute hostname (ADR 0023) -----------------------------------------
+
+    @admin.action(permissions=["change"], description="Recompute hostname")
+    def recompute_hostnames(self, request: HttpRequest, queryset: QuerySet) -> None:
+        """Saved per row, like ``pull_cards`` above — each row is locked,
+        recomputed and saved on its own, sequentially, so a batch of
+        identical devices gets that many distinct names rather than one
+        stale round of sibling data (PR 3 Tests: 17 identical amps -> 17
+        distinct names). ``permissions=["change"]`` restricts this to
+        holders of ``inventory.change_networkdevice`` — Django's own
+        ``_filter_actions_by_permissions``, not a hand-rolled check.
+        """
+        renamed = 0
+        unchanged = 0
+        skipped: list[str] = []
+        for device in queryset:
+            with transaction.atomic():
+                locked = _lock_devices_by_pk(device.pk)
+                current = locked.get(device.pk)
+                if current is None:
+                    continue
+                result = _recompute_hostname(
+                    current,
+                    type_slug=current.device_type.hostname_slug,
+                    exclude_switch_pk=None,
+                    exclude_device_pk=current.pk,
+                )
+                current.save()
+                if result.status == "skipped":
+                    skipped.append(f"{current} ({result.reason})")
+                elif result.status == "renamed":
+                    renamed += 1
+                else:
+                    unchanged += 1
+                for advisory in result.advisories:
+                    messages.info(request, advisory)
+        if renamed:
+            messages.success(request, f"Recomputed {renamed} hostname(s).")
+        if unchanged:
+            messages.info(request, f"{unchanged} hostname(s) already up to date.")
+        if skipped:
+            messages.warning(request, f"Skipped {len(skipped)}: {'; '.join(skipped)}.")
 
     # -- Fit a card (ADR 0022 PR 3) -----------------------------------------------
 

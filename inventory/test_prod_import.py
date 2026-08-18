@@ -31,6 +31,7 @@ below is fabricated for this suite and appears in no CSV under ``prod/``.
 """
 
 import csv
+import importlib
 import ipaddress
 import tempfile
 from pathlib import Path
@@ -40,6 +41,13 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import TestCase
 
+from .management.commands.import_prod_data import (
+    DEVICE_TYPES,
+    PRIMARY_SWITCH_TABLES,
+    SECONDARY_DERIVED_TABLES,
+)
+from .management.commands.import_prod_data import HOSTNAME_SLUGS as IMPORTER_HOSTNAME_SLUGS
+from .management.commands.verify_prod_import import HOSTNAME_SLUGS as VERIFIER_HOSTNAME_SLUGS
 from .management.commands.verify_prod_import import _check_cross_vlan_alignment, _Findings
 from .models import (
     VLAN,
@@ -55,6 +63,16 @@ from .models import (
     Rack,
     RackVlanRange,
 )
+
+# A migration module's name isn't a valid Python identifier ("0018_..."
+# starts with a digit), so importlib rather than a plain `from ... import` —
+# same reasoning tests.py's migration-reconstruction test classes already
+# use. Importing it is safe and does nothing to the database; only actually
+# *applying* a migration (via MigrationExecutor) runs its RunPython
+# functions.
+MIGRATION_HOSTNAME_SLUGS = importlib.import_module(
+    "inventory.migrations.0018_seed_hostname_slugs"
+).HOSTNAME_SLUGS
 
 # -- Synthetic VLAN/rack scheme -----------------------------------------------------
 
@@ -452,7 +470,9 @@ class ImportProdDataTests(TestCase):
 
     def test_sd12_slot_offset_and_dmi_dante_card(self) -> None:
         console = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=1)
-        self.assertEqual(console.hostname, "SD12-TEST-1")
+        # Lowercase — ADR 0023 decision 8 (amended): hostname is normalised
+        # on write.
+        self.assertEqual(console.hostname, "sd12-test-1")
         self.assertEqual(console.device_type.model, "SD12")
         control_port = console.ports.get(slot_offset=0)
         engine_port = console.ports.get(slot_offset=1)
@@ -534,14 +554,39 @@ class ImportProdDataTests(TestCase):
             self.assertEqual(device.ports.get().vlan.vlan_id, dp_id)
 
     def test_hostnames_from_device_description(self) -> None:
+        # Lowercase — ADR 0023 decision 8 (amended).
         self.assertEqual(
             NetworkSwitch.objects.get(rack__name="AMPRACK1", rack_slot=1).hostname,
-            "Cisco SG300-10MP (For 3xAmp Rack Primary)",
+            "cisco sg300-10mp (for 3xamp rack primary)",
         )
-        self.assertEqual(NetworkDevice.objects.get(rack__name="W8LMTEST", rack_slot=2).hostname, "LM26")
+        self.assertEqual(NetworkDevice.objects.get(rack__name="W8LMTEST", rack_slot=2).hostname, "lm26")
         self.assertEqual(
             NetworkDevice.objects.get(rack__name="AVIO", rack_slot=1).hostname, "mps-avio-radial-tx"
         )
+
+    def test_import_applies_hostname_slugs_to_created_types(self) -> None:
+        """ADR 0023 decision 10, amended (phase 18 PR 4) — every Type this
+        import creates gets its ``hostname_slug`` from ``HOSTNAME_SLUGS``,
+        including a switch type (0 of which carried one on the live
+        database, unlike the device side) and one two-profile device
+        model (``IK-42`` — both profiles must agree).
+        """
+        primary = NetworkSwitchType.objects.get(
+            manufacturer="Cisco", model="SG300-10MP", name="For 3xAmp Rack Primary"
+        )
+        secondary = NetworkSwitchType.objects.get(
+            manufacturer="Cisco", model="SG300-10MP", name="For 3xAmp Rack Secondary"
+        )
+        self.assertEqual(primary.hostname_slug, "sg300-10mp")
+        self.assertEqual(secondary.hostname_slug, "sg300-10mp")
+        with_card = NetworkDeviceType.objects.get(
+            manufacturer="Martin Audio", model="IK-42", name="with Dante Card"
+        )
+        without_card = NetworkDeviceType.objects.get(
+            manufacturer="Martin Audio", model="IK-42", name="without Dante Card"
+        )
+        self.assertEqual(with_card.hostname_slug, "ik42")
+        self.assertEqual(without_card.hostname_slug, "ik42")
 
     def test_dm7c_and_dm3_device_control_ports(self) -> None:
         # ADR 0022: the importer's Device Control pre-pass folds each
@@ -550,14 +595,18 @@ class ImportProdDataTests(TestCase):
         # device — in both directions, DM7C's sits below its host, DM3's
         # sits above.
         dm7c_host = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=6)
-        self.assertEqual(dm7c_host.hostname, "DM7C-1")
+        # Lowercase — ADR 0023 decision 8 (amended).
+        self.assertEqual(dm7c_host.hostname, "dm7c-1")
         self.assertEqual(dm7c_host.device_type.name, "Default")
         self.assertEqual(dm7c_host.ports.count(), 4)
         dm7c_device_control = dm7c_host.ports.get(description="Device Control")
         assert dm7c_device_control.source_type_port is not None  # materialized ports always set this
         self.assertEqual(dm7c_device_control.source_type_port.address_source, PortAddressSource.OPERATOR)
         self.assertEqual(dm7c_device_control.address, addr(FN_DANTE_PRIMARY, "CONSOLES", 5))
-        self.assertEqual(dm7c_device_control.hostname, "DM7C-1-device-control")
+        # Lowercase — the very property ADR 0022 believed it had protected
+        # from case-sensitive assertions; ADR 0023 decision 8 (amended)
+        # settles the casing this depends on.
+        self.assertEqual(dm7c_device_control.hostname, "dm7c-1-device-control")
         # Slot 5 — the interface's own row in the sheet — releases entirely;
         # no device sits there at all (#42).
         self.assertFalse(NetworkDevice.objects.filter(rack__name="CONSOLES", rack_slot=5).exists())
@@ -1067,3 +1116,69 @@ class ImportUserIdentityTests(TestCase):
         with self.assertRaises(CommandError):
             call_command("import_prod_data", data_dir=str(self.data_dir))
         self.assertFalse(Rack.objects.exists())  # refused before any writes committed
+
+
+class HostnameSlugsConstantTests(TestCase):
+    """PLAN-hostname-computation.md PR 4 "Seeding" — ``HOSTNAME_SLUGS``
+    covers every ``(manufacturer, model)`` the importer's own catalog
+    actually creates (a subset check, code review round 2, finding 4b —
+    the importer pairs must be **covered**, but the constant is allowed
+    to carry more than that; the migration's own separate copy does, by
+    design, for a live-only pair the current importer no longer creates
+    at all), and the importer's and verifier's independently re-declared
+    copies (neither imports the other, on purpose) agree with each other
+    exactly (still equality — the two are meant to describe the same
+    rebuild-time catalog).
+    """
+
+    def test_every_importer_type_pair_has_a_hostname_slugs_entry(self) -> None:
+        """A subset check (code review finding 2), not equality — the
+        importer's own HOSTNAME_SLUGS must cover every pair the importer
+        actually creates, but is allowed to carry no more than that (the
+        migration's *separate* copy carries one additional, live-only
+        pair — ("Cisco", "SG350-10P") — that the current importer catalog
+        no longer creates at all; equality here would force that pair
+        into a constant where it would be dead weight).
+        """
+        device_pairs = {(spec.manufacturer, spec.model) for spec in DEVICE_TYPES}
+        switch_pairs = {
+            (manufacturer, model) for manufacturer, model, _name in PRIMARY_SWITCH_TABLES.values()
+        } | {(manufacturer, model) for manufacturer, model, _name in SECONDARY_DERIVED_TABLES.values()}
+        self.assertTrue(
+            (device_pairs | switch_pairs) <= set(IMPORTER_HOSTNAME_SLUGS),
+            (device_pairs | switch_pairs) - set(IMPORTER_HOSTNAME_SLUGS),
+        )
+
+    def test_importer_and_verifier_copies_agree(self) -> None:
+        self.assertEqual(IMPORTER_HOSTNAME_SLUGS, VERIFIER_HOSTNAME_SLUGS)
+
+    def test_migration_copy_covers_every_importer_pair(self) -> None:
+        """Not asked for by either review round, but noted and left to
+        judgement: relaxing the importer-catalog check (above) to a
+        subset removed the last structural pressure keeping the
+        migration's *own* separate copy (0018_seed_hostname_slugs.py,
+        deliberately not shared code — see that module's own docstring)
+        in step with the importer's. This restores it cheaply: every
+        pair the importer creates must also appear, with the same slug,
+        in the migration's copy — which is free to carry more (the
+        live-only ("Cisco", "SG350-10P") pair, currently), just not less.
+        """
+        self.assertTrue(
+            set(IMPORTER_HOSTNAME_SLUGS) <= set(MIGRATION_HOSTNAME_SLUGS),
+            set(IMPORTER_HOSTNAME_SLUGS) - set(MIGRATION_HOSTNAME_SLUGS),
+        )
+        mismatched = {
+            pair: (slug, MIGRATION_HOSTNAME_SLUGS[pair])
+            for pair, slug in IMPORTER_HOSTNAME_SLUGS.items()
+            if MIGRATION_HOSTNAME_SLUGS.get(pair) != slug
+        }
+        self.assertEqual(mismatched, {})
+
+    def test_amphenol_entries_are_corrected_not_the_live_typo(self) -> None:
+        """Settled with Mike: the live ``rdj…`` slugs against models
+        spelled ``RJD…`` are a typo. The constant carries the correction,
+        not the typo.
+        """
+        for model in ("RJD1212-0050", "RJD2203-0050", "RJD32A3-0050", "RJD32U1-0050"):
+            slug = IMPORTER_HOSTNAME_SLUGS[("Amphenol", model)]
+            self.assertTrue(slug.startswith("rjd"), f"{model}: {slug!r} does not start with 'rjd'")

@@ -2,7 +2,7 @@
 
 High-level phases only — day-to-day task tracking belongs in GitHub Issues once there's code to file issues against. This file exists so it's obvious what phase the project is in and what's next, even after a fresh start.
 
-**Current phase: 18 — hostname computation, designed in ADR 0023 and ready to build. Phases 1–6 and 8–17 done; phase 7 scoped but skipped.**
+**Current phase: 19 — aligned rack allocation. Phases 1–6 and 8–18 done; phase 7 scoped but skipped.**
 
 ## 1. Foundation — done
 
@@ -309,24 +309,39 @@ Assembles phase 17's components at creation, enforces uniqueness, and resolves c
 Computed at materialization and stored — **not** immutable, and never re-derived automatically.
 That is the same rule ADR 0003 gives static addresses, and what #31 already committed to.
 
+`docs/plans/PLAN-hostname-computation.md` is the build, in four PRs. ADR 0023 needed **no
+successor** but carries four amendments made while planning this phase — decisions 6, 7, 8 and 10 —
+every one of them found by measuring the **live database** rather than `prod/*.csv`. The CSVs are
+now stale as a source of truth: 49 hostnames have been renamed by hand into scheme shape and every
+prose value is gone, so figures re-derived from the export are right about the export and wrong
+about the system.
+
 - [x] ADR: **`docs/adr/0023-hostname-scheme.md`**, written in phase 17 and covering both halves. It
       had no ADR 0018 to amend — ADR 0022 superseded it outright, and the Yamaha Device Control
       interface that forced the question is now a *port* on its console carrying
       `hostname_suffix="device-control"`, so nothing copies a host's hostname verbatim any more and
       the uniqueness rule below meets no companion
-- [ ] Assembly fills a **blank** hostname only and never overwrites a hand-typed one — ADR 0019's
+- [x] Assembly fills a **blank** hostname only and never overwrites a hand-typed one — ADR 0019's
       suggest-don't-lock applied to names. A helper in `inventory/hostnames.py`, called from the two
       admin add forms and the recompute action; never from `save()`, `clean()` or the importer,
       because the advisory messages below need a request that `save()` has not got
-- [ ] Owner and the Type's `hostname_slug` are **blocking** components — absent, no hostname is
+- [x] Owner and the Type's `hostname_slug` are **blocking** components — absent, no hostname is
       computed at all. Location, purpose and sequence are skipped when absent. A name whose first
       component has silently become the location is worse than no name
-- [ ] Cross-table uniqueness across `NetworkSwitch` + `NetworkDevice` together, validated in
+- [x] Cross-table uniqueness across `NetworkSwitch` + `NetworkDevice` together, validated in
       `full_clean()` with a plain-language error, blank exempt. Same shape as the existing
       cross-table static-address check, inheriting its known race (#5) rather than introducing a
       second, stricter mechanism for names; blank-exempt means the spare pool and every existing
-      row need no backfill
-- [ ] A `NetworkDevicePort` hostname as a **derived, read-only property** —
+      row need no backfill. **Rename-only** (ADR 0023 decision 6, amended twice): enforced when
+      `pk is not None` and `hostname` changes. The live database holds 32 rows across 5 duplicated
+      hostnames — `IK42` alone names 17 amps — so unconditional validation would freeze them all,
+      with recompute unable to help because it is blocked on `hostname_slug`. **Creation is exempt
+      too**, because the importer creates duplicates by design: it commits every row to
+      `full_clean()` and the addressing CSV repeats `IK42` eighteen times, so enforcing there would
+      break every rebuild. Little is lost — the computed path cannot collide, so a hand-typed
+      *rename* is the realistic way to make a duplicate, and that is refused. Hostnames are therefore
+      **not** unique in the database and no code may assume they are
+- [x] A `NetworkDevicePort` hostname as a **derived, read-only property** —
       `<device.hostname>-<hostname_suffix>` — **already shipped by phase 17's ADR 0022 PR 1**. This
       is where `…-sd12-engine` and `…-device-control` live. Ports have no hostname field and gain
       none. **Derived port names are inside the uniqueness check**, contrary to what this line used
@@ -336,30 +351,54 @@ That is the same rule ADR 0003 gives static addresses, and what #31 already comm
       port and a device with purpose `engine` produce the same string, and purpose is free-form.
       The check is **forward only**: renaming a device shifts its ports' derived names, and that
       cascade stays a named gap
-- [ ] Collisions bump `hostname_sequence` until the name is free, in physical and virtual racks
+- [x] Collisions bump `hostname_sequence` until the name is free, in physical and virtual racks
       alike, and never block a save. Two advisory messages ride along: recommend assigning `1` to
       a twin that has no sequence, and where the rack has a `location_slug`, note that a purpose
       reads better than a number
-- [ ] *"In a physical rack, the 4th field should be used to avoid collisions"* is guidance, not
+- [x] The **starting** sequence is chosen before that loop runs (ADR 0023 decision 7, amended),
+      because bump-until-free is wrong in two reachable cases. Nothing exists → bare name. Bare name
+      exists with no numbered siblings → start at **2**, leaving `1` for the advisory, which is what
+      `MORE_MUSINGS.md` specifies and what production's uniform `-1`/`-2` pairs look like. Any
+      numbered sibling exists → **highest + 1**, which also stops a third device taking the free bare
+      stem beside `-1` and `-2`. Highest + 1 rather than lowest-free so a gap left by a deleted
+      device is never reused — a retired hostname is referenced by DNS, switch configs and the label
+      on the box, none of which this system can see
+- [x] *"In a physical rack, the 4th field should be used to avoid collisions"* is guidance, not
       machinery — the purpose is free-form operator input (`midhi-01-04`, `sub`) that the system
       cannot invent. Likewise *"recommend the existing device be assigned 1"* is a message about
       an already-saved row, not an action
-- [ ] An explicit "recompute hostname" admin action. Moves never rename automatically. It also
+- [x] An explicit "recompute hostname" admin action. Moves never rename automatically. It also
       **fills a blank `owner` from the rack** before computing — the add-form default never fired
       for imported rows, so without this every production device stays permanently blocked on a
       null owner. Done in the action rather than in assembly so the value is *stored*, not
       inherited
-- [ ] `hostname` drops to `CharField(63)` and is stripped and lowercased on write; no
-      `validate_dns_label` on it, because the only illegal values are eight imported switch rows
-      whose hostname is prose the importer had nothing better for. Free today — the longest
-      existing value is 43 characters. Also closes the casing divergence `NetworkDevicePort.
-      hostname`'s docstring defers here: the port property starts yielding `dm7c-1-device-control`
-- [ ] #54: a **stateless** `hostname_diverges` property — every component present, a hostname
+- [x] `hostname` drops to `CharField(63)` and is stripped and lowercased on write; no
+      `validate_dns_label` on it, because the importer commits every row to
+      `construct → full_clean() → save()` and writes prose descriptions from the CSVs, so a
+      validator would break a rebuild — and a switch's hostname is the only human-readable label it
+      has. Free today; the longest live value is 22 characters
+- [x] **The migration backfills** (ADR 0023 decision 8, amended). On-write normalisation cannot
+      close the casing divergence on its own — a row nobody saves is never normalised, so `DM7C-1`
+      would sit there indefinitely and `NetworkDevicePort.hostname` would keep yielding
+      `DM7C-1-device-control`. 40 of 83 live rows change. Those rows get rewritten *anyway*, one at
+      a time, whenever someone saves an unrelated field — so the choice is one reviewable migration
+      versus 40 unattributable surprises. It refuses rather than truncates if any row exceeds 63.
+      Its fallout is larger than it looks: `verify_prod_import.py` compares hostnames to the raw CSV
+      case-sensitively, and eight existing assertions do the same
+- [x] **Seed the remaining `hostname_slug`s** (ADR 0023 decision 10, amended), via a
+      `{(manufacturer, model): slug}` constant applied by both the importer and a data migration.
+      Mostly **already done by hand** — 24 of 33 Types now carry a slug; the 8 switch Types and
+      `NA2-DLINE` remain. The constant must be *derived from* those live values rather than invented,
+      or a rebuild silently produces a different estate from the one running. Not the per-device
+      backfill decision 10 refuses — that one has no join key, whereas Types already come from a
+      constant in the importer. Not `slugify()` either: `IK-42` → `ik-42` where the name in use is
+      `ik42`
+- [x] #54: a **stateless** `hostname_diverges` property — every component present, a hostname
       present, and the two differ. No `hostname_is_computed` boolean, because state that can itself
       go stale is what the indicator exists to catch. Framed as divergence, not staleness: it says
       the name differs from what its components produce, not which is right. #28, the address-side
       sibling, stays open — same staleness *class*, different mechanism (the allocator, not naming)
-- [ ] Tests: assembly with and without each optional component; each blocking component absent
+- [x] Tests: assembly with and without each optional component; each blocking component absent
       yields no name; blank hostnames don't collide with each other; a switch-vs-device collision is
       caught; a device-vs-derived-port-name collision is caught; sequence auto-bump; a hand-typed
       hostname survives creation untouched; a console with a labelled port renders both its own name

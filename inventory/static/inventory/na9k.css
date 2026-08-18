@@ -315,6 +315,16 @@ a {
   font-weight: 700;
 }
 
+/* Divergence (#54) — informational, not an error: the stored name simply
+ * no longer matches what its own components would compute right now
+ * (a rack move left the old location baked in, e.g.). Distinct from
+ * .badge--conflict's danger tone on purpose — this isn't a data problem,
+ * it's a "you may want to recompute this" note. */
+.badge--diverges {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .conflict-list {
   margin: 0.2rem 0 0;
   padding-left: 1.1rem;

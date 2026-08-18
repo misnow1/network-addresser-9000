@@ -60,6 +60,13 @@ from .admin import (
     SwitchPortVlanProfileForm,
     VLANAdmin,
 )
+from .hostnames import (
+    HostnameComponents,
+    assemble_hostname,
+    choose_sequence,
+    hostname_is_taken,
+    resolve_explicit_sequence,
+)
 from .models import (
     DEFAULT_PROFILE_NAME,
     DEFAULT_VLAN_ID,
@@ -1504,8 +1511,12 @@ class RBACAdminPermissionTests(TestCase):
 
 class AuditTrailScopingTests(TestCase):
     """Locks in ADR 0004/0008's scoping: only address overrides, rack/slot
-    reassignment, and removals are tracked — not every field on every
-    object (a hostname rename, or a port description typo fix).
+    reassignment, removals, and (since ADR 0023/phase 18 PR 3) a hostname
+    rename are tracked — not every field on every object (a port
+    description typo fix, e.g.). ``hostname`` joined the whitelist because
+    it is now writable through the add forms and the recompute action, not
+    only by hand — see ``HostnameWriteAuditTests`` for the dedicated
+    coverage.
     """
 
     def setUp(self) -> None:
@@ -1525,13 +1536,18 @@ class AuditTrailScopingTests(TestCase):
         self.assertEqual(entries.count(), 1)
         self.assertIn("rack_slot", entries.first().changes_dict)
 
-    def test_hostname_only_edit_is_not_logged(self) -> None:
+    def test_hostname_only_edit_is_now_logged(self) -> None:
+        """Flipped by ADR 0023/phase 18 PR 3 — ``hostname`` joined both
+        models' ``include_fields`` whitelist (config/settings.py), so an
+        Editor renaming equipment now leaves a trace where it previously
+        didn't. See ``HostnameWriteAuditTests`` for the dedicated coverage.
+        """
         LogEntry.objects.filter(object_pk=str(self.switch.pk)).delete()
         self.switch.hostname = "sw1-renamed"
         self.switch.save()
-        self.assertFalse(
-            LogEntry.objects.filter(object_pk=str(self.switch.pk), action=LogEntry.Action.UPDATE).exists()
-        )
+        entries = LogEntry.objects.filter(object_pk=str(self.switch.pk), action=LogEntry.Action.UPDATE)
+        self.assertEqual(entries.count(), 1)
+        self.assertIn("hostname", entries.first().changes_dict)
 
     def test_delete_is_logged_with_identifying_object_repr(self) -> None:
         pk = self.switch.pk
@@ -5314,11 +5330,16 @@ class HostnameIngredientAuditTests(TestCase):
         )
 
 
-class HostnameComputesNothingYetTests(TestCase):
-    """The phase-18 guard: creating a device/switch with every hostname
-    component set leaves ``hostname`` exactly as submitted — blank
-    included. If this ever fails, hostname assembly has leaked backward
-    into phase 17, which builds fields and computes nothing.
+class ObjectsCreateNeverComputesHostnameTests(TestCase):
+    """ADR 0023 decision 5: assembly runs in the add forms and the
+    recompute action, **nowhere else** — not ``save()``, not ``clean()``,
+    not ``objects.create()``. This class used to be named
+    ``HostnameComputesNothingYetTests`` and guard phase 17 (before PR 3
+    existed, *nothing* computed a hostname, add form included); PR 3 gives
+    the add forms real assembly (``HostnameAddFormAssemblyTests`` covers
+    that), so what's left to guard is narrower but still real:
+    ``objects.create()`` — the importer's own path — must stay inert
+    forever, with every hostname component set.
     """
 
     def setUp(self) -> None:
@@ -5339,7 +5360,11 @@ class HostnameComputesNothingYetTests(TestCase):
             hostname_purpose="sub",
             hostname_sequence=1,
         )
-        self.assertEqual(device.hostname, "Some Prose Hostname")
+        # Stripped/lowercased, not left byte-identical — ADR 0023 decision 8
+        # (amended, phase 18) normalises casing on every write; this test's
+        # guard is that no *component assembly* has leaked backward, not
+        # that casing survives untouched.
+        self.assertEqual(device.hostname, "some prose hostname")
 
     def test_device_hostname_left_blank_when_submitted_blank(self) -> None:
         device = NetworkDevice.objects.create(
@@ -5363,15 +5388,263 @@ class HostnameComputesNothingYetTests(TestCase):
             hostname_purpose="sub",
             hostname_sequence=1,
         )
-        self.assertEqual(switch.hostname, "Some Prose Hostname")
+        # See the device test above — normalised, not byte-identical.
+        self.assertEqual(switch.hostname, "some prose hostname")
 
-    def test_device_add_form_leaves_blank_hostname_blank_with_every_component_set(self) -> None:
-        """``objects.create()`` above never exercises the one path ADR 0023
-        decision 5 actually puts phase 18's assembly on: the add forms'
-        ``clean()``. A backward leak of hostname assembly would show up
-        here first, with every component present and the submitted
-        hostname left blank.
+
+class HostnameNormalisationTests(TestCase):
+    """PLAN-hostname-computation.md PR 1 — hostname drops to CharField(63)
+    and is stripped/lowercased in ``clean_fields()``/``clean()``/``save()``,
+    the same three-place pattern phase 17 already established for
+    ``hostname_purpose`` (ADR 0023 decision 8, amended).
+    """
+
+    def setUp(self) -> None:
+        self.rack = Rack.objects.create(name="Rack 1", slot_count=10)
+        self.switch_type = _make_switch_type()
+        self.device_type = _make_device_type()
+
+    def test_device_hostname_normalises_through_objects_create(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, rack=self.rack, rack_slot=1, hostname="  DM7C-1  "
+        )
+        self.assertEqual(device.hostname, "dm7c-1")
+
+    def test_device_hostname_normalises_through_full_clean(self) -> None:
+        device = NetworkDevice(
+            device_type=self.device_type, rack=self.rack, rack_slot=1, hostname="  DM7C-1  "
+        )
+        device.full_clean()
+        self.assertEqual(device.hostname, "dm7c-1")
+
+    def test_device_hostname_normalises_through_admin_form(self) -> None:
+        form = NetworkDeviceAddForm(
+            data={
+                "device_type": str(self.device_type.pk),
+                "hostname": "DM7C-1",
+                "rack": str(self.rack.pk),
+                "rack_slot": "1",
+                "port_addressing": "dhcp",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        obj = form.save()
+        self.assertEqual(obj.hostname, "dm7c-1")
+
+    def test_switch_hostname_normalises_through_objects_create(self) -> None:
+        switch = NetworkSwitch.objects.create(
+            switch_type=self.switch_type, rack=self.rack, rack_slot=1, hostname="  DM7C-1  "
+        )
+        self.assertEqual(switch.hostname, "dm7c-1")
+
+    def test_switch_hostname_normalises_through_full_clean(self) -> None:
+        switch = NetworkSwitch(
+            switch_type=self.switch_type, rack=self.rack, rack_slot=1, hostname="  DM7C-1  "
+        )
+        switch.full_clean()
+        self.assertEqual(switch.hostname, "dm7c-1")
+
+    def test_switch_hostname_normalises_through_admin_form(self) -> None:
+        form = NetworkSwitchAddForm(
+            data={
+                "switch_type": str(self.switch_type.pk),
+                "hostname": "DM7C-1",
+                "rack": str(self.rack.pk),
+                "rack_slot": "1",
+                "address_materialization": "manual",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        obj = form.save()
+        self.assertEqual(obj.hostname, "dm7c-1")
+
+    def test_derived_port_hostname_reflects_backfilled_lowercase(self) -> None:
+        """Proves the *backfill*, not the on-write path: a hostname stored
+        as ``DM7C-1`` before the migration — simulated here by writing
+        through the historical shape via ``update()``, which (unlike
+        ``save()``) never normalises — still yields a lowercase derived
+        port name once ``NetworkDevicePort.hostname`` reads it back,
+        exactly as it would after ``0017_hostname_normalise`` runs.
         """
+        device_type = _make_console_type_for_hostname_suffix()
+        # Unracked (spare pool) — materializes DHCP regardless of the type
+        # port's OPERATOR address_source, so no operator_addresses input is
+        # needed; this test only cares about the derived hostname property.
+        device = NetworkDevice.objects.create(device_type=device_type, hostname="dm7c-1")
+        # Bypass save()'s normalisation entirely — this row now sits in the
+        # database exactly as an un-migrated pre-PR-1 row would.
+        NetworkDevice.objects.filter(pk=device.pk).update(hostname="DM7C-1")
+        # Fetched through the *base* manager, not device.ports — the
+        # reverse-FK manager primes a "known related object" cache that
+        # would hand the port's .device accessor the stale, already-loaded
+        # ``device`` instance instead of re-reading the row this test just
+        # rewrote underneath it.
+        port = NetworkDevicePort.objects.get(
+            device_id=device.pk, source_type_port__hostname_suffix="device-control"
+        )
+        self.assertEqual(port.hostname, "DM7C-1-device-control")  # not yet migrated — raw casing
+        # Now apply the migration's own backfill logic directly.
+        NetworkDevice.objects.filter(pk=device.pk).update(hostname="dm7c-1")
+        port = NetworkDevicePort.objects.get(pk=port.pk)
+        self.assertEqual(port.hostname, "dm7c-1-device-control")
+
+    def test_length_guard_raises_on_64_char_hostname(self) -> None:
+        overlong = "a" * 64
+        device = NetworkDevice(device_type=self.device_type, rack=self.rack, rack_slot=1)
+        # save() lowercases but does not truncate or validate length before
+        # clean_fields() runs the field's own MaxLengthValidator.
+        device.hostname = overlong
+        with self.assertRaises(ValidationError) as ctx:
+            device.full_clean()
+        self.assertIn("hostname", ctx.exception.message_dict)
+
+
+def _make_console_type_for_hostname_suffix() -> NetworkDeviceType:
+    """A one-port device type whose sole port is OPERATOR-sourced and
+    carries ``hostname_suffix="device-control"`` — the minimal shape
+    ``NetworkDevicePort.hostname`` needs to derive a name at all.
+    """
+    vlan = VLAN.objects.create(name="Control HN", vlan_id=6011, subnet="10.202.0.0/27")
+    device_type = NetworkDeviceType.objects.create(
+        manufacturer="Test", model="Console-HN", name="Default", port_count=1
+    )
+    NetworkDeviceTypePort.objects.create(
+        device_type=device_type,
+        description="Device Control",
+        port_type=PortType.GBE_RJ45,
+        vlan=vlan,
+        ordinal=1,
+        address_source=PortAddressSource.OPERATOR,
+        hostname_suffix="device-control",
+    )
+    return device_type
+
+
+class HostnameUniquenessTests(TestCase):
+    """PLAN-hostname-computation.md PR 3 — ``_validate_hostname_unique()``
+    (ADR 0023 decision 6, amended twice): rename-only, cross-table,
+    blank-exempt. Creation is deliberately exempt — the importer creates
+    duplicates by design — so this class proves both halves: duplicates
+    can be *created* freely, and only a *rename into* one is refused.
+    """
+
+    def setUp(self) -> None:
+        self.device_type = _make_device_type()
+        self.switch_type = _make_switch_type()
+
+    def test_creating_a_duplicate_device_hostname_is_allowed(self) -> None:
+        NetworkDevice.objects.create(device_type=self.device_type, hostname="ik42")
+        second = NetworkDevice(device_type=self.device_type, hostname="ik42")
+        second.full_clean()  # must not raise
+        second.save()
+        self.assertEqual(NetworkDevice.objects.filter(hostname="ik42").count(), 2)
+
+    def test_creating_a_duplicate_switch_hostname_is_allowed(self) -> None:
+        NetworkSwitch.objects.create(switch_type=self.switch_type, hostname="sg300")
+        second = NetworkSwitch(switch_type=self.switch_type, hostname="sg300")
+        second.full_clean()  # must not raise
+        second.save()
+        self.assertEqual(NetworkSwitch.objects.filter(hostname="sg300").count(), 2)
+
+    def test_renaming_a_device_into_an_existing_device_hostname_is_refused(self) -> None:
+        NetworkDevice.objects.create(device_type=self.device_type, hostname="taken")
+        mover = NetworkDevice.objects.create(device_type=self.device_type, hostname="mover")
+        mover.hostname = "taken"
+        with self.assertRaises(ValidationError) as ctx:
+            mover.full_clean()
+        self.assertIn("hostname", ctx.exception.message_dict)
+
+    def test_renaming_a_switch_into_an_existing_switch_hostname_is_refused(self) -> None:
+        NetworkSwitch.objects.create(switch_type=self.switch_type, hostname="taken")
+        mover = NetworkSwitch.objects.create(switch_type=self.switch_type, hostname="mover")
+        mover.hostname = "taken"
+        with self.assertRaises(ValidationError) as ctx:
+            mover.full_clean()
+        self.assertIn("hostname", ctx.exception.message_dict)
+
+    def test_renaming_a_device_into_an_existing_switch_hostname_is_refused(self) -> None:
+        """Cross-table — the namespace is shared."""
+        NetworkSwitch.objects.create(switch_type=self.switch_type, hostname="taken")
+        mover = NetworkDevice.objects.create(device_type=self.device_type, hostname="mover")
+        mover.hostname = "taken"
+        with self.assertRaises(ValidationError):
+            mover.full_clean()
+
+    def test_renaming_a_device_into_a_derived_port_name_is_refused(self) -> None:
+        console_type = _make_console_type_for_hostname_suffix()
+        NetworkDevice.objects.create(device_type=console_type, hostname="mps-avio-sd12")
+        mover = NetworkDevice.objects.create(device_type=self.device_type, hostname="mover")
+        mover.hostname = "mps-avio-sd12-device-control"
+        with self.assertRaises(ValidationError):
+            mover.full_clean()
+
+    def test_renaming_to_the_same_value_is_not_a_rename(self) -> None:
+        """Not blocked by *itself* — the hostname is unchanged, so this
+        never reaches the uniqueness check at all.
+        """
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname="steady")
+        device.serial_number = "SN-1"
+        device.full_clean()  # must not raise
+        device.save()
+
+    def test_editing_an_unrelated_field_on_a_duplicated_row_saves_cleanly(self) -> None:
+        NetworkDevice.objects.create(device_type=self.device_type, hostname="ik42")
+        duplicate = NetworkDevice.objects.create(device_type=self.device_type, hostname="ik42")
+        duplicate.serial_number = "SN-42"
+        duplicate.full_clean()  # must not raise despite the row already being a duplicate
+        duplicate.save()
+        duplicate.refresh_from_db()
+        self.assertEqual(duplicate.serial_number, "SN-42")
+
+    def test_renaming_to_blank_is_exempt(self) -> None:
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname="named")
+        device.hostname = ""
+        device.full_clean()  # must not raise — blank is exempt
+        device.save()
+
+    def test_renaming_away_from_a_duplicate_is_unaffected_by_the_other_duplicate(self) -> None:
+        """Renaming *out* of a duplicated pair only checks the new value
+        against everything else — it isn't blocked by the sibling it's
+        leaving behind.
+        """
+        NetworkDevice.objects.create(device_type=self.device_type, hostname="ik42")
+        duplicate = NetworkDevice.objects.create(device_type=self.device_type, hostname="ik42")
+        duplicate.hostname = "ik42-renamed"
+        duplicate.full_clean()  # must not raise
+        duplicate.save()
+
+
+class HostnameAddFormAssemblyTests(TestCase):
+    """PLAN-hostname-computation.md PR 3 "Add-form assembly" — blank
+    hostname only, a typed value is never overwritten, and assembly must
+    run for a spare-pool device (no rack) too, not just a racked one.
+    """
+
+    def setUp(self) -> None:
+        self.owner = Owner.objects.create(slug="mps", name="MPS")
+        self.rack = Rack.objects.create(
+            name="Rack 1", slot_count=10, owner=self.owner, location_slug="wpcsrl"
+        )
+        self.device_type = _make_device_type(hostname_slug="ik42")
+        self.switch_type = _make_switch_type(hostname_slug="sg300")
+
+    def test_hand_typed_hostname_survives_creation(self) -> None:
+        form = NetworkDeviceAddForm(
+            data={
+                "device_type": str(self.device_type.pk),
+                "hostname": "My-Custom-Name",
+                "rack": str(self.rack.pk),
+                "rack_slot": "1",
+                "port_addressing": "dhcp",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        # Lowercased by normalisation (PR 1), but not recomputed — it
+        # would differ from the assembled shape ("mps-wpcsrl-ik42") if it
+        # had been.
+        self.assertEqual(form.instance.hostname, "my-custom-name")
+
+    def test_blank_device_hostname_is_filled(self) -> None:
         form = NetworkDeviceAddForm(
             data={
                 "device_type": str(self.device_type.pk),
@@ -5379,13 +5652,1118 @@ class HostnameComputesNothingYetTests(TestCase):
                 "rack": str(self.rack.pk),
                 "rack_slot": "1",
                 "port_addressing": "dhcp",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.hostname, "mps-wpcsrl-ik42")
+
+    def test_blank_switch_hostname_is_filled(self) -> None:
+        form = NetworkSwitchAddForm(
+            data={
+                "switch_type": str(self.switch_type.pk),
+                "hostname": "",
+                "rack": str(self.rack.pk),
+                "rack_slot": "1",
+                "address_materialization": "manual",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.hostname, "mps-wpcsrl-sg300")
+
+    def test_spare_pool_device_with_no_rack_still_assembles(self) -> None:
+        """The trap the plan review caught: assembly must run *before*
+        the device form's ``rack is None`` early return, or every spare-
+        pool device silently skips it.
+        """
+        form = NetworkDeviceAddForm(
+            data={
+                "device_type": str(self.device_type.pk),
+                "hostname": "",
+                "rack": "",
+                "rack_slot": "",
                 "owner": str(self.owner.pk),
-                "hostname_purpose": "sub",
+                "port_addressing": "dhcp",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.hostname, "mps-ik42")  # no location — no rack at all
+
+    def test_change_form_does_not_assemble(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, rack=self.rack, rack_slot=1, owner=self.owner
+        )
+        self.assertEqual(device.hostname, "")  # objects.create() never assembles either
+        form = NetworkDeviceChangeForm(
+            data={
+                "device_type": str(self.device_type.pk),
+                "hostname": "",
+                "serial_number": "",
+                "rack": str(self.rack.pk),
+                "rack_slot": "1",
+                "owner": str(self.owner.pk),
+                "hostname_purpose": "",
+                "hostname_sequence": "",
+            },
+            instance=device,
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.hostname, "")
+
+    def test_objects_create_does_not_assemble(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, rack=self.rack, rack_slot=1, owner=self.owner
+        )
+        self.assertEqual(device.hostname, "")
+
+    def test_explicit_sequence_collision_on_add_form_is_bumped_forward(self) -> None:
+        """Code review finding 3 — an explicit ``hostname_sequence`` is
+        honoured, not overridden, but ADR 0023 decision 7 also says
+        assembly "only bump[s] if hostname_is_taken() says that exact
+        name is occupied": two operators independently typing the same
+        sequence on twin devices must not both compute the same name,
+        which is the load-bearing argument for exempting *creation* from
+        uniqueness at all.
+        """
+        NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=self.owner,
+            hostname="mps-wpcsrl-ik42-1",
+        )
+        form = NetworkDeviceAddForm(
+            data={
+                "device_type": str(self.device_type.pk),
+                "hostname": "",
+                "rack": str(self.rack.pk),
+                "rack_slot": "2",
+                "port_addressing": "dhcp",
+                "owner": str(self.owner.pk),
                 "hostname_sequence": "1",
             }
         )
         self.assertTrue(form.is_valid(), form.errors)
-        self.assertEqual(form.instance.hostname, "")
+        self.assertEqual(form.instance.hostname, "mps-wpcsrl-ik42-2")
+        self.assertEqual(form.instance.hostname_sequence, 2)
+        # Code review round 2, finding 3 — the rewrite is not silent.
+        self.assertTrue(any("hostname_sequence 1 was already in use" in a for a in form._hostname_advisories))
+
+
+class RecomputeHostnameActionTests(TestCase):
+    """PLAN-hostname-computation.md PR 3 "The recompute action" — fills a
+    blank owner from the rack, computes and stores idempotently, honours
+    an explicitly-set sequence, and gives 17 identical devices 17 distinct
+    names.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.owner = Owner.objects.create(slug="mps", name="MPS")
+        self.rack = Rack.objects.create(
+            name="Rack 1", slot_count=30, owner=self.owner, location_slug="wpcsrl"
+        )
+        self.device_type = _make_device_type(hostname_slug="ik42")
+        self.switch_type = _make_switch_type(hostname_slug="sg300")
+        self.user = User.objects.create_user("recompute-user", password="x")
+        self.editor = User.objects.create_user("recompute-editor", password="testpass123", is_staff=True)
+        self.editor.groups.add(Group.objects.get(name="Editor"))
+
+    def _request(self):
+        request = RequestFactory().post("/admin/inventory/networkdevice/")
+        request.session = {}
+        request._messages = FallbackStorage(request)
+        request.user = self.user
+        return request
+
+    def test_fills_blank_owner_from_rack_and_stores_it(self) -> None:
+        device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=1)
+        self.assertIsNone(device.owner)
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        admin.recompute_hostnames(self._request(), NetworkDevice.objects.filter(pk=device.pk))
+        device.refresh_from_db()
+        self.assertEqual(device.owner, self.owner)
+        self.assertEqual(device.hostname, "mps-wpcsrl-ik42")
+
+    def test_recompute_twice_yields_the_same_name_and_reports_unchanged(self) -> None:
+        device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=1)
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        first_request = self._request()
+        admin.recompute_hostnames(first_request, NetworkDevice.objects.filter(pk=device.pk))
+        device.refresh_from_db()
+        first_name = device.hostname
+        first_sequence = device.hostname_sequence
+
+        second_request = self._request()
+        admin.recompute_hostnames(second_request, NetworkDevice.objects.filter(pk=device.pk))
+        device.refresh_from_db()
+        self.assertEqual(device.hostname, first_name)
+        self.assertEqual(device.hostname_sequence, first_sequence)
+        self.assertTrue(any("already up to date" in str(m) for m in get_messages(second_request)))
+
+    def test_explicit_sequence_is_honoured_the_advisory_remedy_works(self) -> None:
+        """The advisory's own remedy: a bare twin gets ``hostname_sequence
+        = 1`` by hand, and the *next* recompute of the twin itself yields
+        ``…-1``, not ``…-3`` — the starting-value table never runs for it
+        because its sequence is no longer null.
+        """
+        twin = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=self.owner,
+            hostname="mps-wpcsrl-ik42",
+            hostname_sequence=1,
+        )
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        admin.recompute_hostnames(self._request(), NetworkDevice.objects.filter(pk=twin.pk))
+        twin.refresh_from_db()
+        self.assertEqual(twin.hostname, "mps-wpcsrl-ik42-1")
+        self.assertEqual(twin.hostname_sequence, 1)
+
+    def test_recompute_explicit_sequence_collision_is_bumped_forward(self) -> None:
+        """Code review finding 3, the recompute-action half — see the
+        add-form test of the same shape in
+        ``HostnameAddFormAssemblyTests``.
+        """
+        first = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=self.owner,
+            hostname="mps-wpcsrl-ik42-1",
+            hostname_sequence=1,
+        )
+        twin = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=2,
+            owner=self.owner,
+            hostname="something-else",
+            hostname_sequence=1,
+        )
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        request = self._request()
+        admin.recompute_hostnames(request, NetworkDevice.objects.filter(pk=twin.pk))
+        twin.refresh_from_db()
+        first.refresh_from_db()
+        self.assertNotEqual(twin.hostname, first.hostname)
+        self.assertEqual(twin.hostname, "mps-wpcsrl-ik42-2")
+        self.assertEqual(twin.hostname_sequence, 2)
+        # Code review round 2, finding 3 — the rewrite is not silent.
+        self.assertTrue(
+            any("hostname_sequence 1 was already in use" in str(m) for m in get_messages(request))
+        )
+
+    def test_recompute_over_17_identical_devices_yields_17_distinct_names(self) -> None:
+        devices = [
+            NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=slot)
+            for slot in range(1, 18)
+        ]
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        pks = [d.pk for d in devices]
+        admin.recompute_hostnames(self._request(), NetworkDevice.objects.filter(pk__in=pks))
+        names = set(NetworkDevice.objects.filter(pk__in=pks).values_list("hostname", flat=True))
+        self.assertEqual(len(names), 17)
+
+    def test_recompute_over_17_identical_devices_twice_is_idempotent(self) -> None:
+        """Code review finding 1 — the single-device idempotence test
+        elsewhere in this class can't catch this: the bug is specific to
+        the *bare*-named member of a numbered group, which only exists
+        once there's a group to be the bare member of. Without
+        ``choose_sequence()`` honouring that device's own already-held
+        bare name, excluding it from its own sibling scan makes the
+        highest *remaining* sibling look like the group's own top, and it
+        gets bumped to a new numbered suffix on this second pass — quite
+        possibly one already held by another device in the group, so this
+        doubles as a regression test for exactly the collision that would
+        produce.
+        """
+        devices = [
+            NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=slot)
+            for slot in range(1, 18)
+        ]
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        pks = [d.pk for d in devices]
+        admin.recompute_hostnames(self._request(), NetworkDevice.objects.filter(pk__in=pks))
+        first_names = set(NetworkDevice.objects.filter(pk__in=pks).values_list("hostname", flat=True))
+        self.assertEqual(len(first_names), 17)
+
+        second_request = self._request()
+        admin.recompute_hostnames(second_request, NetworkDevice.objects.filter(pk__in=pks))
+        second_names = set(NetworkDevice.objects.filter(pk__in=pks).values_list("hostname", flat=True))
+        self.assertEqual(second_names, first_names)
+        unchanged_messages = [str(m) for m in get_messages(second_request) if "already up to date" in str(m)]
+        self.assertEqual(len(unchanged_messages), 1)
+        self.assertIn("17", unchanged_messages[0])
+
+    def test_skips_and_reports_the_missing_component(self) -> None:
+        no_slug_type = _make_device_type(hostname_slug="", name="No Slug")
+        device = NetworkDevice.objects.create(device_type=no_slug_type, rack=self.rack, rack_slot=1)
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        request = self._request()
+        admin.recompute_hostnames(request, NetworkDevice.objects.filter(pk=device.pk))
+        device.refresh_from_db()
+        self.assertEqual(device.hostname, "")
+        self.assertTrue(any("Skipped" in str(m) for m in get_messages(request)))
+
+    def test_switch_recompute_action_available_too(self) -> None:
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=1)
+        admin = NetworkSwitchAdmin(NetworkSwitch, AdminSite())
+        admin.recompute_hostnames(self._request(), NetworkSwitch.objects.filter(pk=switch.pk))
+        switch.refresh_from_db()
+        self.assertEqual(switch.hostname, "mps-wpcsrl-sg300")
+        self.assertEqual(switch.owner, self.owner)
+
+    def test_device_action_reachable_through_the_changelist(self) -> None:
+        """Code review finding 4 — every test above calls ``admin.
+        recompute_hostnames(request, queryset)`` directly, which passes
+        whether or not the action is actually named in ``actions`` and
+        whether or not its ``permissions=["change"]`` holds. This is the
+        one test that goes through the real admin URL and action-dropdown
+        machinery instead, the same idiom
+        ``FitAndPullAdminTests.test_pull_clears_host_leaves_rack_and_slot``
+        uses for ``pull_cards``.
+        """
+        device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=1)
+        self.client.force_login(self.editor)
+        response = self.client.post(
+            "/admin/inventory/networkdevice/",
+            {"action": "recompute_hostnames", "_selected_action": [str(device.pk)]},
+        )
+        self.assertEqual(response.status_code, 302)
+        device.refresh_from_db()
+        self.assertEqual(device.hostname, "mps-wpcsrl-ik42")
+
+    def test_switch_action_reachable_through_the_changelist(self) -> None:
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=1)
+        self.client.force_login(self.editor)
+        response = self.client.post(
+            "/admin/inventory/networkswitch/",
+            {"action": "recompute_hostnames", "_selected_action": [str(switch.pk)]},
+        )
+        self.assertEqual(response.status_code, 302)
+        switch.refresh_from_db()
+        self.assertEqual(switch.hostname, "mps-wpcsrl-sg300")
+
+
+class HostnameAdvisoryEmissionTests(TestCase):
+    """PLAN-hostname-computation.md PR 3 "The advisories" — ``ModelForm.
+    clean()`` has no request, so a bare form can only *stash* advisories;
+    only the admin add view, through ``save_model()``, actually emits one.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.owner = Owner.objects.create(slug="mps", name="MPS")
+        self.rack = Rack.objects.create(
+            name="Rack 1", slot_count=10, owner=self.owner, location_slug="wpcsrl"
+        )
+        self.device_type = _make_device_type(hostname_slug="ik42")
+        # A bare twin with no sequence of its own — computing a second
+        # identical device should bump to 2 and advise assigning this one 1.
+        self.twin = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=self.owner,
+            hostname="mps-wpcsrl-ik42",
+        )
+        self.editor = User.objects.create_user("advisory-editor", password="testpass123", is_staff=True)
+        self.editor.groups.add(Group.objects.get(name="Editor"))
+
+    def test_bare_form_only_stashes_no_request_to_emit_through(self) -> None:
+        form = NetworkDeviceAddForm(
+            data={
+                "device_type": str(self.device_type.pk),
+                "hostname": "",
+                "rack": str(self.rack.pk),
+                "rack_slot": "2",
+                "port_addressing": "dhcp",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertTrue(form._hostname_advisories)  # stashed...
+        # ...and there is no request anywhere in this path for anything to
+        # have emitted it through — this is the whole point of the stash.
+
+    def test_advisory_fires_through_the_admin_add_view(self) -> None:
+        self.client.force_login(self.editor)
+        response = self.client.post(
+            "/admin/inventory/networkdevice/add/",
+            {
+                "device_type": str(self.device_type.pk),
+                "hostname": "",
+                "serial_number": "",
+                "rack": str(self.rack.pk),
+                "rack_slot": "2",
+                "port_addressing": "dhcp",
+                "ports-TOTAL_FORMS": "0",
+                "ports-INITIAL_FORMS": "0",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+            },
+        )
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        self.assertTrue(any("hostname_sequence=1" in str(m) for m in get_messages(response.wsgi_request)))
+
+
+class HostnameWriteAuditTests(TestCase):
+    """PLAN-hostname-computation.md PR 3 "Audit" — ``hostname`` was in
+    neither model's ``include_fields`` whitelist, so an Editor could
+    rename any selection of equipment with no trace at all (shape of
+    ``DepartmentAuditTests``).
+    """
+
+    def setUp(self) -> None:
+        self.device_type = _make_device_type()
+        self.switch_type = _make_switch_type()
+
+    def test_device_hostname_change_produces_update_log_entry_naming_hostname(self) -> None:
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname="before")
+        LogEntry.objects.filter(object_pk=str(device.pk)).delete()
+        device.hostname = "after"
+        device.save()
+        entries = LogEntry.objects.filter(object_pk=str(device.pk), action=LogEntry.Action.UPDATE)
+        self.assertEqual(entries.count(), 1)
+        self.assertIn("hostname", entries.first().changes_dict)
+
+    def test_switch_hostname_change_produces_update_log_entry_naming_hostname(self) -> None:
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, hostname="before")
+        LogEntry.objects.filter(object_pk=str(switch.pk)).delete()
+        switch.hostname = "after"
+        switch.save()
+        entries = LogEntry.objects.filter(object_pk=str(switch.pk), action=LogEntry.Action.UPDATE)
+        self.assertEqual(entries.count(), 1)
+        self.assertIn("hostname", entries.first().changes_dict)
+
+
+class HostnameDivergesTests(TestCase):
+    """PLAN-hostname-computation.md PR 4 — ``hostname_diverges``: stateless,
+    no new field, no collision query. False when a blocking component is
+    missing (assembly can't even produce a name to compare against), false
+    when the stored name matches, true when it differs.
+    """
+
+    def setUp(self) -> None:
+        self.owner = Owner.objects.create(slug="mps", name="MPS")
+        self.rack = Rack.objects.create(
+            name="Rack 1", slot_count=10, owner=self.owner, location_slug="wpcsrl"
+        )
+        self.device_type = _make_device_type(hostname_slug="ik42")
+        self.switch_type = _make_switch_type(hostname_slug="sg300")
+
+    def test_false_when_owner_missing(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, rack=self.rack, rack_slot=1, hostname="anything"
+        )
+        self.assertIsNone(device.owner)
+        self.assertFalse(device.hostname_diverges)
+
+    def test_false_when_type_slug_missing(self) -> None:
+        no_slug_type = _make_device_type(hostname_slug="", name="No Slug")
+        device = NetworkDevice.objects.create(
+            device_type=no_slug_type, rack=self.rack, rack_slot=1, owner=self.owner, hostname="anything"
+        )
+        self.assertFalse(device.hostname_diverges)
+
+    def test_false_when_hostname_blank(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, rack=self.rack, rack_slot=1, owner=self.owner
+        )
+        self.assertEqual(device.hostname, "")
+        self.assertFalse(device.hostname_diverges)
+
+    def test_false_when_stored_name_matches(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=self.owner,
+            hostname="mps-wpcsrl-ik42",
+        )
+        self.assertFalse(device.hostname_diverges)
+
+    def test_true_when_stored_name_differs(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=self.owner,
+            hostname="hand-typed-name",
+        )
+        self.assertTrue(device.hostname_diverges)
+
+    def test_true_after_a_rack_move_leaves_the_old_location_baked_in(self) -> None:
+        """#54's motivating case."""
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=self.owner,
+            hostname="mps-wpcsrl-ik42",
+        )
+        self.assertFalse(device.hostname_diverges)
+        other_rack = Rack.objects.create(name="Rack 2", slot_count=10, location_slug="foh")
+        device.rack = other_rack
+        device.rack_slot = 1
+        device.save()
+        self.assertTrue(device.hostname_diverges)
+
+    def test_switch_matches_the_same_shape(self) -> None:
+        switch = NetworkSwitch.objects.create(
+            switch_type=self.switch_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=self.owner,
+            hostname="hand-typed-name",
+        )
+        self.assertTrue(switch.hostname_diverges)
+        switch.hostname = "mps-wpcsrl-sg300"
+        switch.save()
+        self.assertFalse(switch.hostname_diverges)
+
+
+class HostnameDivergesAdminFilterTests(TestCase):
+    """PLAN-hostname-computation.md PR 4 — the ``SimpleListFilter``
+    (``hostname_diverges`` can't be an ordinary ``list_filter`` string
+    entry; it's a property, not a column) selects the right rows on both
+    admins.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.owner = Owner.objects.create(slug="mps", name="MPS")
+        self.rack = Rack.objects.create(
+            name="Rack 1", slot_count=10, owner=self.owner, location_slug="wpcsrl"
+        )
+        self.device_type = _make_device_type(hostname_slug="ik42")
+        self.switch_type = _make_switch_type(hostname_slug="sg300")
+        self.admin_user = User.objects.create_user("filter-admin", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.force_login(self.admin_user)
+
+    def test_device_filter_yes_selects_only_diverging_rows(self) -> None:
+        diverging = NetworkDevice.objects.create(
+            device_type=self.device_type, rack=self.rack, rack_slot=1, owner=self.owner, hostname="hand-typed"
+        )
+        matching = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=2,
+            owner=self.owner,
+            hostname="mps-wpcsrl-ik42",
+        )
+        response = self.client.get("/admin/inventory/networkdevice/", {"hostname_diverges": "yes"})
+        content = response.content.decode()
+        self.assertIn(diverging.hostname, content)
+        self.assertNotIn(matching.hostname, content)
+
+    def test_device_filter_no_selects_only_matching_rows(self) -> None:
+        diverging = NetworkDevice.objects.create(
+            device_type=self.device_type, rack=self.rack, rack_slot=1, owner=self.owner, hostname="hand-typed"
+        )
+        matching = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=2,
+            owner=self.owner,
+            hostname="mps-wpcsrl-ik42",
+        )
+        response = self.client.get("/admin/inventory/networkdevice/", {"hostname_diverges": "no"})
+        content = response.content.decode()
+        self.assertIn(matching.hostname, content)
+        self.assertNotIn(diverging.hostname, content)
+
+    def test_switch_filter_yes_selects_only_diverging_rows(self) -> None:
+        diverging = NetworkSwitch.objects.create(
+            switch_type=self.switch_type, rack=self.rack, rack_slot=1, owner=self.owner, hostname="hand-typed"
+        )
+        matching = NetworkSwitch.objects.create(
+            switch_type=self.switch_type,
+            rack=self.rack,
+            rack_slot=2,
+            owner=self.owner,
+            hostname="mps-wpcsrl-sg300",
+        )
+        response = self.client.get("/admin/inventory/networkswitch/", {"hostname_diverges": "yes"})
+        content = response.content.decode()
+        self.assertIn(diverging.hostname, content)
+        self.assertNotIn(matching.hostname, content)
+
+    def test_unfiltered_shows_both(self) -> None:
+        NetworkDevice.objects.create(
+            device_type=self.device_type, rack=self.rack, rack_slot=1, owner=self.owner, hostname="hand-typed"
+        )
+        NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=2,
+            owner=self.owner,
+            hostname="mps-wpcsrl-ik42",
+        )
+        response = self.client.get("/admin/inventory/networkdevice/")
+        content = response.content.decode()
+        self.assertIn("hand-typed", content)
+        self.assertIn("mps-wpcsrl-ik42", content)
+
+
+class HostnameNormaliseMigrationTests(TransactionTestCase):
+    """``0017_hostname_normalise`` (PLAN-hostname-computation.md PR 1) —
+    reconstructs the schema as of ``0016_hostname_ingredients`` (immediately
+    before this migration, hostname still ``CharField(255)``) via
+    ``MigrationExecutor``, the same shape ``RetireCompanionsMigrationTests``
+    uses, since the length guard specifically needs a hostname the *live*
+    (already-narrowed) schema could no longer store at all.
+
+    Rows are inserted with ``bulk_create()`` against the historical model,
+    bypassing ``save()`` entirely — the only way to prove the *backfill*
+    runs, as opposed to the on-write normalisation PR 1 also adds.
+    """
+
+    apps: Any
+    _migration_module: Any
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        executor = MigrationExecutor(connection)
+        executor.migrate([("inventory", "0016_hostname_ingredients")])
+        executor.loader.build_graph()
+        cls.apps = executor.loader.project_state(("inventory", "0016_hostname_ingredients")).apps
+        cls._migration_module = importlib.import_module("inventory.migrations.0017_hostname_normalise")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        call_command("migrate", "inventory", verbosity=0)
+        super().tearDownClass()
+
+    def setUp(self) -> None:
+        self.schema_editor = _FakeSchemaEditor(connection.alias)
+        NetworkDeviceType = self.apps.get_model("inventory", "NetworkDeviceType")
+        self.device_type = NetworkDeviceType.objects.create(
+            manufacturer="Test", model="Migration", name="Default", port_count=0
+        )
+
+    def test_backfill_lowercases_bulk_created_rows(self) -> None:
+        NetworkDevice = self.apps.get_model("inventory", "NetworkDevice")
+        # bulk_create, not save() — proves the *backfill* runs rather than
+        # the live model's on-write normalisation, which bulk_create skips
+        # entirely even on the real model.
+        (device,) = NetworkDevice.objects.bulk_create(
+            [NetworkDevice(device_type=self.device_type, hostname="  DM7C-1  ")]
+        )
+        self._migration_module._backfill_hostname_casing(self.apps, self.schema_editor)
+        device.refresh_from_db()
+        self.assertEqual(device.hostname, "dm7c-1")
+
+    def test_backfill_leaves_blank_hostname_alone(self) -> None:
+        NetworkDevice = self.apps.get_model("inventory", "NetworkDevice")
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname="")
+        self._migration_module._backfill_hostname_casing(self.apps, self.schema_editor)
+        device.refresh_from_db()
+        self.assertEqual(device.hostname, "")
+
+    def test_length_guard_raises_and_names_the_overlong_row(self) -> None:
+        NetworkDevice = self.apps.get_model("inventory", "NetworkDevice")
+        overlong = "a" * 64
+        device = NetworkDevice.objects.create(device_type=self.device_type)
+        NetworkDevice.objects.filter(pk=device.pk).update(hostname=overlong)
+        with self.assertRaises(RuntimeError) as ctx:
+            self._migration_module._check_hostname_lengths(self.apps, self.schema_editor)
+        message = str(ctx.exception)
+        self.assertIn("NetworkDevice", message)
+        self.assertIn(str(device.pk), message)
+        self.assertIn(overlong, message)
+
+    def test_length_guard_passes_when_nothing_exceeds_63(self) -> None:
+        NetworkDevice = self.apps.get_model("inventory", "NetworkDevice")
+        NetworkDevice.objects.create(device_type=self.device_type, hostname="a" * 63)
+        self._migration_module._check_hostname_lengths(self.apps, self.schema_editor)  # must not raise
+
+    def test_length_guard_measures_the_stripped_length(self) -> None:
+        """``_check_hostname_lengths()`` on its own, called directly, with
+        no backfill run first — it measures ``len(hostname.strip())``
+        regardless of when it's called, which is what makes running it
+        *after* the backfill (below) redundant-but-safe rather than
+        load-bearing. This does **not** by itself prove the real
+        migration is safe against a whitespace-padded overlong value —
+        that claim depends on the operations *order*, which
+        ``test_backfill_before_length_guard_matches_the_real_migration_
+        order`` below exercises against both ``RunPython`` steps together.
+        """
+        NetworkDevice = self.apps.get_model("inventory", "NetworkDevice")
+        NetworkDevice.objects.create(device_type=self.device_type, hostname="  " + "a" * 63 + "  ")
+        self._migration_module._check_hostname_lengths(self.apps, self.schema_editor)  # must not raise
+
+    def test_backfill_before_length_guard_matches_the_real_migration_order(self) -> None:
+        """Code review round 2, finding 1 — the real migration's
+        ``operations`` list runs the backfill *before* the pre-check (and
+        before the ``AlterField``s), not the reverse. An earlier revision
+        of this migration got that backwards: the pre-check measured the
+        stripped length but ran *before* the backfill had stripped
+        anything, so a raw value like the one below (67 characters, 63
+        once stripped) would pass the pre-check on its stripped length
+        and then reach the ``AlterField`` still 67 characters wide —
+        MariaDB's ``STRICT_TRANS_TABLES`` raises 1406 mid-``ALTER``,
+        exactly the opaque failure the pre-check exists to prevent. This
+        test calls both ``RunPython`` functions in the real migration's
+        order and asserts the whole sequence is safe, not just the
+        pre-check in isolation.
+        """
+        NetworkDevice = self.apps.get_model("inventory", "NetworkDevice")
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname="  " + "a" * 63 + "  ")
+        self._migration_module._backfill_hostname_casing(self.apps, self.schema_editor)
+        self._migration_module._check_hostname_lengths(self.apps, self.schema_editor)  # must not raise
+        device.refresh_from_db()
+        self.assertEqual(device.hostname, "a" * 63)
+
+    def test_length_guard_still_catches_a_genuinely_overlong_row_after_backfill(self) -> None:
+        """The reorder must not turn the guard into a no-op — a row that
+        is still too long even after stripping is caught, whether or not
+        the backfill already ran over it.
+        """
+        NetworkDevice = self.apps.get_model("inventory", "NetworkDevice")
+        overlong = "a" * 70
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname=f"  {overlong}  ")
+        self._migration_module._backfill_hostname_casing(self.apps, self.schema_editor)
+        with self.assertRaises(RuntimeError) as ctx:
+            self._migration_module._check_hostname_lengths(self.apps, self.schema_editor)
+        self.assertIn(str(device.pk), str(ctx.exception))
+
+
+class SeedHostnameSlugsMigrationTests(TransactionTestCase):
+    """``0018_seed_hostname_slugs`` (PLAN-hostname-computation.md PR 4) —
+    reconstructs the schema as of ``0017_hostname_normalise`` (immediately
+    before this migration) via ``MigrationExecutor``, same shape as
+    ``HostnameNormaliseMigrationTests``/``RetireCompanionsMigrationTests``.
+    """
+
+    apps: Any
+    _migration_module: Any
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        executor = MigrationExecutor(connection)
+        executor.migrate([("inventory", "0017_hostname_normalise")])
+        executor.loader.build_graph()
+        cls.apps = executor.loader.project_state(("inventory", "0017_hostname_normalise")).apps
+        cls._migration_module = importlib.import_module("inventory.migrations.0018_seed_hostname_slugs")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        call_command("migrate", "inventory", verbosity=0)
+        super().tearDownClass()
+
+    def setUp(self) -> None:
+        self.schema_editor = _FakeSchemaEditor(connection.alias)
+
+    def _run(self) -> None:
+        self._migration_module.seed_hostname_slugs(self.apps, self.schema_editor)
+
+    def test_blank_switch_type_gets_seeded(self) -> None:
+        NetworkSwitchType = self.apps.get_model("inventory", "NetworkSwitchType")
+        switch_type = NetworkSwitchType.objects.create(
+            manufacturer="Cisco", model="SG300-10MP", name="For 3xAmp Rack Primary", port_count=0
+        )
+        self._run()
+        switch_type.refresh_from_db()
+        self.assertEqual(switch_type.hostname_slug, "sg300-10mp")
+
+    def test_live_only_sg350_10p_gets_seeded(self) -> None:
+        """Code review finding 2 — this migration's own copy of the
+        constant carries ("Cisco", "SG350-10P"), which the importer's
+        catalog no longer creates at all; this is the one live switch
+        Type that would otherwise be permanently uncomputable.
+        """
+        NetworkSwitchType = self.apps.get_model("inventory", "NetworkSwitchType")
+        switch_type = NetworkSwitchType.objects.create(
+            manufacturer="Cisco", model="SG350-10P", name="For Drive Rack Primary", port_count=0
+        )
+        self._run()
+        switch_type.refresh_from_db()
+        self.assertEqual(switch_type.hostname_slug, "sg350-10p")
+
+    def test_blank_na2_dline_gets_seeded(self) -> None:
+        NetworkDeviceType = self.apps.get_model("inventory", "NetworkDeviceType")
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="Neutrik", model="NA2-DLINE", name="Default", port_count=0
+        )
+        self._run()
+        device_type.refresh_from_db()
+        self.assertEqual(device_type.hostname_slug, "na2dline")
+
+    def test_operator_set_slug_is_not_overwritten(self) -> None:
+        """A Type an operator already hand-set a slug on — even a value
+        the constant would not itself have produced — must survive
+        unchanged. Only the four Amphenol rows are ever corrected, and
+        only from their specific known-typo value.
+        """
+        NetworkSwitchType = self.apps.get_model("inventory", "NetworkSwitchType")
+        switch_type = NetworkSwitchType.objects.create(
+            manufacturer="Cisco",
+            model="SG300-10MP",
+            name="For 3xAmp Rack Primary",
+            port_count=0,
+            hostname_slug="operator-chosen",
+        )
+        self._run()
+        switch_type.refresh_from_db()
+        self.assertEqual(switch_type.hostname_slug, "operator-chosen")
+
+    def test_amphenol_rows_are_corrected(self) -> None:
+        NetworkDeviceType = self.apps.get_model("inventory", "NetworkDeviceType")
+        cases = [
+            ("RJD1212-0050", "rdj1212", "rjd1212"),
+            ("RJD2203-0050", "rdj2203", "rjd2203"),
+            ("RJD32A3-0050", "rdj32a3", "rjd32a3"),
+            ("RJD32U1-0050", "rdj32u1", "rjd32u1"),
+        ]
+        rows = {
+            model: NetworkDeviceType.objects.create(
+                manufacturer="Amphenol", model=model, name="Default", port_count=0, hostname_slug=typo
+            )
+            for model, typo, _expected in cases
+        }
+        self._run()
+        for model, _typo, expected in cases:
+            rows[model].refresh_from_db()
+            self.assertEqual(rows[model].hostname_slug, expected, model)
+
+    def test_amphenol_row_with_a_different_operator_value_is_left_alone(self) -> None:
+        """The correction targets the specific known-typo value only — an
+        Amphenol row an operator has already retyped to something else
+        entirely (not the ``rdj…`` typo) is not touched either.
+        """
+        NetworkDeviceType = self.apps.get_model("inventory", "NetworkDeviceType")
+        device_type = NetworkDeviceType.objects.create(
+            manufacturer="Amphenol",
+            model="RJD1212-0050",
+            name="Default",
+            port_count=0,
+            hostname_slug="something-else",
+        )
+        self._run()
+        device_type.refresh_from_db()
+        self.assertEqual(device_type.hostname_slug, "something-else")
+
+    def test_idempotent(self) -> None:
+        NetworkSwitchType = self.apps.get_model("inventory", "NetworkSwitchType")
+        NetworkDeviceType = self.apps.get_model("inventory", "NetworkDeviceType")
+        switch_type = NetworkSwitchType.objects.create(
+            manufacturer="Cisco", model="SG300-10MP", name="For 3xAmp Rack Primary", port_count=0
+        )
+        amphenol = NetworkDeviceType.objects.create(
+            manufacturer="Amphenol",
+            model="RJD1212-0050",
+            name="Default",
+            port_count=0,
+            hostname_slug="rdj1212",
+        )
+        self._run()
+        self._run()  # must not raise, and must not change anything further
+        switch_type.refresh_from_db()
+        amphenol.refresh_from_db()
+        self.assertEqual(switch_type.hostname_slug, "sg300-10mp")
+        self.assertEqual(amphenol.hostname_slug, "rjd1212")
+
+
+class AssembleHostnameTests(TestCase):
+    """PLAN-hostname-computation.md PR 2 — ``assemble_hostname()`` is a
+    pure join, no queries, no object: ``HostnameComponents`` carries
+    already-resolved plain values (owner slug, location slug, type slug,
+    purpose, sequence).
+    """
+
+    def _components(self, **overrides: Any) -> HostnameComponents:
+        defaults: dict[str, Any] = {
+            "owner_slug": "mps",
+            "location_slug": "wpcsrl",
+            "type_slug": "ik42",
+            "purpose": "sub",
+            "sequence": 1,
+        }
+        defaults.update(overrides)
+        return HostnameComponents(**defaults)
+
+    def test_every_component_present(self) -> None:
+        self.assertEqual(assemble_hostname(self._components()), "mps-wpcsrl-ik42-sub-1")
+
+    def test_owner_absent_blocks(self) -> None:
+        self.assertIsNone(assemble_hostname(self._components(owner_slug=None)))
+
+    def test_owner_blank_blocks(self) -> None:
+        self.assertIsNone(assemble_hostname(self._components(owner_slug="")))
+
+    def test_type_slug_absent_blocks(self) -> None:
+        self.assertIsNone(assemble_hostname(self._components(type_slug=None)))
+
+    def test_type_slug_blank_blocks(self) -> None:
+        self.assertIsNone(assemble_hostname(self._components(type_slug="")))
+
+    def test_location_skipped_when_none(self) -> None:
+        self.assertEqual(assemble_hostname(self._components(location_slug=None)), "mps-ik42-sub-1")
+
+    def test_purpose_skipped_when_blank(self) -> None:
+        self.assertEqual(assemble_hostname(self._components(purpose="")), "mps-wpcsrl-ik42-1")
+
+    def test_sequence_skipped_when_none(self) -> None:
+        self.assertEqual(assemble_hostname(self._components(sequence=None)), "mps-wpcsrl-ik42-sub")
+
+    def test_every_optional_component_absent_yields_bare_owner_typeslug(self) -> None:
+        components = self._components(location_slug=None, purpose="", sequence=None)
+        self.assertEqual(assemble_hostname(components), "mps-ik42")
+
+
+class HostnameIsTakenTests(TestCase):
+    """PLAN-hostname-computation.md PR 2 — ``hostname_is_taken()`` spans
+    ``NetworkSwitch``, ``NetworkDevice`` and the derived
+    ``NetworkDevicePort.hostname`` (ADR 0022 decision 4), plain ``=``, and
+    excludes the object being computed by pk.
+    """
+
+    def setUp(self) -> None:
+        self.device_type = _make_device_type()
+        self.switch_type = _make_switch_type()
+
+    def test_blank_never_taken(self) -> None:
+        self.assertFalse(hostname_is_taken(""))
+
+    def test_not_taken_when_nothing_matches(self) -> None:
+        self.assertFalse(hostname_is_taken("mps-ik42-1"))
+
+    def test_switch_hostname_taken(self) -> None:
+        NetworkSwitch.objects.create(switch_type=self.switch_type, hostname="mps-sg300")
+        self.assertTrue(hostname_is_taken("mps-sg300"))
+
+    def test_switch_excluded_by_pk(self) -> None:
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, hostname="mps-sg300")
+        self.assertFalse(hostname_is_taken("mps-sg300", exclude_switch_pk=switch.pk))
+
+    def test_device_hostname_taken(self) -> None:
+        NetworkDevice.objects.create(device_type=self.device_type, hostname="mps-ik42")
+        self.assertTrue(hostname_is_taken("mps-ik42"))
+
+    def test_device_excluded_by_pk(self) -> None:
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname="mps-ik42")
+        self.assertFalse(hostname_is_taken("mps-ik42", exclude_device_pk=device.pk))
+
+    def test_derived_port_name_taken(self) -> None:
+        device_type = _make_console_type_for_hostname_suffix()
+        NetworkDevice.objects.create(device_type=device_type, hostname="mps-avio-sd12")
+        self.assertTrue(hostname_is_taken("mps-avio-sd12-device-control"))
+
+    def test_derived_port_name_not_blocked_by_own_device_exclusion(self) -> None:
+        """A rename must not be blocked by its own ports' derived names,
+        which shift together with it.
+        """
+        device_type = _make_console_type_for_hostname_suffix()
+        device = NetworkDevice.objects.create(device_type=device_type, hostname="mps-avio-sd12")
+        self.assertFalse(hostname_is_taken("mps-avio-sd12-device-control", exclude_device_pk=device.pk))
+
+    def test_blank_device_hostname_never_yields_a_port_collision(self) -> None:
+        """A device with no hostname of its own derives no port hostname
+        at all (the property returns ``None``, never ``"-suffix"``) — so a
+        blank-hostname device must never register as a false collision
+        against a bare ``"-suffix"``-shaped name.
+        """
+        device_type = _make_console_type_for_hostname_suffix()
+        NetworkDevice.objects.create(device_type=device_type, hostname="")
+        self.assertFalse(hostname_is_taken("-device-control"))
+
+
+class ChooseSequenceTests(TestCase):
+    """PLAN-hostname-computation.md PR 2 — the numbering rule (ADR 0023
+    decision 7, amended): table-driven over the starting value, plus the
+    free-check loop's own guarantees.
+    """
+
+    def setUp(self) -> None:
+        self.device_type = _make_device_type()
+
+    def _device(self, hostname: str) -> NetworkDevice:
+        return NetworkDevice.objects.create(device_type=self.device_type, hostname=hostname)
+
+    def test_nothing_exists_returns_none(self) -> None:
+        self.assertIsNone(choose_sequence("mps-ik42"))
+
+    def test_bare_exists_no_numbered_siblings_returns_2(self) -> None:
+        self._device("mps-ik42")
+        self.assertEqual(choose_sequence("mps-ik42"), 2)
+
+    def test_numbered_sibling_exists_returns_highest_plus_one(self) -> None:
+        self._device("mps-ik42-1")
+        self._device("mps-ik42-2")
+        self.assertEqual(choose_sequence("mps-ik42"), 3)
+
+    def test_gap_left_by_a_deleted_device_is_never_reused(self) -> None:
+        self._device("mps-ik42-1")
+        self._device("mps-ik42-3")
+        self.assertEqual(choose_sequence("mps-ik42"), 4)
+
+    def test_hand_typed_sibling_is_counted(self) -> None:
+        # No different from a computed one, as far as the sibling scan is
+        # concerned — "whatever their origin".
+        self._device("mps-ik42-7")
+        self.assertEqual(choose_sequence("mps-ik42"), 8)
+
+    def test_numbered_sibling_beats_bare_existing_too(self) -> None:
+        """Both a bare stem *and* a numbered sibling exist — the numbered-
+        sibling branch wins (highest + 1), not the bare-only branch (2).
+        """
+        self._device("mps-ik42")
+        self._device("mps-ik42-5")
+        self.assertEqual(choose_sequence("mps-ik42"), 6)
+
+    def test_collision_with_derived_port_name_is_bumped_past(self) -> None:
+        """Nothing in the sibling scan sees this collision at all — the
+        bare stem matches no switch/device hostname — but the free-check
+        loop must still catch it via ``hostname_is_taken()``.
+        """
+        console_type = _make_console_type_for_hostname_suffix()
+        NetworkDevice.objects.create(device_type=console_type, hostname="mps-ik42")
+        # mps-ik42's Device Control port now derives "mps-ik42-device-control".
+        self.assertEqual(choose_sequence("mps-ik42-device-control"), 2)
+
+    def test_self_exclusion_is_idempotent(self) -> None:
+        """Computing for an object that already holds a name in its own
+        stem returns that same name — otherwise recompute renames a device
+        on every run (settled decision 3): without exclusion, the target
+        below (already ``-3``) would see *itself* as the highest numbered
+        sibling and be bumped to ``-4``.
+        """
+        self._device("mps-ik42-2")  # a genuine other sibling
+        target = self._device("mps-ik42-3")
+        # Without self-exclusion: target counts itself, highest becomes 3,
+        # runaway to 4.
+        self.assertEqual(choose_sequence("mps-ik42"), 4)
+        # With self-exclusion: only the other sibling (2) remains visible,
+        # reproducing target's own already-stored sequence (3).
+        self.assertEqual(choose_sequence("mps-ik42", exclude_device_pk=target.pk), 3)
+
+    def test_self_exclusion_on_bare_name(self) -> None:
+        device = self._device("mps-ik42")
+        self.assertIsNone(choose_sequence("mps-ik42", exclude_device_pk=device.pk))
+
+    def test_current_name_bare_is_honoured_despite_numbered_siblings(self) -> None:
+        """Code review finding 1 — self-exclusion alone is not enough for
+        the *bare*-named member of a numbered group: excluding it from
+        the sibling scan makes the highest remaining sibling look like
+        the group's own top, and without ``current_name`` it would be
+        bumped to a new numbered suffix on every recompute.
+        """
+        target = self._device("mps-ik42")
+        self._device("mps-ik42-2")
+        self._device("mps-ik42-17")
+        # Without current_name: excluding target still leaves -17 as the
+        # highest remaining sibling, so the naive answer is 18 — the
+        # runaway finding 1 describes.
+        self.assertEqual(choose_sequence("mps-ik42", exclude_device_pk=target.pk), 18)
+        # With current_name honoured: target's own bare name is free
+        # (nothing but target itself ever held it), so it stays bare.
+        self.assertIsNone(choose_sequence("mps-ik42", current_name="mps-ik42", exclude_device_pk=target.pk))
+
+    def test_current_name_numbered_is_honoured_over_the_sibling_scan(self) -> None:
+        target = self._device("mps-ik42-3")
+        self._device("mps-ik42-9")
+        # Without current_name: highest remaining sibling is 9 -> 10.
+        self.assertEqual(choose_sequence("mps-ik42", exclude_device_pk=target.pk), 10)
+        # With current_name: target's own -3 is free (excluding itself),
+        # so it's reproduced rather than bumped past the other sibling.
+        self.assertEqual(
+            choose_sequence("mps-ik42", current_name="mps-ik42-3", exclude_device_pk=target.pk), 3
+        )
+
+    def test_current_name_not_matching_the_stem_is_ignored(self) -> None:
+        target = self._device("totally-unrelated-name")
+        self.assertEqual(
+            choose_sequence("mps-ik42", current_name="totally-unrelated-name", exclude_device_pk=target.pk),
+            None,
+        )
+
+    def test_current_name_matching_but_taken_by_something_else_falls_through(self) -> None:
+        """Defensive: if the current name happens to also be held by a
+        *different* object (a hand-edited duplicate, e.g.), it must not
+        be handed back as if it were free — the normal derivation runs
+        instead.
+        """
+        self._device("mps-ik42-5")  # a different device already holds this exact name
+        target = self._device("mps-ik42-9")
+        self.assertEqual(
+            choose_sequence("mps-ik42", current_name="mps-ik42-5", exclude_device_pk=target.pk), 6
+        )
+
+    def test_current_name_with_a_non_canonical_suffix_is_not_honoured(self) -> None:
+        """Code review round 2, finding 2 — ``int()`` is not a round-trip:
+        ``"03"`` parses to ``3``, but ``"03" != str(3)``. Honouring
+        ``current_name="…-03"`` as sequence 3 without re-checking the
+        *reassembled* string ``"…-3"`` would silently produce a duplicate
+        here, since a different device genuinely holds that exact name.
+        """
+        self._device("mps-ik42-3")  # genuine other sibling holding the round-tripped value
+        target = self._device("mps-ik42-03")
+        self.assertEqual(
+            choose_sequence("mps-ik42", current_name="mps-ik42-03", exclude_device_pk=target.pk), 4
+        )
+
+    def test_non_canonical_numeric_suffix_is_invisible_to_the_sibling_scan(self) -> None:
+        """The same round-trip guard applies inside ``_sibling_state()``
+        (code review round 2, finding 2) — a stored ``…-03`` is not
+        counted as a numbered sibling at all, the same as any other
+        non-numeric suffix would be.
+        """
+        self._device("mps-ik42-03")
+        self.assertIsNone(choose_sequence("mps-ik42"))
+
+    def test_non_ascii_digit_suffix_does_not_raise(self) -> None:
+        """``"²".isdigit()`` is ``True`` but ``int("²")`` raises — a
+        hostname carrying a non-ASCII "digit" suffix must be treated as
+        non-numeric, not crash the numbering rule (code review round 2,
+        finding 2).
+        """
+        self._device("mps-ik42-²")
+        self.assertIsNone(choose_sequence("mps-ik42"))  # must not raise
+
+
+class ResolveExplicitSequenceTests(TestCase):
+    """PLAN-hostname-computation.md PR 3 / code review finding 3 —
+    ``resolve_explicit_sequence()``: honoured as typed when free, bumped
+    forward (never re-derived from the sibling-scan table) when taken.
+    """
+
+    def setUp(self) -> None:
+        self.device_type = _make_device_type()
+
+    def _device(self, hostname: str, sequence: int | None = None) -> NetworkDevice:
+        return NetworkDevice.objects.create(
+            device_type=self.device_type, hostname=hostname, hostname_sequence=sequence
+        )
+
+    def test_free_value_is_returned_unchanged(self) -> None:
+        self.assertEqual(resolve_explicit_sequence("mps-ik42", 1), 1)
+
+    def test_taken_value_bumps_forward_from_itself(self) -> None:
+        self._device("mps-ik42-1", sequence=1)
+        self.assertEqual(resolve_explicit_sequence("mps-ik42", 1), 2)
+
+    def test_bump_skips_every_taken_value_in_a_row(self) -> None:
+        self._device("mps-ik42-1", sequence=1)
+        self._device("mps-ik42-2", sequence=2)
+        self.assertEqual(resolve_explicit_sequence("mps-ik42", 1), 3)
+
+    def test_never_consults_the_sibling_scan_starting_table(self) -> None:
+        """Even with a numbered sibling present that ``choose_sequence()``
+        would treat as "highest" evidence, an explicit, free value is
+        honoured exactly as typed — the starting-value table plays no
+        part here at all.
+        """
+        self._device("mps-ik42-9")
+        self.assertEqual(resolve_explicit_sequence("mps-ik42", 1), 1)
+
+    def test_self_exclusion(self) -> None:
+        target = self._device("mps-ik42-1", sequence=1)
+        self.assertEqual(resolve_explicit_sequence("mps-ik42", 1, exclude_device_pk=target.pk), 1)
 
 
 class RackTemplateModelTests(TestCase):
@@ -6209,7 +7587,9 @@ class OperatorSetPortTests(TestCase):
         self.assertEqual(ports["Dante Primary"].address, "10.201.6.5")
         self.assertEqual(ports["Dante Secondary"].address, "10.202.6.5")
         self.assertEqual(ports["Device Control"].address, "10.201.6.4")
-        self.assertEqual(ports["Device Control"].hostname, "DM7C-1-device-control")
+        # Lowercase — ADR 0023 decision 8 (amended): hostname is normalised
+        # on write, even though "DM7C-1" was typed above.
+        self.assertEqual(ports["Device Control"].hostname, "dm7c-1-device-control")
 
     def test_two_slot_ports_one_vlan_still_refused(self) -> None:
         """The exemption is narrow — two *SLOT* ports on one VLAN are

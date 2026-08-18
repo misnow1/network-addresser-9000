@@ -21,7 +21,12 @@
             {# Stage B — retargeted off the admin: NetworkSwitch has no shaped page of #}
             {# its own, but it does have a read-parity one now (Stage C's Viewer can't  #}
             {# reach admin:inventory_networkswitch_change at all). #}
-            <td><a href="{% url 'inventory:model_detail' 'networkswitch' switch.pk %}">{{ switch }}</a></td>
+            <td>
+              <a href="{% url 'inventory:model_detail' 'networkswitch' switch.pk %}">{{ switch }}</a>
+              {% if switch.hostname_diverges %}
+                <span class="badge badge--diverges" title="This name no longer matches its owner/location/type/purpose/sequence.">name diverges</span>
+              {% endif %}
+            </td>
             <td>{{ switch.switch_type }}</td>
             <td>{{ switch.serial_number|default:"—" }}</td>
           </tr>
@@ -41,7 +46,12 @@
       <tbody>
         {% for device in spare_devices %}
           <tr>
-            <td><a href="{% url 'inventory:device' device.pk %}">{{ device }}</a></td>
+            <td>
+              <a href="{% url 'inventory:device' device.pk %}">{{ device }}</a>
+              {% if device.hostname_diverges %}
+                <span class="badge badge--diverges" title="This name no longer matches its owner/location/type/purpose/sequence.">name diverges</span>
+              {% endif %}
+            </td>
             <td>{{ device.device_type }}</td>
             <td>{{ device.serial_number|default:"—" }}</td>
           </tr>
