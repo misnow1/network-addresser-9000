@@ -440,8 +440,16 @@ def _fill_computed_hostname(cleaned_data: dict[str, Any], rack: Any, type_obj: A
     sequence_conflict: int | None = None
     if sequence is None:
         bare_twin = _bare_twin_without_sequence(stem, exclude_switch_pk=None, exclude_device_pk=None)
-        sequence = choose_sequence(stem, exclude_switch_pk=None, exclude_device_pk=None)
-        if sequence == 2 and bare_twin is not None:
+        sequence = choose_sequence(
+            stem, purpose=stem_components.purpose, exclude_switch_pk=None, exclude_device_pk=None
+        )
+        # The starting value only ever reaches 2 via the bare-name branch
+        # when a purpose is set (ADR 0023 decision 7, amended again) — for
+        # a blank purpose, 1 is tried directly, so a bare twin is never
+        # asked to cede it; recommending 1 here would risk naming an
+        # already-taken slot on the rare mixed-state stem where a numbered
+        # sibling also holds 1.
+        if sequence == 2 and bare_twin is not None and stem_components.purpose:
             advisories.append(
                 f"Hostname {bare_twin} shares this name with no sequence of its own — consider "
                 "giving it hostname_sequence=1."
@@ -568,11 +576,18 @@ def _recompute_hostname(
         # bumped to a numbered suffix on every subsequent recompute.
         obj.hostname_sequence = choose_sequence(
             stem,
+            purpose=obj.hostname_purpose,
             current_name=obj.hostname,
             exclude_switch_pk=exclude_switch_pk,
             exclude_device_pk=exclude_device_pk,
         )
-        if obj.hostname_sequence == 2 and bare_twin is not None:
+        # The starting value only ever reaches 2 via the bare-name branch
+        # when a purpose is set (ADR 0023 decision 7, amended again) — for
+        # a blank purpose, 1 is tried directly, so a bare twin is never
+        # asked to cede it; recommending 1 here would risk naming an
+        # already-taken slot on the rare mixed-state stem where a numbered
+        # sibling also holds 1.
+        if obj.hostname_sequence == 2 and bare_twin is not None and obj.hostname_purpose:
             advisories.append(
                 f"Hostname {bare_twin} shares this name with no sequence of its own — consider "
                 "giving it hostname_sequence=1."

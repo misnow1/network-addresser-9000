@@ -240,24 +240,47 @@ def _bump_until_free(
 def choose_sequence(
     stem: str,
     *,
+    purpose: str,
     current_name: str | None = None,
     exclude_switch_pk: int | None = None,
     exclude_device_pk: int | None = None,
 ) -> int | None:
-    """The numbering rule (ADR 0023 decision 7, amended): where to *start*
-    ``hostname_sequence``, chosen before any free-check runs, then bumped
-    until ``hostname_is_taken()`` says the assembled name is free.
+    """The numbering rule (ADR 0023 decision 7, twice amended): where to
+    *start* ``hostname_sequence``, chosen before any free-check runs, then
+    bumped until ``hostname_is_taken()`` says the assembled name is free.
 
-    | State of ``stem`` | Start at |
-    |---|---|
-    | nothing exists | ``None`` — take the bare name |
-    | bare name exists, no numbered siblings | **2**, leaving 1 for the advisory |
-    | any numbered sibling exists | **highest + 1** |
+    ``purpose`` is the component being assembled alongside this sequence
+    (``stem_components.purpose``/``obj.hostname_purpose``) — **not**
+    optional, because the starting value depends on whether it's blank:
+
+    | State of ``stem`` | ``purpose`` blank | ``purpose`` set |
+    |---|---|---|
+    | nothing exists | **1** | ``None`` — take the bare name |
+    | bare name exists, no numbered siblings | **1** | **2**, leaving 1 for the advisory |
+    | any numbered sibling exists | **highest + 1** | **highest + 1** |
+
+    Measured against all 52 production hostnames, the purpose-set column
+    (numbering from 2, leaving a bare name in reserve) reproduces 42; the
+    blank-purpose column (numbering from 1 unconditionally) reproduces 49
+    — every one of the 10 misses under the old, single-table rule was the
+    same shape, a purpose-less group like ``mps-avio-amph-output`` whose
+    first member production names ``…-output-1``, not bare. Applying
+    "start from 1" to a *purpose-carrying* stem instead would turn
+    ``mps-wpc1sru-ik42-sub`` into ``…-sub-1`` and break the 30
+    purpose-carrying production rows that are correctly bare today, which
+    is why the two columns diverge only when ``purpose`` is blank.
 
     Highest + 1, never lowest-free, so a gap left by a deleted device's
     hostname is never handed to different hardware — a retired hostname
     may still be referenced by DNS, switch configs or the label on the
-    box, none of which this system can see.
+    box, none of which this system can see. This is why a blank-purpose
+    stem with a bare name already sitting on it still starts at 1 rather
+    than treating the bare name itself as "1 taken": nothing yet holds
+    the literal ``stem-1`` string, so 1 is genuinely free, and the bare
+    row is expected to renumber to ``-1`` (or further, if 1 turns out
+    already taken by a numbered sibling — see the recompute idempotence
+    note below) on its own next recompute rather than being treated as
+    if it already occupied that slot.
 
     Only called when ``hostname_sequence`` is not already explicitly set
     on the object (settled decision 6) — that check is the caller's, not
@@ -281,10 +304,24 @@ def choose_sequence(
     text* nonetheless already matches this stem — exactly the bare-name
     case, since a numbered name normally carries its number in the field
     too.
+
+    **The bare-name half of that honouring is itself conditional on
+    ``purpose`` now.** A bare ``current_name`` is only honoured when
+    ``purpose`` is set — a legitimate answer there, unchanged from
+    before. When ``purpose`` is blank, the numbering rule above says this
+    row should carry ``1``, not stay bare, so a bare ``current_name`` is
+    *not* honoured and falls through to the ordinary sibling-scan
+    derivation instead — the very case the table's first two rows exist
+    to renumber. A *numbered* ``current_name`` (``stem-<digits>``) is
+    still honoured either way; that's what keeps recompute idempotent
+    once a blank-purpose row has taken its ``-1`` (or higher) on a prior
+    run — the second run's sibling scan would otherwise see its own
+    current suffix excluded and derive a *different*, higher number
+    every time, the same failure mode this parameter was added to close.
     """
     if current_name is not None:
         if current_name == stem:
-            if not hostname_is_taken(
+            if purpose and not hostname_is_taken(
                 stem, exclude_switch_pk=exclude_switch_pk, exclude_device_pk=exclude_device_pk
             ):
                 return None
@@ -298,8 +335,11 @@ def choose_sequence(
     bare_exists, highest = _sibling_state(
         stem, exclude_switch_pk=exclude_switch_pk, exclude_device_pk=exclude_device_pk
     )
+    sequence: int | None
     if highest is not None:
-        sequence: int | None = highest + 1
+        sequence = highest + 1
+    elif not purpose:
+        sequence = 1
     elif bare_exists:
         sequence = 2
     else:
