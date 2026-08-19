@@ -481,6 +481,71 @@ what ADR 0010 says Types are for.
       needs a fourth role ("Shure Control"), and the DiGiCo SD12 needs ADR 0017's derived offsets.
       Modes are a convenience layer over a port model that must stay fully expressive
 
+## 22. Dante device names and the Yamaha unit ID
+
+`docs/adr/0024-dante-device-names.md` separates three things this project had been treating as one:
+a **hostname** (a convenience nothing reads), a **Dante device name** (an identifier Dante routes
+audio by), and a **Yamaha unit ID** (the `Y0##` key a console addresses a box with). They coincide
+for most equipment and stop coinciding on exactly the hardware this site owns — Rio and Tio stage
+boxes now, Shure receivers later.
+
+Small: one nullable field, one derived property, one conditional validation. No migration touches
+data. Two devices need an ID today and neither has one, so neither is integrated correctly — which
+this phase makes visible for the first time.
+
+- [ ] `NetworkDevice.dante_unit_id` — `PositiveSmallIntegerField`, null, **1–127**. That range is
+      the intersection of two vendor limits that disagree: Rio allows `Y000`–`Y07F` (0–127), Shure's
+      Yamaha mode allows hex `01`–`FF` (1–255)
+- [ ] `dante_device_name` as a **derived, read-only property** — the hostname where no unit ID is
+      set, `Y0{id:02X}-{hostname}` where one is, and **`None` where the hostname is blank** even if
+      a unit ID exists, since `Y001-` ends in a hyphen and Dante forbids that. The hostname is a
+      blocking input, exactly as ADR 0023 decision 1 treats a missing owner. Nothing stored, for
+      ADR 0022 decision 4's reason: a stored copy has nothing keeping it in step
+- [ ] Site-wide uniqueness on `dante_unit_id`, validated in `full_clean()`, null exempt, **enforced
+      on creation as well as rename** — unlike ADR 0023's hostname rule, because no importer writes
+      unit IDs and so no rebuild can break
+- [ ] The **assembled name** is validated at **31 characters** where a unit ID is set — Dante's
+      published limit, not a 26-character hostname cap with the prefix length baked in. Raised on
+      the hostname field, stating the arithmetic. Where no unit ID is set, an over-31 hostname
+      raises a **non-blocking advisory** instead: the tool cannot tell whether Dante's rule applies,
+      but staying silent about a name it can see will fail is worse. Reachable from components that
+      exist today — `bej-w8lm1sr-rio3224d3-midhi-01-04` is 33, and 36 with a sequence
+- [ ] Suggested value is **highest assigned + 1**, never a retired ID, field stays editable. Harder
+      justification than the hostname version: Dante routes to whatever currently holds a name and
+      Shure warns that changing a Dante ID *"will cause a loss of audio signal"*, so a reused ID can
+      silently pull audio from the wrong box. At 127 the suggester falls back to lowest-unused and
+      names what it is reclaiming
+- [ ] Help text carrying the *why*, not just the what — the field is meaningless without it:
+      - `dante_unit_id`: *"Yamaha consoles find and control this device by this number. Must be
+        unique across every Yamaha-controlled device on the network — stage boxes and wireless
+        receivers share one range. 1–127. Leave blank for equipment that is not controlled by a
+        Yamaha console, including the consoles themselves."*
+      - `dante_device_name` (read-only): *"The name to set in Dante Controller. Dante routes audio
+        by this name, so changing it drops audio until subscriptions are rebuilt — and a name that
+        was previously in use will pull audio from whatever now holds it."*
+      - On the length error: *"With Dante unit ID 1 this device's Dante name would be 33
+        characters. Dante allows 31, and the `Y001-` prefix uses 5, leaving 26 for the hostname."*
+        Name the arithmetic, not just the limit
+      - On the over-31 advisory with no unit ID: *"This hostname is 33 characters. Dante's
+        device-name limit is 31, so if this device is on a Dante network its name will be rejected."*
+- [ ] **ADR 0023's recompute action warns per affected device** when it changes a Dante name,
+      naming the new name and the Dante Controller step. Phase 18's bulk rename plus this ADR's
+      derived name compose into an audio outage neither has alone — Shure states that changing a
+      Dante ID *"will cause a loss of audio signal"* until subscriptions are rebuilt. The action
+      still renames; it just stops being silent about it
+- [ ] Read-only UI parity, and the derived name on the device detail page
+- [ ] Tests: the derived name across all four rows of the decision-1 table, including **blank
+      hostname with a unit ID yielding `None`, not `Y001-`**; uppercase hex (`Y01B`, not `Y01b`);
+      the 31-character check errors only when a unit ID is set and advises otherwise; site-wide
+      uniqueness including on creation; the suggester skips a retired ID; the 127 fallback names
+      what it reclaims; the recompute action warns for a unit-ID device and stays silent for others
+
+Known gap the ADR names: an ordinary Dante device with no unit ID and an over-long hostname gets no
+warning, because the tool cannot identify Dante devices structurally. Deriving that — "has a port on
+a VLAN whose *role* is Dante Primary" — is what ADR 0021 designed VLAN role for, and role is phase
+21. If it ships, this gap closes with no schema change.
+
+
 ## Later / not yet designed
 
 ### Blocked on one gate: ADR 0020 decision 2
@@ -526,6 +591,7 @@ work.
 - Slot moves don't re-suggest an already-static device port's address (armed by default now that static materializes by default, ADR 0013; follows from ADR 0003's "stored, not immutable") — see #28. Its hostname sibling **#54 is closed by phase 18**, which ships a stateless `hostname_diverges` indicator (ADR 0023). #28 is the same staleness *class* but a different mechanism — it compares a stored address against what the allocator would now suggest, which carries its own decisions about derived, offset and operator-set addresses, so it was deliberately not folded into a naming phase. One UI treatment should eventually serve both — report, don't enforce, as in phase 19
 - **Dante device names and Martin Vu-Net names are separate namespaces** from the hostname — see #64. The production Dante sheet carries both, and they share the hostname vocabulary while differing in shape, case and uniqueness scope: Vu-Net drops owner and model, is uppercase, and is unique only per model (`SPARE-1` appears twice, for the IK42 and IK81 spares). Both are names configured on the hardware itself, like an address, so the interesting behaviour is reconciling what is configured against what the components say — not generating them. Pointless before ADR 0023 lands, since they borrow its component fields
 - Multicast configuration: port-level filtering plus switch-level IGMP snooping — see #22
+- **Dante mode as something the tool reasons about, not just records.** A device's Dante networking mode (Switched / Redundant / Split) currently lives inside `NetworkDeviceType.name` — the free-text *profile label* ADR 0010 defines — alongside a second, orthogonal axis (whether a Dante card is fitted). That is tolerable only while nothing reads it. It stops being tolerable as soon as the tool should enforce a rule that depends on it, and there is now a concrete one: Shure receivers integrating with Yamaha consoles **must not** be in Split mode — *"Do not use SPLIT mode. This is not compatible with control from the Yamaha consoles"* (`docs/Shure Devices.md`, and the Shure/Yamaha integration guide it links). A rule cannot be enforced against a substring of a label. Making mode a first-class field is a substantially larger change than it looks — it splits one identity axis into two, touches every Type profile in the estate, and interacts with ADR 0010's `(manufacturer, model, name)` identity and its seed-once port materialization — so it needs its own ADR rather than riding along with another phase
 - Populated rack templates: slot layouts that materialize equipment (needs Type `PROTECT`, unlike the VLAN-only feature) — see #30. **No longer blocks hostnames** (phase 17); it would *enhance* them by prefilling the purpose component, and it does gate the rack creation wizard
 - Rack *slot* occupancy has no DB-level overlap guarantee once a device spans several ordinals (ADR 0017's known gap) — see #40. `RackSlotAssignmentMixin`'s docstring defers this to phase 3's "Overlap validation", but that item shipped covering rack-range-vs-range and DHCP overlap only — the deferral still has no live home and the pointer is still stale
 - **Address regions** — named, declared partitions of the host-offset space that racks are allocated *from*, so that "amp racks live here, wireless lives there" is a property the system knows rather than something achieved by picking offsets by hand. Motivated by `PROD-DATA-ANALYSIS.md` §7.2: production's offset gaps are **mnemonic, not technical** — they exist so an address can be identified by eye in the field, the same instinct as VLAN-ID-in-the-second-octet, and they double as error detection. Composes with phase 19 but is not scheduled with it
