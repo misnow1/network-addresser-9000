@@ -508,8 +508,8 @@ this phase makes visible for the first time.
       published limit, not a 26-character hostname cap with the prefix length baked in. Raised on
       the hostname field, stating the arithmetic. Where no unit ID is set, an over-31 hostname
       raises a **non-blocking advisory** instead: the tool cannot tell whether Dante's rule applies,
-      but staying silent about a name it can see will fail is worse. Reachable from components
-      already in the database — `mps-floatswitch-rio3224d3-midhi-01-04` is 37
+      but staying silent about a name it can see will fail is worse. Reachable from components that
+      exist today — `bej-w8lm1sr-rio3224d3-midhi-01-04` is 33, and 36 with a sequence
 - [ ] Suggested value is **highest assigned + 1**, never a retired ID, field stays editable. Harder
       justification than the hostname version: Dante routes to whatever currently holds a name and
       Shure warns that changing a Dante ID *"will cause a loss of audio signal"*, so a reused ID can
@@ -526,7 +526,7 @@ this phase makes visible for the first time.
       - On the length error: *"With Dante unit ID 1 this device's Dante name would be 33
         characters. Dante allows 31, and the `Y001-` prefix uses 5, leaving 26 for the hostname."*
         Name the arithmetic, not just the limit
-      - On the over-31 advisory with no unit ID: *"This hostname is 37 characters. Dante's
+      - On the over-31 advisory with no unit ID: *"This hostname is 33 characters. Dante's
         device-name limit is 31, so if this device is on a Dante network its name will be rejected."*
 - [ ] **ADR 0023's recompute action warns per affected device** when it changes a Dante name,
       naming the new name and the Dante Controller step. Phase 18's bulk rename plus this ADR's

@@ -129,7 +129,7 @@ Where it is null, nothing changes: the hostname keeps ADR 0023's 63-character ca
 nothing about the device.
 
 **No `is_dante_device` flag**, deliberately. A flag would be a second hand-maintained truth that can
-disagree with reality, and would need 25 existing Types classified by hand. Deriving the answer
+disagree with reality, and would need 26 existing device Types classified by hand. Deriving the answer
 structurally — "does it have a port on a VLAN whose *role* is Dante Primary?" — is what ADR 0021
 designed VLAN role for, but role is phase 21 and unbuilt, and matching on a VLAN's free-text name is
 the failure mode issue #10 documents. Making the unit ID itself the opt-in needs neither.
@@ -139,16 +139,18 @@ structurally, so it cannot *enforce* Dante's limit on a device that never opted 
 silent about a name it can see will fail is worse. Any hostname over **31 characters** raises an
 advisory, whatever its unit ID:
 
-> This hostname is 37 characters. Dante's device-name limit is 31, so if this device is on a Dante
+> This hostname is 33 characters. Dante's device-name limit is 31, so if this device is on a Dante
 > network its name will be rejected.
 
 Non-blocking: the device saves. Lighting and video equipment is never constrained by an audio
 protocol, and nothing is refused for a rule that may not apply to it.
 
-This is reachable now, not theoretical. Composing the longest component values already in the
-database — owner `mps`, location `floatswitch`, type slug `rio3224d3`, purpose `midhi-01-04` —
-gives `mps-floatswitch-rio3224d3-midhi-01-04`, 37 characters, and 40 with a sequence. Nothing live
-is close (the longest hostname is 19), but ADR 0023's own scheme can build it from parts that exist.
+This is reachable now, not theoretical. Composing the longest component values that actually exist
+in the database — owner `bej`, location `w8lm1sr`, type slug `rio3224d3`, and `midhi-01-04`, the
+purpose `MORE_MUSINGS.md` gives as its own example — yields `bej-w8lm1sr-rio3224d3-midhi-01-04` at
+**33 characters**, or 36 with a sequence. Nothing live is close (the longest hostname is 19,
+`mps-wpc1sru-sg300-1`), but ADR 0023's scheme can build an over-limit name out of parts already
+present.
 
 **The gap that remains:** the advisory fires on length only. Nothing checks that an un-flagged Dante
 device's name is *unique on the Dante network*, because the tool does not know which devices share
@@ -236,9 +238,9 @@ receivers when they arrive.
   is currently integrated correctly, which this ADR makes visible for the first time.
 - **`hostname` gains a conditional 31-character check** — an error where a unit ID is set, an
   advisory everywhere else. The longest live hostname is 19, so nothing breaks today, but ADR 0023's
-  scheme can produce 37 from component values already in the database
-  (`mps-floatswitch-rio3224d3-midhi-01-04`). Latent in the same way the 63-character cap was before
-  phase 18 measured it.
+  scheme can produce 33 from component values that already exist
+  (`bej-w8lm1sr-rio3224d3-midhi-01-04`), or 36 with a sequence. Latent in the same way the
+  63-character cap was before phase 18 measured it.
 - **ADR 0023's recompute action gains a warning** for devices carrying a unit ID (decision 5). That
   is a change to behaviour shipped in phase 18, not new machinery — the advisory path already
   exists.
