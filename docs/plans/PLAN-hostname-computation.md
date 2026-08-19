@@ -147,7 +147,15 @@ No queries beyond the three relation reads. Location is read through the rack an
 for spare-pool equipment. Never reads through to `rack.owner` — that fallback belongs to the
 recompute action alone, so the value is stored rather than inherited.
 
-### `choose_sequence(stem, *, exclude_switch_pk=None, exclude_device_pk=None) -> int | None`
+### `choose_sequence(stem, *, purpose, exclude_switch_pk=None, exclude_device_pk=None) -> int | None`
+
+> **Superseded post-ship** — ADR 0023 decision 7's third amendment (2026-08-17, from a live-admin
+> report). The table below is the plan's original, `hostname_purpose`-blind rule; production
+> reproduction was 42/52 against it. A `purpose` column was added afterward — blank starts at 1
+> unconditionally rather than reserving 1 for the advisory, raising reproduction to 49/52 — because
+> starting from 1 unconditionally would break the 30 purpose-carrying rows this table already gets
+> right. See the ADR for the full table, the measurement, and the interaction with the `current_name`
+> honouring below (a bare name is no longer honoured when `purpose` is blank, so it renumbers).
 
 | State of the stem | Start at |
 |---|---|

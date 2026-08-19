@@ -31,6 +31,7 @@ from django.db import IntegrityError, connection, transaction
 from django.db.migrations.executor import MigrationExecutor
 from django.db.models import ProtectedError
 from django.forms import inlineformset_factory
+from django.template.defaultfilters import capfirst
 from django.test import RequestFactory, TestCase, TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
@@ -5655,7 +5656,9 @@ class HostnameAddFormAssemblyTests(TestCase):
             }
         )
         self.assertTrue(form.is_valid(), form.errors)
-        self.assertEqual(form.instance.hostname, "mps-wpcsrl-ik42")
+        # Blank hostname_purpose starts numbering at 1 (ADR 0023 decision 7,
+        # amended again) — a bare name is no longer the no-purpose default.
+        self.assertEqual(form.instance.hostname, "mps-wpcsrl-ik42-1")
 
     def test_blank_switch_hostname_is_filled(self) -> None:
         form = NetworkSwitchAddForm(
@@ -5668,7 +5671,7 @@ class HostnameAddFormAssemblyTests(TestCase):
             }
         )
         self.assertTrue(form.is_valid(), form.errors)
-        self.assertEqual(form.instance.hostname, "mps-wpcsrl-sg300")
+        self.assertEqual(form.instance.hostname, "mps-wpcsrl-sg300-1")
 
     def test_spare_pool_device_with_no_rack_still_assembles(self) -> None:
         """The trap the plan review caught: assembly must run *before*
@@ -5686,7 +5689,9 @@ class HostnameAddFormAssemblyTests(TestCase):
             }
         )
         self.assertTrue(form.is_valid(), form.errors)
-        self.assertEqual(form.instance.hostname, "mps-ik42")  # no location — no rack at all
+        # No location (no rack at all) — still numbered from 1, blank
+        # purpose (ADR 0023 decision 7, amended again).
+        self.assertEqual(form.instance.hostname, "mps-ik42-1")
 
     def test_change_form_does_not_assemble(self) -> None:
         device = NetworkDevice.objects.create(
@@ -5746,7 +5751,9 @@ class HostnameAddFormAssemblyTests(TestCase):
         self.assertEqual(form.instance.hostname, "mps-wpcsrl-ik42-2")
         self.assertEqual(form.instance.hostname_sequence, 2)
         # Code review round 2, finding 3 — the rewrite is not silent.
-        self.assertTrue(any("hostname_sequence 1 was already in use" in a for a in form._hostname_advisories))
+        self.assertTrue(
+            any("Requested hostname_sequence 1 was already taken" in a for a in form._hostname_advisories)
+        )
 
 
 class RecomputeHostnameActionTests(TestCase):
@@ -5782,9 +5789,17 @@ class RecomputeHostnameActionTests(TestCase):
         admin.recompute_hostnames(self._request(), NetworkDevice.objects.filter(pk=device.pk))
         device.refresh_from_db()
         self.assertEqual(device.owner, self.owner)
-        self.assertEqual(device.hostname, "mps-wpcsrl-ik42")
+        # Blank hostname_purpose numbers from 1 (ADR 0023 decision 7,
+        # amended again) — even a lone, ungrouped device is no longer bare.
+        self.assertEqual(device.hostname, "mps-wpcsrl-ik42-1")
 
     def test_recompute_twice_yields_the_same_name_and_reports_unchanged(self) -> None:
+        """The idempotence the blank-purpose numbering change depends on:
+        ``mps-wpcsrl-ik42`` computes to ``…-1`` on the first run (the new
+        rule), and the second run must reproduce that exact name rather
+        than treating the now-numbered ``current_name`` as an unrelated
+        sibling and bumping past it.
+        """
         device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=1)
         admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
         first_request = self._request()
@@ -5792,6 +5807,8 @@ class RecomputeHostnameActionTests(TestCase):
         device.refresh_from_db()
         first_name = device.hostname
         first_sequence = device.hostname_sequence
+        self.assertEqual(first_name, "mps-wpcsrl-ik42-1")
+        self.assertEqual(first_sequence, 1)
 
         second_request = self._request()
         admin.recompute_hostnames(second_request, NetworkDevice.objects.filter(pk=device.pk))
@@ -5851,7 +5868,7 @@ class RecomputeHostnameActionTests(TestCase):
         self.assertEqual(twin.hostname_sequence, 2)
         # Code review round 2, finding 3 — the rewrite is not silent.
         self.assertTrue(
-            any("hostname_sequence 1 was already in use" in str(m) for m in get_messages(request))
+            any("Requested hostname_sequence 1 was already taken" in str(m) for m in get_messages(request))
         )
 
     def test_recompute_over_17_identical_devices_yields_17_distinct_names(self) -> None:
@@ -5865,18 +5882,63 @@ class RecomputeHostnameActionTests(TestCase):
         names = set(NetworkDevice.objects.filter(pk__in=pks).values_list("hostname", flat=True))
         self.assertEqual(len(names), 17)
 
+    def test_recompute_over_several_identical_devices_gives_each_its_own_advisory(self) -> None:
+        """Change 2's motivating report: the action emits one advisory
+        per row, so recomputing a batch of blank-purpose devices used to
+        produce that many *identical, anonymous* "purpose reads better"
+        banners — nothing said which device was which. Each must now name
+        its own computed hostname, so five identical devices give five
+        distinct messages, not one repeated five times.
+        """
+        devices = [
+            NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=slot)
+            for slot in range(1, 6)
+        ]
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        pks = [d.pk for d in devices]
+        request = self._request()
+        admin.recompute_hostnames(request, NetworkDevice.objects.filter(pk__in=pks))
+        purpose_advisories = [
+            str(m) for m in get_messages(request) if "A purpose reads better than a bare number" in str(m)
+        ]
+        # Four, not five: the first device takes the default sequence 1,
+        # which is the ordinary outcome rather than a collision, so it is
+        # deliberately silent. Only 2-5 were forced up by a collision the
+        # purpose field could have avoided.
+        self.assertEqual(len(purpose_advisories), 4)
+        self.assertEqual(len(set(purpose_advisories)), 4)  # each names a different row
+        for advisory in purpose_advisories:
+            self.assertEqual(capfirst(advisory), advisory)
+
+    def test_default_sequence_of_1_raises_no_purpose_advisory(self) -> None:
+        """The purpose advisory is about avoiding a *collision*
+        (MORE_MUSINGS: "in a physical rack, the 4th field should be used
+        to avoid collisions"). Once hostname_sequence defaults to 1, a
+        bare 1 means nothing collided, so advising on it would fire for
+        every purposeless racked device and drown the cases that matter.
+        """
+        device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=1)
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        request = self._request()
+        admin.recompute_hostnames(request, NetworkDevice.objects.filter(pk=device.pk))
+        device.refresh_from_db()
+        self.assertEqual(device.hostname_sequence, 1)
+        self.assertFalse([m for m in get_messages(request) if "A purpose reads better" in str(m)])
+
     def test_recompute_over_17_identical_devices_twice_is_idempotent(self) -> None:
         """Code review finding 1 — the single-device idempotence test
-        elsewhere in this class can't catch this: the bug is specific to
-        the *bare*-named member of a numbered group, which only exists
-        once there's a group to be the bare member of. Without
-        ``choose_sequence()`` honouring that device's own already-held
-        bare name, excluding it from its own sibling scan makes the
+        elsewhere in this class can't catch this: without
+        ``choose_sequence()`` honouring each device's own already-held
+        numbered name, excluding it from its own sibling scan makes the
         highest *remaining* sibling look like the group's own top, and it
         gets bumped to a new numbered suffix on this second pass — quite
         possibly one already held by another device in the group, so this
         doubles as a regression test for exactly the collision that would
-        produce.
+        produce. Blank purpose now numbers every member of the group from
+        1 (ADR 0023 decision 7, amended again), so none of the 17 is ever
+        bare — the *bare*-name half of ``current_name`` honouring, still
+        needed for a purpose-carrying group, has its own coverage in
+        ``ChooseSequenceTests``.
         """
         devices = [
             NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=slot)
@@ -5911,7 +5973,7 @@ class RecomputeHostnameActionTests(TestCase):
         admin = NetworkSwitchAdmin(NetworkSwitch, AdminSite())
         admin.recompute_hostnames(self._request(), NetworkSwitch.objects.filter(pk=switch.pk))
         switch.refresh_from_db()
-        self.assertEqual(switch.hostname, "mps-wpcsrl-sg300")
+        self.assertEqual(switch.hostname, "mps-wpcsrl-sg300-1")
         self.assertEqual(switch.owner, self.owner)
 
     def test_device_action_reachable_through_the_changelist(self) -> None:
@@ -5932,7 +5994,7 @@ class RecomputeHostnameActionTests(TestCase):
         )
         self.assertEqual(response.status_code, 302)
         device.refresh_from_db()
-        self.assertEqual(device.hostname, "mps-wpcsrl-ik42")
+        self.assertEqual(device.hostname, "mps-wpcsrl-ik42-1")
 
     def test_switch_action_reachable_through_the_changelist(self) -> None:
         switch = NetworkSwitch.objects.create(switch_type=self.switch_type, rack=self.rack, rack_slot=1)
@@ -5943,7 +6005,7 @@ class RecomputeHostnameActionTests(TestCase):
         )
         self.assertEqual(response.status_code, 302)
         switch.refresh_from_db()
-        self.assertEqual(switch.hostname, "mps-wpcsrl-sg300")
+        self.assertEqual(switch.hostname, "mps-wpcsrl-sg300-1")
 
 
 class HostnameAdvisoryEmissionTests(TestCase):
@@ -5959,14 +6021,16 @@ class HostnameAdvisoryEmissionTests(TestCase):
             name="Rack 1", slot_count=10, owner=self.owner, location_slug="wpcsrl"
         )
         self.device_type = _make_device_type(hostname_slug="ik42")
-        # A bare twin with no sequence of its own — computing a second
-        # identical device should bump to 2 and advise assigning this one 1.
+        # A bare, purpose-carrying twin with no sequence of its own —
+        # computing a second device with the same purpose should bump to 2
+        # and advise assigning this one 1.
         self.twin = NetworkDevice.objects.create(
             device_type=self.device_type,
             rack=self.rack,
             rack_slot=1,
             owner=self.owner,
-            hostname="mps-wpcsrl-ik42",
+            hostname="mps-wpcsrl-ik42-sub",
+            hostname_purpose="sub",
         )
         self.editor = User.objects.create_user("advisory-editor", password="testpass123", is_staff=True)
         self.editor.groups.add(Group.objects.get(name="Editor"))
@@ -5976,6 +6040,7 @@ class HostnameAdvisoryEmissionTests(TestCase):
             data={
                 "device_type": str(self.device_type.pk),
                 "hostname": "",
+                "hostname_purpose": "sub",  # shares the twin's stem+purpose
                 "rack": str(self.rack.pk),
                 "rack_slot": "2",
                 "port_addressing": "dhcp",
@@ -5993,6 +6058,7 @@ class HostnameAdvisoryEmissionTests(TestCase):
             {
                 "device_type": str(self.device_type.pk),
                 "hostname": "",
+                "hostname_purpose": "sub",  # shares the twin's stem+purpose
                 "serial_number": "",
                 "rack": str(self.rack.pk),
                 "rack_slot": "2",
@@ -6006,6 +6072,111 @@ class HostnameAdvisoryEmissionTests(TestCase):
         errors = response.context["adminform"].errors if response.context else None
         self.assertEqual(response.status_code, 302, errors)
         self.assertTrue(any("hostname_sequence=1" in str(m) for m in get_messages(response.wsgi_request)))
+
+    def test_twin_advisory_does_not_lead_with_the_hostname_and_names_it(self) -> None:
+        """Django admin renders every message through ``capfirst``
+        (``django/contrib/admin/templates/admin/base.html``), which
+        uppercases the message's first *letter* — wrong for a hostname,
+        which is a DNS label and always lowercase. The advisory must open
+        with an ordinary word ``capfirst`` may safely capitalise, and must
+        still say which row it's about: the *twin*, a different,
+        already-saved row from the one being computed.
+        """
+        form = NetworkDeviceAddForm(
+            data={
+                "device_type": str(self.device_type.pk),
+                "hostname": "",
+                "hostname_purpose": "sub",
+                "rack": str(self.rack.pk),
+                "rack_slot": "2",
+                "port_addressing": "dhcp",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        (advisory,) = form._hostname_advisories
+        self.assertEqual(
+            advisory,
+            "Hostname mps-wpcsrl-ik42-sub shares this name with no sequence of its own — consider "
+            "giving it hostname_sequence=1.",
+        )
+        # The root-cause regression check: capfirst() must be a no-op.
+        self.assertEqual(capfirst(advisory), advisory)
+        self.assertFalse(advisory.startswith("mps-"))
+
+    def test_purpose_advisory_names_the_row_being_computed(self) -> None:
+        """The purpose advisory's subject is the row *being recomputed*
+        (change 2) — distinct from the twin advisory's subject, which is
+        the *other*, already-saved row. Also not test-covered before this
+        change (the brief's own diagnosis: grepping for its text returned
+        nothing). A numbered sibling (rather than a nothing-exists or
+        bare-twin stem) keeps this scenario's expected sequence the same
+        regardless of the ``hostname_purpose`` numbering rule.
+        """
+        NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=3,
+            owner=self.owner,
+            hostname="mps-wpcsrl-ik42-1",
+            hostname_sequence=1,
+        )
+        form = NetworkDeviceAddForm(
+            data={
+                "device_type": str(self.device_type.pk),
+                "hostname": "",
+                "rack": str(self.rack.pk),
+                "rack_slot": "4",
+                "port_addressing": "dhcp",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.hostname, "mps-wpcsrl-ik42-2")
+        self.assertEqual(
+            form._hostname_advisories,
+            [
+                "A purpose reads better than a bare number for mps-wpcsrl-ik42-2 — consider setting "
+                "hostname_purpose."
+            ],
+        )
+        for advisory in form._hostname_advisories:
+            self.assertEqual(capfirst(advisory), advisory)
+            self.assertFalse(advisory.startswith("mps-"))
+
+    def test_explicit_sequence_conflict_advisory_names_the_row_and_does_not_lead_with_a_field_name(
+        self,
+    ) -> None:
+        """``hostname_sequence`` (a field name, not a hostname) used to
+        lead the message and get mangled to ``Hostname_sequence`` by
+        ``capfirst`` — reworded alongside the other two for the same
+        reason, and identifies which row ended up with which value.
+        """
+        NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=5,
+            owner=self.owner,
+            hostname="mps-wpcsrl-ik42-1",
+            hostname_sequence=1,
+        )
+        form = NetworkDeviceAddForm(
+            data={
+                "device_type": str(self.device_type.pk),
+                "hostname": "",
+                "rack": str(self.rack.pk),
+                "rack_slot": "6",
+                "port_addressing": "dhcp",
+                "owner": str(self.owner.pk),
+                "hostname_sequence": "1",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.hostname, "mps-wpcsrl-ik42-2")
+        (advisory,) = [a for a in form._hostname_advisories if "Requested hostname_sequence" in a]
+        self.assertEqual(
+            advisory,
+            "Requested hostname_sequence 1 was already taken for mps-wpcsrl-ik42-2 — using 2 instead.",
+        )
+        self.assertEqual(capfirst(advisory), advisory)
 
 
 class HostnameWriteAuditTests(TestCase):
@@ -6575,9 +6746,17 @@ class HostnameIsTakenTests(TestCase):
 
 class ChooseSequenceTests(TestCase):
     """PLAN-hostname-computation.md PR 2 — the numbering rule (ADR 0023
-    decision 7, amended): table-driven over the starting value, plus the
-    free-check loop's own guarantees.
+    decision 7, twice amended) for a **purpose-carrying** stem: table-
+    driven over the starting value, plus the free-check loop's own
+    guarantees. This whole class is "unchanged from today" behaviour —
+    every call passes a non-blank ``purpose``. The blank-purpose column
+    (numbering from 1 unconditionally) has its own class below,
+    ``ChooseSequenceBlankPurposeTests``.
     """
+
+    #: Any non-blank value exercises the "purpose set" column of the
+    #: starting-value table — the tests don't care which.
+    PURPOSE = "sub"
 
     def setUp(self) -> None:
         self.device_type = _make_device_type()
@@ -6585,28 +6764,31 @@ class ChooseSequenceTests(TestCase):
     def _device(self, hostname: str) -> NetworkDevice:
         return NetworkDevice.objects.create(device_type=self.device_type, hostname=hostname)
 
+    def _choose(self, stem: str, **kwargs: Any) -> int | None:
+        return choose_sequence(stem, purpose=self.PURPOSE, **kwargs)
+
     def test_nothing_exists_returns_none(self) -> None:
-        self.assertIsNone(choose_sequence("mps-ik42"))
+        self.assertIsNone(self._choose("mps-ik42"))
 
     def test_bare_exists_no_numbered_siblings_returns_2(self) -> None:
         self._device("mps-ik42")
-        self.assertEqual(choose_sequence("mps-ik42"), 2)
+        self.assertEqual(self._choose("mps-ik42"), 2)
 
     def test_numbered_sibling_exists_returns_highest_plus_one(self) -> None:
         self._device("mps-ik42-1")
         self._device("mps-ik42-2")
-        self.assertEqual(choose_sequence("mps-ik42"), 3)
+        self.assertEqual(self._choose("mps-ik42"), 3)
 
     def test_gap_left_by_a_deleted_device_is_never_reused(self) -> None:
         self._device("mps-ik42-1")
         self._device("mps-ik42-3")
-        self.assertEqual(choose_sequence("mps-ik42"), 4)
+        self.assertEqual(self._choose("mps-ik42"), 4)
 
     def test_hand_typed_sibling_is_counted(self) -> None:
         # No different from a computed one, as far as the sibling scan is
         # concerned — "whatever their origin".
         self._device("mps-ik42-7")
-        self.assertEqual(choose_sequence("mps-ik42"), 8)
+        self.assertEqual(self._choose("mps-ik42"), 8)
 
     def test_numbered_sibling_beats_bare_existing_too(self) -> None:
         """Both a bare stem *and* a numbered sibling exist — the numbered-
@@ -6614,7 +6796,7 @@ class ChooseSequenceTests(TestCase):
         """
         self._device("mps-ik42")
         self._device("mps-ik42-5")
-        self.assertEqual(choose_sequence("mps-ik42"), 6)
+        self.assertEqual(self._choose("mps-ik42"), 6)
 
     def test_collision_with_derived_port_name_is_bumped_past(self) -> None:
         """Nothing in the sibling scan sees this collision at all — the
@@ -6624,7 +6806,7 @@ class ChooseSequenceTests(TestCase):
         console_type = _make_console_type_for_hostname_suffix()
         NetworkDevice.objects.create(device_type=console_type, hostname="mps-ik42")
         # mps-ik42's Device Control port now derives "mps-ik42-device-control".
-        self.assertEqual(choose_sequence("mps-ik42-device-control"), 2)
+        self.assertEqual(self._choose("mps-ik42-device-control"), 2)
 
     def test_self_exclusion_is_idempotent(self) -> None:
         """Computing for an object that already holds a name in its own
@@ -6637,21 +6819,24 @@ class ChooseSequenceTests(TestCase):
         target = self._device("mps-ik42-3")
         # Without self-exclusion: target counts itself, highest becomes 3,
         # runaway to 4.
-        self.assertEqual(choose_sequence("mps-ik42"), 4)
+        self.assertEqual(self._choose("mps-ik42"), 4)
         # With self-exclusion: only the other sibling (2) remains visible,
         # reproducing target's own already-stored sequence (3).
-        self.assertEqual(choose_sequence("mps-ik42", exclude_device_pk=target.pk), 3)
+        self.assertEqual(self._choose("mps-ik42", exclude_device_pk=target.pk), 3)
 
     def test_self_exclusion_on_bare_name(self) -> None:
         device = self._device("mps-ik42")
-        self.assertIsNone(choose_sequence("mps-ik42", exclude_device_pk=device.pk))
+        self.assertIsNone(self._choose("mps-ik42", exclude_device_pk=device.pk))
 
     def test_current_name_bare_is_honoured_despite_numbered_siblings(self) -> None:
         """Code review finding 1 — self-exclusion alone is not enough for
         the *bare*-named member of a numbered group: excluding it from
         the sibling scan makes the highest remaining sibling look like
         the group's own top, and without ``current_name`` it would be
-        bumped to a new numbered suffix on every recompute.
+        bumped to a new numbered suffix on every recompute. Bare-name
+        honouring only applies with a purpose set (ADR 0023 decision 7,
+        amended again) — this class's whole point — a legitimate answer
+        there, unlike the blank-purpose case below.
         """
         target = self._device("mps-ik42")
         self._device("mps-ik42-2")
@@ -6659,26 +6844,24 @@ class ChooseSequenceTests(TestCase):
         # Without current_name: excluding target still leaves -17 as the
         # highest remaining sibling, so the naive answer is 18 — the
         # runaway finding 1 describes.
-        self.assertEqual(choose_sequence("mps-ik42", exclude_device_pk=target.pk), 18)
+        self.assertEqual(self._choose("mps-ik42", exclude_device_pk=target.pk), 18)
         # With current_name honoured: target's own bare name is free
         # (nothing but target itself ever held it), so it stays bare.
-        self.assertIsNone(choose_sequence("mps-ik42", current_name="mps-ik42", exclude_device_pk=target.pk))
+        self.assertIsNone(self._choose("mps-ik42", current_name="mps-ik42", exclude_device_pk=target.pk))
 
     def test_current_name_numbered_is_honoured_over_the_sibling_scan(self) -> None:
         target = self._device("mps-ik42-3")
         self._device("mps-ik42-9")
         # Without current_name: highest remaining sibling is 9 -> 10.
-        self.assertEqual(choose_sequence("mps-ik42", exclude_device_pk=target.pk), 10)
+        self.assertEqual(self._choose("mps-ik42", exclude_device_pk=target.pk), 10)
         # With current_name: target's own -3 is free (excluding itself),
         # so it's reproduced rather than bumped past the other sibling.
-        self.assertEqual(
-            choose_sequence("mps-ik42", current_name="mps-ik42-3", exclude_device_pk=target.pk), 3
-        )
+        self.assertEqual(self._choose("mps-ik42", current_name="mps-ik42-3", exclude_device_pk=target.pk), 3)
 
     def test_current_name_not_matching_the_stem_is_ignored(self) -> None:
         target = self._device("totally-unrelated-name")
         self.assertEqual(
-            choose_sequence("mps-ik42", current_name="totally-unrelated-name", exclude_device_pk=target.pk),
+            self._choose("mps-ik42", current_name="totally-unrelated-name", exclude_device_pk=target.pk),
             None,
         )
 
@@ -6690,9 +6873,7 @@ class ChooseSequenceTests(TestCase):
         """
         self._device("mps-ik42-5")  # a different device already holds this exact name
         target = self._device("mps-ik42-9")
-        self.assertEqual(
-            choose_sequence("mps-ik42", current_name="mps-ik42-5", exclude_device_pk=target.pk), 6
-        )
+        self.assertEqual(self._choose("mps-ik42", current_name="mps-ik42-5", exclude_device_pk=target.pk), 6)
 
     def test_current_name_with_a_non_canonical_suffix_is_not_honoured(self) -> None:
         """Code review round 2, finding 2 — ``int()`` is not a round-trip:
@@ -6703,9 +6884,7 @@ class ChooseSequenceTests(TestCase):
         """
         self._device("mps-ik42-3")  # genuine other sibling holding the round-tripped value
         target = self._device("mps-ik42-03")
-        self.assertEqual(
-            choose_sequence("mps-ik42", current_name="mps-ik42-03", exclude_device_pk=target.pk), 4
-        )
+        self.assertEqual(self._choose("mps-ik42", current_name="mps-ik42-03", exclude_device_pk=target.pk), 4)
 
     def test_non_canonical_numeric_suffix_is_invisible_to_the_sibling_scan(self) -> None:
         """The same round-trip guard applies inside ``_sibling_state()``
@@ -6714,7 +6893,7 @@ class ChooseSequenceTests(TestCase):
         non-numeric suffix would be.
         """
         self._device("mps-ik42-03")
-        self.assertIsNone(choose_sequence("mps-ik42"))
+        self.assertIsNone(self._choose("mps-ik42"))
 
     def test_non_ascii_digit_suffix_does_not_raise(self) -> None:
         """``"²".isdigit()`` is ``True`` but ``int("²")`` raises — a
@@ -6723,7 +6902,92 @@ class ChooseSequenceTests(TestCase):
         finding 2).
         """
         self._device("mps-ik42-²")
-        self.assertIsNone(choose_sequence("mps-ik42"))  # must not raise
+        self.assertIsNone(self._choose("mps-ik42"))  # must not raise
+
+
+class ChooseSequenceBlankPurposeTests(TestCase):
+    """ADR 0023 decision 7, amended again — the blank-``hostname_purpose``
+    column of the starting-value table: **1** unconditionally, unless a
+    numbered sibling already exists, in which case **highest + 1** exactly
+    as the purpose-set column. Measured against all 52 production
+    hostnames: numbering from 1 whenever purpose is blank reproduces 49,
+    versus 42 for numbering from 2 (leaving 1 for the twin) unconditionally
+    — every one of the 10 misses under the old, single-table rule was the
+    same shape, a group like ``mps-avio-amph-output`` whose first member
+    production names ``…-output-1``, not bare.
+    """
+
+    def setUp(self) -> None:
+        self.device_type = _make_device_type()
+
+    def _device(self, hostname: str) -> NetworkDevice:
+        return NetworkDevice.objects.create(device_type=self.device_type, hostname=hostname)
+
+    def _choose(self, stem: str, **kwargs: Any) -> int | None:
+        return choose_sequence(stem, purpose="", **kwargs)
+
+    def test_nothing_exists_returns_1_not_none(self) -> None:
+        """The headline behaviour change: a lone, ungrouped device with no
+        purpose is no longer left bare.
+        """
+        self.assertEqual(self._choose("mps-avio-amph-output"), 1)
+
+    def test_bare_name_exists_also_returns_1(self) -> None:
+        """Unlike the purpose-set column, an existing bare twin does not
+        push this device to 2 — nothing yet holds the literal ``-1``
+        string, so 1 is genuinely free, and the bare twin is expected to
+        renumber to ``-1`` itself on its own next recompute.
+        """
+        self._device("mps-ik42")
+        self.assertEqual(self._choose("mps-ik42"), 1)
+
+    def test_numbered_sibling_exists_returns_highest_plus_one(self) -> None:
+        self._device("mps-ik42-1")
+        self.assertEqual(self._choose("mps-ik42"), 2)
+
+    def test_gap_left_by_a_deleted_device_is_never_reused(self) -> None:
+        """Highest + 1, not lowest-free, even under the new rule — a
+        stray ``-1`` must not make this jump straight back down to a
+        retired number instead of past the real highest sibling.
+        """
+        self._device("mps-ik42-1")
+        self._device("mps-ik42-5")
+        self.assertEqual(self._choose("mps-ik42"), 6)
+
+    def test_bare_current_name_is_not_honoured_and_renumbers_to_1(self) -> None:
+        """The subtle interaction with the idempotence fix: ``current_name``
+        honouring must *stop* honouring a bare name when purpose is blank,
+        because the rule now says this row should carry 1. Without this,
+        a device already named ``mps-ik42`` would stay bare forever
+        instead of renumbering — settled: existing bare names renumber.
+        """
+        target = self._device("mps-ik42")
+        self.assertEqual(self._choose("mps-ik42", current_name="mps-ik42", exclude_device_pk=target.pk), 1)
+
+    def test_numbered_current_name_is_still_honoured(self) -> None:
+        """Unlike the bare case, a *numbered* ``current_name`` is honoured
+        regardless of purpose — this is what keeps recompute idempotent
+        once a blank-purpose row has taken its ``-1``: the second run must
+        reproduce it, not exclude it from the sibling scan and derive a
+        new, higher number.
+        """
+        target = self._device("mps-ik42-1")
+        self.assertEqual(self._choose("mps-ik42", current_name="mps-ik42-1", exclude_device_pk=target.pk), 1)
+
+    def test_recompute_is_idempotent_across_two_runs(self) -> None:
+        """End to end, without the admin layer: ``mps-avio-aes`` computes
+        to ``mps-avio-aes-1`` on the first run (nothing exists), then a
+        second run — now excluding the object, whose ``current_name`` is
+        ``mps-avio-aes-1`` — reproduces the same value rather than
+        treating it as a sibling and bumping past it.
+        """
+        target = self._device("mps-avio-aes")
+        first = self._choose("mps-avio-aes", current_name=target.hostname, exclude_device_pk=target.pk)
+        self.assertEqual(first, 1)
+        target.hostname = f"mps-avio-aes-{first}"
+        target.save()
+        second = self._choose("mps-avio-aes", current_name=target.hostname, exclude_device_pk=target.pk)
+        self.assertEqual(second, first)
 
 
 class ResolveExplicitSequenceTests(TestCase):

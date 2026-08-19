@@ -437,32 +437,57 @@ def _fill_computed_hostname(cleaned_data: dict[str, Any], rack: Any, type_obj: A
 
     sequence = cleaned_data.get("hostname_sequence")
     advisories: list[str] = []
+    sequence_conflict: int | None = None
     if sequence is None:
         bare_twin = _bare_twin_without_sequence(stem, exclude_switch_pk=None, exclude_device_pk=None)
-        sequence = choose_sequence(stem, exclude_switch_pk=None, exclude_device_pk=None)
-        if sequence == 2 and bare_twin is not None:
+        sequence = choose_sequence(
+            stem, purpose=stem_components.purpose, exclude_switch_pk=None, exclude_device_pk=None
+        )
+        # The starting value only ever reaches 2 via the bare-name branch
+        # when a purpose is set (ADR 0023 decision 7, amended again) — for
+        # a blank purpose, 1 is tried directly, so a bare twin is never
+        # asked to cede it; recommending 1 here would risk naming an
+        # already-taken slot on the rare mixed-state stem where a numbered
+        # sibling also holds 1.
+        if sequence == 2 and bare_twin is not None and stem_components.purpose:
             advisories.append(
-                f"{bare_twin} shares this hostname with no sequence of its own — consider giving "
-                "it hostname_sequence=1."
+                f"Hostname {bare_twin} shares this name with no sequence of its own — consider "
+                "giving it hostname_sequence=1."
             )
         cleaned_data["hostname_sequence"] = sequence
     else:
         # Explicit — honoured as typed, only bumped forward if that exact
         # name is already occupied (code review finding 3).
-        resolved = resolve_explicit_sequence(stem, sequence, exclude_switch_pk=None, exclude_device_pk=None)
-        if resolved != sequence:
+        typed_sequence = sequence
+        sequence = resolve_explicit_sequence(stem, sequence, exclude_switch_pk=None, exclude_device_pk=None)
+        if sequence != typed_sequence:
             # Silently rewriting the operator's own typed value with no
             # explanation would be exactly the kind of surprise ADR 0019's
             # suggest-don't-lock exists to avoid (code review finding 3).
-            advisories.append(f"hostname_sequence {sequence} was already in use; used {resolved} instead.")
-            cleaned_data["hostname_sequence"] = resolved
-        sequence = resolved
-    if rack is not None and rack.location_slug and sequence is not None and not stem_components.purpose:
-        advisories.append(
-            "A purpose reads better than a bare number here — consider setting hostname_purpose."
-        )
+            sequence_conflict = typed_sequence
+            cleaned_data["hostname_sequence"] = sequence
 
     final_name = assemble_hostname(stem_components._replace(sequence=sequence))
+    if sequence_conflict is not None:
+        advisories.append(
+            f"Requested hostname_sequence {sequence_conflict} was already taken for {final_name} — "
+            f"using {sequence} instead."
+        )
+    # `> 1`, not `is not None`: since hostname_sequence defaults to 1
+    # (ADR 0023 decision 7's purpose amendment), a bare 1 is the ordinary
+    # outcome rather than a disambiguator, and advising on it would fire
+    # for every purposeless racked device. MORE_MUSINGS' rule is about
+    # *avoiding collisions* — only a number forced above 1 represents one.
+    if (
+        rack is not None
+        and rack.location_slug
+        and sequence is not None
+        and sequence > 1
+        and not stem_components.purpose
+    ):
+        advisories.append(
+            f"A purpose reads better than a bare number for {final_name} — consider setting hostname_purpose."
+        )
     if final_name:
         cleaned_data["hostname"] = final_name
     return advisories
@@ -550,6 +575,7 @@ def _recompute_hostname(
         return _HostnameRecomputeResult("skipped", f"missing {' and '.join(missing)}", [])
 
     advisories: list[str] = []
+    sequence_conflict: int | None = None
     if obj.hostname_sequence is None:
         bare_twin = _bare_twin_without_sequence(
             stem, exclude_switch_pk=exclude_switch_pk, exclude_device_pk=exclude_device_pk
@@ -561,14 +587,21 @@ def _recompute_hostname(
         # bumped to a numbered suffix on every subsequent recompute.
         obj.hostname_sequence = choose_sequence(
             stem,
+            purpose=obj.hostname_purpose,
             current_name=obj.hostname,
             exclude_switch_pk=exclude_switch_pk,
             exclude_device_pk=exclude_device_pk,
         )
-        if obj.hostname_sequence == 2 and bare_twin is not None:
+        # The starting value only ever reaches 2 via the bare-name branch
+        # when a purpose is set (ADR 0023 decision 7, amended again) — for
+        # a blank purpose, 1 is tried directly, so a bare twin is never
+        # asked to cede it; recommending 1 here would risk naming an
+        # already-taken slot on the rare mixed-state stem where a numbered
+        # sibling also holds 1.
+        if obj.hostname_sequence == 2 and bare_twin is not None and obj.hostname_purpose:
             advisories.append(
-                f"{bare_twin} shares this hostname with no sequence of its own — consider giving "
-                "it hostname_sequence=1."
+                f"Hostname {bare_twin} shares this name with no sequence of its own — consider "
+                "giving it hostname_sequence=1."
             )
     else:
         # Explicit — honoured as-is, only bumped forward if that exact
@@ -581,24 +614,30 @@ def _recompute_hostname(
             exclude_device_pk=exclude_device_pk,
         )
         if obj.hostname_sequence != original_sequence:
-            advisories.append(
-                f"hostname_sequence {original_sequence} was already in use; used "
-                f"{obj.hostname_sequence} instead."
-            )
-    if (
-        rack is not None
-        and rack.location_slug
-        and obj.hostname_sequence is not None
-        and not obj.hostname_purpose
-    ):
-        advisories.append(
-            "A purpose reads better than a bare number here — consider setting hostname_purpose."
-        )
+            sequence_conflict = original_sequence
 
     final_name = assemble_hostname(stem_components._replace(sequence=obj.hostname_sequence))
     # stem (owner + type_slug at minimum) already assembled above; adding a
     # sequence on top of already-present components can't newly block.
     assert final_name is not None
+    if sequence_conflict is not None:
+        advisories.append(
+            f"Requested hostname_sequence {sequence_conflict} was already taken for {final_name} — "
+            f"using {obj.hostname_sequence} instead."
+        )
+    if (
+        rack is not None
+        and rack.location_slug
+        and obj.hostname_sequence is not None
+        # See the matching comment on the add-form path above: a bare 1 is
+        # now the default, so only a number forced above it means a
+        # collision the purpose field could have avoided.
+        and obj.hostname_sequence > 1
+        and not obj.hostname_purpose
+    ):
+        advisories.append(
+            f"A purpose reads better than a bare number for {final_name} — consider setting hostname_purpose."
+        )
     if obj.hostname == final_name:
         return _HostnameRecomputeResult("unchanged", None, advisories)
     obj.hostname = final_name
