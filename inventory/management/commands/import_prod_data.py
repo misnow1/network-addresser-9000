@@ -119,11 +119,26 @@ OWNER_ROWS: tuple[tuple[str, str], ...] = (("mps", "MPS"), ("bej", "BEJ"))
 #: ``verify_prod_import.py`` re-derives this independently rather than
 #: importing it — see that module's docstring.
 RACK_LOCATION_SLUG_EXCEPTIONS: dict[str, str | None] = {
-    "XE300-1": "xe1",
-    "XE300-2": "xe2",
+    # XE300 is a Martin Audio speaker model, and this rack holds the amps that
+    # drive them — so the model number is the meaningful part, not noise to be
+    # abbreviated away. "xe1" also loses the distinction from a future XE500.
+    # (Operator decision, 2026-08-18; "xe3001" reads as "X E three thousand
+    # and one", which is why the digits are not simply run together.)
+    "XE300-1": "xe300-1",
+    "XE300-2": "xe300-2",
     "FOH Drive #1": "foh1",
     "FOH Drive #2": "foh2",
+    # Not in the source CSVs yet, so the importer never reaches it today —
+    # carried so that adding it to the sheet cannot silently produce
+    # "foh-drive-3" instead of matching its two siblings.
+    "FOH Drive #3": "foh3",
+    # Virtual pools rather than places, so they contribute no location
+    # component to a computed hostname (ADR 0023 decision 2). Without explicit
+    # None entries these slugify to "cdd"/"control" and gain a location they
+    # should not have.
     "CONSOLES": None,
+    "CDD": None,
+    "CONTROL": None,
 }
 
 #: ADR 0023 decision 10, amended (phase 18 PR 4) — ``(manufacturer, model)``

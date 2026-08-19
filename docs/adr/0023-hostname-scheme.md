@@ -458,9 +458,19 @@ What *does* ship, because it needs no join:
   `BEJ` row is an unracked console, so `bej` is seeded as vocabulary an operator will need rather
   than because any rack points at it
 - `Rack.location_slug` on each imported rack, by **slugifying the rack name, with a small constant
-  of exceptions** for the four that do not slug directly (`XE300-1` → `xe1`, `FOH Drive #1` →
-  `foh1`, and their siblings); `CONSOLES` maps to null deliberately. A name that neither appears in
-  the constant nor slugs to a legal DNS label is an error, not a silent skip
+  of exceptions** for the ones that do not slug directly (`FOH Drive #1` → `foh1` and its siblings);
+  virtual pools that are not places map to null deliberately. A name that neither appears in the
+  constant nor slugs to a legal DNS label is an error, not a silent skip
+
+  > **Since amended (2026-08-18).** The constant's contents drifted from the live estate and had to
+  > be re-derived from it. `XE300-1`/`-2` are **`xe300-1`/`xe300-2`**, not the `xe1`/`xe2` this ADR
+  > originally recorded: XE300 is a Martin Audio speaker model and this rack holds the amps driving
+  > them, so the model number is the meaningful part — and `xe1` would not distinguish it from a
+  > future XE500. `CDD` and `CONTROL` are virtual pools like `CONSOLES` and map to **null**; without
+  > explicit entries they slugified to `cdd`/`control` and gained a location component they should
+  > not have. Both errors were live: `verify_prod_import` was failing on four racks, and a rebuild
+  > would have overwritten the operator's chosen slugs. See the note on `HOSTNAME_SLUGS` under this
+  > decision — the same drift, caught there before it shipped and here only after.
 
 A rule-plus-exceptions shape rather than a full enumeration, because the importer creates 21 racks
 and only 14 appear as a location in the Dante sheet — enumerating all 21 would mean inventing five

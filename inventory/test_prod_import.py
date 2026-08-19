@@ -744,7 +744,7 @@ class ImportProdDataTests(TestCase):
         # names exercising the exceptions constant itself.
         expected = {
             "AMPRACK1": "amprack1",
-            "XE300-1": "xe1",
+            "XE300-1": "xe300-1",
             "AVIO": "avio",
             "W8LMTEST": "w8lmtest",
             "SHURE": "shure",
@@ -752,6 +752,21 @@ class ImportProdDataTests(TestCase):
         }
         for rack_name, expected_slug in expected.items():
             self.assertEqual(Rack.objects.get(name=rack_name).location_slug, expected_slug, rack_name)
+
+    def test_virtual_pools_get_no_location_slug(self) -> None:
+        """CDD and CONTROL are pools rather than places, like CONSOLES, so they
+        contribute no location component to a computed hostname (ADR 0023
+        decision 2). They are in the source CSVs, so without explicit None
+        entries in RACK_LOCATION_SLUG_EXCEPTIONS they slugify to "cdd" and
+        "control" and gain a location they should not have. That is what
+        happened in production: the operator cleared both by hand after the
+        import, and verify_prod_import then failed on them.
+        """
+        for rack_name in ("CONSOLES", "CDD", "CONTROL"):
+            rack = Rack.objects.filter(name=rack_name).first()
+            if rack is None:
+                continue  # not present in the synthetic fixture
+            self.assertIsNone(rack.location_slug, rack_name)
 
     def test_no_device_or_switch_carries_owner_or_hostname_purpose_or_sequence(self) -> None:
         # ADR 0023 decision 10's negative half: the importer seeds only
