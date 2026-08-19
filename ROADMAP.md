@@ -497,14 +497,19 @@ this phase makes visible for the first time.
       the intersection of two vendor limits that disagree: Rio allows `Y000`–`Y07F` (0–127), Shure's
       Yamaha mode allows hex `01`–`FF` (1–255)
 - [ ] `dante_device_name` as a **derived, read-only property** — the hostname where no unit ID is
-      set, `Y0{id:02X}-{hostname}` where one is. Nothing stored, for ADR 0022 decision 4's reason: a
-      stored copy has nothing keeping it in step with the hostname it is built from
+      set, `Y0{id:02X}-{hostname}` where one is, and **`None` where the hostname is blank** even if
+      a unit ID exists, since `Y001-` ends in a hyphen and Dante forbids that. The hostname is a
+      blocking input, exactly as ADR 0023 decision 1 treats a missing owner. Nothing stored, for
+      ADR 0022 decision 4's reason: a stored copy has nothing keeping it in step
 - [ ] Site-wide uniqueness on `dante_unit_id`, validated in `full_clean()`, null exempt, **enforced
       on creation as well as rename** — unlike ADR 0023's hostname rule, because no importer writes
       unit IDs and so no rebuild can break
-- [ ] The hostname is validated at **26 characters** where a unit ID is set (31 minus the
-      five-character prefix), **enforced not advised** — Dante refuses an over-length name outright.
-      Nothing is close today (longest live hostname is 19) but ADR 0023's scheme can produce 28
+- [ ] The **assembled name** is validated at **31 characters** where a unit ID is set — Dante's
+      published limit, not a 26-character hostname cap with the prefix length baked in. Raised on
+      the hostname field, stating the arithmetic. Where no unit ID is set, an over-31 hostname
+      raises a **non-blocking advisory** instead: the tool cannot tell whether Dante's rule applies,
+      but staying silent about a name it can see will fail is worse. Reachable from components
+      already in the database — `mps-floatswitch-rio3224d3-midhi-01-04` is 37
 - [ ] Suggested value is **highest assigned + 1**, never a retired ID, field stays editable. Harder
       justification than the hostname version: Dante routes to whatever currently holds a name and
       Shure warns that changing a Dante ID *"will cause a loss of audio signal"*, so a reused ID can
@@ -518,11 +523,22 @@ this phase makes visible for the first time.
       - `dante_device_name` (read-only): *"The name to set in Dante Controller. Dante routes audio
         by this name, so changing it drops audio until subscriptions are rebuilt — and a name that
         was previously in use will pull audio from whatever now holds it."*
-      - On the 26-character error: name the budget and its cause, not just the limit
+      - On the length error: *"With Dante unit ID 1 this device's Dante name would be 33
+        characters. Dante allows 31, and the `Y001-` prefix uses 5, leaving 26 for the hostname."*
+        Name the arithmetic, not just the limit
+      - On the over-31 advisory with no unit ID: *"This hostname is 37 characters. Dante's
+        device-name limit is 31, so if this device is on a Dante network its name will be rejected."*
+- [ ] **ADR 0023's recompute action warns per affected device** when it changes a Dante name,
+      naming the new name and the Dante Controller step. Phase 18's bulk rename plus this ADR's
+      derived name compose into an audio outage neither has alone — Shure states that changing a
+      Dante ID *"will cause a loss of audio signal"* until subscriptions are rebuilt. The action
+      still renames; it just stops being silent about it
 - [ ] Read-only UI parity, and the derived name on the device detail page
-- [ ] Tests: the derived name with and without a unit ID; uppercase hex (`Y01B`, not `Y01b`); the
-      26-character validation fires only when a unit ID is set; site-wide uniqueness including on
-      creation; the suggester skips a retired ID; the 127 fallback
+- [ ] Tests: the derived name across all four rows of the decision-1 table, including **blank
+      hostname with a unit ID yielding `None`, not `Y001-`**; uppercase hex (`Y01B`, not `Y01b`);
+      the 31-character check errors only when a unit ID is set and advises otherwise; site-wide
+      uniqueness including on creation; the suggester skips a retired ID; the 127 fallback names
+      what it reclaims; the recompute action warns for a unit-ID device and stays silent for others
 
 Known gap the ADR names: an ordinary Dante device with no unit ID and an over-long hostname gets no
 warning, because the tool cannot identify Dante devices structurally. Deriving that — "has a port on

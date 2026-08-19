@@ -86,10 +86,20 @@ argument for this tool *displaying* the name the operator should type.
 `NetworkDevice.dante_unit_id` — `PositiveSmallIntegerField`, null, range **1–127**. Nothing else is
 added. The Dante device name is a **read-only property**:
 
-| `dante_unit_id` | `dante_device_name` |
-|---|---|
-| null | `hostname` (or `None` if the hostname is blank) |
-| set | `Y0{id:02X}-{hostname}` |
+| `dante_unit_id` | `hostname` | `dante_device_name` |
+|---|---|---|
+| null | blank | `None` |
+| null | set | `hostname` |
+| set | blank | **`None`** |
+| set | set | `Y0{id:02X}-{hostname}` |
+
+**A blank hostname blocks, even with a unit ID set.** The obvious reading —
+`Y0{id:02X}-{hostname}` unconditionally — emits `Y001-` for an unnamed device, and Audinate is
+explicit that a name *"cannot begin or end with a hyphen"*, so that is an illegal name generated in
+a reachable case. Emitting the bare `Y001` instead would be legal but is precisely the meaningless
+string this ADR exists to avoid. So the hostname is a **blocking input**, exactly as ADR 0023
+decision 1 treats a missing owner or type slug: a required part is absent, so nothing is computed
+and the UI says what is missing.
 
 Deriving rather than storing follows the same reasoning as ADR 0022 decision 4's derived port
 hostname: a stored copy would have nothing keeping it in step with the hostname it is built from.
@@ -103,8 +113,17 @@ case-insensitive, so this is presentation, not correctness.
 
 A unit ID is the opt-in. Where one is set:
 
-- the hostname is validated at **26 characters** — 31 minus the five-character prefix
+- the **assembled name** is validated at **31 characters** — Dante's actual limit
 - the derived name is surfaced in the UI
+
+The check is stated against the assembled result, not against a 26-character hostname cap, even
+though 26 is what it works out to today. 26 is a derived number with the prefix length baked into
+it, and would silently become wrong if a prefix were ever a different length — 31 is the rule Dante
+publishes. The error is *raised on the hostname field*, so it lands where the operator is typing,
+and states the arithmetic rather than asserting a limit:
+
+> With Dante unit ID 1 this device's Dante name would be 33 characters. Dante allows 31, and the
+> `Y001-` prefix uses 5, leaving 26 for the hostname.
 
 Where it is null, nothing changes: the hostname keeps ADR 0023's 63-character cap and this ADR says
 nothing about the device.
@@ -115,10 +134,26 @@ structurally — "does it have a port on a VLAN whose *role* is Dante Primary?" 
 designed VLAN role for, but role is phase 21 and unbuilt, and matching on a VLAN's free-text name is
 the failure mode issue #10 documents. Making the unit ID itself the opt-in needs neither.
 
-**The known gap this accepts:** an ordinary Dante device with no unit ID and a 40-character hostname
-gets no warning that Dante will refuse the name. Nothing is close today — the longest live hostname
-is 19 characters — and the operator who sets a unit ID is the one who gets the check. If VLAN role
-ships in phase 21, the population becomes derivable and this gap can close without a schema change.
+**An over-long hostname advises, even with no unit ID.** The tool cannot identify Dante devices
+structurally, so it cannot *enforce* Dante's limit on a device that never opted in — but staying
+silent about a name it can see will fail is worse. Any hostname over **31 characters** raises an
+advisory, whatever its unit ID:
+
+> This hostname is 37 characters. Dante's device-name limit is 31, so if this device is on a Dante
+> network its name will be rejected.
+
+Non-blocking: the device saves. Lighting and video equipment is never constrained by an audio
+protocol, and nothing is refused for a rule that may not apply to it.
+
+This is reachable now, not theoretical. Composing the longest component values already in the
+database — owner `mps`, location `floatswitch`, type slug `rio3224d3`, purpose `midhi-01-04` —
+gives `mps-floatswitch-rio3224d3-midhi-01-04`, 37 characters, and 40 with a sequence. Nothing live
+is close (the longest hostname is 19), but ADR 0023's own scheme can build it from parts that exist.
+
+**The gap that remains:** the advisory fires on length only. Nothing checks that an un-flagged Dante
+device's name is *unique on the Dante network*, because the tool does not know which devices share
+one. If ADR 0021's VLAN role ships in phase 21 the population becomes derivable and this closes with
+no schema change.
 
 ### 3. Unit IDs are unique site-wide, and validated
 
@@ -131,8 +166,10 @@ Validated in `full_clean()` with a plain-language error, null exempt. Unlike ADR
 hostname rule, this one applies on **creation as well**, because there is no importer writing unit
 IDs and therefore no rebuild to break.
 
-The 26-character budget is **enforced, not advised** — exceeding it means Dante refuses the name
-outright, which is a different class of consequence from a name that merely reads badly.
+The 31-character limit is **enforced where a unit ID is set**, and merely **advised elsewhere**
+(decision 2). Enforced, because exceeding it means Dante refuses the name outright, which is a
+different class of consequence from a name that merely reads badly; advised elsewhere, because the
+tool cannot tell whether the rule applies.
 
 ### 4. The suggester never hands out a retired ID
 
@@ -150,7 +187,30 @@ At **127 available and 2 in use** the cost is theoretical for years. When the hi
 reaches 127 the suggester falls back to the lowest unused value and says so, naming the ID it is
 reclaiming — degrading loudly rather than refusing.
 
-### 5. Yamaha consoles get no unit ID
+### 5. Recomputing a hostname warns when it changes a Dante name
+
+ADR 0023's "Recompute hostname" action overwrites hostnames in bulk. Under decision 1 the Dante name
+is *derived from* the hostname, so recomputing a device that carries a unit ID silently changes its
+Dante device name — and both vendors state what that costs: Audinate routes to whatever currently
+holds a name, and Shure warns that *"changing the Dante ID will cause a loss of audio signal. After
+an ID has been changed, use the Dante controller to restore audio route subscriptions."*
+
+Selecting seventeen devices and running the action could therefore take equipment off air, with
+nothing in the tool saying so.
+
+The action still renames — that is what it is for — but emits a warning per affected device:
+
+> `mps-stage-rio-1` is a Dante device (unit ID 1). Its Dante name is now `Y001-mps-stage-rio-2` —
+> update it in Dante Controller and rebuild its subscriptions, or audio will not route.
+
+Skipping such devices instead was rejected: it would make recompute unusable for exactly the
+equipment whose names most need to be right. This is report-don't-enforce, consistent with the rest
+of the project, and it reuses the advisory machinery phase 18 already built.
+
+**Neither ADR has this hazard alone.** It exists only where ADR 0023's bulk rename composes with
+this ADR's derived name, which is why it is recorded here rather than left for someone to discover.
+
+### 6. Yamaha consoles get no unit ID
 
 The console is the controller doing the discovering, not a discovered device. `DM7C`, `DM7-EX` and
 `DM3` carry no `Y0##` prefix. Only controlled equipment does — Rio and Tio stage boxes today, Shure
@@ -174,10 +234,14 @@ receivers when they arrive.
   existing row changes.
 - **Two devices need an ID today** — one Rio3224-D3 and one Tio1608-D2. Neither has one, so neither
   is currently integrated correctly, which this ADR makes visible for the first time.
-- **`hostname` gains a conditional 26-character validation.** The longest live hostname is 19, so
-  nothing breaks — but ADR 0023's own scheme can produce 28 (`mps-wpc1sru-ik42-midhi-01-04`), so a
-  device carrying both that shape and a unit ID would be refused. Latent, in the same way the
-  63-character cap was before phase 18 measured it.
+- **`hostname` gains a conditional 31-character check** — an error where a unit ID is set, an
+  advisory everywhere else. The longest live hostname is 19, so nothing breaks today, but ADR 0023's
+  scheme can produce 37 from component values already in the database
+  (`mps-floatswitch-rio3224d3-midhi-01-04`). Latent in the same way the 63-character cap was before
+  phase 18 measured it.
+- **ADR 0023's recompute action gains a warning** for devices carrying a unit ID (decision 5). That
+  is a change to behaviour shipped in phase 18, not new machinery — the advisory path already
+  exists.
 - **`sync_roles` must be re-run after migrating**, per ADR 0021's standing note, if a new model is
   added. This ADR adds none, so it is not required.
 - **No addressing behaviour changes.** No suggestion, materialization, offset or stored address is
