@@ -15,7 +15,57 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Decides whether this run has anything to test. Job-level, deliberately:
+  # a `paths-ignore` on the trigger above would stop the workflow starting at
+  # all, and `main`'s ruleset requires `lint` and `test` BY NAME -- a required
+  # check that never reports stays "Expected -- waiting for status to be
+  # reported" forever, and the PR can never merge. A job skipped by an `if`
+  # reports success and satisfies the requirement. GitHub documents both
+  # halves; the difference is the whole reason this job exists.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # Needed to diff against the base branch; the default shallow
+          # checkout has no merge base to compare with.
+          fetch-depth: 0
+
+      - name: Does this change touch anything but Markdown?
+        id: filter
+        run: |
+          # `push` to main always runs everything. The concurrency block above
+          # states that main is "the record of what's actually green on the
+          # branch", and skipping tests there would undercut exactly that. The
+          # wait this saves is the one on a pull request anyway.
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "Not a pull request -- running everything."
+            exit 0
+          fi
+
+          base='${{ github.event.pull_request.base.sha }}'
+          changed=$(git diff --name-only "$base" HEAD)
+          echo "Changed files:"
+          echo "$changed" | sed 's/^/  /'
+
+          # Only `*.md` counts as documentation. Deliberately narrow: docs/
+          # also holds CSVs that the production importer reads, and treating
+          # the whole directory as prose would skip tests on a data change.
+          if echo "$changed" | grep -qvE '\.md$'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "Non-Markdown files changed -- running lint and test."
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "Markdown only -- skipping lint and test."
+          fi
+
   lint:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -54,6 +104,8 @@ jobs:
         run: pre-commit run --all-files --show-diff-on-failure
 
   test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
