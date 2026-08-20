@@ -29,6 +29,22 @@
       · Hostname purpose: {{ device.hostname_purpose|default:"—" }}
       · Hostname sequence: {{ device.hostname_sequence|default_if_none:"—" }}
     </p>
+    {% if device.dante_unit_id %}
+      {# ADR 0024 — only where a unit ID is set (decision 9): showing this  #}
+      {# unconditionally would print a "Dante device name" equal to the    #}
+      {# hostname on every other device, asserting Dante membership this   #}
+      {# tool cannot establish. Reads two columns already on this row —    #}
+      {# no extra query. #}
+      <p class="tile__meta">
+        Dante unit ID: {{ device.dante_unit_id }}
+        · Dante name:
+        {% if device.dante_device_name %}
+          {{ device.dante_device_name }}
+        {% else %}
+          none yet — it has no hostname to build one from
+        {% endif %}
+      </p>
+    {% endif %}
     {% if device.host %}
       {# ADR 0022 — a soft "currently fitted to" pointer, no addressing meaning. #}
       <p>Fitted to <a href="{% url 'inventory:device' device.host_id %}">{{ device.host }}</a></p>

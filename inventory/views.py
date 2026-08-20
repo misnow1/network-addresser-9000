@@ -1581,8 +1581,15 @@ REGISTRY: dict[str, ModelSpec] = {
             # marker; this is what the /models/networkdevice/ *list* page
             # (not the detail redirect) shows instead.
             FieldSpec("Diverges", "hostname_diverges", render="boolean"),
+            # ADR 0024 plan settled decision 9 — the ID everywhere, sparse
+            # (2 of 61 devices) but "which IDs are taken" is a real
+            # question; the derived name stays off this list (only 2 rows
+            # would ever show one) and renders on device_detail instead.
+            FieldSpec("Dante unit ID", "dante_unit_id"),
         ),
         # Never actually rendered — see the Rack entry's identical note.
+        # Kept in step with list_columns above regardless (the Rack
+        # entry's own note requires it).
         detail_fields=(
             FieldSpec("Hostname", "hostname"),
             FieldSpec("Type", "device_type", render="relation"),
@@ -1592,6 +1599,7 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Host", "host", render="relation"),
             FieldSpec("Owner", "owner", render="relation"),
             FieldSpec("Diverges", "hostname_diverges", render="boolean"),
+            FieldSpec("Dante unit ID", "dante_unit_id"),
         ),
         inlines=(
             InlineSpec(

@@ -6,13 +6,15 @@ from django.contrib import admin, messages
 from django.contrib.admin.actions import delete_selected as default_delete_selected
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import IntegrityError, transaction
-from django.db.models import QuerySet
+from django.db.models import Max, QuerySet
 from django.forms import BaseInlineFormSet, BaseModelFormSet
 from django.http import HttpRequest, HttpResponse, HttpResponseRedirect
 from django.shortcuts import get_object_or_404, redirect
 from django.template.response import TemplateResponse
 from django.urls import URLPattern, path
 
+from . import dante
+from .dante import UnitIdSuggestion
 from .hostnames import HostnameComponents, assemble_hostname, choose_sequence, resolve_explicit_sequence
 from .models import (
     _PROFILE_IN_USE_LOCKED_FIELDS,
@@ -645,20 +647,65 @@ def _recompute_hostname(
 
 
 def _emit_hostname_advisories(request: HttpRequest, form: object) -> None:
-    """Emits whatever ``_fill_computed_hostname()`` stashed on ``form.
-    _hostname_advisories`` (ADR 0023 decision 7's two messages) — called
-    from each admin's ``save_model()``, which is the first place both a
-    ``request`` and the form exist together (review note 6).
+    """Emits whatever a form stashed on ``form._hostname_advisories`` —
+    originally only ``_fill_computed_hostname()``'s two messages (ADR
+    0023 decision 7), called from each admin's ``save_model()``, which is
+    the first place both a ``request`` and the form exist together
+    (review note 6). ``NetworkDeviceChangeForm`` now stashes here too
+    (ADR 0024 plan settled decision 6) — the over-31 length advisory,
+    computed in ``_post_clean()`` rather than assembled in ``clean()``,
+    but surfaced through this same list and the same ``messages.info``
+    level either way.
 
     ``getattr(..., [])`` covers every form that never stashed anything at
-    all — the change form (never assembles), a bare ``ModelForm``
-    constructed directly rather than through the admin (no ``save_model()``
-    call reaches it either, so this never even runs for one), and an add
-    form whose ``clean()`` bailed before reaching
-    ``_fill_computed_hostname()``.
+    all — a bare ``ModelForm`` constructed directly rather than through
+    the admin (no ``save_model()`` call reaches it either, so this never
+    even runs for one), and an add form whose ``clean()`` bailed before
+    reaching ``_fill_computed_hostname()``.
     """
     for advisory in getattr(form, "_hostname_advisories", []):
         messages.info(request, advisory)
+
+
+def _emit_dante_warnings(request: HttpRequest, form: object) -> None:
+    """Emits whatever ``_post_clean()`` stashed on ``form._dante_warnings``
+    (ADR 0024 plan settled decision 8's rename warning) — ``messages.
+    warning``, not ``messages.info``: this names a hazard (an audio
+    outage), not a suggestion. Called from ``NetworkDeviceAdmin.
+    save_model()`` beside ``_emit_hostname_advisories()``.
+
+    ``getattr(..., [])`` covers the add form, which never stashes this at
+    all (no rename warning on creation — settled decision 8, nothing
+    exists yet to re-subscribe), and any bare ``ModelForm`` built outside
+    the admin.
+    """
+    for warning in getattr(form, "_dante_warnings", []):
+        messages.warning(request, warning)
+
+
+def _suggest_dante_unit_id() -> UnitIdSuggestion | None:
+    """``suggest_unit_id()`` (ADR 0024 decision 4), backed by the query
+    the pure function itself can't make (settled decision 3 — ``dante.py``
+    is pure; the admin does the query). One aggregate query for the
+    common case — SQL ``MAX()`` already ignores nulls, so no separate
+    ``isnull`` exclude is needed — and the full assigned-ID set is
+    fetched only once the highest reaches 127, the one case
+    ``suggest_unit_id()`` needs more than the highest value to answer.
+    """
+    highest = NetworkDevice.objects.aggregate(Max("dante_unit_id"))["dante_unit_id__max"]
+    if highest is None or highest < dante.DANTE_UNIT_ID_MAX:
+        return dante.suggest_unit_id([] if highest is None else [highest])
+    # The `.exclude(isnull=True)` above already guarantees no None reaches
+    # here — the `if value is not None` filter is what lets mypy narrow
+    # the column's nullable int type to plain int, not a second check.
+    assigned: list[int] = [
+        value
+        for value in NetworkDevice.objects.exclude(dante_unit_id__isnull=True).values_list(
+            "dante_unit_id", flat=True
+        )
+        if value is not None
+    ]
+    return dante.suggest_unit_id(assigned)
 
 
 class NetworkDeviceAddForm(forms.ModelForm):
@@ -723,9 +770,10 @@ class NetworkDeviceAddForm(forms.ModelForm):
     class Meta:
         model = NetworkDevice
         # owner/hostname_purpose/hostname_sequence (ADR 0023, plan settled
-        # decision 2) must be listed here explicitly — this is an explicit
-        # list, not exclude=[], so construct_instance() silently drops any
-        # field left out of it, including the rack-derived owner default
+        # decision 2) and dante_unit_id (ADR 0024 plan settled decision 2)
+        # must be listed here explicitly — this is an explicit list, not
+        # exclude=[], so construct_instance() silently drops any field
+        # left out of it, including the rack-derived owner default
         # clean() below computes.
         fields = [
             "device_type",
@@ -736,6 +784,7 @@ class NetworkDeviceAddForm(forms.ModelForm):
             "owner",
             "hostname_purpose",
             "hostname_sequence",
+            "dante_unit_id",
         ]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -927,15 +976,37 @@ class NetworkDeviceAddForm(forms.ModelForm):
             if f"{self._OPERATOR_ADDRESS_FIELD_PREFIX}{type_port.pk}" in self.cleaned_data
         }
         super()._post_clean()  # type: ignore[misc]
+        # ADR 0024 plan settled decision 6, review note 1 — measured here,
+        # off the fully-normalized self.instance super()._post_clean() just
+        # produced (construct_instance() then instance.full_clean(), which
+        # lowercases hostname), not in clean()'s un-normalized cleaned_data.
+        # Appended to clean()'s own _fill_computed_hostname() advisories
+        # rather than replacing them — both surface through the same list,
+        # at the same messages.info level, via _emit_hostname_advisories().
+        # No rename warning on creation (settled decision 8): nothing
+        # exists yet to re-subscribe.
+        if self.instance.dante_unit_id is None:
+            advisory = dante.over_length_advisory(self.instance.hostname)
+            if advisory is not None:
+                self._hostname_advisories.append(advisory)
 
 
 class NetworkDeviceChangeForm(forms.ModelForm):
-    """Plain change form for an existing device — deliberately distinct
-    from ``NetworkDeviceAddForm`` (same shape as ``NetworkSwitchAddForm``/
-    the default ``ModelForm`` split elsewhere here): ``port_addressing``
-    and the ``OPERATOR``-port address fields only make sense at creation,
-    so the change form omits them entirely rather than showing fields that
+    """Change form for an existing device — deliberately distinct from
+    ``NetworkDeviceAddForm`` (same shape as ``NetworkSwitchAddForm``/the
+    default ``ModelForm`` split elsewhere here): ``port_addressing`` and
+    the ``OPERATOR``-port address fields only make sense at creation, so
+    the change form omits them entirely rather than showing fields that
     do nothing.
+
+    ``_post_clean()`` (ADR 0024 plan settled decisions 6 and 8, review
+    note 1) is new here — this form had neither ``clean()`` nor
+    ``_post_clean()`` before. Both the over-31 advisory and the Dante
+    rename warning are computed **after** ``super()._post_clean()``, off
+    the fully-normalized ``self.instance``, against a fresh query for the
+    row as it's stored right now — never against ``self.instance`` before
+    normalization, which is un-lowercased and would false-positive a
+    rename warning on a case-only edit (review note 1's finding).
     """
 
     class Meta:
@@ -949,7 +1020,84 @@ class NetworkDeviceChangeForm(forms.ModelForm):
             "owner",
             "hostname_purpose",
             "hostname_sequence",
+            "dante_unit_id",
         ]
+        # dante_device_name isn't a model field — Django's admin only
+        # pulls a readonly field's help text from an actual model field
+        # (django.contrib.admin.utils.help_text_for_field), so the ADR's
+        # verbatim text is supplied here instead; AdminReadonlyField
+        # checks form._meta.help_texts before falling back to that.
+        help_texts = {
+            "dante_device_name": (
+                "The name to set in Dante Controller. Dante routes audio by this name, so "
+                "changing it drops audio until subscriptions are rebuilt — and a name that was "
+                "previously in use will pull audio from whatever now holds it."
+            ),
+        }
+
+    def _post_clean(self) -> None:
+        super()._post_clean()  # type: ignore[misc]
+        self._hostname_advisories: list[str] = []
+        self._dante_warnings: list[str] = []
+        if self.instance.pk is None:
+            return  # defensive only — this form is never used to create
+        stored = NetworkDevice.objects.filter(pk=self.instance.pk).values("hostname", "dante_unit_id").first()
+        if stored is None:
+            return  # row vanished under us; save() will fail its own way
+        old_hostname = stored["hostname"]
+        old_unit_id = stored["dante_unit_id"]
+        new_unit_id = self.instance.dante_unit_id
+        # Advisory: NetworkDevice-only, only where the unit ID is null
+        # (settled decision 6) — unconditional on whether the hostname
+        # itself changed this submission, the same posture the model's
+        # own blocking check takes for a unit-ID device.
+        if new_unit_id is None:
+            advisory = dante.over_length_advisory(self.instance.hostname)
+            if advisory is not None:
+                self._hostname_advisories.append(advisory)
+        # Rename warning: fires whenever this save changes the *Dante*
+        # name of a device that carries (or carried) a unit ID on either
+        # side — editing dante_unit_id, editing hostname while a unit ID
+        # is set, or setting/clearing the unit ID itself (settled
+        # decision 8's table) — **and** there was an actual previous
+        # Dante name to lose. Three conditions, all required:
+        #
+        # - ``old_unit_id is not None or new_unit_id is not None`` — the
+        #   tool cannot know it's a Dante device at all when neither side
+        #   ever carried an ID (a plain hostname rename must stay silent).
+        # - ``old_name is not None`` — a unit-ID device whose hostname was
+        #   *always* blank never had anything for Dante to route by, so
+        #   there is nothing to re-subscribe; same "commissioning, not an
+        #   outage" reasoning settled decision 8 already gives creation,
+        #   extended to the equivalent case reached by editing instead.
+        # - ``old_name != new_name`` — no-op, unrelated-field and
+        #   case-only edits must not warn (review note 1).
+        old_name = dante.dante_device_name(old_unit_id, old_hostname)
+        new_name = self.instance.dante_device_name
+        if (
+            (old_unit_id is not None or new_unit_id is not None)
+            and old_name is not None
+            and old_name != new_name
+        ):
+            # Labelled by the *old* hostname, not the post-rename one
+            # (ADR 0024's own pinned example: "mps-stage-rio-1 is a Dante
+            # device … Its Dante name is now `Y001-mps-stage-rio-2`") —
+            # Dante Controller still shows the old name until the
+            # operator acts on this warning, so that's the identity an
+            # operator can actually go find. __str__'s own "Device #pk"
+            # fallback, replicated here since self.instance's blank-
+            # hostname fallback would otherwise read the *new* pk-less
+            # state.
+            old_label = old_hostname or f"Device #{self.instance.pk}"
+            self._dante_warnings.append(
+                dante.rename_warning(
+                    old_label,
+                    old_unit_id=old_unit_id,
+                    new_unit_id=new_unit_id,
+                    old_name=old_name,
+                    new_name=new_name,
+                )
+            )
 
 
 class NetworkSwitchAddForm(forms.ModelForm):
@@ -1649,6 +1797,11 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
         "owner",
         "hostname_purpose",
         "hostname_sequence",
+        # ADR 0024 plan settled decision 9 — sparse (2 of 61 devices today)
+        # but "which IDs are taken" is the question an operator actually
+        # has; the derived name stays off the changelist and only renders
+        # on the detail surfaces, where it has an object to read from.
+        "dante_unit_id",
     ]
     search_fields = ["hostname", "serial_number"]
     # ("host", EmptyFieldListFilter) gives fitted/unfitted as the filter
@@ -1674,11 +1827,19 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
         # locked on every subsequent Change.
         if obj is None:
             return []
-        return ["device_type"]
+        readonly = ["device_type"]
+        # ADR 0024 plan settled decision 9 — only for an existing object
+        # that carries a unit ID; dante_device_name reads null when there
+        # isn't one (decision 1's table), and showing it unconditionally
+        # would assert Dante membership this tool cannot establish.
+        if obj.dante_unit_id is not None:
+            readonly.append("dante_device_name")
+        return readonly
 
     def save_model(self, request: HttpRequest, obj: Any, form: object, change: bool) -> None:
         super().save_model(request, obj, form, change)
         _emit_hostname_advisories(request, form)
+        _emit_dante_warnings(request, form)
 
     def get_form(self, request: HttpRequest, obj: Any = None, change: bool = False, **kwargs: Any) -> Any:
         # port_addressing/operator-address inputs (ADR 0013/0022) only
@@ -1699,7 +1860,44 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
             kwargs["form"] = NetworkDeviceAddForm.with_operator_fields(device_type_id)
         else:
             kwargs["form"] = NetworkDeviceChangeForm
-        return super().get_form(request, obj, change=change, **kwargs)
+        form_class = super().get_form(request, obj, change=change, **kwargs)
+        self._append_dante_unit_id_suggestion(form_class)
+        return form_class
+
+    @staticmethod
+    def _append_dante_unit_id_suggestion(form_class: Any) -> None:
+        """Appends the live "next free unit ID" suggestion to
+        ``dante_unit_id``'s help text — displayed, never written (ADR
+        0024 plan settled decision 2): every other suggester in this
+        codebase fills a blank field in ``clean()``, but blank means "not
+        controlled by a Yamaha console" here, and filling it would hand a
+        unit ID to consoles that must never carry one (decision 6).
+
+        Mutates only ``form_class.base_fields`` — the class
+        ``super().get_form()`` just built via ``modelform_factory()``,
+        never ``NetworkDeviceAddForm``/``NetworkDeviceChangeForm``'s own
+        ``base_fields`` directly. That distinction is what keeps this
+        safe to call on every request (review note 4): ``modelform_
+        factory()``'s metaclass rebuilds ``base_fields`` with fresh field
+        instances each call, so appending to *that* copy can't leak
+        across requests, but appending to the two form classes' own
+        ``base_fields`` would grow the help string by one sentence per
+        page load.
+        """
+        field = form_class.base_fields.get("dante_unit_id")
+        if field is None:
+            return
+        suggestion = _suggest_dante_unit_id()
+        if suggestion is None:
+            field.help_text += " All 127 unit IDs are in use."
+        elif suggestion.reclaimed:
+            field.help_text += (
+                f" Allocation has reached 127, so the next suggestion is {suggestion.value} — a gap, "
+                "which may have been used before. Check what last held "
+                f"Y0{suggestion.value:02X}- before using it, or audio may route to the wrong box."
+            )
+        else:
+            field.help_text += f" Next free unit ID: {suggestion.value}."
 
     # -- Pull (ADR 0022 PR 3) -----------------------------------------------------
 
@@ -1744,6 +1942,25 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
         distinct names). ``permissions=["change"]`` restricts this to
         holders of ``inventory.change_networkdevice`` — Django's own
         ``_filter_actions_by_permissions``, not a hand-rolled check.
+
+        ADR 0024 plan settled decisions 7 and 8 add two things this
+        method's ``NetworkSwitchAdmin`` counterpart (untouched — a switch
+        carries no Dante name of its own) does not need:
+
+        - A device carrying a unit ID whose *computed* name would exceed
+          Dante's 31-character limit is **skipped**, not saved — this
+          action calls ``current.save()`` directly, never
+          ``full_clean()``, so decision 2's enforcement is otherwise
+          bypassed and could write a name the device's own change form
+          would then refuse. Reuses the existing ``_HostnameRecomputeResult
+          ("skipped", reason, …)`` shape rather than a bespoke branch, so
+          it reports through the same ``skipped`` bucket as "missing
+          owner and type's hostname_slug".
+        - A renamed, unit-ID-carrying device emits the Dante rename
+          warning; a null-unit-ID device whose (possibly unchanged)
+          hostname is over 31 characters emits the advisory — both via
+          the same helpers the change form's ``_post_clean()`` uses, so
+          wording can't drift between the two paths.
         """
         renamed = 0
         unchanged = 0
@@ -1754,19 +1971,75 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
                 current = locked.get(device.pk)
                 if current is None:
                     continue
+                original_hostname = current.hostname
                 result = _recompute_hostname(
                     current,
                     type_slug=current.device_type.hostname_slug,
                     exclude_switch_pk=None,
                     exclude_device_pk=current.pk,
                 )
-                current.save()
+                # Decision 7 — only reachable once a name was actually
+                # computed (result.status != "skipped" already covers a
+                # missing owner/type-slug); never overrides that skip's
+                # own reason.
+                if result.status != "skipped" and current.dante_unit_id is not None:
+                    assembled_length = dante.DANTE_UNIT_ID_PREFIX_LENGTH + len(current.hostname)
+                    if assembled_length > dante.DANTE_NAME_MAX_LENGTH:
+                        result = _HostnameRecomputeResult(
+                            "skipped",
+                            f"computed hostname {current.hostname!r} ({len(current.hostname)} "
+                            f"characters) would assemble to {assembled_length} with Dante unit ID "
+                            f"{current.dante_unit_id}, over the {dante.DANTE_NAME_MAX_LENGTH}-"
+                            "character Dante limit",
+                            result.advisories,
+                        )
                 if result.status == "skipped":
                     skipped.append(f"{current} ({result.reason})")
-                elif result.status == "renamed":
+                    continue
+                current.save()
+                if result.status == "renamed":
                     renamed += 1
+                    # Decision 8 — fires whenever this rename changes a
+                    # unit-ID device's Dante name; the recompute action
+                    # never touches dante_unit_id itself, so old and new
+                    # are the same value here. Also requires an actual
+                    # previous Dante name to lose (``old_name is not
+                    # None``, the same guard NetworkDeviceChangeForm.
+                    # _post_clean() applies) — a unit-ID device that never
+                    # had a hostname before this run had nothing for
+                    # Dante to route by, so there is nothing to
+                    # re-subscribe.
+                    if current.dante_unit_id is not None:
+                        old_name = dante.dante_device_name(current.dante_unit_id, original_hostname)
+                        if old_name is not None:
+                            # Labelled by the *old* hostname (ADR 0024's
+                            # own pinned example — see the identical
+                            # comment on NetworkDeviceChangeForm.
+                            # _post_clean()): Dante Controller still shows
+                            # the pre-rename name until the operator acts
+                            # on this warning.
+                            old_label = original_hostname or f"Device #{current.pk}"
+                            messages.warning(
+                                request,
+                                dante.rename_warning(
+                                    old_label,
+                                    old_unit_id=current.dante_unit_id,
+                                    new_unit_id=current.dante_unit_id,
+                                    old_name=old_name,
+                                    new_name=current.dante_device_name,
+                                ),
+                            )
                 else:
                     unchanged += 1
+                # Decision 6 — NetworkDevice-only, unit-ID-null only, and
+                # unconditional on renamed-vs-unchanged: an already-over-
+                # length hostname that recompute leaves untouched is still
+                # worth flagging, same as the model's own blocking check
+                # doesn't care whether a save is a rename.
+                if current.dante_unit_id is None:
+                    advisory = dante.over_length_advisory(current.hostname)
+                    if advisory is not None:
+                        messages.info(request, advisory)
                 for advisory in result.advisories:
                     messages.info(request, advisory)
         if renamed:

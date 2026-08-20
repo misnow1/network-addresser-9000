@@ -2388,6 +2388,8 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
                 "StageB Ownership (stageb-owner)",
                 # #54 — hand-typed hostname, unrelated to its own components.
                 "Yes",
+                # ADR 0024 — no unit ID set on this fixture device.
+                "—",
                 "Details",
             ],
         )
@@ -2496,6 +2498,53 @@ class HostnameIngredientCanonicalPageTests(TestCase):
         self.assertContains(response, "HI Owner")
         self.assertContains(response, "hi-purpose")
         self.assertContains(response, "Hostname sequence: 7")
+
+
+class DanteDeviceDetailRenderingTests(TestCase):
+    """ADR 0024 plan settled decision 9 — the derived name renders only
+    on ``device_detail`` (never the parity list) and only where a unit ID
+    is set; reads two columns already on the loaded row, no new query.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.device_type = _make_device_type()
+        self.with_id = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname="mps-stage-rio-1", dante_unit_id=1
+        )
+        self.without_id = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname="mps-stage-rio-2"
+        )
+        self.admin_user = User.objects.create_user(
+            "dante-detail-admin", password="testpass123", is_staff=True
+        )
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="dante-detail-admin", password="testpass123")
+
+    def test_renders_unit_id_and_derived_name_when_set(self) -> None:
+        response = self.client.get(f"/devices/{self.with_id.pk}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Dante unit ID: 1")
+        self.assertContains(response, "Y001-mps-stage-rio-1")
+
+    def test_omits_the_block_entirely_when_no_unit_id(self) -> None:
+        response = self.client.get(f"/devices/{self.without_id.pk}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, "Dante unit ID")
+        self.assertNotContains(response, "Dante name")
+
+    def test_names_what_is_missing_when_hostname_is_blank(self) -> None:
+        blank = NetworkDevice.objects.create(device_type=self.device_type, dante_unit_id=2)
+        response = self.client.get(f"/devices/{blank.pk}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Dante unit ID: 2")
+        self.assertNotContains(response, "Y002-")
+        self.assertContains(response, "no hostname")
+
+    def test_parity_list_page_renders_the_unit_id_column(self) -> None:
+        response = self.client.get("/models/networkdevice/")
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Dante unit ID")
 
 
 class HostnameDivergesMarkerTests(TestCase):
