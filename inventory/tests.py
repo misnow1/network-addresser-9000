@@ -61,6 +61,7 @@ from .admin import (
     SwitchPortVlanProfileForm,
     VLANAdmin,
 )
+from .dante import UnitIdSuggestion, dante_device_name, suggest_unit_id
 from .hostnames import (
     HostnameComponents,
     assemble_hostname,
@@ -9432,3 +9433,282 @@ class FitAndPullAdminTests(TestCase):
         self.assertIsNone(self.hostless_card.host_id)
         self.assertEqual(self.hostless_card.rack_id, rack_id)
         self.assertEqual(self.hostless_card.rack_slot, slot)
+
+
+# ---------------------------------------------------------------------------
+# ADR 0024 / PLAN-adr-0024.md PR 1 — Dante device names and the Yamaha unit
+# ID. Pure inventory.dante functions first, then the model-layer rules that
+# compose them (uniqueness, the 31-character check, the DB backstops).
+# ---------------------------------------------------------------------------
+
+
+class DanteDeviceNameTests(TestCase):
+    """``dante_device_name()`` across all four rows of ADR 0024 decision
+    1's table — in particular, blank-hostname-with-a-unit-ID yielding
+    ``None`` and **not** the hyphen-terminated ``Y001-``, which Dante's own
+    rules forbid.
+    """
+
+    def test_null_id_blank_hostname_yields_none(self) -> None:
+        self.assertIsNone(dante_device_name(None, ""))
+
+    def test_null_id_set_hostname_yields_bare_hostname(self) -> None:
+        self.assertEqual(dante_device_name(None, "mps-rio3224d3-1"), "mps-rio3224d3-1")
+
+    def test_set_id_blank_hostname_yields_none(self) -> None:
+        """The hostname is checked *before* the unit ID (settled decision
+        3 in dante.py's own docstring) — otherwise this would produce the
+        illegal, hyphen-terminated ``Y001-``.
+        """
+        self.assertIsNone(dante_device_name(1, ""))
+
+    def test_set_id_set_hostname_yields_prefixed_name(self) -> None:
+        self.assertEqual(dante_device_name(1, "mps-rio3224d3-1"), "Y001-mps-rio3224d3-1")
+
+    def test_hex_prefix_is_uppercase_for_27(self) -> None:
+        self.assertEqual(dante_device_name(27, "x"), "Y01B-x")
+
+    def test_hex_prefix_for_1_is_not_bare_hex(self) -> None:
+        self.assertEqual(dante_device_name(1, "x"), "Y001-x")
+
+    def test_hex_prefix_for_127(self) -> None:
+        self.assertEqual(dante_device_name(127, "x"), "Y07F-x")
+
+
+class SuggestUnitIdTests(TestCase):
+    """``suggest_unit_id()`` (ADR 0024 decision 4) — highest assigned + 1
+    while below 127, never lowest-free before that point (a retired ID
+    must be reclaimed deliberately, not handed out automatically), then a
+    flagged fallback to the lowest unused value once 127 is reached.
+    """
+
+    def test_nothing_assigned_suggests_one(self) -> None:
+        self.assertEqual(suggest_unit_id([]), UnitIdSuggestion(1, False))
+
+    def test_suggests_highest_assigned_plus_one(self) -> None:
+        self.assertEqual(suggest_unit_id([1, 2]), UnitIdSuggestion(3, False))
+
+    def test_a_gap_is_not_reclaimed_before_127(self) -> None:
+        self.assertEqual(suggest_unit_id([1, 3]), UnitIdSuggestion(4, False))
+
+    def test_at_127_falls_back_to_lowest_unused_and_flags_reclaimed(self) -> None:
+        assigned = set(range(1, 128)) - {4}
+        self.assertEqual(suggest_unit_id(assigned), UnitIdSuggestion(4, True))
+
+    def test_all_127_assigned_returns_none(self) -> None:
+        self.assertIsNone(suggest_unit_id(range(1, 128)))
+
+
+class DanteUnitIdUniquenessTests(TestCase):
+    """``NetworkDevice._clean_dante_fields()`` uniqueness (ADR 0024 plan
+    settled decision 4) — unlike ADR 0023's hostname rule, this one
+    applies on *creation* as well as rename, since no importer ever
+    writes a unit ID and so there is no bulk rebuild to break.
+    """
+
+    def setUp(self) -> None:
+        self.device_type = _make_device_type()
+
+    def test_creating_with_a_taken_unit_id_is_refused(self) -> None:
+        taken = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname="mps-stage-rio-1", dante_unit_id=1
+        )
+        newcomer = NetworkDevice(device_type=self.device_type, hostname="bej-stage-tio-1", dante_unit_id=1)
+        with self.assertRaises(ValidationError) as ctx:
+            newcomer.full_clean()
+        self.assertIn("dante_unit_id", ctx.exception.message_dict)
+        self.assertIn(str(taken), ctx.exception.message_dict["dante_unit_id"][0])
+
+    def test_renaming_a_unit_id_into_one_already_taken_is_refused(self) -> None:
+        taken = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname="mps-stage-rio-1", dante_unit_id=1
+        )
+        mover = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname="bej-stage-tio-1", dante_unit_id=2
+        )
+        mover.dante_unit_id = 1
+        with self.assertRaises(ValidationError) as ctx:
+            mover.full_clean()
+        self.assertIn("dante_unit_id", ctx.exception.message_dict)
+        self.assertIn(str(taken), ctx.exception.message_dict["dante_unit_id"][0])
+
+    def test_two_null_unit_ids_coexist(self) -> None:
+        first = NetworkDevice(device_type=self.device_type, hostname="a")
+        first.full_clean()  # must not raise
+        first.save()
+        second = NetworkDevice(device_type=self.device_type, hostname="b")
+        second.full_clean()  # must not raise — null is exempt
+        second.save()
+        self.assertEqual(NetworkDevice.objects.filter(dante_unit_id__isnull=True).count(), 2)
+
+    def test_an_existing_device_revalidates_cleanly_against_its_own_unit_id(self) -> None:
+        """Self-exclusion (review note 2) — otherwise every ordinary save
+        of a Dante device would fail on its own ID.
+        """
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname="mps-stage-rio-1", dante_unit_id=1
+        )
+        device.serial_number = "SN-1"
+        device.full_clean()  # must not raise
+        device.save()
+
+
+class DanteUnitIdDatabaseConstraintTests(TestCase):
+    """The DB backstop (ADR 0024 plan settled decision 4) — bites where
+    ``full_clean()`` was skipped entirely: ``objects.create()``/
+    ``bulk_create()``, the recompute action's ``save()``, any future
+    importer.
+    """
+
+    def setUp(self) -> None:
+        self.device_type = _make_device_type()
+
+    def test_db_rejects_a_duplicate_unit_id_bypassing_clean(self) -> None:
+        NetworkDevice.objects.create(device_type=self.device_type, hostname="a", dante_unit_id=1)
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            NetworkDevice.objects.bulk_create(
+                [NetworkDevice(device_type=self.device_type, hostname="b", dante_unit_id=1)]
+            )
+
+    def test_db_rejects_zero_bypassing_clean(self) -> None:
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            NetworkDevice.objects.bulk_create(
+                [NetworkDevice(device_type=self.device_type, hostname="a", dante_unit_id=0)]
+            )
+
+    def test_db_rejects_128_bypassing_clean(self) -> None:
+        """Review note 2 — the boundary from both sides at the database,
+        not only the low end.
+        """
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            NetworkDevice.objects.bulk_create(
+                [NetworkDevice(device_type=self.device_type, hostname="a", dante_unit_id=128)]
+            )
+
+    def test_db_accepts_1_and_127_bypassing_clean(self) -> None:
+        NetworkDevice.objects.bulk_create(
+            [
+                NetworkDevice(device_type=self.device_type, hostname="a", dante_unit_id=1),
+                NetworkDevice(device_type=self.device_type, hostname="b", dante_unit_id=127),
+            ]
+        )
+        self.assertEqual(NetworkDevice.objects.filter(dante_unit_id__in=[1, 127]).count(), 2)
+
+
+class DanteUnitIdRangeValidationTests(TestCase):
+    """The field-level range validators — matching
+    ``networkdevice_rack_slot_gte_1``'s posture of validators *plus* a
+    ``CheckConstraint`` rather than one or the other.
+    """
+
+    def setUp(self) -> None:
+        self.device_type = _make_device_type()
+
+    def test_zero_is_rejected(self) -> None:
+        device = NetworkDevice(device_type=self.device_type, hostname="a", dante_unit_id=0)
+        with self.assertRaises(ValidationError) as ctx:
+            device.full_clean()
+        self.assertIn("dante_unit_id", ctx.exception.message_dict)
+
+    def test_128_is_rejected(self) -> None:
+        device = NetworkDevice(device_type=self.device_type, hostname="a", dante_unit_id=128)
+        with self.assertRaises(ValidationError) as ctx:
+            device.full_clean()
+        self.assertIn("dante_unit_id", ctx.exception.message_dict)
+
+    def test_1_is_accepted(self) -> None:
+        device = NetworkDevice(device_type=self.device_type, hostname="a", dante_unit_id=1)
+        device.full_clean()  # must not raise
+
+    def test_127_is_accepted(self) -> None:
+        device = NetworkDevice(device_type=self.device_type, hostname="a", dante_unit_id=127)
+        device.full_clean()  # must not raise
+
+
+class DanteLengthValidationTests(TestCase):
+    """The 31-character assembled-name limit (ADR 0024 decision 2) —
+    errors only where a unit ID is set, raised on the ``hostname`` field,
+    stating the arithmetic. Neither this rule nor the boundary is
+    reachable on live data (longest hostname is 19 against a 26-character
+    budget), so every case here builds its own hostname and asserts the
+    length it built, per the plan's own warning that a test which quietly
+    stops constructing an over-long name would fail silently.
+    """
+
+    def setUp(self) -> None:
+        self.device_type = _make_device_type()
+
+    def test_over_length_errors_only_with_a_unit_id_set(self) -> None:
+        hostname = "a" * 27
+        self.assertEqual(len(hostname), 27)
+        with_id = NetworkDevice(device_type=self.device_type, hostname=hostname, dante_unit_id=1)
+        with self.assertRaises(ValidationError) as ctx:
+            with_id.full_clean()
+        self.assertIn("hostname", ctx.exception.message_dict)
+
+    def test_the_same_over_length_hostname_saves_without_a_unit_id(self) -> None:
+        hostname = "a" * 27
+        self.assertEqual(len(hostname), 27)
+        without_id = NetworkDevice(device_type=self.device_type, hostname=hostname)
+        without_id.full_clean()  # must not raise — no unit ID, no enforcement
+        without_id.save()
+
+    def test_error_message_states_the_arithmetic(self) -> None:
+        hostname = "a" * 33
+        self.assertEqual(len(hostname), 33)
+        device = NetworkDevice(device_type=self.device_type, hostname=hostname, dante_unit_id=1)
+        with self.assertRaises(ValidationError) as ctx:
+            device.full_clean()
+        message = ctx.exception.message_dict["hostname"][0]
+        self.assertEqual(
+            message,
+            "With Dante unit ID 1 this device's Dante name would be 38 characters. Dante allows 31, "
+            "and the `Y001-` prefix uses 5, leaving 26 for the hostname.",
+        )
+
+    def test_26_characters_plus_the_5_character_prefix_saves_exactly_at_the_limit(self) -> None:
+        hostname = "a" * 26
+        self.assertEqual(len(hostname), 26)
+        device = NetworkDevice(device_type=self.device_type, hostname=hostname, dante_unit_id=1)
+        device.full_clean()  # must not raise — 26 + 5 = 31, exactly the limit
+        device.save()
+
+    def test_27_characters_plus_the_5_character_prefix_is_rejected(self) -> None:
+        hostname = "a" * 27
+        self.assertEqual(len(hostname), 27)
+        device = NetworkDevice(device_type=self.device_type, hostname=hostname, dante_unit_id=1)
+        with self.assertRaises(ValidationError) as ctx:
+            device.full_clean()
+        self.assertIn("hostname", ctx.exception.message_dict)
+
+    def test_both_a_duplicate_unit_id_and_an_over_length_hostname_report_together(self) -> None:
+        """Both errors accumulate into one dict (ADR 0024 plan settled
+        decision 4's reasoning, review note 2) — an operator with both
+        problems sees both, not just the first.
+        """
+        NetworkDevice.objects.create(device_type=self.device_type, hostname="taken", dante_unit_id=1)
+        hostname = "a" * 27
+        self.assertEqual(len(hostname), 27)
+        device = NetworkDevice(device_type=self.device_type, hostname=hostname, dante_unit_id=1)
+        with self.assertRaises(ValidationError) as ctx:
+            device.full_clean()
+        self.assertIn("dante_unit_id", ctx.exception.message_dict)
+        self.assertIn("hostname", ctx.exception.message_dict)
+
+
+class DanteUnitIdAuditTests(TestCase):
+    """``dante_unit_id`` must be in ``NetworkDevice``'s auditlog
+    ``include_fields`` whitelist (ADR 0024 plan settled decision 10) — a
+    whitelist doesn't pick up a new field automatically, and this is the
+    one change both vendors describe as audio-affecting.
+    """
+
+    def test_dante_unit_id_change_produces_update_log_entry_naming_it(self) -> None:
+        device_type = _make_device_type()
+        device = NetworkDevice.objects.create(device_type=device_type, hostname="mps-stage-rio-1")
+        LogEntry.objects.filter(object_pk=str(device.pk)).delete()
+        device.dante_unit_id = 1
+        device.save()
+        entries = LogEntry.objects.filter(object_pk=str(device.pk), action=LogEntry.Action.UPDATE)
+        self.assertEqual(entries.count(), 1)
+        self.assertIn("dante_unit_id", entries.first().changes_dict)

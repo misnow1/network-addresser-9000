@@ -320,6 +320,12 @@ AUDITLOG_INCLUDE_TRACKING_MODELS = (
             "owner",
             "hostname_purpose",
             "hostname_sequence",
+            # ADR 0024 — the one change both vendors describe as
+            # audio-affecting. Same trap as hostname above: this is a
+            # whitelist, so a new field is not tracked automatically —
+            # the next field added to NetworkDevice needs the same
+            # explicit addition here, not an assumption that it's covered.
+            "dante_unit_id",
             "created_at",
         ],
     },

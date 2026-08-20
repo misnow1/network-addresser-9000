@@ -36,6 +36,7 @@ from django.db import models, transaction
 from django.db.models import Value
 from django.db.models.functions import Coalesce, Concat
 
+from . import dante
 from .suggestions import (
     dhcp_range_overlaps_cidr,
     ranges_overlap,
@@ -3535,6 +3536,17 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         help_text="Hostname component 5 — an integer distinguishing otherwise-identical names, "
         "e.g. 1 or 2 for mps-avio-aes-1 and mps-avio-aes-2 (ADR 0023).",
     )
+    dante_unit_id = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(dante.DANTE_UNIT_ID_MIN), MaxValueValidator(dante.DANTE_UNIT_ID_MAX)],
+        help_text=(
+            "Yamaha consoles find and control this device by this number. Must be unique across "
+            "every Yamaha-controlled device on the network — stage boxes and wireless receivers "
+            "share one range. 1–127. Leave blank for equipment that is not controlled by a Yamaha "
+            "console, including the consoles themselves."
+        ),
+    )
     host = models.ForeignKey(
         "self",
         null=True,
@@ -3596,6 +3608,25 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
             # other two edges already had, and to the same documented gap
             # models.py:203-206 already names for a raw bulk write that
             # bypasses save() entirely.
+            # ADR 0024 plan settled decision 4 — a backstop for paths that
+            # never call full_clean() (objects.create(), the recompute
+            # action's save(), any future importer), on top of
+            # _clean_dante_fields()'s plain-language error below. Safe
+            # unconditionally: the column is born entirely null and
+            # MariaDB does not collide NULLs in a unique index, the same
+            # property unique_device_rack_slot already relies on over
+            # nullable rack/rack_slot.
+            models.UniqueConstraint(fields=["dante_unit_id"], name="unique_device_dante_unit_id"),
+            # ADR 0024 plan settled decision 5 — matches
+            # networkdevice_rack_slot_gte_1's shape rather than inventing
+            # a second enforcement posture on the same model.
+            models.CheckConstraint(
+                condition=(
+                    models.Q(dante_unit_id__isnull=True)
+                    | models.Q(dante_unit_id__range=(dante.DANTE_UNIT_ID_MIN, dante.DANTE_UNIT_ID_MAX))
+                ),
+                name="networkdevice_dante_unit_id_range",
+            ),
         ]
         ordering = ["hostname"]
 
@@ -3705,6 +3736,51 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
             if stored_hostname is not None and self.hostname != stored_hostname:
                 _validate_hostname_unique(self.hostname, exclude_switch_pk=None, exclude_device_pk=self.pk)
         self._check_host_invariants()
+        self._clean_dante_fields()
+
+    def _clean_dante_fields(self) -> None:
+        """The Dante block of ``clean()`` (ADR 0024 plan settled decisions
+        4 and 5) — uniqueness and the 31-character assembled-name limit,
+        both gated on ``dante_unit_id`` being set (a blank ID is exempt
+        from both, decisions 1/2's "opt-in" framing), accumulated into
+        **one** error dict so an operator who has both problems in a
+        single submission sees both rather than being told about the
+        first and, on their next attempt, the second.
+
+        Uniqueness excludes ``self.pk`` only when it is not ``None``,
+        mirroring ``_validate_hostname_unique()`` rather than leaning on
+        ``exclude(pk=None)``'s isnull rewrite — and, unlike that rule,
+        runs on **creation as well as rename**: no importer ever writes a
+        unit ID, so there is no bulk rebuild this could break by
+        enforcing unconditionally (decision 3).
+        """
+        if self.dante_unit_id is None:
+            return
+        errors: dict[str, list[str]] = {}
+        conflicts = NetworkDevice.objects.filter(dante_unit_id=self.dante_unit_id)
+        if self.pk is not None:
+            conflicts = conflicts.exclude(pk=self.pk)
+        conflict = conflicts.first()
+        if conflict is not None:
+            errors["dante_unit_id"] = [f"Dante unit ID {self.dante_unit_id} is already used by {conflict}."]
+        # Raised on the hostname field (decision 2) — it lands where the
+        # operator is typing, not on the field that merely opted them in.
+        message = dante.length_error(self.dante_unit_id, self.hostname)
+        if message is not None:
+            errors["hostname"] = [message]
+        if errors:
+            raise ValidationError(errors)
+
+    @property
+    def dante_device_name(self) -> str | None:
+        """The name to set in Dante Controller (ADR 0024). Read-only and
+        never stored: a stored copy would have nothing keeping it in step
+        with the hostname it's built from (ADR 0022 decision 4's
+        reasoning, applied to a second derived field). Delegates to
+        ``inventory.dante.dante_device_name()``, the one place this
+        derivation is computed.
+        """
+        return dante.dante_device_name(self.dante_unit_id, self.hostname)
 
     @property
     def hostname_diverges(self) -> bool:
