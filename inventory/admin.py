@@ -1,3 +1,4 @@
+import functools
 from typing import Any, NamedTuple
 
 from auditlog.mixins import AuditlogHistoryAdminMixin
@@ -678,9 +679,38 @@ def _emit_dante_warnings(request: HttpRequest, form: object) -> None:
     all (no rename warning on creation — settled decision 8, nothing
     exists yet to re-subscribe), and any bare ``ModelForm`` built outside
     the admin.
+
+    Deferred to ``transaction.on_commit()`` (Codex review finding 2) —
+    unlike ``_emit_hostname_advisories()`` above, which still fires
+    immediately and is deliberately left that way. Django's admin
+    ``_changeform_view()`` wraps ``save_model()`` and ``save_related()``
+    (which is what actually saves ``NetworkDevicePortInline``, present on
+    this very page) in **one** ``transaction.atomic()`` block. A device
+    can save cleanly here and then have the ports formset raise —
+    ``AuditedModelAdminMixin.changeform_view()`` catches that and
+    redirects with an error, but Django's message queue is not
+    transactional, so a warning emitted immediately would still reach the
+    operator for a rename that never committed. That is the worst
+    possible direction for *this* message specifically to be wrong in: it
+    instructs someone to go re-point live Dante routing at a name the
+    database doesn't actually hold. ``on_commit()`` is a no-op wrapper
+    (fires immediately) outside an atomic block, so this changes nothing
+    for the recompute action's own already-self-contained per-row
+    transaction, or for any other caller.
+
+    The identical risk on ``_emit_hostname_advisories()`` is judged not
+    worth the same treatment: "consider setting hostname_purpose"
+    surviving a rolled-back save is cosmetic, not an instruction to touch
+    production audio equipment, so that phase-18 path is left as it was.
     """
     for warning in getattr(form, "_dante_warnings", []):
-        messages.warning(request, warning)
+        # functools.partial, not a lambda closing over the loop variable
+        # — a plain closure would see whatever `warning` is by the time
+        # commit fires (always the last one, for more than one warning in
+        # the list), since Python closures bind the variable, not its
+        # value at closure-creation time. partial() binds the value
+        # immediately as a bound argument instead.
+        transaction.on_commit(functools.partial(messages.warning, request, warning))
 
 
 def _suggest_dante_unit_id() -> UnitIdSuggestion | None:
@@ -1982,6 +2012,21 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
                 # computed (result.status != "skipped" already covers a
                 # missing owner/type-slug); never overrides that skip's
                 # own reason.
+                #
+                # over_length_skip tracks *which* skip this is, because the
+                # two must not save() the same way (Codex review finding
+                # 1). The pre-existing blocked-stem skip (missing owner or
+                # type's hostname_slug) never touches current.hostname, so
+                # phase 18's own current.save() below still needs to run —
+                # it is the only place a rack-derived owner
+                # (_recompute_hostname() step 1, "stored regardless of
+                # what happens next") gets persisted for a row that was
+                # never touched by the add form. The over-length skip is
+                # different in kind: current.hostname now holds a
+                # too-long value full_clean() would reject, so save()
+                # must be skipped entirely or this would strand the row
+                # in a state its own change form then refuses.
+                over_length_skip = False
                 if result.status != "skipped" and current.dante_unit_id is not None:
                     assembled_length = dante.DANTE_UNIT_ID_PREFIX_LENGTH + len(current.hostname)
                     if assembled_length > dante.DANTE_NAME_MAX_LENGTH:
@@ -1993,8 +2038,12 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
                             "character Dante limit",
                             result.advisories,
                         )
+                        over_length_skip = True
                 if result.status == "skipped":
                     skipped.append(f"{current} ({result.reason})")
+                    if over_length_skip:
+                        continue
+                    current.save()  # phase 18: still persists a rack-derived owner (see above)
                     continue
                 current.save()
                 if result.status == "renamed":

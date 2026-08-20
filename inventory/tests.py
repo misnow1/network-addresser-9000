@@ -9973,6 +9973,41 @@ class DanteAdvisoryFormTests(TestCase):
             any("This hostname is 32 characters" in str(m) for m in get_messages(response.wsgi_request))
         )
 
+    def test_change_form_does_not_advise_at_exactly_31_characters(self) -> None:
+        """Codex review finding 3 — the boundary from the other side.
+        Every existing advisory test uses 32 characters; nothing proved
+        that exactly 31 (the limit itself, not one past it) stays silent,
+        so an accidental ``>= 31`` off-by-one in ``over_length_advisory()``
+        would have passed the whole suite. Nothing live can catch this
+        either — the longest real hostname is 19.
+        """
+        hostname = "e" * 31
+        self.assertEqual(len(hostname), 31)
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname=hostname)
+        response = self.client.post(
+            f"/admin/inventory/networkdevice/{device.pk}/change/",
+            {
+                "device_type": str(self.device_type.pk),
+                "hostname": hostname,
+                "serial_number": "",
+                "rack": "",
+                "rack_slot": "",
+                "owner": "",
+                "hostname_purpose": "",
+                "hostname_sequence": "",
+                "dante_unit_id": "",
+                "ports-TOTAL_FORMS": "0",
+                "ports-INITIAL_FORMS": "0",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+            },
+        )
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        self.assertFalse(
+            any("Dante's device-name limit" in str(m) for m in get_messages(response.wsgi_request))
+        )
+
     def test_change_form_does_not_advise_when_a_unit_id_is_set(self) -> None:
         """Decision 6's other half — the advisory is null-ID-only; a
         unit-ID device over 31 gets the *blocking* error instead (proven
@@ -10006,6 +10041,54 @@ class DanteAdvisoryFormTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Dante allows 31")
         self.assertNotContains(response, "if this device is on a Dante network")
+
+    def test_invalid_rename_stashes_nothing_that_survives_to_save_model(self) -> None:
+        """Codex review finding 4 — ``test_change_form_does_not_advise_
+        when_a_unit_id_is_set`` above submits an *unchanged* already-
+        overlong name, so ``_post_clean()`` never stashes a rename
+        warning in the first place; it passes without touching the
+        "stashing, not raising, is safe" guarantee at all (a form that
+        fails model validation never reaches ``save_model()``, so
+        whatever it stashed is simply never emitted).
+
+        This one actually exercises it: a valid unit-ID device (26 + 5 =
+        31, exactly at the limit) is renamed to a hostname one character
+        longer — genuinely changing the Dante name, so ``_post_clean()``
+        *does* stash a rename warning, while also tripping the blocking
+        length error, so the form never saves and ``save_model()`` never
+        runs to emit it.
+        """
+        old_hostname = "f" * 26
+        self.assertEqual(len(old_hostname), 26)
+        new_hostname = "g" * 27
+        self.assertEqual(len(new_hostname), 27)
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname=old_hostname, dante_unit_id=1
+        )
+        response = self.client.post(
+            f"/admin/inventory/networkdevice/{device.pk}/change/",
+            {
+                "device_type": str(self.device_type.pk),
+                "hostname": new_hostname,
+                "serial_number": "",
+                "rack": "",
+                "rack_slot": "",
+                "owner": "",
+                "hostname_purpose": "",
+                "hostname_sequence": "",
+                "dante_unit_id": "1",
+                "ports-TOTAL_FORMS": "0",
+                "ports-INITIAL_FORMS": "0",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+            },
+        )
+        # Re-rendered with the blocking error, not saved (200, not 302).
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Dante allows 31")
+        device.refresh_from_db()
+        self.assertEqual(device.hostname, old_hostname)  # the invalid rename never persisted
+        self.assertFalse(any(m.level_tag == "warning" for m in get_messages(response.wsgi_request)))
 
     def test_switch_change_form_never_emits_a_dante_message(self) -> None:
         """Not ``NetworkSwitch`` (decision 6) — a switch carries Dante
@@ -10069,7 +10152,15 @@ class DanteRenameWarningChangeFormTests(TestCase):
             "ports-MAX_NUM_FORMS": "1000",
         }
         data.update(overrides)
-        return self.client.post(f"/admin/inventory/networkdevice/{device.pk}/change/", data)
+        # The Dante rename warning is now deferred to transaction.
+        # on_commit() (Codex review finding 2) — under a plain TestCase,
+        # which wraps every test in a savepoint that's rolled back rather
+        # than committed, on_commit() callbacks never fire on their own.
+        # captureOnCommitCallbacks(execute=True) is Django's documented
+        # mechanism for exercising them anyway, without paying for a
+        # TransactionTestCase's real commit/truncate per test.
+        with self.captureOnCommitCallbacks(execute=True):
+            return self.client.post(f"/admin/inventory/networkdevice/{device.pk}/change/", data)
 
     def _warnings(self, response: Any) -> list[str]:
         return [str(m) for m in get_messages(response.wsgi_request) if m.level_tag == "warning"]
@@ -10409,3 +10500,35 @@ class DanteRecomputeActionTests(TestCase):
         messages_text = [str(m) for m in get_messages(request)]
         self.assertTrue(any("Skipped 1" in m for m in messages_text))
         self.assertTrue(any("Recomputed 3" in m for m in messages_text))
+
+    def test_blocked_stem_skip_still_persists_a_rack_derived_owner(self) -> None:
+        """Codex review finding 1 — a regression this PR could have
+        introduced, not a new Dante behaviour: on ``main``,
+        ``current.save()`` runs unconditionally after a skip, because
+        ``_recompute_hostname()`` step 1 assigns ``obj.owner`` from
+        ``obj.rack.owner`` *before* it can ever return ``"skipped"``, and
+        that assignment is "stored regardless of what happens next" per
+        its own docstring — the only mechanism by which an imported row,
+        which never went through the add form, gets an owner at all.
+
+        The new over-length skip (settled decision 7) must bypass
+        ``save()`` — it would otherwise persist a hostname
+        ``full_clean()`` rejects — but the *pre-existing* blocked-stem
+        skip ("missing owner and type's hostname_slug") has nothing
+        invalid to write and must keep saving exactly as it always did.
+        Conflating the two ``continue``s would silently stop persisting
+        the rack-derived owner for every blocked-stem skip, not just the
+        new Dante one.
+        """
+        no_slug_type = _make_device_type(hostname_slug="", name="No Slug Recompute")
+        device = NetworkDevice.objects.create(
+            device_type=no_slug_type, rack=self.rack, rack_slot=10, owner=None
+        )
+        self.assertIsNone(device.owner)
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        request = self._request()
+        admin.recompute_hostnames(request, NetworkDevice.objects.filter(pk=device.pk))
+        device.refresh_from_db()
+        self.assertEqual(device.owner, self.owner)  # the rack's owner, persisted despite the skip
+        self.assertEqual(device.hostname, "")  # still blocked — nothing computed to write
+        self.assertTrue(any("Skipped" in str(m) for m in get_messages(request)))
