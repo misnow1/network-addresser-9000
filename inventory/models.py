@@ -1299,6 +1299,26 @@ def _candidate_range_is_free(
     )
 
 
+def _format_allocation(address_range: str, subnet: str) -> str:
+    """ "<address_range> (offset <n>)" — the vocabulary every ADR 0025
+    advisory that names an allocation outcome uses (Codex review round 2,
+    finding 3). Decision 3 and the whole ADR are about the offset from a
+    VLAN's *network address*, deliberately, because a third-octet or a bare
+    CIDR reading doesn't survive a VLAN that isn't a /21 — but the CIDR
+    is what an operator will actually type into the next field, so both
+    are reported rather than either alone: ``10.201.1.32/27 (offset
+    288)``, not just one or the other. Falls back to the bare CIDR if the
+    offset can't be computed (a malformed value reaching this point is
+    already a different problem for something else to report, not this
+    helper's).
+    """
+    try:
+        offset = range_offset(subnet, address_range)
+    except ValueError:
+        return address_range
+    return f"{address_range} (offset {offset})"
+
+
 def _rack_established_offset(rack: "Rack") -> "tuple[int | None, bool]":
     """``(offset, disagreed)`` — the single offset every one of ``rack``'s
     *existing* ``RackVlanRange`` rows agrees on, for the sticky rule (ADR
@@ -1697,7 +1717,9 @@ class Rack(AuditedModel):
                 rng.full_clean()
                 rng.save()
                 if offset is None:
-                    fallback_details.append(f"{link.vlan}: {rng.address_range}")
+                    fallback_details.append(
+                        f"{link.vlan}: {_format_allocation(rng.address_range, link.vlan.subnet)}"
+                    )
         finally:
             self._applying_template = False
         if offset is None and fallback_details:
@@ -1899,15 +1921,16 @@ class RackVlanRange(AuditedModel):
                         vlan.subnet, rack.slot_count, used_ranges, dhcp_range
                     )
                     if suggestion and rack.pk is not None:
+                        described = _format_allocation(suggestion, vlan.subnet)
                         if established_offset is not None:
                             rack._range_alignment_advisories.append(
                                 f"{vlan}: {rack}'s established offset ({established_offset}) isn't "
-                                f"free here — allocated {suggestion} instead."
+                                f"free here — allocated {described} instead."
                             )
                         elif disagreed:
                             rack._range_alignment_advisories.append(
                                 f"{vlan}: {rack}'s existing ranges don't all share one offset, so "
-                                f"none could be inherited — allocated {suggestion} by first-fit."
+                                f"none could be inherited — allocated {described} by first-fit."
                             )
                 if suggestion:
                     self.address_range = suggestion

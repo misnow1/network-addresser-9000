@@ -42,6 +42,7 @@ from .models import (
     SwitchAddressing,
     SwitchPortVlanProfile,
     _candidate_range_is_free,
+    _format_allocation,
     _lock_devices_by_pk,
     _vlan_alignment_input,
     occupied_rack_slot_ranges,
@@ -222,22 +223,36 @@ class RackVlanRangeInlineFormSet(BaseInlineFormSet):
         outcome decisions 2 and 3 forbid; the fix is that when nothing
         common exists across everything being allocated, *everything*
         falls back independently, not just the part this method can't see.
+        ``self.instance._aligned_offset`` is reset to ``None`` in the same
+        place (Codex review round 2, finding 1): a formset re-validated
+        against one already-used ``Rack`` instance (a programmatic
+        caller, not the admin — Django constructs one formset per
+        request) would otherwise leave a *previous* attempt's stashed
+        offset in place for ``_resolve_template_offset()`` to reuse if
+        *this* attempt's own union search fails — reintroducing the same
+        subset-alignment bug finding 2 fixed, by a different route.
 
-        Any advisory already on ``self.instance`` is cleared first (Codex
-        review finding 4): a blank row's own ``full_clean()`` — which,
-        on an existing rack, runs the sticky rule (``RackVlanRange.
-        clean()``) — always happens before this method, so anything
-        already recorded here was written by a sticky check against
-        *pre-this-submission* data (e.g. a sibling range that a DELETE
-        checkbox elsewhere in this very submission is about to remove).
-        This method's own decision, made with full knowledge of every
-        row's fate in this submission, supersedes that — an advisory
-        describing a rack that no longer disagrees with itself once the
-        deleted row is excluded is worse than none at all.
+        Any advisory the sticky rule recorded on a blank row during its
+        own ``full_clean()`` (which always runs before this method) is
+        cleared once this method is actually about to decide something —
+        after the "nothing to align"/malformed-subnet bails below, not
+        before (Codex review round 2, finding 2): a formset that ends up
+        aligning nothing must not silently discard advisories a
+        programmatic caller had already accumulated from an earlier,
+        unrelated ``RackVlanRange.full_clean()`` call — the attribute is
+        documented as readable by exactly that kind of caller. Once this
+        method *is* deciding something, anything already present was
+        necessarily written by a sticky check against *pre-this-
+        submission* data (e.g. a sibling range a DELETE checkbox
+        elsewhere in this same submission is about to remove), and this
+        method's own decision — made with full knowledge of every row's
+        fate in this submission — supersedes it: an advisory describing a
+        rack that no longer disagrees with itself once the deleted row is
+        excluded is worse than none at all.
         """
         rack = self.instance
-        rack._range_alignment_advisories.clear()
         rack._aligned_offset_attempted = True
+        rack._aligned_offset = None
         anchors: list[tuple[VLAN, str]] = []
         blank_forms = []
         represented_pks: set[int] = set()
@@ -281,6 +296,11 @@ class RackVlanRangeInlineFormSet(BaseInlineFormSet):
                 return  # a malformed subnet; that VLAN's own validation reports it elsewhere
             vlans_input.append((vlan, info))
 
+        # Only cleared once we know we're actually deciding something —
+        # see the docstring's finding-2 paragraph for why this can't move
+        # any earlier than here.
+        rack._range_alignment_advisories.clear()
+
         def offset_fits_every_vlan(offset: int) -> bool:
             for _vlan, (subnet, used_ranges, dhcp_range) in vlans_input:
                 try:
@@ -292,16 +312,21 @@ class RackVlanRangeInlineFormSet(BaseInlineFormSet):
             return True
 
         def blank_row_outcomes() -> str:
-            """ "<vlan>: <address_range>" for every blank row, joined — what
-            this method actually has to report (decision 3: name the
-            outcome, not blame a VLAN) at the moment it falls back: each
-            blank row's own already-computed first-fit value. Empty when
-            there are no blank rows at all — a template-only fallback has
-            nothing here to add, since the template's own rows don't exist
-            yet; ``_apply_template()`` reports those once it creates them.
+            """ "<vlan>: <address_range> (offset <n>)" for every blank row,
+            joined — what this method actually has to report (decision 3:
+            name the outcome, not blame a VLAN) at the moment it falls
+            back: each blank row's own already-computed first-fit value,
+            in the CIDR-plus-offset vocabulary every ADR 0025 advisory
+            uses (``_format_allocation()``, Codex review round 2, finding
+            3). Empty when there are no blank rows at all — a
+            template-only fallback has nothing here to add, since the
+            template's own rows don't exist yet; ``_apply_template()``
+            reports those once it creates them.
             """
             return "; ".join(
-                f"{form.cleaned_data['vlan']}: {form.instance.address_range}" for form in blank_forms
+                f"{form.cleaned_data['vlan']}: "
+                f"{_format_allocation(form.instance.address_range, form.cleaned_data['vlan'].subnet)}"
+                for form in blank_forms
             )
 
         anchor_offsets = set()
