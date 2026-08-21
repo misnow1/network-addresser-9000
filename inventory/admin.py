@@ -41,11 +41,13 @@ from .models import (
     RackVlanRange,
     SwitchAddressing,
     SwitchPortVlanProfile,
+    _candidate_range_is_free,
     _lock_devices_by_pk,
+    _vlan_alignment_input,
     occupied_rack_slot_ranges,
     switch_port_profile_summary,
 )
-from .suggestions import lowest_free_run
+from .suggestions import lowest_free_run, range_at_offset, range_offset, suggest_aligned_offset
 
 
 class AuditedModelAdminMixin:
@@ -128,11 +130,9 @@ class AuditedModelAdminMixin:
 
 
 class RackVlanRangeInlineFormSet(BaseInlineFormSet):
-    """Implements ADR 0014 decision 11: a manually-entered range here that
-    names a VLAN the chosen template already covers is a validation error
-    naming that VLAN — not silent precedence in either direction, and not a
-    raw ``unique_rack_vlan_range`` IntegrityError surfacing after template
-    rows have already been written.
+    """Implements ADR 0014 decision 11 (the template/manual-VLAN conflict
+    check) and ADR 0025 decision 7 (one joint offset across everything
+    this submission is about to allocate).
 
     Reads ``self.instance.template`` — populated by ``RackAddForm.
     _post_clean()`` before this formset's own ``clean()`` runs. This works
@@ -142,12 +142,13 @@ class RackVlanRangeInlineFormSet(BaseInlineFormSet):
     *after* ``form.is_valid()`` has already run ``_post_clean()`` — even
     though the formsets themselves are *constructed* earlier, before
     ``form.is_valid()`` runs. If a future Django release reorders that,
-    this degrades to the raw IntegrityError decision 11 forbids rather than
-    silently doing nothing — ``RackTemplateAdminTests`` asserts the *form
-    error* specifically so that regression fails loudly. On the rack change
-    form (no ``template`` field at all), ``self.instance.template`` is
-    simply the property's default ``None`` and this check is a no-op,
-    exactly as intended.
+    the template-conflict check below degrades to the raw IntegrityError
+    decision 11 forbids rather than silently doing nothing —
+    ``RackTemplateAdminTests`` asserts the *form error* specifically so
+    that regression fails loudly. On the rack change form (no
+    ``template`` field at all), ``self.instance.template`` is simply the
+    property's default ``None`` and that check is a no-op, exactly as
+    intended.
     """
 
     def clean(self) -> None:
@@ -155,20 +156,164 @@ class RackVlanRangeInlineFormSet(BaseInlineFormSet):
         if any(self.errors):
             return
         template = getattr(self.instance, "template", None)
-        if template is None:
-            return
-        template_vlan_ids = set(template.vlan_links.values_list("vlan_id", flat=True))
-        if not template_vlan_ids:
-            return
+        template_vlan_ids: set[int] = set()
+        if template is not None:
+            template_vlan_ids = set(template.vlan_links.values_list("vlan_id", flat=True))
+        if template_vlan_ids:
+            for form in self.forms:
+                if not form.cleaned_data or form.cleaned_data.get("DELETE", False):
+                    continue
+                vlan = form.cleaned_data.get("vlan")
+                if vlan is not None and vlan.pk in template_vlan_ids:
+                    raise forms.ValidationError(
+                        f"{vlan} is already included by the selected Rack Template — remove this "
+                        "row or choose a different VLAN; it will be allocated by the template "
+                        "automatically."
+                    )
+        self._align_offsets(template, template_vlan_ids)
+
+    def _align_offsets(self, template: "RackTemplate | None", template_vlan_ids: "set[int]") -> None:
+        """ADR 0025 decision 7: one joint offset over the template's VLANs
+        (which have no ``RackVlanRange`` rows yet — ``_apply_template()``
+        only creates them once ``Rack.save()`` runs, *after* this formset
+        validates) and this formset's own **user-blank** rows, together.
+
+        A blank row's ``form.instance.address_range`` already holds a
+        per-VLAN first-fit suggestion by this point — ``instance.
+        full_clean()`` (called from ``form.is_valid()``, which runs before
+        ``formset.clean()``) already filled it in. So "blank" is read from
+        ``form.cleaned_data["address_range"]`` (the *submitted* value,
+        still ``""``), not the instance — the plan's "ordering trap".
+
+        "Anchors" are ranges already fixed by this submission: a
+        manually-typed non-blank value here, or (the change-page case) an
+        unchanged existing row — both surface identically through
+        ``form.cleaned_data``, since Django prefills a bound form's
+        initial value as its "submitted" one when the operator leaves it
+        untouched — plus, for completeness, any already-saved range this
+        formset has no form for at all (review note 4). Deleted rows are
+        excluded from all of it, matching the DELETE skip above.
+
+        If the anchors agree on one offset and it's free on every VLAN
+        being aligned, that offset wins. With no anchors at all, a fresh
+        ``suggest_aligned_offset()`` search runs over exactly those VLANs
+        (decision 6 — never the whole VLAN set). Either way, a winning
+        offset is stashed on ``self.instance._aligned_offset`` so
+        ``Rack._apply_template()`` — which independently needs the same
+        offset for the template's own rows — doesn't have to (and can't)
+        rediscover it after the fact; see that method's docstring for the
+        other half of this trick. Anything short of a winning offset
+        leaves every blank row's already-computed first-fit value alone
+        and records an advisory (decision 3 — fall back, and say so).
+        """
+        rack = self.instance
+        anchors: list[tuple[VLAN, str]] = []
+        blank_forms = []
+        represented_pks: set[int] = set()
         for form in self.forms:
+            # Recorded regardless of DELETE/blank below: "represented in
+            # this formset" means this saved row *has a form here at all*,
+            # not that its form counts as an anchor — a deleted row must
+            # still be excluded from the sibling-range fallback query
+            # right below, or its still-in-the-database value would sneak
+            # back in as an anchor through that second path.
+            if form.instance.pk is not None:
+                represented_pks.add(form.instance.pk)
             if not form.cleaned_data or form.cleaned_data.get("DELETE", False):
                 continue
             vlan = form.cleaned_data.get("vlan")
-            if vlan is not None and vlan.pk in template_vlan_ids:
-                raise forms.ValidationError(
-                    f"{vlan} is already included by the selected Rack Template — remove this row "
-                    "or choose a different VLAN; it will be allocated by the template automatically."
+            if vlan is None:
+                continue
+            submitted_range = form.cleaned_data.get("address_range")
+            if submitted_range:
+                anchors.append((vlan, submitted_range))
+            else:
+                blank_forms.append(form)
+        if rack.pk is not None:
+            for sibling in rack.vlan_ranges.exclude(pk__in=represented_pks).select_related("vlan"):
+                anchors.append((sibling.vlan, sibling.address_range))
+
+        template_vlans = (
+            [link.vlan for link in template.vlan_links.select_related("vlan")]
+            if template is not None and template_vlan_ids
+            else []
+        )
+        blank_vlans = [form.cleaned_data["vlan"] for form in blank_forms]
+        aligned_vlans = template_vlans + blank_vlans
+        if not aligned_vlans:
+            return  # nothing here for a joint offset to fill in
+
+        vlans_input = []
+        for vlan in aligned_vlans:
+            info = _vlan_alignment_input(vlan)
+            if info is None:
+                return  # a malformed subnet; that VLAN's own validation reports it elsewhere
+            vlans_input.append((vlan, info))
+
+        def offset_fits_every_vlan(offset: int) -> bool:
+            for _vlan, (subnet, used_ranges, dhcp_range) in vlans_input:
+                try:
+                    candidate_cidr = range_at_offset(subnet, offset, rack.slot_count)
+                except ValueError:
+                    return False
+                if not _candidate_range_is_free(candidate_cidr, subnet, used_ranges, dhcp_range):
+                    return False
+            return True
+
+        anchor_offsets = set()
+        for anchor_vlan, anchor_range in anchors:
+            try:
+                anchor_offsets.add(range_offset(anchor_vlan.subnet, anchor_range))
+            except ValueError:
+                continue  # malformed anchor value; not this check's job
+
+        offset: int | None = None
+        if len(anchor_offsets) == 1:
+            candidate_offset = anchor_offsets.pop()
+            if offset_fits_every_vlan(candidate_offset):
+                offset = candidate_offset
+            else:
+                rack._range_alignment_advisories.append(
+                    f"This rack's anchored offset ({candidate_offset}) isn't free on every VLAN "
+                    "being allocated here — allocated per VLAN instead."
                 )
+        elif not anchors:
+            offset = suggest_aligned_offset([info for _vlan, info in vlans_input], rack.slot_count)
+            if offset is None:
+                rack._range_alignment_advisories.append(
+                    "No single offset is free on every VLAN this rack is being given a range on "
+                    "— allocated per VLAN instead of jointly."
+                )
+        elif len(anchor_offsets) > 1:
+            rack._range_alignment_advisories.append(
+                "This rack's existing/entered ranges don't all share one offset, so none could "
+                "be inherited for the new rows — allocated per VLAN instead."
+            )
+
+        if offset is None:
+            return
+        rack._aligned_offset = offset
+        for form in blank_forms:
+            vlan = form.cleaned_data["vlan"]
+            form.instance.address_range = range_at_offset(vlan.subnet, offset, rack.slot_count)
+            try:
+                # "rack" is force-excluded on top of form._get_validation_
+                # exclusions(): BaseInlineFormSet.__init__ deliberately
+                # re-adds the fk to form._meta.fields ("to make sure
+                # validation isn't skipped on that field" — its own
+                # comment), which defeats _get_validation_exclusions()'s
+                # normal "not one of this form's own fields" skip and
+                # leaves exclusion resting on a blank/required inference
+                # that isn't reliably true across configurations. Without
+                # forcing it, Model.full_clean() validates the FK's raw
+                # rack_id — None for a rack that exists only in memory,
+                # not yet saved (see _get_related()'s docstring) — and
+                # raises a "cannot be null" error that has nothing to do
+                # with the address_range value just assigned above.
+                exclude = form._get_validation_exclusions() | {"rack"}
+                form.instance.full_clean(exclude=exclude)
+            except ValidationError as exc:
+                form.add_error(None, exc)
 
 
 class RackVlanRangeInline(admin.TabularInline):
@@ -1576,11 +1721,43 @@ class RackTemplateAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin
         return ", ".join(str(vlan_id) for vlan_id in sorted(vlan.vlan_id for vlan in obj.vlans.all()))
 
 
+class RackRangeOffsetsDivergeFilter(admin.SimpleListFilter):
+    """ADR 0025 decision 5 — copied from ``_HostnameDivergesFilterBase``
+    (`:1774` below), since ``Rack.range_offsets_diverge`` is a Python
+    property, not a database column, and can't be an ordinary
+    ``list_filter`` string entry either. Scans in Python — 21 racks in
+    production today — with ``vlan_ranges__vlan`` prefetched here so the
+    scan itself stays one query rather than an N+1 across the
+    changelist's own row count; ``RackAdmin.get_queryset()`` already
+    carries this same prefetch unconditionally for the ordinary
+    changelist, but the filter doesn't rely on that — it applies its own,
+    the same defensive posture ``_HostnameDivergesFilterBase`` takes.
+    """
+
+    title = "range offset divergence"
+    parameter_name = "range_offsets_diverge"
+
+    def lookups(self, request: HttpRequest, model_admin: Any) -> list[tuple[str, str]]:
+        return [("yes", "Diverges"), ("no", "Matches")]
+
+    def queryset(self, request: HttpRequest, queryset: QuerySet) -> QuerySet:
+        value = self.value()
+        if value not in ("yes", "no"):
+            return queryset
+        wants_diverging = value == "yes"
+        matching_pks = [
+            obj.pk
+            for obj in queryset.prefetch_related("vlan_ranges__vlan")
+            if obj.range_offsets_diverge == wants_diverging
+        ]
+        return queryset.filter(pk__in=matching_pks)
+
+
 @admin.register(Rack)
 class RackAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
-    list_display = ["name", "slot_count", "owner", "location_slug"]
+    list_display = ["name", "slot_count", "owner", "location_slug", "range_offsets_diverge"]
     search_fields = ["name", "location_slug"]
-    list_filter = ["owner"]
+    list_filter = ["owner", RackRangeOffsetsDivergeFilter]
     # A declarative attribute, not relying on Django's auto-select_related()
     # — owner is nullable, so the auto-apply path doesn't descend it (see
     # VLANAdmin's identical comment above for the mechanism).
@@ -1597,6 +1774,30 @@ class RackAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAd
         if obj is None:
             kwargs["form"] = RackAddForm
         return super().get_form(request, obj, change=change, **kwargs)
+
+    def get_queryset(self, request: HttpRequest) -> QuerySet:
+        # ADR 0025 — range_offsets_diverge (rendered by the column below)
+        # reads every range's own vlan. Unconditional here, not left to
+        # RackRangeOffsetsDivergeFilter (which only prefetches when a
+        # filter value is actually selected), so the ordinary changelist
+        # — no filter applied — doesn't N+1 across the rack list.
+        return super().get_queryset(request).prefetch_related("vlan_ranges__vlan")
+
+    @admin.display(boolean=True, description="Offsets diverge")
+    def range_offsets_diverge(self, obj: Rack) -> bool:
+        return obj.range_offsets_diverge
+
+    def save_model(self, request: HttpRequest, obj: Any, form: object, change: bool) -> None:
+        super().save_model(request, obj, form, change)
+        # ADR 0025 — whatever any of the three allocation paths recorded
+        # on this exact rack instance during formset/model validation
+        # (the inline formset's joint offset, RackVlanRange.clean()'s
+        # sticky rule, and _apply_template()'s own fallback, all reachable
+        # from this one save) — same messages.info level and same
+        # "admin-only, programmatic callers read the attribute instead"
+        # posture as _emit_hostname_advisories().
+        for advisory in obj._range_alignment_advisories:
+            messages.info(request, advisory)
 
 
 @admin.register(NetworkSwitchType)

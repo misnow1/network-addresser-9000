@@ -39,8 +39,11 @@ from django.db.models.functions import Coalesce, Concat
 from . import dante
 from .suggestions import (
     dhcp_range_overlaps_cidr,
+    range_at_offset,
+    range_offset,
     ranges_overlap,
     required_block_size,
+    suggest_aligned_offset,
     suggest_default_gateway,
     suggest_rack_vlan_range,
     suggest_slot_address,
@@ -1240,6 +1243,89 @@ def _validate_rack_template_vlan_change(
 models.signals.m2m_changed.connect(_validate_rack_template_vlan_change, sender=RackTemplate.vlans.through)
 
 
+def _vlan_alignment_input(vlan: "VLAN") -> "tuple[str, list[str], tuple[str, str] | None] | None":
+    """``(subnet, used_ranges, dhcp_range)`` for ``suggest_aligned_offset()``
+    — built the same way ``Rack._check_template_application_possible()``
+    already builds it for its own per-VLAN first-fit pre-flight, so every
+    ADR 0025 allocation path (the template, the sticky single-range case,
+    and the inline formset) reads "free" identically. ``None`` when
+    ``vlan``'s own subnet is malformed — nothing to align against.
+
+    Malformed sibling ``RackVlanRange``/``VLAN`` data (a bare ``save()``
+    that bypassed ``clean()``) is skipped rather than raised — that
+    sibling's own ``clean()`` is what reports it, not this helper's job.
+    """
+    try:
+        validate_ipv4_cidr(vlan.subnet)
+    except ValidationError:
+        return None
+    used_ranges = []
+    for value in vlan.rack_ranges.values_list("address_range", flat=True):
+        try:
+            validate_ipv4_cidr(value)
+        except ValidationError:
+            continue
+        used_ranges.append(value)
+    dhcp_range = None
+    if vlan.dhcp_range_start and vlan.dhcp_range_end:
+        try:
+            ipaddress.IPv4Address(vlan.dhcp_range_start)
+            ipaddress.IPv4Address(vlan.dhcp_range_end)
+        except ValueError:
+            pass  # VLAN's own malformed dhcp range; its own clean() reports it
+        else:
+            dhcp_range = (vlan.dhcp_range_start, vlan.dhcp_range_end)
+    return (vlan.subnet, used_ranges, dhcp_range)
+
+
+def _candidate_range_is_free(
+    candidate_cidr: str, subnet: str, used_ranges: "list[str]", dhcp_range: "tuple[str, str] | None"
+) -> bool:
+    """Whether ``candidate_cidr`` — one already-known block, not a search
+    — sits inside ``subnet`` and overlaps neither ``used_ranges`` nor
+    ``dhcp_range``. Used only by the sticky rule (``RackVlanRange.
+    clean()``) to test a rack's established offset against a VLAN it
+    hasn't allocated on yet, as distinct from ``iter_free_offsets()``/
+    ``suggest_aligned_offset()``'s searches over many candidates.
+    """
+    vlan_network = ipaddress.IPv4Network(subnet, strict=True)
+    candidate_network = ipaddress.IPv4Network(candidate_cidr, strict=True)
+    if not candidate_network.subnet_of(vlan_network):
+        return False
+    if any(ranges_overlap(candidate_cidr, other) for other in used_ranges):
+        return False
+    return not (
+        dhcp_range is not None and dhcp_range_overlaps_cidr(dhcp_range[0], dhcp_range[1], candidate_cidr)
+    )
+
+
+def _rack_established_offset(rack: "Rack") -> "tuple[int | None, bool]":
+    """``(offset, disagreed)`` — the single offset every one of ``rack``'s
+    *existing* ``RackVlanRange`` rows agrees on, for the sticky rule (ADR
+    0025 decision 1) to extend to a new VLAN. ``offset`` is ``None`` when
+    there is no single agreed value; ``disagreed`` distinguishes *why*,
+    since the two cases get different advisory wording (ADR 0025 plan,
+    "Advisory surfacing"): ``True`` only when at least two distinct valid
+    offsets exist among the rack's ranges (a genuinely misaligned rack),
+    ``False`` when there are zero or one — nothing to disagree about, most
+    commonly a rack that has no ranges yet at all, which isn't a
+    divergence, just a rack with nothing established to be sticky about.
+
+    Never guesses (decision 2): a range whose own value or VLAN doesn't
+    parse is skipped exactly like ``_vlan_alignment_input()`` skips a
+    malformed sibling, rather than treated as a disagreement.
+    """
+    offsets = set()
+    for sibling in rack.vlan_ranges.all().select_related("vlan"):
+        try:
+            offsets.add(range_offset(sibling.vlan.subnet, sibling.address_range))
+        except ValueError:
+            continue  # malformed vlan.subnet or address_range; not this check's job
+    if len(offsets) == 1:
+        return offsets.pop(), False
+    return None, len(offsets) > 1
+
+
 class Rack(AuditedModel):
     """An abstract grouping of equipment with a fixed slot count.
 
@@ -1286,6 +1372,37 @@ class Rack(AuditedModel):
     #: name is a field or a property (mirrors ADR 0013's
     #: ``NetworkDevice._port_addressing``/``port_addressing``).
     _template: "RackTemplate | None" = None
+
+    #: Stashed by ``RackVlanRangeInlineFormSet.clean()`` (ADR 0025) when a
+    #: rack is created with a template *and* manually-entered inline
+    #: blanks on the same submission — the one joint offset computed
+    #: across both, so ``_apply_template()`` doesn't independently
+    #: recompute its own offset and hand the inline rows something
+    #: different (the "ordering trap": ``all_valid(formsets)`` runs before
+    #: ``save_model()``, so the template's rows don't exist yet when the
+    #: formset's own ``clean()`` runs). Same never-a-plain-class-attribute
+    #: reasoning as ``_template`` above.
+    _aligned_offset: "int | None" = None
+
+    #: True only while ``_apply_template()`` is actively looping over its
+    #: own template's VLANs. Read by ``RackVlanRange.clean()``'s sticky
+    #: rule (ADR 0025 decision 1) to suppress itself: by the time
+    #: ``_apply_template()`` runs, ``self.pk`` is already set (it runs from
+    #: inside ``Rack.save()``, after the row is inserted), so without this
+    #: flag the sticky rule would fire on the *second* VLAN of a
+    #: fallback-to-first-fit template application, "establishing" an
+    #: offset from the *first* VLAN's just-saved fallback range — one
+    #: rack-level batch decision producing a cascade of per-VLAN sticky
+    #: re-decisions, and a duplicate advisory for what is conceptually one
+    #: event. The sticky rule stays fully live for its real purpose: a
+    #: genuinely later, independent addition to an already-existing rack.
+    #: Same never-a-plain-class-attribute reasoning as ``_template`` above.
+    _applying_template: bool = False
+
+    #: Class-level default for the ``_range_alignment_advisories``
+    #: property below — same reasoning as ``_template`` above: a shared
+    #: mutable list would leak advisories across every Rack instance.
+    _range_alignment_advisories_store: "list[str] | None" = None
 
     class Meta:
         ordering = ["name"]
@@ -1390,17 +1507,105 @@ class Rack(AuditedModel):
             raise ValidationError(f"{value!r} is not a RackTemplate.")
         self._template = value
 
+    @property
+    def _range_alignment_advisories(self) -> "list[str]":
+        """Advisories recorded by any of ADR 0025's three allocation paths
+        — the fallback-to-first-fit case below, the sticky rule in
+        ``RackVlanRange.clean()``, and the inline formset's joint offset
+        (``RackVlanRangeInlineFormSet.clean()``) — all keyed off this one
+        rack instance so ``RackAdmin.save_model()`` can emit whatever
+        accumulated during that request's validation, via
+        ``messages.info``, the same pattern ``_emit_hostname_advisories()``
+        already uses for phase 18's advisories. Read directly by any
+        programmatic caller too — this is a plain instance attribute, not
+        admin-only plumbing.
+        """
+        if self._range_alignment_advisories_store is None:
+            self._range_alignment_advisories_store = []
+        return self._range_alignment_advisories_store
+
+    @property
+    def range_offsets_diverge(self) -> bool:
+        """Stateless indicator (ADR 0025 decision 5), modelled directly on
+        ``NetworkSwitch.hostname_diverges`` (ADR 0023 decision 9): ``True``
+        when this rack's ``RackVlanRange`` rows don't all share one
+        offset.
+
+        Zero or one range is never divergent — there's nothing for it to
+        disagree with. A rack with two or more ranges where **any**
+        offset is ``None`` (a malformed stored value, an L2-only VLAN
+        reachable only via a bypassed ``save()``, or a range genuinely
+        outside its VLAN's subnet) counts as **diverging**: it cannot be
+        shown to be aligned, and silently reporting "aligned" for data
+        this property can't read would be worse than a false positive
+        (ADR 0025 plan, review note 3).
+
+        No extra query when the caller has already prefetched
+        ``vlan_ranges__vlan`` — same no-extra-queries posture as
+        ``hostname_diverges``: this reads only ``self.vlan_ranges.all()``
+        (satisfied from the prefetch cache when present) and each range's
+        own ``.offset`` property, which needs only the already-
+        ``select_related``d ``vlan``.
+        """
+        ranges = list(self.vlan_ranges.all())
+        if len(ranges) < 2:
+            return False
+        offsets = {rack_range.offset for rack_range in ranges}
+        return None in offsets or len(offsets) > 1
+
+    def _resolve_template_offset(self, links: "list[RackTemplateVlan]") -> int | None:
+        """The joint offset ``_apply_template()`` should use across
+        ``links``' VLANs (ADR 0025 decision 1's "batch" half).
+
+        Prefers ``self._aligned_offset`` — stashed by
+        ``RackVlanRangeInlineFormSet.clean()`` when this rack is being
+        created with a template *and* manually-entered inline blanks on
+        the same submission — if it's still free on every listed VLAN.
+        Otherwise runs a fresh joint search restricted to exactly this
+        template's VLANs (decision 6: never the whole VLAN set). ``None``
+        when no offset is free on all of them, which
+        ``_apply_template()`` reads as "fall back to independent
+        first-fit, and say so."
+        """
+        vlans_input = []
+        for link in links:
+            info = _vlan_alignment_input(link.vlan)
+            if info is None:
+                # A malformed subnet here would already have failed
+                # _check_template_application_possible() (called just
+                # before this), so this is unreached in practice — kept
+                # defensive rather than assumed, matching this module's
+                # general posture toward sibling data.
+                return None
+            vlans_input.append(info)
+        if not vlans_input:
+            return None
+        stashed = self._aligned_offset
+        if stashed is not None:
+            try:
+                candidates = [
+                    range_at_offset(subnet, stashed, self.slot_count) for subnet, _, _ in vlans_input
+                ]
+            except ValueError:
+                candidates = None
+            if candidates is not None and all(
+                _candidate_range_is_free(cidr, subnet, used, dhcp)
+                for cidr, (subnet, used, dhcp) in zip(candidates, vlans_input, strict=True)
+            ):
+                return stashed
+        return suggest_aligned_offset(vlans_input, self.slot_count)
+
     def _apply_template(self) -> None:
         """One-time copy of ``self.template``'s VLAN list into real
         ``RackVlanRange`` rows (ADR 0014 decision 7). Each range is built
-        unsaved with a blank ``address_range`` and put through
-        ``full_clean()`` before ``save()`` — ``RackVlanRange`` has no
-        ``save()`` override, so a bare ``objects.create()`` would otherwise
-        persist an empty string on a NOT NULL column instead of triggering
-        ``RackVlanRange.clean()``'s existing suggestion logic. Runs inside
-        the same transaction as this rack's insert (see ``save()``), so any
-        failure rolls back the rack and every range materialized before it
-        (decision 8's all-or-nothing).
+        unsaved and put through ``full_clean()`` before ``save()`` —
+        ``RackVlanRange`` has no ``save()`` override, so a bare
+        ``objects.create()`` would otherwise persist an empty string on a
+        NOT NULL column instead of triggering ``RackVlanRange.clean()``'s
+        existing suggestion logic. Runs inside the same transaction as
+        this rack's insert (see ``save()``), so any failure rolls back the
+        rack and every range materialized before it (decision 8's
+        all-or-nothing).
 
         Reads the template's VLAN links exactly once into ``links`` and
         reuses that same snapshot for both the pre-flight and this loop,
@@ -1411,15 +1616,54 @@ class Rack(AuditedModel):
         narrow this specific torn-read window, not ADR 0014's already-
         accepted range-allocation race (see that ADR's Known-gap section),
         so a snapshot is the right amount of correctness for what it costs.
+
+        ADR 0025: a single joint offset (``_resolve_template_offset()``)
+        is computed once across every listed VLAN. On a hit, each range is
+        built with an explicit ``address_range`` — skipping the per-row
+        suggester while still passing through ``full_clean()``/
+        ``_validate_range()`` — so the suggester never independently
+        re-decides a VLAN this method has already placed. On a miss, every
+        range is built blank exactly as before ADR 0025, and one advisory
+        names which VLAN landed on which offset (decision 3 — the outcome
+        is reported, not blamed on a VLAN, since no single VLAN "caused"
+        an empty intersection of free offsets).
+
+        ``self._applying_template`` brackets the loop below so
+        ``RackVlanRange.clean()``'s sticky rule stays quiet for its
+        duration — without it, the *second* blank range in a fallback
+        would see the *first* one (already saved, since ``self.pk`` is set
+        the moment this method runs) as an "established" rack offset and
+        opportunistically adopt or reject it on its own, turning one
+        rack-level batch decision into a cascade of per-VLAN sticky
+        re-decisions with a duplicate advisory riding along.
         """
         template = self._template
         assert template is not None  # only ever called from save() after that same check
         links = list(template.vlan_links.select_related("vlan").order_by("vlan__vlan_id"))
         self._check_template_application_possible(links)
-        for link in links:
-            rng = RackVlanRange(rack=self, vlan=link.vlan, address_range="", created_by=self.created_by)
-            rng.full_clean()
-            rng.save()
+        offset = self._resolve_template_offset(links) if links else None
+        fallback_details = []
+        self._applying_template = True
+        try:
+            for link in links:
+                if offset is not None:
+                    address_range = range_at_offset(link.vlan.subnet, offset, self.slot_count)
+                else:
+                    address_range = ""
+                rng = RackVlanRange(
+                    rack=self, vlan=link.vlan, address_range=address_range, created_by=self.created_by
+                )
+                rng.full_clean()
+                rng.save()
+                if offset is None:
+                    fallback_details.append(f"{link.vlan}: {rng.address_range}")
+        finally:
+            self._applying_template = False
+        if offset is None and fallback_details:
+            self._range_alignment_advisories.append(
+                "No single offset is free on every VLAN this rack is being given a range on — "
+                "allocated per VLAN instead of jointly: " + "; ".join(fallback_details)
+            )
 
     def _check_template_application_possible(self, links: "list[RackTemplateVlan]") -> None:
         """Pure pre-flight over a snapshot of a template's VLAN links:
@@ -1507,6 +1751,40 @@ class RackVlanRange(AuditedModel):
     def __str__(self) -> str:
         return f"{self.rack} / {self.vlan}: {self.address_range}"
 
+    @property
+    def offset(self) -> int | None:
+        """This range's offset from its VLAN's network address (ADR 0025)
+        — the tolerant counterpart to the strict ``range_offset()`` pure
+        function. ``None``, never a raised exception, when the VLAN has
+        no subnet (L2-only, ADR 0012), either value is malformed (a bare
+        ``save()`` bypasses ``clean()`` — ``RobustnessTests`` exists
+        precisely because the write path allows this), or the range sits
+        outside its own VLAN's subnet — a range this far wrong can't be
+        shown to have *an* offset, honestly.
+
+        This is how the offset reaches every read-only surface without a
+        view annotation or a template filter: rack_detail's columns and
+        ``Rack.range_offsets_diverge`` are both ``RackVlanRange`` objects
+        with ``vlan`` already ``select_related``, which is everything this
+        property needs.
+        """
+        vlan = _get_related(self, "vlan")
+        if vlan is None or not vlan.subnet:
+            return None
+        try:
+            validate_ipv4_cidr(vlan.subnet)
+            validate_ipv4_cidr(self.address_range)
+        except ValidationError:
+            return None
+        try:
+            vlan_network = ipaddress.IPv4Network(vlan.subnet, strict=True)
+            range_network = ipaddress.IPv4Network(self.address_range, strict=True)
+        except ValueError:
+            return None
+        if not range_network.subnet_of(vlan_network):
+            return None
+        return range_offset(vlan.subnet, self.address_range)
+
     def clean(self) -> None:
         super().clean()
         rack = _get_related(self, "rack")
@@ -1542,7 +1820,54 @@ class RackVlanRange(AuditedModel):
             except ValidationError:
                 pass  # VLAN's own subnet is invalid; nothing sensible to suggest
             else:
-                suggestion = suggest_rack_vlan_range(vlan.subnet, rack.slot_count, used_ranges, dhcp_range)
+                # ADR 0025 decision 1's sticky half: a blank range added to
+                # an *already-existing* rack (rack.pk is not None — a rack
+                # still being created has no saved siblings to be sticky
+                # to, and is handled by _apply_template()/the inline
+                # formset instead) adopts the rack's established offset
+                # when one exists and a block at it is free here.
+                # _rack_established_offset() returns (None, False) both
+                # when the rack has no ranges yet at all (nothing to
+                # inherit — not a divergence) and when its existing ranges
+                # don't parse; it returns (None, True) only when they
+                # genuinely disagree (decision 2 — never guess one).
+                #
+                # Also suppressed for the duration of rack._applying_template
+                # (see that flag's docstring on Rack): _apply_template()'s
+                # own fallback loop already makes one rack-level batch
+                # decision, and without this guard the sticky rule would
+                # opportunistically re-decide it VLAN by VLAN as each
+                # fallback range gets saved, against siblings that only
+                # exist because *this same* fallback is still in progress.
+                suggestion = None
+                established_offset: int | None = None
+                disagreed = False
+                if rack.pk is not None and not rack._applying_template:
+                    established_offset, disagreed = _rack_established_offset(rack)
+                    if established_offset is not None:
+                        try:
+                            candidate_cidr = range_at_offset(vlan.subnet, established_offset, rack.slot_count)
+                        except ValueError:
+                            candidate_cidr = None
+                        if candidate_cidr is not None and _candidate_range_is_free(
+                            candidate_cidr, vlan.subnet, used_ranges, dhcp_range
+                        ):
+                            suggestion = candidate_cidr
+                if suggestion is None:
+                    suggestion = suggest_rack_vlan_range(
+                        vlan.subnet, rack.slot_count, used_ranges, dhcp_range
+                    )
+                    if suggestion and rack.pk is not None:
+                        if established_offset is not None:
+                            rack._range_alignment_advisories.append(
+                                f"{vlan}: {rack}'s established offset ({established_offset}) isn't "
+                                f"free here — allocated {suggestion} instead."
+                            )
+                        elif disagreed:
+                            rack._range_alignment_advisories.append(
+                                f"{vlan}: {rack}'s existing ranges don't all share one offset, so "
+                                f"none could be inherited — allocated {suggestion} by first-fit."
+                            )
                 if suggestion:
                     self.address_range = suggestion
         if not self.address_range:

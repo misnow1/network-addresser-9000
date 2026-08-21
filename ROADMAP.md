@@ -2,7 +2,7 @@
 
 High-level phases only — day-to-day task tracking belongs in GitHub Issues once there's code to file issues against. This file exists so it's obvious what phase the project is in and what's next, even after a fresh start.
 
-**Current phase: 19 — aligned rack allocation, not yet started. Phases 1–6, 8–18 and 22 done (22 landed out of numeric order — ADR 0024 needed none of phases 19–21's machinery); phase 7 scoped but skipped. Phases 19–21 remain outstanding.**
+**Current phase: 20 — addressing per `(device, VLAN)` instead of per port. Phases 1–6, 8–19 and 22 done (22 landed out of numeric order — ADR 0024 needed none of phases 19–21's machinery); phase 7 scoped but skipped. Phases 20–21 remain outstanding.**
 
 ## 1. Foundation — done
 
@@ -421,27 +421,31 @@ point — **gives the same answer when the VLANs have different DHCP geometry**,
 the case where today's per-VLAN first-fit diverges. Strictly more robust than what we have, not
 merely tidier. No schema change; this is a suggester change plus a report.
 
-- [ ] **Suggest, don't enforce.** A hard constraint would be the first place this system forbids
+- [x] **Suggest, don't enforce.** A hard constraint would be the first place this system forbids
       something an operator may legitimately need, cutting against ADR 0001's suggest-with-override
       and ADR 0003's stored-not-derived stance. Real cases exist: a VLAN whose subnet is too small
       for the aligned offset, a rack joining a VLAN whose aligned offset is already taken, or
       importing a site that is already misaligned. Aligned-by-default achieves the outcome; a
       constraint mainly produces a wall at the worst moment
-- [ ] **The invariant is the offset from the VLAN's network address, not the third octet.** 16 of
+- [x] **The invariant is the offset from the VLAN's network address, not the third octet.** 16 of
       the 21 production racks don't start on a `/24` boundary. An offset-based rule survives a VLAN
       that isn't a `/21`; a third-octet rule doesn't (§6.1)
-- [ ] **Static addresses only.** DHCP interfaces are outside the guarantee — the only promises
+- [x] **Static addresses only.** DHCP interfaces are outside the guarantee — the only promises
       there are the VLAN subnet and the server's pool. A DHCP port stores no address at all, so
-      this needs no special handling, but any misalignment report must ignore DHCP ports or it
-      will flag every mixed device (§6.1)
-- [ ] **Department scoping stays declined**, even though phase 16 now supplies the grouping field
+      this needs no special handling. The "ignore DHCP ports or it will flag every mixed device"
+      hazard this bullet originally warned about turned out not to need any code at all: decision 4
+      (ADR 0025) scoped the report to rack level, where there is no per-port reasoning to get wrong
+      in the first place — recorded here since that's a stronger resolution than the one predicted,
+      not the one assumed when this bullet was written
+- [x] **Department scoping stays declined**, even though phase 16 now supplies the grouping field
       that was the first of four reasons for declining it. The other three stand: ADR 0014
       decision 1 declined the nearest thing deliberately; all 21 production racks carry only audio
       VLANs, so department-scoped and global alignment are identical on today's data; and the
       spreadsheet's own model is one offset per rack applied to *every* VLAN base, so scoping
       would depart from current practice rather than formalise it
-- [ ] A divergence report (or an admin column) so misalignment is *visible* — far cheaper than a
-      constraint, and it strands nobody
+- [x] A divergence report (or an admin column) so misalignment is *visible* — far cheaper than a
+      constraint, and it strands nobody. Shipped as `Rack.range_offsets_diverge` (ADR 0025), an
+      admin column/filter, and read-only markers on the index tile and rack elevation page
 
 ## 20. Addressing per `(device, VLAN)` instead of per port — #27
 

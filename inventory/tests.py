@@ -11,6 +11,8 @@ inside ``save()`` itself, can guard those paths.
 import importlib
 import io
 import ipaddress
+import itertools
+import re
 import threading
 import time
 from types import SimpleNamespace
@@ -101,9 +103,13 @@ from .models import (
 )
 from .suggestions import (
     dhcp_range_overlaps_cidr,
+    iter_free_offsets,
     lowest_free_run,
     prefix_length_for_capacity,
+    range_at_offset,
+    range_offset,
     required_block_size,
+    suggest_aligned_offset,
     suggest_default_gateway,
     suggest_rack_vlan_range,
     suggest_slot_address,
@@ -155,6 +161,20 @@ def _make_profile(native_vlan: VLAN, **kwargs) -> SwitchPortVlanProfile:
     kwargs.setdefault("name", "Test Profile")
     kwargs.setdefault("port_mode", PortMode.TRUNK)
     return SwitchPortVlanProfile.objects.create(native_vlan=native_vlan, **kwargs)
+
+
+def _admin_row_html(content: str, marker: str) -> str:
+    """One ``<tr>`` from a Django admin changelist, located by a marker
+    string appearing in it (typically a row's own name/hostname, shown in
+    another column) — coordinates, not presence: proves *which* row
+    carries an encoding, not merely that it appears somewhere on the page
+    (same reasoning as ``test_ui.py``'s ``_row_html``/``_list_row_cells``).
+    Raises if no such row exists, which is itself a useful failure.
+    """
+    for row in re.findall(r"<tr[^>]*>.*?</tr>", content, re.DOTALL):
+        if marker in row:
+            return row
+    raise AssertionError(f"no admin changelist row found containing {marker!r}")
 
 
 class RackSlotAssignmentTests(TestCase):
@@ -7517,6 +7537,590 @@ class RackAddressingProductionReplayTests(TestCase):
         # either gap.
         _rack, twentieth = self._create_rack("Twentieth Rack", 3)
         self.assertEqual(twentieth.address_range, "10.200.3.96/27")
+
+
+class AlignedAllocationSuggestionTests(TestCase):
+    """ADR 0025 — pure-function tests for the joint allocator: ``inventory.
+    suggestions.iter_free_offsets()``/``range_offset()``/``range_at_offset()``/
+    ``suggest_aligned_offset()``. No DB involved, mirroring
+    ``SuggestionFunctionTests`` above.
+    """
+
+    # -- iter_free_offsets() --------------------------------------------------
+
+    def test_iter_free_offsets_yields_ascending_multiples_of_block_size(self) -> None:
+        offsets = list(itertools.islice(iter_free_offsets("10.200.0.0/21", 27, []), 3))
+        self.assertEqual(offsets, [0, 32, 64])
+
+    def test_iter_free_offsets_skips_used_ranges(self) -> None:
+        offsets = list(
+            itertools.islice(iter_free_offsets("10.200.0.0/21", 27, ["10.200.0.0/27", "10.200.0.32/27"]), 2)
+        )
+        self.assertEqual(offsets, [64, 96])
+
+    def test_iter_free_offsets_skips_dhcp_range(self) -> None:
+        offsets = list(
+            itertools.islice(
+                iter_free_offsets("10.200.0.0/21", 27, [], dhcp_range=("10.200.0.1", "10.200.0.254")), 1
+            )
+        )
+        self.assertEqual(offsets, [256])
+
+    def test_iter_free_offsets_empty_when_block_bigger_than_subnet(self) -> None:
+        # Mirrors suggest_rack_vlan_range()'s pre-ADR-0025 prefixlen <
+        # network.prefixlen guard — a /21-sized block asked of a /27
+        # subnet yields nothing rather than raising.
+        self.assertEqual(list(iter_free_offsets("10.200.1.0/27", 21, [])), [])
+
+    def test_iter_free_offsets_is_lazy_over_a_legal_slash_0(self) -> None:
+        # validators.py's validate_ipv4_cidr permits any IPv4 CIDR,
+        # including a /0 (review note 1) — a /27-sized search over one has
+        # 134,217,728 candidates. next() must return promptly rather than
+        # this test hanging while the space is enumerated.
+        self.assertEqual(next(iter_free_offsets("0.0.0.0/0", 27, [])), 0)
+
+    def test_iter_free_offsets_islice_over_a_legal_slash_0_terminates_promptly(self) -> None:
+        gen = iter_free_offsets("0.0.0.0/0", 27, [])
+        self.assertEqual(list(itertools.islice(gen, 3)), [0, 32, 64])
+
+    # -- range_offset() / range_at_offset() round-trip ------------------------
+
+    def test_range_offset_and_range_at_offset_round_trip(self) -> None:
+        self.assertEqual(range_offset("10.200.0.0/21", "10.200.1.32/27"), 288)
+        self.assertEqual(range_at_offset("10.200.0.0/21", 288, 30), "10.200.1.32/27")
+
+    def test_range_offset_spans_an_octet_boundary(self) -> None:
+        # WPC1SRU's real production offset (PROD-DATA-ANALYSIS.md §6.1) —
+        # 1*256 + 32 = 288, the exact case a third-octet rule gets wrong
+        # and an offset-from-network-address rule doesn't.
+        self.assertEqual(range_offset("10.200.0.0/21", "10.200.1.32/27"), 288)
+
+    def test_range_offset_subnet_not_starting_on_a_slash_24(self) -> None:
+        # 16 of the 21 production racks don't start on a /24 boundary
+        # (§6.1) — none of the production VLANs exercise this, so it's
+        # covered here instead.
+        self.assertEqual(range_offset("10.200.1.128/25", "10.200.1.160/27"), 32)
+        self.assertEqual(range_at_offset("10.200.1.128/25", 32, 30), "10.200.1.160/27")
+
+    def test_range_offset_zero_at_the_subnets_own_base(self) -> None:
+        self.assertEqual(range_offset("10.200.0.0/21", "10.200.0.0/27"), 0)
+
+    def test_range_offset_raises_on_malformed_range(self) -> None:
+        with self.assertRaises(ValueError):
+            range_offset("10.200.0.0/21", "not-a-cidr")
+
+    def test_range_offset_raises_on_malformed_subnet(self) -> None:
+        with self.assertRaises(ValueError):
+            range_offset("not-a-cidr", "10.200.0.0/27")
+
+    # -- suggest_aligned_offset() ----------------------------------------------
+
+    def test_suggest_aligned_offset_lowest_offset_free_on_all(self) -> None:
+        vlans: list[tuple[str, list[str], tuple[str, str] | None]] = [
+            ("10.200.0.0/21", [], None),
+            ("10.201.0.0/21", [], None),
+        ]
+        self.assertEqual(suggest_aligned_offset(vlans, 30), 0)
+
+    def test_suggest_aligned_offset_skips_to_agreement_past_used_blocks(self) -> None:
+        vlans: list[tuple[str, list[str], tuple[str, str] | None]] = [
+            ("10.200.0.0/21", ["10.200.0.0/27"], None),
+            ("10.201.0.0/21", [], None),
+        ]
+        self.assertEqual(suggest_aligned_offset(vlans, 30), 32)
+
+    def test_suggest_aligned_offset_none_when_one_subnet_too_small(self) -> None:
+        vlans: list[tuple[str, list[str], tuple[str, str] | None]] = [
+            ("10.200.0.0/21", [], None),
+            ("10.201.0.0/28", [], None),
+        ]
+        self.assertIsNone(suggest_aligned_offset(vlans, 30))
+
+    def test_suggest_aligned_offset_agrees_across_vlans_of_unequal_size(self) -> None:
+        # A /21 and a /24 together — the lowest common offset (32, once
+        # vlan_a's own offset 0 is taken) is a valid boundary on both
+        # despite the size difference, per the plan's own claim that
+        # network_address + k*block_size lands on a valid CIDR boundary
+        # on every VLAN regardless of its own prefix length.
+        vlans: list[tuple[str, list[str], tuple[str, str] | None]] = [
+            ("10.200.0.0/21", ["10.200.0.0/27"], None),
+            ("10.201.0.0/24", [], None),
+        ]
+        self.assertEqual(suggest_aligned_offset(vlans, 30), 32)
+
+    def test_suggest_aligned_offset_none_when_free_sets_never_intersect(self) -> None:
+        # Every *even*-indexed /27 block is taken on A, every *odd*-indexed
+        # one is taken on B — free(A) and free(B) partition the whole /24
+        # and never agree anywhere in it.
+        vlan_a_used = ["10.200.0.0/27", "10.200.0.64/27", "10.200.0.128/27", "10.200.0.192/27"]
+        vlan_b_used = ["10.201.0.32/27", "10.201.0.96/27", "10.201.0.160/27", "10.201.0.224/27"]
+        vlans: list[tuple[str, list[str], tuple[str, str] | None]] = [
+            ("10.200.0.0/24", vlan_a_used, None),
+            ("10.201.0.0/24", vlan_b_used, None),
+        ]
+        self.assertIsNone(suggest_aligned_offset(vlans, 30))
+
+    def test_suggest_aligned_offset_none_for_empty_vlan_list(self) -> None:
+        self.assertIsNone(suggest_aligned_offset([], 30))
+
+
+class AlignedAllocationPointTest(TestCase):
+    """The point test (PLAN-aligned-rack-allocation.md): PROD-DATA-
+    ANALYSIS.md §6.1's case that today's model gets wrong. One VLAN
+    reserves .2-.254 for DHCP, its neighbour has none — replaying today's
+    independent per-VLAN first-fit genuinely gives offsets 0 and 256; the
+    joint allocator gives one.
+    """
+
+    def test_per_vlan_first_fit_diverges_but_aligned_allocation_agrees(self) -> None:
+        subnet_a = "10.200.0.0/21"
+        subnet_b = "10.201.0.0/21"
+        dhcp_range = ("10.200.0.2", "10.200.0.254")
+
+        result_a = suggest_rack_vlan_range(subnet_a, 30, [], dhcp_range=dhcp_range)
+        result_b = suggest_rack_vlan_range(subnet_b, 30, [])
+        assert result_a is not None and result_b is not None
+        self.assertEqual(range_offset(subnet_a, result_a), 256)
+        self.assertEqual(range_offset(subnet_b, result_b), 0)
+
+        vlans: list[tuple[str, list[str], tuple[str, str] | None]] = [
+            (subnet_a, [], dhcp_range),
+            (subnet_b, [], None),
+        ]
+        self.assertEqual(suggest_aligned_offset(vlans, 30), 256)
+
+
+class RackTemplateAlignedAllocationTests(TestCase):
+    """ADR 0025 — ``Rack._apply_template()``'s joint offset across a
+    template's VLANs (decision 1's "batch" half, and decision 3's
+    fall-back-and-say-so).
+    """
+
+    def setUp(self) -> None:
+        self.vlan_a = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.vlan_b = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+
+    def test_template_vlans_share_one_offset(self) -> None:
+        # vlan_a already has a sibling range at offset 0 — independent
+        # first-fit would give this rack 10.200.0.32/27 on vlan_a but
+        # 10.201.0.0/27 on vlan_b (exactly the divergence §6.1 describes);
+        # the joint offset must instead land both on 32.
+        sibling = Rack.objects.create(name="Sibling", slot_count=30)
+        RackVlanRange.objects.create(rack=sibling, vlan=self.vlan_a, address_range="10.200.0.0/27")
+        template = RackTemplate.objects.create(name="Audio Rack")
+        RackTemplateVlan.objects.create(template=template, vlan=self.vlan_a)
+        RackTemplateVlan.objects.create(template=template, vlan=self.vlan_b)
+        rack = Rack(name="Rack 1", slot_count=30)
+        rack.template = template
+        rack.save()
+        range_a = RackVlanRange.objects.get(rack=rack, vlan=self.vlan_a)
+        range_b = RackVlanRange.objects.get(rack=rack, vlan=self.vlan_b)
+        self.assertEqual(range_a.address_range, "10.200.0.32/27")
+        self.assertEqual(range_b.address_range, "10.201.0.32/27")
+        self.assertFalse(rack.range_offsets_diverge)
+        self.assertEqual(rack._range_alignment_advisories, [])
+
+    def test_falls_back_and_advises_when_no_joint_offset_exists(self) -> None:
+        small_vlan_a = VLAN.objects.create(name="Small A", vlan_id=210, subnet="10.210.0.0/24")
+        small_vlan_b = VLAN.objects.create(name="Small B", vlan_id=211, subnet="10.211.0.0/24")
+        # Every *even*-indexed block taken on A, every *odd*-indexed block
+        # taken on B (AlignedAllocationSuggestionTests' None-case shape) —
+        # no offset is free on both anywhere in either /24.
+        for offset in (0, 64, 128, 192):
+            sibling = Rack.objects.create(name=f"SiblingA{offset}", slot_count=30)
+            RackVlanRange.objects.create(
+                rack=sibling, vlan=small_vlan_a, address_range=f"10.210.0.{offset}/27"
+            )
+        for offset in (32, 96, 160, 224):
+            sibling = Rack.objects.create(name=f"SiblingB{offset}", slot_count=30)
+            RackVlanRange.objects.create(
+                rack=sibling, vlan=small_vlan_b, address_range=f"10.211.0.{offset}/27"
+            )
+        template = RackTemplate.objects.create(name="Mismatched")
+        RackTemplateVlan.objects.create(template=template, vlan=small_vlan_a)
+        RackTemplateVlan.objects.create(template=template, vlan=small_vlan_b)
+        rack = Rack(name="Rack 2", slot_count=30)
+        rack.template = template
+        rack.save()
+        range_a = RackVlanRange.objects.get(rack=rack, vlan=small_vlan_a)
+        range_b = RackVlanRange.objects.get(rack=rack, vlan=small_vlan_b)
+        # Ranges are still created — independently, by ordinary first-fit.
+        self.assertEqual(range_a.address_range, "10.210.0.32/27")
+        self.assertEqual(range_b.address_range, "10.211.0.0/27")
+        self.assertEqual(len(rack._range_alignment_advisories), 1)
+        advisory = rack._range_alignment_advisories[0]
+        self.assertIn(str(small_vlan_a), advisory)
+        self.assertIn(str(small_vlan_b), advisory)
+
+
+class RackVlanRangeStickyOffsetTests(TestCase):
+    """ADR 0025 decision 1's sticky half — ``RackVlanRange.clean()``, only
+    reachable when ``rack.pk is not None`` (a blank range added to an
+    *already-existing* rack).
+    """
+
+    def setUp(self) -> None:
+        self.vlan_a = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.vlan_b = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+        self.rack = Rack.objects.create(name="Existing", slot_count=30)
+
+    def test_agreeing_rack_adopts_its_established_offset(self) -> None:
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan_a, address_range="10.200.0.32/27")
+        new_range = RackVlanRange(rack=self.rack, vlan=self.vlan_b)
+        new_range.full_clean()
+        self.assertEqual(new_range.address_range, "10.201.0.32/27")
+        self.assertEqual(self.rack._range_alignment_advisories, [])
+
+    def test_disagreeing_rack_falls_back_with_advisory(self) -> None:
+        # The rack's own two existing ranges already disagree (offset 0
+        # vs 32) — decision 2: never guess which one is "the" offset.
+        vlan_c = VLAN.objects.create(name="Dante Secondary", vlan_id=202, subnet="10.202.0.0/21")
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan_a, address_range="10.200.0.0/27")
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan_b, address_range="10.201.0.32/27")
+        new_range = RackVlanRange(rack=self.rack, vlan=vlan_c)
+        new_range.full_clean()
+        self.assertEqual(new_range.address_range, "10.202.0.0/27")  # ordinary first-fit
+        self.assertEqual(len(self.rack._range_alignment_advisories), 1)
+        self.assertIn("don't all share one offset", self.rack._range_alignment_advisories[0])
+
+    def test_established_offset_unavailable_on_new_vlan_falls_back(self) -> None:
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan_a, address_range="10.200.0.32/27")
+        sibling = Rack.objects.create(name="Sibling", slot_count=30)
+        RackVlanRange.objects.create(rack=sibling, vlan=self.vlan_b, address_range="10.201.0.32/27")
+        new_range = RackVlanRange(rack=self.rack, vlan=self.vlan_b)
+        new_range.full_clean()
+        self.assertEqual(new_range.address_range, "10.201.0.0/27")  # offset 32 is taken here
+        self.assertEqual(len(self.rack._range_alignment_advisories), 1)
+        self.assertIn("isn't free here", self.rack._range_alignment_advisories[0])
+
+    def test_no_existing_ranges_is_not_a_divergence_and_advises_nothing(self) -> None:
+        # A rack's very first range has nothing established to be sticky
+        # to — this must not read as "disagreement".
+        new_range = RackVlanRange(rack=self.rack, vlan=self.vlan_a)
+        new_range.full_clean()
+        self.assertEqual(new_range.address_range, "10.200.0.0/27")
+        self.assertEqual(self.rack._range_alignment_advisories, [])
+
+
+class RackVlanRangeInlineFormSetAlignedOffsetTests(TestCase):
+    """ADR 0025 decision 7 — ``RackVlanRangeInlineFormSet.clean()``'s joint
+    offset, covering both the rack-creation ordering trap and the plain
+    inline-formset anchor rules.
+    """
+
+    def setUp(self) -> None:
+        self.vlan_a = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.vlan_b = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+
+    def _formset(self, instance: Rack, rows: "list[dict[str, str]]", initial: int = 0):
+        FormSet = inlineformset_factory(  # type: ignore[var-annotated]
+            Rack,
+            RackVlanRange,
+            formset=RackVlanRangeInlineFormSet,
+            fields=["vlan", "address_range"],
+            extra=len(rows) - initial,
+            can_delete=True,
+        )
+        data = {
+            "vlan_ranges-TOTAL_FORMS": str(len(rows)),
+            "vlan_ranges-INITIAL_FORMS": str(initial),
+            "vlan_ranges-MIN_NUM_FORMS": "0",
+            "vlan_ranges-MAX_NUM_FORMS": "1000",
+        }
+        for i, row in enumerate(rows):
+            for key, value in row.items():
+                data[f"vlan_ranges-{i}-{key}"] = value
+        return FormSet(data, instance=instance, prefix="vlan_ranges")
+
+    def test_several_blank_rows_share_one_offset(self) -> None:
+        # vlan_a already has a sibling at offset 0 — independent first-fit
+        # would give this rack 32 on vlan_a but 0 on vlan_b; the joint
+        # offset must land both rows on 32 instead.
+        sibling = Rack.objects.create(name="Sibling", slot_count=30)
+        RackVlanRange.objects.create(rack=sibling, vlan=self.vlan_a, address_range="10.200.0.0/27")
+        form = RackAddForm(data={"name": "Rack", "slot_count": "30"})
+        self.assertTrue(form.is_valid(), form.errors)
+        formset = self._formset(
+            form.instance,
+            [
+                {"vlan": str(self.vlan_a.pk), "address_range": ""},
+                {"vlan": str(self.vlan_b.pk), "address_range": ""},
+            ],
+        )
+        self.assertTrue(formset.is_valid(), formset.errors)
+        self.assertEqual(formset.forms[0].instance.address_range, "10.200.0.32/27")
+        self.assertEqual(formset.forms[1].instance.address_range, "10.201.0.32/27")
+
+    def test_template_and_a_blank_inline_row_on_a_fourth_vlan_share_one_offset(self) -> None:
+        # The ordering trap: _apply_template() runs from Rack.save(),
+        # which all_valid(formsets) — and therefore this formset's own
+        # clean() — runs *before*. Without RackVlanRangeInlineFormSet
+        # stashing the offset it picked onto rack._aligned_offset,
+        # _apply_template() would have no way to know it, and would
+        # independently compute (and possibly land on) a different one.
+        vlan_c = VLAN.objects.create(name="Dante Secondary", vlan_id=202, subnet="10.202.0.0/21")
+        sibling = Rack.objects.create(name="Sibling", slot_count=30)
+        RackVlanRange.objects.create(rack=sibling, vlan=self.vlan_a, address_range="10.200.0.0/27")
+        RackVlanRange.objects.create(rack=sibling, vlan=self.vlan_b, address_range="10.201.0.0/27")
+        template = RackTemplate.objects.create(name="Audio Rack")
+        RackTemplateVlan.objects.create(template=template, vlan=self.vlan_a)
+        RackTemplateVlan.objects.create(template=template, vlan=self.vlan_b)
+        form = RackAddForm(data={"name": "Rack", "slot_count": "30", "template": str(template.pk)})
+        self.assertTrue(form.is_valid(), form.errors)
+        formset = self._formset(form.instance, [{"vlan": str(vlan_c.pk), "address_range": ""}])
+        self.assertTrue(formset.is_valid(), formset.errors)
+
+        rack = form.save(commit=False)
+        rack.save()  # triggers _apply_template(), consuming the stashed offset
+
+        range_a = RackVlanRange.objects.get(rack=rack, vlan=self.vlan_a)
+        range_b = RackVlanRange.objects.get(rack=rack, vlan=self.vlan_b)
+        self.assertEqual(range_a.offset, range_b.offset)
+        fourth_row_offset = range_offset(vlan_c.subnet, formset.forms[0].instance.address_range)
+        self.assertEqual(fourth_row_offset, range_a.offset)
+
+    def test_agreeing_anchor_sets_the_offset_for_blank_rows(self) -> None:
+        form = RackAddForm(data={"name": "Rack", "slot_count": "30"})
+        self.assertTrue(form.is_valid(), form.errors)
+        formset = self._formset(
+            form.instance,
+            [
+                {"vlan": str(self.vlan_a.pk), "address_range": "10.200.0.32/27"},  # anchor
+                {"vlan": str(self.vlan_b.pk), "address_range": ""},  # blank
+            ],
+        )
+        self.assertTrue(formset.is_valid(), formset.errors)
+        self.assertEqual(formset.forms[1].instance.address_range, "10.201.0.32/27")
+
+    def test_disagreeing_anchors_force_first_fit(self) -> None:
+        vlan_c = VLAN.objects.create(name="Dante Secondary", vlan_id=202, subnet="10.202.0.0/21")
+        form = RackAddForm(data={"name": "Rack", "slot_count": "30"})
+        self.assertTrue(form.is_valid(), form.errors)
+        formset = self._formset(
+            form.instance,
+            [
+                {"vlan": str(self.vlan_a.pk), "address_range": "10.200.0.0/27"},  # anchor, offset 0
+                {"vlan": str(self.vlan_b.pk), "address_range": "10.201.0.32/27"},  # anchor, offset 32
+                {"vlan": str(vlan_c.pk), "address_range": ""},  # blank
+            ],
+        )
+        self.assertTrue(formset.is_valid(), formset.errors)
+        self.assertEqual(formset.forms[2].instance.address_range, "10.202.0.0/27")
+        self.assertEqual(len(form.instance._range_alignment_advisories), 1)
+        self.assertIn("don't all share one offset", form.instance._range_alignment_advisories[0])
+
+    def test_unavailable_anchored_offset_falls_back(self) -> None:
+        sibling = Rack.objects.create(name="Sibling", slot_count=30)
+        RackVlanRange.objects.create(rack=sibling, vlan=self.vlan_b, address_range="10.201.0.32/27")
+        form = RackAddForm(data={"name": "Rack", "slot_count": "30"})
+        self.assertTrue(form.is_valid(), form.errors)
+        formset = self._formset(
+            form.instance,
+            [
+                {"vlan": str(self.vlan_a.pk), "address_range": "10.200.0.32/27"},  # anchor, offset 32
+                {"vlan": str(self.vlan_b.pk), "address_range": ""},  # blank; 32 is taken here
+            ],
+        )
+        self.assertTrue(formset.is_valid(), formset.errors)
+        self.assertEqual(formset.forms[1].instance.address_range, "10.201.0.0/27")
+        self.assertEqual(len(form.instance._range_alignment_advisories), 1)
+        self.assertIn("isn't free", form.instance._range_alignment_advisories[0])
+
+    def test_no_common_offset_at_all_falls_back_with_advisory(self) -> None:
+        small_vlan_a = VLAN.objects.create(name="Small A", vlan_id=210, subnet="10.210.0.0/24")
+        small_vlan_b = VLAN.objects.create(name="Small B", vlan_id=211, subnet="10.211.0.0/24")
+        for offset in (0, 64, 128, 192):
+            sibling = Rack.objects.create(name=f"SiblingA{offset}", slot_count=30)
+            RackVlanRange.objects.create(
+                rack=sibling, vlan=small_vlan_a, address_range=f"10.210.0.{offset}/27"
+            )
+        for offset in (32, 96, 160, 224):
+            sibling = Rack.objects.create(name=f"SiblingB{offset}", slot_count=30)
+            RackVlanRange.objects.create(
+                rack=sibling, vlan=small_vlan_b, address_range=f"10.211.0.{offset}/27"
+            )
+        form = RackAddForm(data={"name": "Rack", "slot_count": "30"})
+        self.assertTrue(form.is_valid(), form.errors)
+        formset = self._formset(
+            form.instance,
+            [
+                {"vlan": str(small_vlan_a.pk), "address_range": ""},
+                {"vlan": str(small_vlan_b.pk), "address_range": ""},
+            ],
+        )
+        self.assertTrue(formset.is_valid(), formset.errors)
+        self.assertEqual(formset.forms[0].instance.address_range, "10.210.0.32/27")
+        self.assertEqual(formset.forms[1].instance.address_range, "10.211.0.0/27")
+        self.assertEqual(len(form.instance._range_alignment_advisories), 1)
+
+    def test_unchanged_existing_row_counts_as_anchor_on_change_page(self) -> None:
+        rack = Rack.objects.create(name="Existing", slot_count=30)
+        existing_range = RackVlanRange.objects.create(
+            rack=rack, vlan=self.vlan_a, address_range="10.200.0.32/27"
+        )
+        vlan_c = VLAN.objects.create(name="Dante Secondary", vlan_id=202, subnet="10.202.0.0/21")
+        formset = self._formset(
+            rack,
+            [
+                {
+                    "id": str(existing_range.pk),
+                    "vlan": str(self.vlan_a.pk),
+                    "address_range": "10.200.0.32/27",
+                },
+                {"vlan": str(self.vlan_b.pk), "address_range": ""},
+                {"vlan": str(vlan_c.pk), "address_range": ""},
+            ],
+            initial=1,
+        )
+        self.assertTrue(formset.is_valid(), formset.errors)
+        self.assertEqual(formset.forms[1].instance.address_range, "10.201.0.32/27")
+        self.assertEqual(formset.forms[2].instance.address_range, "10.202.0.32/27")
+
+    def test_deleted_row_does_not_count_as_anchor(self) -> None:
+        rack = Rack.objects.create(name="Existing", slot_count=30)
+        existing_range = RackVlanRange.objects.create(
+            rack=rack, vlan=self.vlan_a, address_range="10.200.0.32/27"
+        )
+        formset = self._formset(
+            rack,
+            [
+                {
+                    "id": str(existing_range.pk),
+                    "vlan": str(self.vlan_a.pk),
+                    "address_range": "10.200.0.32/27",
+                    "DELETE": "on",
+                },
+                {"vlan": str(self.vlan_b.pk), "address_range": ""},
+            ],
+            initial=1,
+        )
+        self.assertTrue(formset.is_valid(), formset.errors)
+        # The deleted row is excluded from anchors, so the blank row falls
+        # to its own independent first-fit (offset 0) rather than
+        # inheriting the soon-to-be-deleted row's offset (32).
+        self.assertEqual(formset.forms[1].instance.address_range, "10.201.0.0/27")
+
+
+class RangeOffsetsDivergeTests(TestCase):
+    """ADR 0025 decision 5 — ``Rack.range_offsets_diverge`` and
+    ``RackVlanRange.offset``.
+    """
+
+    def setUp(self) -> None:
+        self.vlan_a = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.vlan_b = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+        self.rack = Rack.objects.create(name="Rack", slot_count=30)
+
+    def test_zero_ranges_does_not_diverge(self) -> None:
+        self.assertFalse(self.rack.range_offsets_diverge)
+
+    def test_one_range_does_not_diverge(self) -> None:
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan_a, address_range="10.200.0.32/27")
+        self.assertFalse(self.rack.range_offsets_diverge)
+
+    def test_aligned_ranges_do_not_diverge(self) -> None:
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan_a, address_range="10.200.0.32/27")
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan_b, address_range="10.201.0.32/27")
+        self.assertFalse(self.rack.range_offsets_diverge)
+
+    def test_misaligned_ranges_diverge(self) -> None:
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan_a, address_range="10.200.0.0/27")
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan_b, address_range="10.201.0.32/27")
+        self.assertTrue(self.rack.range_offsets_diverge)
+
+    def test_malformed_range_counts_as_diverging_not_crashing(self) -> None:
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan_a, address_range="10.200.0.32/27")
+        malformed = RackVlanRange(rack=self.rack, vlan=self.vlan_b, address_range="not-a-cidr")
+        malformed.save()  # bypasses clean()
+        self.assertTrue(self.rack.range_offsets_diverge)  # must not raise
+
+    def test_offset_none_for_malformed_stored_range(self) -> None:
+        range_ = RackVlanRange(rack=self.rack, vlan=self.vlan_a, address_range="not-a-cidr")
+        range_.save()  # bypasses clean()
+        self.assertIsNone(range_.offset)
+
+    def test_offset_none_for_l2_only_vlan(self) -> None:
+        l2_vlan = VLAN.objects.create(name="L2 Only", vlan_id=999)
+        range_ = RackVlanRange(rack=self.rack, vlan=l2_vlan, address_range="10.200.0.32/27")
+        range_.save()  # bypasses clean(), which would otherwise reject an L2-only VLAN
+        self.assertIsNone(range_.offset)
+
+    def test_offset_none_for_out_of_subnet_range(self) -> None:
+        range_ = RackVlanRange(rack=self.rack, vlan=self.vlan_a, address_range="10.201.0.32/27")
+        range_.save()  # bypasses clean(), which would otherwise reject this
+        self.assertIsNone(range_.offset)
+
+    def test_offset_matches_range_offset_for_a_valid_range(self) -> None:
+        range_ = RackVlanRange.objects.create(
+            rack=self.rack, vlan=self.vlan_a, address_range="10.200.1.32/27"
+        )
+        self.assertEqual(range_.offset, 288)
+
+
+class RackRangeOffsetsDivergeAdminTests(TestCase):
+    """ADR 0025 decision 5's admin surfaces: the ``list_display`` column
+    and ``RackRangeOffsetsDivergeFilter``, mirroring
+    ``HostnameDivergesAdminFilterTests``'s shape above.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.vlan_a = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.vlan_b = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+        self.diverging = Rack.objects.create(name="Diverging Rack", slot_count=30)
+        RackVlanRange.objects.create(rack=self.diverging, vlan=self.vlan_a, address_range="10.200.0.0/27")
+        RackVlanRange.objects.create(rack=self.diverging, vlan=self.vlan_b, address_range="10.201.0.32/27")
+        self.matching = Rack.objects.create(name="Matching Rack", slot_count=30)
+        RackVlanRange.objects.create(rack=self.matching, vlan=self.vlan_a, address_range="10.200.0.32/27")
+        RackVlanRange.objects.create(rack=self.matching, vlan=self.vlan_b, address_range="10.201.0.32/27")
+        self.admin_user = User.objects.create_user("range-admin", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="range-admin", password="testpass123")
+
+    def test_diverging_rack_renders_yes_icon_in_its_own_row(self) -> None:
+        response = self.client.get("/admin/inventory/rack/")
+        row = _admin_row_html(response.content.decode(), self.diverging.name)
+        self.assertIn("icon-yes.svg", row)
+
+    def test_matching_rack_renders_no_icon_in_its_own_row(self) -> None:
+        response = self.client.get("/admin/inventory/rack/")
+        row = _admin_row_html(response.content.decode(), self.matching.name)
+        self.assertIn("icon-no.svg", row)
+
+    def test_filter_yes_selects_only_diverging_racks(self) -> None:
+        response = self.client.get("/admin/inventory/rack/", {"range_offsets_diverge": "yes"})
+        content = response.content.decode()
+        self.assertIn(self.diverging.name, content)
+        self.assertNotIn(self.matching.name, content)
+
+    def test_filter_no_selects_only_matching_racks(self) -> None:
+        response = self.client.get("/admin/inventory/rack/", {"range_offsets_diverge": "no"})
+        content = response.content.decode()
+        self.assertIn(self.matching.name, content)
+        self.assertNotIn(self.diverging.name, content)
+
+    def test_unfiltered_shows_both(self) -> None:
+        response = self.client.get("/admin/inventory/rack/")
+        content = response.content.decode()
+        self.assertIn(self.diverging.name, content)
+        self.assertIn(self.matching.name, content)
+
+    def test_changelist_query_count_independent_of_range_count(self) -> None:
+        # RackAdmin.get_queryset()'s unconditional prefetch_related keeps
+        # the ordinary (unfiltered) changelist's query count independent
+        # of how many ranges each rack carries.
+        small_rack = Rack.objects.create(name="Small", slot_count=30)
+        RackVlanRange.objects.create(rack=small_rack, vlan=self.vlan_a, address_range="10.200.1.0/27")
+        with CaptureQueriesContext(connection) as small_ctx:
+            small_response = self.client.get("/admin/inventory/rack/")
+        big_rack = Rack.objects.create(name="Big", slot_count=30)
+        for i, vlan in enumerate([self.vlan_a, self.vlan_b]):
+            RackVlanRange.objects.create(rack=big_rack, vlan=vlan, address_range=f"10.20{i + 2}.1.0/27")
+        with CaptureQueriesContext(connection) as big_ctx:
+            big_response = self.client.get("/admin/inventory/rack/")
+        self.assertEqual(small_response.status_code, 200)
+        self.assertEqual(big_response.status_code, 200)
+        self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
 
 
 class RackSlotSuggestionTests(TestCase):

@@ -1051,10 +1051,17 @@ def index(request: HttpRequest) -> HttpResponse:
     the nav bar itself short (one more static link, "Audit", is all it
     gains) rather than growing it with every registry entry.
     """
-    racks = Rack.objects.annotate(
-        switch_count=Count("switches", distinct=True),
-        device_count=Count("devices", distinct=True),
-    ).order_by("name")
+    racks = (
+        Rack.objects.annotate(
+            switch_count=Count("switches", distinct=True),
+            device_count=Count("devices", distinct=True),
+        )
+        # range_offsets_diverge (ADR 0025), read by the index tile marker
+        # below, needs every range's own vlan — without this, an N+1
+        # across the rack list.
+        .prefetch_related("vlan_ranges__vlan")
+        .order_by("name")
+    )
     vlans = VLAN.objects.annotate(
         switch_address_count=Count("switch_addresses", distinct=True),
         device_address_count=Count(
