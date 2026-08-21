@@ -39,6 +39,7 @@ services:
       # once Django's own settings import raises ImproperlyConfigured.
       SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required — see .env.compose.example}
       DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required — see .env.compose.example}
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:?DJANGO_ALLOWED_HOSTS is required — see .env.compose.example}
     depends_on:
       db:
         condition: service_healthy

@@ -24,3 +24,6 @@ REVIEW-*.md
 
 # Production data for reference
 prod/
+
+# Docker compose environment contains secrets!
+docker-compose.env
