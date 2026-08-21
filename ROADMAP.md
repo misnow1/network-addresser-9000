@@ -453,6 +453,14 @@ ADR and will partially supersede ADR 0003 and ADR 0013.
 It is scheduled here because it is a **prerequisite for phase 21**, where two of the four
 addressing modes are otherwise unofferable, and because it is the nearest neighbour of #42.
 
+- [ ] **Decide the mirror case in the same ADR**, even if only to decline it. #27 is *two jacks,
+      one logical interface*; `docs/Virtual Network Ports.md` describes *one jack, several logical
+      interfaces* — a Shure receiver's control address riding the same physical jack as its Dante
+      Primary. Both are the same conflation of jack with addressed interface, and both want the
+      same field to move (`NetworkDevicePort.switch_port`, a `OneToOneField` today). An ADR that
+      fixes one direction without looking at the other can easily make the other harder — see the
+      Design deferred entry below
+
 ## 21. Device-type addressing modes
 
 Replace hand-assembled port lists with a short enumeration of real hardware shapes — expressible
@@ -588,9 +596,57 @@ work.
 
 - Device-replacement workflow (swapping a spare into an already-addressed slot) — flagged in ADR 0003, design deferred
 - ~~Two *independent* static addresses on one VLAN (a Yamaha console's "For Device Control" interface) — see #42.~~ **Closed by ADR 0022, built in phase 17** as `NetworkDeviceTypePort.address_source`. This entry predicted the outcome exactly — *"if it ever lands, those consoles collapse to one device and their companion links fall away"* — which is what phase 17's PR 2 does, ADR 0018 and all. Still the nearest neighbour of phase 20, which needs the opposite shape: two ports *sharing* one address (#27), not two addresses on one VLAN
+- **A port is a physical jack *and* a logical interface, and the model has only one row for both**
+  — see `docs/Virtual Network Ports.md`. `NetworkDevicePort` assumes one jack carries one address on
+  one VLAN. The estate already breaks that: a Shure ULXD4Q's control address rides the *same
+  physical jack* as its Dante Primary (both VLAN 201), as does a Yamaha console's Device Control
+  interface (ADR 0022 tier 1) and a DiGiCo SD12's engine (ADR 0017). Every address is correct today;
+  what is lost is which cable each one goes down
+  - **Recording it costs no migration.** The shared jack is currently expressed by *omission* —
+    leaving `port_number` blank on the second port. That is a convention, not a schema limit:
+    `port_number` is nullable and carries **no uniqueness constraint** on either
+    `NetworkDeviceTypePort` or `NetworkDevicePort` (identity is `(device, description)`), so two
+    ports may both say `1` right now. Missing are the convention, a check that ports sharing a jack
+    agree about what is physically true, and anything in the UI that shows it. That is the cheap
+    half and it can move independently of everything below
+  - **Do not build on "same VLAN implies same jack."** It is a sound inference only while every
+    device jack is untagged, which is the assumption this whole entry exists to retire
+  - **The structural blocker is `switch_port`.** `NetworkDevicePort.switch_port` is a
+    `OneToOneField` — a switch port may be claimed by at most one device port — so two logical
+    interfaces sharing a jack cannot both record the cable, and today at most one of them does.
+    Whatever ends up representing the jack is what should hold `switch_port`, alongside
+    `port_type`, which is likewise a fact about the jack and not about the address
+  - **The tagging half is a two-ended problem, and one end already exists.** ADR 0012 gives switch
+    ports the full vocabulary — port mode, native VLAN, allowed VLANs, live-referenced through
+    `SwitchPortVlanProfile`. A device that tags natively (the doc's example is a computer) needs the
+    *device* end to declare which VLANs its jack expects and how, after which the valuable behaviour
+    is **reconciliation**: flagging a device jack whose VLANs the connected switch port's profile
+    doesn't carry. Report the divergence, don't enforce it — the same stance as phase 19's
+    misalignment report and ADR 0023's `hostname_diverges`
+  - **Design it with phase 20, not after it** (see the item added there). Not scheduled on its own:
+    nothing in the estate is misaddressed by this, and the tagging case becomes real only when a
+    VLAN-tagging device is actually added
+  - Open: whether the jack becomes its own row (holding `port_number`, `port_type`, `switch_port`,
+    and the tagging declaration) or a "shares a jack with" pointer between logical ports is enough;
+    and how either interacts with ADR 0010's seed-once materialization, since the jack layout is a
+    property of the Type
 - Slot moves don't re-suggest an already-static device port's address (armed by default now that static materializes by default, ADR 0013; follows from ADR 0003's "stored, not immutable") — see #28. Its hostname sibling **#54 is closed by phase 18**, which ships a stateless `hostname_diverges` indicator (ADR 0023). #28 is the same staleness *class* but a different mechanism — it compares a stored address against what the allocator would now suggest, which carries its own decisions about derived, offset and operator-set addresses, so it was deliberately not folded into a naming phase. One UI treatment should eventually serve both — report, don't enforce, as in phase 19
 - **Dante device names and Martin Vu-Net names are separate namespaces** from the hostname — see #64. The production Dante sheet carries both, and they share the hostname vocabulary while differing in shape, case and uniqueness scope: Vu-Net drops owner and model, is uppercase, and is unique only per model (`SPARE-1` appears twice, for the IK42 and IK81 spares). Both are names configured on the hardware itself, like an address, so the interesting behaviour is reconciling what is configured against what the components say — not generating them. Pointless before ADR 0023 lands, since they borrow its component fields
 - Multicast configuration: port-level filtering plus switch-level IGMP snooping — see #22
+- **A device model has no description** — see `docs/Device Model Description.md`. Nothing records
+  what an `Amphenol RJD32A3-0050` *is* ("Dante interface with AES3 I/O"), so a Type is legible only
+  to someone who already knows the part numbers. The doc's load-bearing claim is that the
+  description belongs to the **model**, not the profile: a Lab Gruppen LM26 is the same box whether
+  its profile is Switched or Redundant, and hanging the text on the profile invites two profiles of
+  one model describing themselves differently — which the doc names as the anti-pattern to prevent
+  - **There is no model-level place to put it.** ADR 0010 makes `(manufacturer, model, name)` the
+    whole identity, with no bare hardware-model entity behind it — phase 17 hit the same wall and
+    accepted the duplication for `hostname_slug` rather than inventing one. So the fork is a
+    `description` field on the Type plus a convention (and possibly validation) against drift,
+    versus a real model row that profiles hang off. The second changes ADR 0010's identity and
+    needs its own ADR; the first is a field and a `help_text`
+  - Nearest neighbour is the Dante-mode entry below — the same complaint from the other side, that
+    the profile label carries facts which aren't profile facts
 - **Dante mode as something the tool reasons about, not just records.** A device's Dante networking mode (Switched / Redundant / Split) currently lives inside `NetworkDeviceType.name` — the free-text *profile label* ADR 0010 defines — alongside a second, orthogonal axis (whether a Dante card is fitted). That is tolerable only while nothing reads it. It stops being tolerable as soon as the tool should enforce a rule that depends on it, and there is now a concrete one: Shure receivers integrating with Yamaha consoles **must not** be in Split mode — *"Do not use SPLIT mode. This is not compatible with control from the Yamaha consoles"* (`docs/Shure Devices.md`, and the Shure/Yamaha integration guide it links). A rule cannot be enforced against a substring of a label. Making mode a first-class field is a substantially larger change than it looks — it splits one identity axis into two, touches every Type profile in the estate, and interacts with ADR 0010's `(manufacturer, model, name)` identity and its seed-once port materialization — so it needs its own ADR rather than riding along with another phase
 - Populated rack templates: slot layouts that materialize equipment (needs Type `PROTECT`, unlike the VLAN-only feature) — see #30. **No longer blocks hostnames** (phase 17); it would *enhance* them by prefilling the purpose component, and it does gate the rack creation wizard
 - Rack *slot* occupancy has no DB-level overlap guarantee once a device spans several ordinals (ADR 0017's known gap) — see #40. `RackSlotAssignmentMixin`'s docstring defers this to phase 3's "Overlap validation", but that item shipped covering rack-range-vs-range and DHCP overlap only — the deferral still has no live home and the pointer is still stale
