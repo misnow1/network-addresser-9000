@@ -15,6 +15,11 @@
             {{ rack.device_count }} device{{ rack.device_count|pluralize }}
             / {{ rack.slot_count }} slot{{ rack.slot_count|pluralize }}
           </div>
+          {% if rack.range_offsets_diverge %}
+            {# ADR 0025 — this rack's VLAN ranges don't all share one offset. #}
+            {# Suggested, never enforced (decision 3): an advisory marker, not a block. #}
+            <span class="badge badge--diverges" title="This rack's VLAN ranges don't all share one address offset.">offsets diverge</span>
+          {% endif %}
         </a>
       {% empty %}
         <p>No racks yet.</p>

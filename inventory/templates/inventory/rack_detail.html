@@ -11,6 +11,17 @@
     · Location: {{ rack.location_slug|default:"—" }}
   </p>
 
+  {% if rack.range_offsets_diverge %}
+    <div class="panel">
+      {# ADR 0025 — rack-level only (decision 4): this says the rack's ranges don't all share #}
+      {# one offset, nothing about which device is affected — that's issue #28's territory. #}
+      {# Suggested, never enforced: a note, not a block, and the per-column offsets below let #}
+      {# the odd one out be found by eye. #}
+      <p>This rack's VLAN ranges don't all share one address offset — see the offsets below each
+        column.</p>
+    </div>
+  {% endif %}
+
   <div class="panel elevation-scroll">
     <table class="elevation">
       <thead>
@@ -23,6 +34,13 @@
               </span>
               <div>{{ column.vlan.name }}</div>
               <div class="tile__meta">{{ column.address_range }}</div>
+              {% if column.offset is not None %}
+                {# ADR 0025 — this range's offset from its VLAN's own network address, the #}
+                {# invariant aligned allocation actually shares (not the third octet — #}
+                {# PROD-DATA-ANALYSIS.md §6.1). Blank rather than raised for a malformed or #}
+                {# out-of-subnet stored value (RobustnessTests). #}
+                <div class="tile__meta">offset {{ column.offset }}</div>
+              {% endif %}
             </th>
           {% endfor %}
         </tr>
