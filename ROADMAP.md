@@ -2,7 +2,7 @@
 
 High-level phases only — day-to-day task tracking belongs in GitHub Issues once there's code to file issues against. This file exists so it's obvious what phase the project is in and what's next, even after a fresh start.
 
-**Current phase: 19 — aligned rack allocation. Phases 1–6 and 8–18 done; phase 7 scoped but skipped.**
+**Current phase: 19 — aligned rack allocation, not yet started. Phases 1–6, 8–18 and 22 done (22 landed out of numeric order — ADR 0024 needed none of phases 19–21's machinery); phase 7 scoped but skipped. Phases 19–21 remain outstanding.**
 
 ## 1. Foundation — done
 
@@ -493,29 +493,29 @@ Small: one nullable field, one derived property, one conditional validation. No 
 data. Two devices need an ID today and neither has one, so neither is integrated correctly — which
 this phase makes visible for the first time.
 
-- [ ] `NetworkDevice.dante_unit_id` — `PositiveSmallIntegerField`, null, **1–127**. That range is
+- [x] `NetworkDevice.dante_unit_id` — `PositiveSmallIntegerField`, null, **1–127**. That range is
       the intersection of two vendor limits that disagree: Rio allows `Y000`–`Y07F` (0–127), Shure's
       Yamaha mode allows hex `01`–`FF` (1–255)
-- [ ] `dante_device_name` as a **derived, read-only property** — the hostname where no unit ID is
+- [x] `dante_device_name` as a **derived, read-only property** — the hostname where no unit ID is
       set, `Y0{id:02X}-{hostname}` where one is, and **`None` where the hostname is blank** even if
       a unit ID exists, since `Y001-` ends in a hyphen and Dante forbids that. The hostname is a
       blocking input, exactly as ADR 0023 decision 1 treats a missing owner. Nothing stored, for
       ADR 0022 decision 4's reason: a stored copy has nothing keeping it in step
-- [ ] Site-wide uniqueness on `dante_unit_id`, validated in `full_clean()`, null exempt, **enforced
+- [x] Site-wide uniqueness on `dante_unit_id`, validated in `full_clean()`, null exempt, **enforced
       on creation as well as rename** — unlike ADR 0023's hostname rule, because no importer writes
       unit IDs and so no rebuild can break
-- [ ] The **assembled name** is validated at **31 characters** where a unit ID is set — Dante's
+- [x] The **assembled name** is validated at **31 characters** where a unit ID is set — Dante's
       published limit, not a 26-character hostname cap with the prefix length baked in. Raised on
       the hostname field, stating the arithmetic. Where no unit ID is set, an over-31 hostname
       raises a **non-blocking advisory** instead: the tool cannot tell whether Dante's rule applies,
       but staying silent about a name it can see will fail is worse. Reachable from components that
       exist today — `bej-w8lm1sr-rio3224d3-midhi-01-04` is 33, and 36 with a sequence
-- [ ] Suggested value is **highest assigned + 1**, never a retired ID, field stays editable. Harder
+- [x] Suggested value is **highest assigned + 1**, never a retired ID, field stays editable. Harder
       justification than the hostname version: Dante routes to whatever currently holds a name and
       Shure warns that changing a Dante ID *"will cause a loss of audio signal"*, so a reused ID can
       silently pull audio from the wrong box. At 127 the suggester falls back to lowest-unused and
       names what it is reclaiming
-- [ ] Help text carrying the *why*, not just the what — the field is meaningless without it:
+- [x] Help text carrying the *why*, not just the what — the field is meaningless without it:
       - `dante_unit_id`: *"Yamaha consoles find and control this device by this number. Must be
         unique across every Yamaha-controlled device on the network — stage boxes and wireless
         receivers share one range. 1–127. Leave blank for equipment that is not controlled by a
@@ -528,22 +528,22 @@ this phase makes visible for the first time.
         Name the arithmetic, not just the limit
       - On the over-31 advisory with no unit ID: *"This hostname is 33 characters. Dante's
         device-name limit is 31, so if this device is on a Dante network its name will be rejected."*
-- [ ] **ADR 0023's recompute action warns per affected device** when it changes a Dante name,
+- [x] **ADR 0023's recompute action warns per affected device** when it changes a Dante name,
       naming the new name and the Dante Controller step. Phase 18's bulk rename plus this ADR's
       derived name compose into an audio outage neither has alone — Shure states that changing a
       Dante ID *"will cause a loss of audio signal"* until subscriptions are rebuilt. The action
       still renames; it just stops being silent about it
-- [ ] Read-only UI parity, and the derived name on the device detail page
-- [ ] Tests: the derived name across all four rows of the decision-1 table, including **blank
+- [x] Read-only UI parity, and the derived name on the device detail page
+- [x] Tests: the derived name across all four rows of the decision-1 table, including **blank
       hostname with a unit ID yielding `None`, not `Y001-`**; uppercase hex (`Y01B`, not `Y01b`);
       the 31-character check errors only when a unit ID is set and advises otherwise; site-wide
       uniqueness including on creation; the suggester skips a retired ID; the 127 fallback names
       what it reclaims; the recompute action warns for a unit-ID device and stays silent for others
 
-Known gap the ADR names: an ordinary Dante device with no unit ID and an over-long hostname gets no
-warning, because the tool cannot identify Dante devices structurally. Deriving that — "has a port on
-a VLAN whose *role* is Dante Primary" — is what ADR 0021 designed VLAN role for, and role is phase
-21. If it ships, this gap closes with no schema change.
+Known gap the ADR names: the advisory above fires on length only. Nothing checks that an un-flagged
+Dante device's name is *unique on the Dante network*, because the tool cannot identify Dante devices
+structurally. Deriving that — "has a port on a VLAN whose *role* is Dante Primary" — is what ADR 0021
+designed VLAN role for, and role is phase 21. If it ships, this gap closes with no schema change.
 
 
 ## Later / not yet designed

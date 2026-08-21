@@ -61,6 +61,7 @@ from .admin import (
     SwitchPortVlanProfileForm,
     VLANAdmin,
 )
+from .dante import UnitIdSuggestion, dante_device_name, suggest_unit_id
 from .hostnames import (
     HostnameComponents,
     assemble_hostname,
@@ -9432,3 +9433,1102 @@ class FitAndPullAdminTests(TestCase):
         self.assertIsNone(self.hostless_card.host_id)
         self.assertEqual(self.hostless_card.rack_id, rack_id)
         self.assertEqual(self.hostless_card.rack_slot, slot)
+
+
+# ---------------------------------------------------------------------------
+# ADR 0024 / PLAN-adr-0024.md PR 1 — Dante device names and the Yamaha unit
+# ID. Pure inventory.dante functions first, then the model-layer rules that
+# compose them (uniqueness, the 31-character check, the DB backstops).
+# ---------------------------------------------------------------------------
+
+
+class DanteDeviceNameTests(TestCase):
+    """``dante_device_name()`` across all four rows of ADR 0024 decision
+    1's table — in particular, blank-hostname-with-a-unit-ID yielding
+    ``None`` and **not** the hyphen-terminated ``Y001-``, which Dante's own
+    rules forbid.
+    """
+
+    def test_null_id_blank_hostname_yields_none(self) -> None:
+        self.assertIsNone(dante_device_name(None, ""))
+
+    def test_null_id_set_hostname_yields_bare_hostname(self) -> None:
+        self.assertEqual(dante_device_name(None, "mps-rio3224d3-1"), "mps-rio3224d3-1")
+
+    def test_set_id_blank_hostname_yields_none(self) -> None:
+        """The hostname is checked *before* the unit ID (settled decision
+        3 in dante.py's own docstring) — otherwise this would produce the
+        illegal, hyphen-terminated ``Y001-``.
+        """
+        self.assertIsNone(dante_device_name(1, ""))
+
+    def test_set_id_set_hostname_yields_prefixed_name(self) -> None:
+        self.assertEqual(dante_device_name(1, "mps-rio3224d3-1"), "Y001-mps-rio3224d3-1")
+
+    def test_hex_prefix_is_uppercase_for_27(self) -> None:
+        self.assertEqual(dante_device_name(27, "x"), "Y01B-x")
+
+    def test_hex_prefix_for_1_is_not_bare_hex(self) -> None:
+        self.assertEqual(dante_device_name(1, "x"), "Y001-x")
+
+    def test_hex_prefix_for_127(self) -> None:
+        self.assertEqual(dante_device_name(127, "x"), "Y07F-x")
+
+
+class SuggestUnitIdTests(TestCase):
+    """``suggest_unit_id()`` (ADR 0024 decision 4) — highest assigned + 1
+    while below 127, never lowest-free before that point (a retired ID
+    must be reclaimed deliberately, not handed out automatically), then a
+    flagged fallback to the lowest unused value once 127 is reached.
+    """
+
+    def test_nothing_assigned_suggests_one(self) -> None:
+        self.assertEqual(suggest_unit_id([]), UnitIdSuggestion(1, False))
+
+    def test_suggests_highest_assigned_plus_one(self) -> None:
+        self.assertEqual(suggest_unit_id([1, 2]), UnitIdSuggestion(3, False))
+
+    def test_a_gap_is_not_reclaimed_before_127(self) -> None:
+        self.assertEqual(suggest_unit_id([1, 3]), UnitIdSuggestion(4, False))
+
+    def test_at_127_falls_back_to_lowest_unused_and_flags_reclaimed(self) -> None:
+        assigned = set(range(1, 128)) - {4}
+        self.assertEqual(suggest_unit_id(assigned), UnitIdSuggestion(4, True))
+
+    def test_all_127_assigned_returns_none(self) -> None:
+        self.assertIsNone(suggest_unit_id(range(1, 128)))
+
+
+class DanteUnitIdUniquenessTests(TestCase):
+    """``NetworkDevice._clean_dante_fields()`` uniqueness (ADR 0024 plan
+    settled decision 4) — unlike ADR 0023's hostname rule, this one
+    applies on *creation* as well as rename, since no importer ever
+    writes a unit ID and so there is no bulk rebuild to break.
+    """
+
+    def setUp(self) -> None:
+        self.device_type = _make_device_type()
+
+    def test_creating_with_a_taken_unit_id_is_refused(self) -> None:
+        taken = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname="mps-stage-rio-1", dante_unit_id=1
+        )
+        newcomer = NetworkDevice(device_type=self.device_type, hostname="bej-stage-tio-1", dante_unit_id=1)
+        with self.assertRaises(ValidationError) as ctx:
+            newcomer.full_clean()
+        self.assertIn("dante_unit_id", ctx.exception.message_dict)
+        self.assertIn(str(taken), ctx.exception.message_dict["dante_unit_id"][0])
+
+    def test_renaming_a_unit_id_into_one_already_taken_is_refused(self) -> None:
+        taken = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname="mps-stage-rio-1", dante_unit_id=1
+        )
+        mover = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname="bej-stage-tio-1", dante_unit_id=2
+        )
+        mover.dante_unit_id = 1
+        with self.assertRaises(ValidationError) as ctx:
+            mover.full_clean()
+        self.assertIn("dante_unit_id", ctx.exception.message_dict)
+        self.assertIn(str(taken), ctx.exception.message_dict["dante_unit_id"][0])
+
+    def test_two_null_unit_ids_coexist(self) -> None:
+        first = NetworkDevice(device_type=self.device_type, hostname="a")
+        first.full_clean()  # must not raise
+        first.save()
+        second = NetworkDevice(device_type=self.device_type, hostname="b")
+        second.full_clean()  # must not raise — null is exempt
+        second.save()
+        self.assertEqual(NetworkDevice.objects.filter(dante_unit_id__isnull=True).count(), 2)
+
+    def test_an_existing_device_revalidates_cleanly_against_its_own_unit_id(self) -> None:
+        """Self-exclusion (review note 2) — otherwise every ordinary save
+        of a Dante device would fail on its own ID.
+        """
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname="mps-stage-rio-1", dante_unit_id=1
+        )
+        device.serial_number = "SN-1"
+        device.full_clean()  # must not raise
+        device.save()
+
+
+class DanteUnitIdDatabaseConstraintTests(TestCase):
+    """The DB backstop (ADR 0024 plan settled decision 4) — bites where
+    ``full_clean()`` was skipped entirely: ``objects.create()``/
+    ``bulk_create()``, the recompute action's ``save()``, any future
+    importer.
+    """
+
+    def setUp(self) -> None:
+        self.device_type = _make_device_type()
+
+    def test_db_rejects_a_duplicate_unit_id_bypassing_clean(self) -> None:
+        NetworkDevice.objects.create(device_type=self.device_type, hostname="a", dante_unit_id=1)
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            NetworkDevice.objects.bulk_create(
+                [NetworkDevice(device_type=self.device_type, hostname="b", dante_unit_id=1)]
+            )
+
+    def test_db_rejects_zero_bypassing_clean(self) -> None:
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            NetworkDevice.objects.bulk_create(
+                [NetworkDevice(device_type=self.device_type, hostname="a", dante_unit_id=0)]
+            )
+
+    def test_db_rejects_128_bypassing_clean(self) -> None:
+        """Review note 2 — the boundary from both sides at the database,
+        not only the low end.
+        """
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            NetworkDevice.objects.bulk_create(
+                [NetworkDevice(device_type=self.device_type, hostname="a", dante_unit_id=128)]
+            )
+
+    def test_db_accepts_1_and_127_bypassing_clean(self) -> None:
+        NetworkDevice.objects.bulk_create(
+            [
+                NetworkDevice(device_type=self.device_type, hostname="a", dante_unit_id=1),
+                NetworkDevice(device_type=self.device_type, hostname="b", dante_unit_id=127),
+            ]
+        )
+        self.assertEqual(NetworkDevice.objects.filter(dante_unit_id__in=[1, 127]).count(), 2)
+
+
+class DanteUnitIdRangeValidationTests(TestCase):
+    """The field-level range validators — matching
+    ``networkdevice_rack_slot_gte_1``'s posture of validators *plus* a
+    ``CheckConstraint`` rather than one or the other.
+    """
+
+    def setUp(self) -> None:
+        self.device_type = _make_device_type()
+
+    def test_zero_is_rejected(self) -> None:
+        device = NetworkDevice(device_type=self.device_type, hostname="a", dante_unit_id=0)
+        with self.assertRaises(ValidationError) as ctx:
+            device.full_clean()
+        self.assertIn("dante_unit_id", ctx.exception.message_dict)
+
+    def test_128_is_rejected(self) -> None:
+        device = NetworkDevice(device_type=self.device_type, hostname="a", dante_unit_id=128)
+        with self.assertRaises(ValidationError) as ctx:
+            device.full_clean()
+        self.assertIn("dante_unit_id", ctx.exception.message_dict)
+
+    def test_1_is_accepted(self) -> None:
+        device = NetworkDevice(device_type=self.device_type, hostname="a", dante_unit_id=1)
+        device.full_clean()  # must not raise
+
+    def test_127_is_accepted(self) -> None:
+        device = NetworkDevice(device_type=self.device_type, hostname="a", dante_unit_id=127)
+        device.full_clean()  # must not raise
+
+
+class DanteLengthValidationTests(TestCase):
+    """The 31-character assembled-name limit (ADR 0024 decision 2) —
+    errors only where a unit ID is set, raised on the ``hostname`` field,
+    stating the arithmetic. Neither this rule nor the boundary is
+    reachable on live data (longest hostname is 19 against a 26-character
+    budget), so every case here builds its own hostname and asserts the
+    length it built, per the plan's own warning that a test which quietly
+    stops constructing an over-long name would fail silently.
+    """
+
+    def setUp(self) -> None:
+        self.device_type = _make_device_type()
+
+    def test_over_length_errors_only_with_a_unit_id_set(self) -> None:
+        hostname = "a" * 27
+        self.assertEqual(len(hostname), 27)
+        with_id = NetworkDevice(device_type=self.device_type, hostname=hostname, dante_unit_id=1)
+        with self.assertRaises(ValidationError) as ctx:
+            with_id.full_clean()
+        self.assertIn("hostname", ctx.exception.message_dict)
+
+    def test_the_same_over_length_hostname_saves_without_a_unit_id(self) -> None:
+        hostname = "a" * 27
+        self.assertEqual(len(hostname), 27)
+        without_id = NetworkDevice(device_type=self.device_type, hostname=hostname)
+        without_id.full_clean()  # must not raise — no unit ID, no enforcement
+        without_id.save()
+
+    def test_error_message_states_the_arithmetic(self) -> None:
+        hostname = "a" * 33
+        self.assertEqual(len(hostname), 33)
+        device = NetworkDevice(device_type=self.device_type, hostname=hostname, dante_unit_id=1)
+        with self.assertRaises(ValidationError) as ctx:
+            device.full_clean()
+        message = ctx.exception.message_dict["hostname"][0]
+        self.assertEqual(
+            message,
+            "With Dante unit ID 1 this device's Dante name would be 38 characters. Dante allows 31, "
+            "and the `Y001-` prefix uses 5, leaving 26 for the hostname.",
+        )
+
+    def test_26_characters_plus_the_5_character_prefix_saves_exactly_at_the_limit(self) -> None:
+        hostname = "a" * 26
+        self.assertEqual(len(hostname), 26)
+        device = NetworkDevice(device_type=self.device_type, hostname=hostname, dante_unit_id=1)
+        device.full_clean()  # must not raise — 26 + 5 = 31, exactly the limit
+        device.save()
+
+    def test_27_characters_plus_the_5_character_prefix_is_rejected(self) -> None:
+        hostname = "a" * 27
+        self.assertEqual(len(hostname), 27)
+        device = NetworkDevice(device_type=self.device_type, hostname=hostname, dante_unit_id=1)
+        with self.assertRaises(ValidationError) as ctx:
+            device.full_clean()
+        self.assertIn("hostname", ctx.exception.message_dict)
+
+    def test_both_a_duplicate_unit_id_and_an_over_length_hostname_report_together(self) -> None:
+        """Both errors accumulate into one dict (ADR 0024 plan settled
+        decision 4's reasoning, review note 2) — an operator with both
+        problems sees both, not just the first.
+        """
+        NetworkDevice.objects.create(device_type=self.device_type, hostname="taken", dante_unit_id=1)
+        hostname = "a" * 27
+        self.assertEqual(len(hostname), 27)
+        device = NetworkDevice(device_type=self.device_type, hostname=hostname, dante_unit_id=1)
+        with self.assertRaises(ValidationError) as ctx:
+            device.full_clean()
+        self.assertIn("dante_unit_id", ctx.exception.message_dict)
+        self.assertIn("hostname", ctx.exception.message_dict)
+
+
+class DanteUnitIdAuditTests(TestCase):
+    """``dante_unit_id`` must be in ``NetworkDevice``'s auditlog
+    ``include_fields`` whitelist (ADR 0024 plan settled decision 10) — a
+    whitelist doesn't pick up a new field automatically, and this is the
+    one change both vendors describe as audio-affecting.
+    """
+
+    def test_dante_unit_id_change_produces_update_log_entry_naming_it(self) -> None:
+        device_type = _make_device_type()
+        device = NetworkDevice.objects.create(device_type=device_type, hostname="mps-stage-rio-1")
+        LogEntry.objects.filter(object_pk=str(device.pk)).delete()
+        device.dante_unit_id = 1
+        device.save()
+        entries = LogEntry.objects.filter(object_pk=str(device.pk), action=LogEntry.Action.UPDATE)
+        self.assertEqual(entries.count(), 1)
+        self.assertIn("dante_unit_id", entries.first().changes_dict)
+
+
+# ---------------------------------------------------------------------------
+# ADR 0024 / PLAN-adr-0024.md PR 2 — admin forms, help text, the recompute
+# action's skip/warning/advisory branches, and the "suggest, never fill"
+# invariant (settled decision 2).
+# ---------------------------------------------------------------------------
+
+
+class DanteUnitIdNeverAutoFilledTests(TestCase):
+    """The single most important consequence of settled decision 2 (review
+    note 4, untested in revision 1): every *other* suggester in this
+    codebase fills a blank field in ``clean()``; this one must not. Both
+    a blank submission persisting ``NULL`` and a typed value actually
+    persisting (the ``Meta.fields`` omission trap) are proven here.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.device_type = _make_device_type()
+        self.admin_user = User.objects.create_user("dante-fill-admin", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="dante-fill-admin", password="testpass123")
+
+    def _add_data(self, **overrides: Any) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "device_type": str(self.device_type.pk),
+            "hostname": "dante-fill-device",
+            "serial_number": "",
+            "rack": "",
+            "rack_slot": "",
+            "owner": "",
+            "hostname_purpose": "",
+            "hostname_sequence": "",
+            "dante_unit_id": "",
+            "port_addressing": "dhcp",
+            "ports-TOTAL_FORMS": "0",
+            "ports-INITIAL_FORMS": "0",
+            "ports-MIN_NUM_FORMS": "0",
+            "ports-MAX_NUM_FORMS": "1000",
+        }
+        data.update(overrides)
+        return data
+
+    def _change_data(self, device: NetworkDevice, **overrides: Any) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "device_type": str(device.device_type.pk),
+            "hostname": device.hostname,
+            "serial_number": device.serial_number,
+            "rack": "",
+            "rack_slot": "",
+            "owner": "",
+            "hostname_purpose": device.hostname_purpose,
+            "hostname_sequence": "" if device.hostname_sequence is None else str(device.hostname_sequence),
+            "dante_unit_id": "" if device.dante_unit_id is None else str(device.dante_unit_id),
+            "ports-TOTAL_FORMS": "0",
+            "ports-INITIAL_FORMS": "0",
+            "ports-MIN_NUM_FORMS": "0",
+            "ports-MAX_NUM_FORMS": "1000",
+        }
+        data.update(overrides)
+        return data
+
+    def test_add_form_blank_submission_persists_null_not_the_suggestion(self) -> None:
+        NetworkDevice.objects.create(device_type=self.device_type, hostname="already-1", dante_unit_id=1)
+        response = self.client.post("/admin/inventory/networkdevice/add/", self._add_data())
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        device = NetworkDevice.objects.get(hostname="dante-fill-device")
+        self.assertIsNone(device.dante_unit_id)  # not 2, the suggestion this state would offer
+
+    def test_add_form_typed_value_actually_persists(self) -> None:
+        response = self.client.post("/admin/inventory/networkdevice/add/", self._add_data(dante_unit_id="7"))
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        device = NetworkDevice.objects.get(hostname="dante-fill-device")
+        self.assertEqual(device.dante_unit_id, 7)
+
+    def test_change_form_blank_submission_persists_null(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname="was-set", dante_unit_id=5
+        )
+        response = self.client.post(
+            f"/admin/inventory/networkdevice/{device.pk}/change/", self._change_data(device, dante_unit_id="")
+        )
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        device.refresh_from_db()
+        self.assertIsNone(device.dante_unit_id)
+
+    def test_change_form_typed_value_actually_persists(self) -> None:
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname="was-blank")
+        response = self.client.post(
+            f"/admin/inventory/networkdevice/{device.pk}/change/",
+            self._change_data(device, dante_unit_id="9"),
+        )
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        device.refresh_from_db()
+        self.assertEqual(device.dante_unit_id, 9)
+
+
+class DanteUnitIdSuggestionAdminTests(TestCase):
+    """The suggester reaches the operator through help text only (settled
+    decision 2) — asserted through rendered admin GETs, not bare
+    ``get_form()`` calls, since the risk (review note 4) is specifically
+    about what actually renders and whether it accumulates across
+    requests.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.device_type = _make_device_type()
+        self.admin_user = User.objects.create_user(
+            "dante-suggest-admin", password="testpass123", is_staff=True
+        )
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="dante-suggest-admin", password="testpass123")
+
+    def test_add_form_shows_next_free_unit_id(self) -> None:
+        NetworkDevice.objects.create(device_type=self.device_type, hostname="a", dante_unit_id=1)
+        NetworkDevice.objects.create(device_type=self.device_type, hostname="b", dante_unit_id=2)
+        response = self.client.get("/admin/inventory/networkdevice/add/")
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Next free unit ID: 3.")
+
+    def test_change_form_shows_next_free_unit_id(self) -> None:
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname="a", dante_unit_id=2)
+        response = self.client.get(f"/admin/inventory/networkdevice/{device.pk}/change/")
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Next free unit ID: 3.")
+
+    def test_add_form_help_text_does_not_accumulate_across_two_requests(self) -> None:
+        """Review note 4's accumulation guard — the same GET issued twice
+        must show the suggestion once each time, not twice on the second.
+        """
+        first = self.client.get("/admin/inventory/networkdevice/add/")
+        second = self.client.get("/admin/inventory/networkdevice/add/")
+        self.assertEqual(first.content.decode().count("Next free unit ID"), 1)
+        self.assertEqual(second.content.decode().count("Next free unit ID"), 1)
+
+    def test_change_form_help_text_does_not_accumulate_across_two_requests(self) -> None:
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname="a", dante_unit_id=1)
+        first = self.client.get(f"/admin/inventory/networkdevice/{device.pk}/change/")
+        second = self.client.get(f"/admin/inventory/networkdevice/{device.pk}/change/")
+        self.assertEqual(first.content.decode().count("Next free unit ID"), 1)
+        self.assertEqual(second.content.decode().count("Next free unit ID"), 1)
+
+    def test_reclaim_wording_appears_at_127(self) -> None:
+        NetworkDevice.objects.bulk_create(
+            [
+                NetworkDevice(device_type=self.device_type, hostname=f"reclaim-{i}", dante_unit_id=i)
+                for i in range(1, 128)
+                if i != 4
+            ]
+        )
+        response = self.client.get("/admin/inventory/networkdevice/add/")
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "the next suggestion is 4")
+        self.assertContains(response, "Y004-")
+
+    def test_exhausted_wording_when_all_127_are_assigned(self) -> None:
+        NetworkDevice.objects.bulk_create(
+            [
+                NetworkDevice(device_type=self.device_type, hostname=f"full-{i}", dante_unit_id=i)
+                for i in range(1, 128)
+            ]
+        )
+        response = self.client.get("/admin/inventory/networkdevice/add/")
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "All 127 unit IDs are in use.")
+
+
+class DanteAdvisoryFormTests(TestCase):
+    """The over-31 advisory (settled decision 6) — ``NetworkDevice``-only,
+    fires through both the add and change forms, and never for a switch
+    (which has no Dante name of its own to advise about). Every case
+    builds and asserts the length of its own hostname — nothing live is
+    reachable (longest hostname 19, budget 31).
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.device_type = _make_device_type()
+        self.switch_type = _make_switch_type()
+        self.admin_user = User.objects.create_user(
+            "dante-advisory-admin", password="testpass123", is_staff=True
+        )
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="dante-advisory-admin", password="testpass123")
+
+    def _request_with_messages(self, path):
+        # Fully unannotated (no param or return type) to match every
+        # other request-plus-messages helper in this file (e.g.
+        # RecomputeHostnameActionTests._request()) — mypy only checks a
+        # function's body when *some* part of its signature is annotated,
+        # so this is how the rest of the suite avoids fighting
+        # HttpRequest's stub over session/_messages, both of which only
+        # exist once the relevant middleware has actually run.
+        request = RequestFactory().post(path)
+        request.session = {}
+        request._messages = FallbackStorage(request)
+        request.user = self.admin_user
+        return request
+
+    def test_add_form_advises_on_a_null_id_over_length_hostname(self) -> None:
+        hostname = "a" * 32
+        self.assertEqual(len(hostname), 32)
+        response = self.client.post(
+            "/admin/inventory/networkdevice/add/",
+            {
+                "device_type": str(self.device_type.pk),
+                "hostname": hostname,
+                "serial_number": "",
+                "rack": "",
+                "rack_slot": "",
+                "owner": "",
+                "hostname_purpose": "",
+                "hostname_sequence": "",
+                "dante_unit_id": "",
+                "port_addressing": "dhcp",
+                "ports-TOTAL_FORMS": "0",
+                "ports-INITIAL_FORMS": "0",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+            },
+        )
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        self.assertTrue(
+            any("This hostname is 32 characters" in str(m) for m in get_messages(response.wsgi_request))
+        )
+
+    def test_change_form_advises_on_a_null_id_over_length_hostname(self) -> None:
+        hostname = "b" * 32
+        self.assertEqual(len(hostname), 32)
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname=hostname)
+        response = self.client.post(
+            f"/admin/inventory/networkdevice/{device.pk}/change/",
+            {
+                "device_type": str(self.device_type.pk),
+                "hostname": hostname,
+                "serial_number": "",
+                "rack": "",
+                "rack_slot": "",
+                "owner": "",
+                "hostname_purpose": "",
+                "hostname_sequence": "",
+                "dante_unit_id": "",
+                "ports-TOTAL_FORMS": "0",
+                "ports-INITIAL_FORMS": "0",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+            },
+        )
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        self.assertTrue(
+            any("This hostname is 32 characters" in str(m) for m in get_messages(response.wsgi_request))
+        )
+
+    def test_change_form_does_not_advise_at_exactly_31_characters(self) -> None:
+        """Codex review finding 3 — the boundary from the other side.
+        Every existing advisory test uses 32 characters; nothing proved
+        that exactly 31 (the limit itself, not one past it) stays silent,
+        so an accidental ``>= 31`` off-by-one in ``over_length_advisory()``
+        would have passed the whole suite. Nothing live can catch this
+        either — the longest real hostname is 19.
+        """
+        hostname = "e" * 31
+        self.assertEqual(len(hostname), 31)
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname=hostname)
+        response = self.client.post(
+            f"/admin/inventory/networkdevice/{device.pk}/change/",
+            {
+                "device_type": str(self.device_type.pk),
+                "hostname": hostname,
+                "serial_number": "",
+                "rack": "",
+                "rack_slot": "",
+                "owner": "",
+                "hostname_purpose": "",
+                "hostname_sequence": "",
+                "dante_unit_id": "",
+                "ports-TOTAL_FORMS": "0",
+                "ports-INITIAL_FORMS": "0",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+            },
+        )
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        self.assertFalse(
+            any("Dante's device-name limit" in str(m) for m in get_messages(response.wsgi_request))
+        )
+
+    def test_change_form_does_not_advise_when_a_unit_id_is_set(self) -> None:
+        """Decision 6's other half — the advisory is null-ID-only; a
+        unit-ID device over 31 gets the *blocking* error instead (proven
+        in ``DanteLengthValidationTests``), never both.
+        """
+        hostname = "d" * 27
+        self.assertEqual(len(hostname), 27)
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname=hostname, dante_unit_id=1
+        )
+        response = self.client.post(
+            f"/admin/inventory/networkdevice/{device.pk}/change/",
+            {
+                "device_type": str(self.device_type.pk),
+                "hostname": hostname,
+                "serial_number": "",
+                "rack": "",
+                "rack_slot": "",
+                "owner": "",
+                "hostname_purpose": "",
+                "hostname_sequence": "",
+                "dante_unit_id": "1",
+                "ports-TOTAL_FORMS": "0",
+                "ports-INITIAL_FORMS": "0",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+            },
+        )
+        # 27 + 5 = 32 > 31 — the blocking error, not the advisory, so this
+        # re-renders (200) rather than redirecting.
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Dante allows 31")
+        self.assertNotContains(response, "if this device is on a Dante network")
+
+    def test_invalid_rename_stashes_nothing_that_survives_to_save_model(self) -> None:
+        """Codex review finding 4 — ``test_change_form_does_not_advise_
+        when_a_unit_id_is_set`` above submits an *unchanged* already-
+        overlong name, so ``_post_clean()`` never stashes a rename
+        warning in the first place; it passes without touching the
+        "stashing, not raising, is safe" guarantee at all (a form that
+        fails model validation never reaches ``save_model()``, so
+        whatever it stashed is simply never emitted).
+
+        This one actually exercises it: a valid unit-ID device (26 + 5 =
+        31, exactly at the limit) is renamed to a hostname one character
+        longer — genuinely changing the Dante name, so ``_post_clean()``
+        *does* stash a rename warning, while also tripping the blocking
+        length error, so the form never saves and ``save_model()`` never
+        runs to emit it.
+        """
+        old_hostname = "f" * 26
+        self.assertEqual(len(old_hostname), 26)
+        new_hostname = "g" * 27
+        self.assertEqual(len(new_hostname), 27)
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname=old_hostname, dante_unit_id=1
+        )
+        response = self.client.post(
+            f"/admin/inventory/networkdevice/{device.pk}/change/",
+            {
+                "device_type": str(self.device_type.pk),
+                "hostname": new_hostname,
+                "serial_number": "",
+                "rack": "",
+                "rack_slot": "",
+                "owner": "",
+                "hostname_purpose": "",
+                "hostname_sequence": "",
+                "dante_unit_id": "1",
+                "ports-TOTAL_FORMS": "0",
+                "ports-INITIAL_FORMS": "0",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+            },
+        )
+        # Re-rendered with the blocking error, not saved (200, not 302).
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Dante allows 31")
+        device.refresh_from_db()
+        self.assertEqual(device.hostname, old_hostname)  # the invalid rename never persisted
+        self.assertFalse(any(m.level_tag == "warning" for m in get_messages(response.wsgi_request)))
+
+    def test_switch_change_form_never_emits_a_dante_message(self) -> None:
+        """Not ``NetworkSwitch`` (decision 6) — a switch carries Dante
+        traffic but is never itself a Dante device, so it has no field
+        for an advisory to attach to and no ``_post_clean()`` hook that
+        computes one at all.
+        """
+        hostname = "c" * 32
+        self.assertEqual(len(hostname), 32)
+        switch = NetworkSwitch.objects.create(switch_type=self.switch_type, hostname=hostname)
+        admin = NetworkSwitchAdmin(NetworkSwitch, AdminSite())
+        request = self._request_with_messages(f"/admin/inventory/networkswitch/{switch.pk}/change/")
+        form_class = admin.get_form(request, switch, change=True)
+        form = form_class(
+            data={
+                "switch_type": str(self.switch_type.pk),
+                "hostname": hostname,
+                "serial_number": "",
+                "rack": "",
+                "rack_slot": "",
+                "owner": "",
+                "hostname_purpose": "",
+                "hostname_sequence": "",
+            },
+            instance=switch,
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        admin.save_model(request, form.instance, form, change=True)
+        self.assertFalse(any("Dante" in str(m) for m in get_messages(request)))
+
+
+class DanteRenameWarningChangeFormTests(TestCase):
+    """The Dante rename warning (settled decision 8) — fires on every
+    admin-form path that changes a unit-ID device's Dante name, not only
+    a hostname rename. Covers every row of the plan's own table, plus
+    review note 1's false-positive guard (a case-only edit must not warn,
+    since it changes nothing once normalized).
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.device_type = _make_device_type()
+        self.admin_user = User.objects.create_user("dante-warn-admin", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="dante-warn-admin", password="testpass123")
+
+    def _post(self, device: NetworkDevice, **overrides: Any) -> Any:
+        data: dict[str, Any] = {
+            "device_type": str(device.device_type.pk),
+            "hostname": device.hostname,
+            "serial_number": device.serial_number,
+            "rack": "",
+            "rack_slot": "",
+            "owner": "",
+            "hostname_purpose": device.hostname_purpose,
+            "hostname_sequence": "" if device.hostname_sequence is None else str(device.hostname_sequence),
+            "dante_unit_id": "" if device.dante_unit_id is None else str(device.dante_unit_id),
+            "ports-TOTAL_FORMS": "0",
+            "ports-INITIAL_FORMS": "0",
+            "ports-MIN_NUM_FORMS": "0",
+            "ports-MAX_NUM_FORMS": "1000",
+        }
+        data.update(overrides)
+        # The Dante rename warning is now deferred to transaction.
+        # on_commit() (Codex review finding 2) — under a plain TestCase,
+        # which wraps every test in a savepoint that's rolled back rather
+        # than committed, on_commit() callbacks never fire on their own.
+        # captureOnCommitCallbacks(execute=True) is Django's documented
+        # mechanism for exercising them anyway, without paying for a
+        # TransactionTestCase's real commit/truncate per test.
+        with self.captureOnCommitCallbacks(execute=True):
+            return self.client.post(f"/admin/inventory/networkdevice/{device.pk}/change/", data)
+
+    def _warnings(self, response: Any) -> list[str]:
+        return [str(m) for m in get_messages(response.wsgi_request) if m.level_tag == "warning"]
+
+    def test_editing_the_unit_id_warns(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname="mps-stage-rio-1", dante_unit_id=1
+        )
+        response = self._post(device, dante_unit_id="3")
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        device.refresh_from_db()
+        self.assertEqual(device.dante_unit_id, 3)
+        self.assertEqual(
+            self._warnings(response),
+            [
+                "mps-stage-rio-1 is a Dante device (unit ID 3). Its Dante name is now "
+                "`Y003-mps-stage-rio-1` (was `Y001-mps-stage-rio-1`) — update it in Dante "
+                "Controller and rebuild its subscriptions, or audio will not route."
+            ],
+        )
+
+    def test_renaming_a_unit_id_device_warns_matching_the_adr_pinned_example(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname="mps-stage-rio-1", dante_unit_id=1
+        )
+        response = self._post(device, hostname="mps-stage-rio-2")
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        self.assertEqual(
+            self._warnings(response),
+            [
+                "mps-stage-rio-1 is a Dante device (unit ID 1). Its Dante name is now "
+                "`Y001-mps-stage-rio-2` (was `Y001-mps-stage-rio-1`) — update it in Dante "
+                "Controller and rebuild its subscriptions, or audio will not route."
+            ],
+        )
+
+    def test_setting_a_first_unit_id_warns(self) -> None:
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname="mps-stage-rio-1")
+        response = self._post(device, dante_unit_id="1")
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        self.assertEqual(
+            self._warnings(response),
+            [
+                "mps-stage-rio-1 is a Dante device (unit ID 1). Its Dante name is now "
+                "`Y001-mps-stage-rio-1` (was `mps-stage-rio-1`) — update it in Dante Controller "
+                "and rebuild its subscriptions, or audio will not route."
+            ],
+        )
+
+    def test_clearing_a_unit_id_warns(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname="mps-stage-rio-1", dante_unit_id=1
+        )
+        response = self._post(device, dante_unit_id="")
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        self.assertEqual(
+            self._warnings(response),
+            [
+                "mps-stage-rio-1 no longer carries a Dante unit ID. Its Dante name is now "
+                "`mps-stage-rio-1` (was `Y001-mps-stage-rio-1`) — update it in Dante Controller "
+                "and rebuild its subscriptions, or audio will not route."
+            ],
+        )
+
+    def test_clearing_a_unit_id_that_never_had_a_hostname_is_silent(self) -> None:
+        """A unit-ID device whose hostname was *always* blank never had a
+        real Dante name for anything to route by — no previous name to
+        lose, so clearing the ID is silent, the same "commissioning, not
+        an outage" reasoning settled decision 8 gives creation.
+        """
+        device = NetworkDevice.objects.create(device_type=self.device_type, dante_unit_id=1)
+        response = self._post(device, dante_unit_id="")
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        self.assertEqual(self._warnings(response), [])
+
+    def test_blanking_the_hostname_of_a_unit_id_device_names_the_old_name_as_unclaimed(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname="mps-stage-rio-1", dante_unit_id=1
+        )
+        response = self._post(device, hostname="")
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        self.assertEqual(
+            self._warnings(response),
+            [
+                "mps-stage-rio-1 is a Dante device (unit ID 1). It has no Dante name until it has "
+                "a hostname — its old name `Y001-mps-stage-rio-1` is now unclaimed in Dante "
+                "Controller."
+            ],
+        )
+
+    def test_renaming_with_no_unit_id_either_side_is_silent(self) -> None:
+        device = NetworkDevice.objects.create(device_type=self.device_type, hostname="plain-device-1")
+        response = self._post(device, hostname="plain-device-2")
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        self.assertEqual(self._warnings(response), [])
+
+    def test_case_only_edit_does_not_warn(self) -> None:
+        """Review note 1 — comparing un-normalized input would see this as
+        a rename (different case) and fire a false audio-outage warning;
+        computed off the normalized ``self.instance`` after
+        ``super()._post_clean()``, it correctly sees no change at all.
+        """
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type, hostname="mps-stage-rio-1", dante_unit_id=1
+        )
+        response = self._post(device, hostname="MPS-STAGE-RIO-1")
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        self.assertEqual(self._warnings(response), [])
+        device.refresh_from_db()
+        self.assertEqual(device.hostname, "mps-stage-rio-1")
+
+    def test_unrelated_field_edit_does_not_warn(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            hostname="mps-stage-rio-1",
+            dante_unit_id=1,
+            serial_number="OLD-SN",
+        )
+        response = self._post(device, serial_number="NEW-SN")
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        self.assertEqual(self._warnings(response), [])
+        device.refresh_from_db()
+        self.assertEqual(device.serial_number, "NEW-SN")
+
+    def test_no_rename_warning_on_creation(self) -> None:
+        """Settled decision 8 — nothing exists yet to re-subscribe, so
+        creating a device with a unit ID is commissioning, not an outage.
+        """
+        response = self.client.post(
+            "/admin/inventory/networkdevice/add/",
+            {
+                "device_type": str(self.device_type.pk),
+                "hostname": "mps-stage-tio-1",
+                "serial_number": "",
+                "rack": "",
+                "rack_slot": "",
+                "owner": "",
+                "hostname_purpose": "",
+                "hostname_sequence": "",
+                "dante_unit_id": "1",
+                "port_addressing": "dhcp",
+                "ports-TOTAL_FORMS": "0",
+                "ports-INITIAL_FORMS": "0",
+                "ports-MIN_NUM_FORMS": "0",
+                "ports-MAX_NUM_FORMS": "1000",
+            },
+        )
+        errors = response.context["adminform"].errors if response.context else None
+        self.assertEqual(response.status_code, 302, errors)
+        self.assertEqual(self._warnings(response), [])
+
+
+class DanteRecomputeActionTests(TestCase):
+    """The recompute action's Dante branches (settled decisions 7 and 8) —
+    every branch reviewed round 1's note 3 asked for: the skip, the
+    warning, the null-ID advisory, the exact-31 boundary, and a mixed
+    batch proving a skip doesn't distort the others.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.owner = Owner.objects.create(slug="mps", name="MPS")
+        self.rack = Rack.objects.create(
+            name="Recompute Rack", slot_count=40, owner=self.owner, location_slug="wpcsrl"
+        )
+        self.device_type = _make_device_type(hostname_slug="ik42")
+
+    def _request(self):
+        request = RequestFactory().post("/admin/inventory/networkdevice/")
+        request.session = {}
+        request._messages = FallbackStorage(request)
+        request.user = User.objects.create_user(f"recompute-dante-{id(self)}", password="x")
+        return request
+
+    def test_renamed_unit_id_device_warns(self) -> None:
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=self.owner,
+            hostname="mps-wpcsrl-ik42-old",
+            hostname_purpose="old",
+            dante_unit_id=1,
+        )
+        device.hostname_purpose = "new"
+        device.save()
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        request = self._request()
+        admin.recompute_hostnames(request, NetworkDevice.objects.filter(pk=device.pk))
+        device.refresh_from_db()
+        self.assertEqual(device.hostname, "mps-wpcsrl-ik42-new")
+        warnings = [str(m) for m in get_messages(request) if m.level_tag == "warning"]
+        self.assertEqual(
+            warnings,
+            [
+                "mps-wpcsrl-ik42-old is a Dante device (unit ID 1). Its Dante name is now "
+                "`Y001-mps-wpcsrl-ik42-new` (was `Y001-mps-wpcsrl-ik42-old`) — update it in Dante "
+                "Controller and rebuild its subscriptions, or audio will not route."
+            ],
+        )
+
+    def test_unchanged_unit_id_device_is_silent(self) -> None:
+        """Recompute that reproduces the same name is not a rename and
+        must not claim an outage that isn't happening.
+        """
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=self.owner,
+            hostname="mps-wpcsrl-ik42-1",
+            hostname_sequence=1,
+            dante_unit_id=1,
+        )
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        request = self._request()
+        admin.recompute_hostnames(request, NetworkDevice.objects.filter(pk=device.pk))
+        device.refresh_from_db()
+        self.assertEqual(device.hostname, "mps-wpcsrl-ik42-1")
+        self.assertEqual([m for m in get_messages(request) if m.level_tag == "warning"], [])
+
+    def test_skips_a_unit_id_device_whose_computed_name_would_exceed_31(self) -> None:
+        """The stored row is untouched on **all three** fields
+        ``_recompute_hostname()`` mutates — asserting the hostname alone
+        would pass while the action silently persisted a recomputed owner
+        or sequence (review note 3).
+        """
+        long_purpose = "p" * 30
+        self.assertEqual(len(f"mps-wpcsrl-ik42-{long_purpose}"), 16 + 30)
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=None,
+            hostname="",
+            hostname_purpose=long_purpose,
+            dante_unit_id=1,
+        )
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        request = self._request()
+        admin.recompute_hostnames(request, NetworkDevice.objects.filter(pk=device.pk))
+        device.refresh_from_db()
+        self.assertIsNone(device.owner)
+        self.assertIsNone(device.hostname_sequence)
+        self.assertEqual(device.hostname, "")
+        self.assertTrue(any("Skipped" in str(m) for m in get_messages(request)))
+        self.assertTrue(any("over the 31-character Dante limit" in str(m) for m in get_messages(request)))
+
+    def test_null_id_device_over_31_saves_and_advises(self) -> None:
+        """The skip is conditional on the unit ID — an unconditional skip
+        would be a regression in phase 18's own behaviour.
+        """
+        long_purpose = "q" * 30
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=self.owner,
+            hostname="",
+            hostname_purpose=long_purpose,
+        )
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        request = self._request()
+        admin.recompute_hostnames(request, NetworkDevice.objects.filter(pk=device.pk))
+        device.refresh_from_db()
+        self.assertTrue(len(device.hostname) > 31)
+        self.assertTrue(any("Skipped" in str(m) for m in get_messages(request)) is False)
+        self.assertTrue(
+            any(
+                f"This hostname is {len(device.hostname)} characters" in str(m) for m in get_messages(request)
+            )
+        )
+
+    def test_assembled_name_of_exactly_31_saves(self) -> None:
+        """The *assembled* (``Y0##-``-prefixed) name at exactly 31 saves —
+        a 26-character hostname, since 26 + 5 = 31. No rack — a
+        spare-pool device skips the location_slug component (ADR 0023:
+        absent, not blocking), keeping this arithmetic exact: 1 ("e") +
+        1("-") + 4("ik42") + 1("-") + purpose = 26 total.
+        """
+        owner = Owner.objects.create(slug="e", name="E")
+        purpose = "p" * 19
+        self.assertEqual(len(f"e-ik42-{purpose}"), 26)
+        device = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            owner=owner,
+            hostname="",
+            hostname_purpose=purpose,
+            dante_unit_id=5,
+        )
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        request = self._request()
+        admin.recompute_hostnames(request, NetworkDevice.objects.filter(pk=device.pk))
+        device.refresh_from_db()
+        self.assertEqual(len(device.hostname), 26)
+        self.assertFalse(any("Skipped" in str(m) for m in get_messages(request)))
+
+    def test_mixed_batch_skip_does_not_block_or_distort_other_rows(self) -> None:
+        """One skipped row among rows that rename — proves the skip
+        neither prevents later rows from saving nor distorts the
+        renamed/unchanged/skipped counters.
+        """
+        long_purpose = "r" * 30
+        skip_me = NetworkDevice.objects.create(
+            device_type=self.device_type,
+            rack=self.rack,
+            rack_slot=1,
+            owner=None,
+            hostname="",
+            hostname_purpose=long_purpose,
+            dante_unit_id=9,
+        )
+        renamed_ones = [
+            NetworkDevice.objects.create(
+                device_type=self.device_type, rack=self.rack, rack_slot=slot, owner=self.owner
+            )
+            for slot in range(2, 5)
+        ]
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        request = self._request()
+        pks = [skip_me.pk] + [d.pk for d in renamed_ones]
+        admin.recompute_hostnames(request, NetworkDevice.objects.filter(pk__in=pks))
+        skip_me.refresh_from_db()
+        self.assertEqual(skip_me.hostname, "")
+        for device in renamed_ones:
+            device.refresh_from_db()
+            self.assertTrue(device.hostname.startswith("mps-wpcsrl-ik42"))
+        messages_text = [str(m) for m in get_messages(request)]
+        self.assertTrue(any("Skipped 1" in m for m in messages_text))
+        self.assertTrue(any("Recomputed 3" in m for m in messages_text))
+
+    def test_blocked_stem_skip_still_persists_a_rack_derived_owner(self) -> None:
+        """Codex review finding 1 — a regression this PR could have
+        introduced, not a new Dante behaviour: on ``main``,
+        ``current.save()`` runs unconditionally after a skip, because
+        ``_recompute_hostname()`` step 1 assigns ``obj.owner`` from
+        ``obj.rack.owner`` *before* it can ever return ``"skipped"``, and
+        that assignment is "stored regardless of what happens next" per
+        its own docstring — the only mechanism by which an imported row,
+        which never went through the add form, gets an owner at all.
+
+        The new over-length skip (settled decision 7) must bypass
+        ``save()`` — it would otherwise persist a hostname
+        ``full_clean()`` rejects — but the *pre-existing* blocked-stem
+        skip ("missing owner and type's hostname_slug") has nothing
+        invalid to write and must keep saving exactly as it always did.
+        Conflating the two ``continue``s would silently stop persisting
+        the rack-derived owner for every blocked-stem skip, not just the
+        new Dante one.
+        """
+        no_slug_type = _make_device_type(hostname_slug="", name="No Slug Recompute")
+        device = NetworkDevice.objects.create(
+            device_type=no_slug_type, rack=self.rack, rack_slot=10, owner=None
+        )
+        self.assertIsNone(device.owner)
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        request = self._request()
+        admin.recompute_hostnames(request, NetworkDevice.objects.filter(pk=device.pk))
+        device.refresh_from_db()
+        self.assertEqual(device.owner, self.owner)  # the rack's owner, persisted despite the skip
+        self.assertEqual(device.hostname, "")  # still blocked — nothing computed to write
+        self.assertTrue(any("Skipped" in str(m) for m in get_messages(request)))
