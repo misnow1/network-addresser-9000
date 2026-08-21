@@ -217,6 +217,31 @@ def _vlan_map_department_line(content: str) -> tuple[str, str]:
     return match.group(1), _clean_text(match.group(2))
 
 
+def _column_header_html(content: str, vlan_id: int) -> str:
+    """The ``rack_detail.html`` column ``<th>`` markup for one VLAN, keyed
+    by ``vlan_id`` — coordinates, not presence (review note 7): proves
+    *which* column's offset rendered, not merely that some offset appears
+    somewhere on the page. Raises if no such column exists.
+    """
+    match = re.search(
+        rf'<th>\s*<span class="vlan-chip"[^>]*>\s*VLAN {vlan_id}\s*</span>.*?</th>', content, re.DOTALL
+    )
+    if match is None:
+        raise AssertionError(f"no column header found for VLAN {vlan_id}")
+    return match.group(0)
+
+
+def _index_tile_html(content: str, rack_name: str) -> str:
+    """The ``index.html`` rack tile ``<a class="tile">...</a>`` markup for
+    one rack, keyed by its name — same coordinate reasoning as
+    ``_column_header_html`` above. Raises if no such tile exists.
+    """
+    for tile in re.findall(r'<a class="tile".*?</a>', content, re.DOTALL):
+        if rack_name in tile:
+            return tile
+    raise AssertionError(f"no index tile found for rack {rack_name!r}")
+
+
 def _list_row_cells(content: str, row_marker: str) -> list[str]:
     """Every ``<td>`` in the ``model_list.html`` row containing
     ``row_marker`` (a value unique to that row), stripped and in column
@@ -664,7 +689,16 @@ class PartialGrantAccessTests(TestCase):
 
     def test_index_requires_every_declared_codename(self) -> None:
         self._assert_403_when_missing_each(
-            "/", ["view_rack", "view_vlan", "view_networkswitch", "view_networkdevice"]
+            "/",
+            [
+                "view_rack",
+                "view_vlan",
+                "view_networkswitch",
+                "view_networkdevice",
+                # ADR 0025 — Codex review finding 1: the rack tile marker
+                # reads Rack.range_offsets_diverge -> RackVlanRange.offset.
+                "view_rackvlanrange",
+            ],
         )
 
     def test_rack_detail_requires_every_declared_codename(self) -> None:
@@ -1607,6 +1641,17 @@ class RobustnessTests(TestCase):
         row = _row_html(response.content.decode(), 1)
         self.assertNotIn("would-be-address", row)
 
+    def test_malformed_stored_range_index_renders_200(self) -> None:
+        # ADR 0025 — the index now reads range_offsets_diverge for every
+        # rack, which reads RackVlanRange.offset per range; a malformed
+        # stored value must still render a blank marker state, not 500.
+        rack = Rack.objects.create(name="Malformed On Index", slot_count=5)
+        rack_range = RackVlanRange(rack=rack, vlan=self.vlan, address_range="not-a-cidr")
+        rack_range.save()  # bypasses clean()
+
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+
     def test_l2_only_vlan_map_renders_200_no_tracked_addressing(self) -> None:
         l2_vlan = VLAN.objects.create(name="L2 Only", vlan_id=999)
         response = self.client.get(f"/vlans/{l2_vlan.pk}/")
@@ -1952,6 +1997,31 @@ class QueryBudgetTests(TestCase):
 
         with CaptureQueriesContext(connection) as big_ctx:
             big_response = self.client.get("/audit/")
+        self.assertEqual(big_response.status_code, 200)
+        self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
+
+    def test_index_query_count_independent_of_range_count_per_rack(self) -> None:
+        """ADR 0025 — the index's ``range_offsets_diverge`` marker reads
+        every rack's ranges (and each range's own ``vlan``); the view's
+        unconditional ``prefetch_related("vlan_ranges__vlan")`` must keep
+        this flat regardless of how many ranges a rack carries.
+        """
+        vlan_a = VLAN.objects.create(name="QB Index A", vlan_id=292, subnet="10.202.0.0/21")
+        vlan_b = VLAN.objects.create(name="QB Index B", vlan_id=293, subnet="10.203.0.0/21")
+        small_rack = Rack.objects.create(name="QB Index Small", slot_count=30)
+        RackVlanRange.objects.create(rack=small_rack, vlan=vlan_a, address_range="10.202.0.0/27")
+
+        with CaptureQueriesContext(connection) as small_ctx:
+            small_response = self.client.get("/")
+
+        big_rack = Rack.objects.create(name="QB Index Big", slot_count=30)
+        RackVlanRange.objects.create(rack=big_rack, vlan=vlan_a, address_range="10.202.1.0/27")
+        RackVlanRange.objects.create(rack=big_rack, vlan=vlan_b, address_range="10.203.1.0/27")
+
+        with CaptureQueriesContext(connection) as big_ctx:
+            big_response = self.client.get("/")
+
+        self.assertEqual(small_response.status_code, 200)
         self.assertEqual(big_response.status_code, 200)
         self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
 
@@ -2679,6 +2749,63 @@ class HostnameDivergesMarkerTests(TestCase):
         self.assertEqual(small_response.status_code, 200)
         self.assertEqual(big_response.status_code, 200)
         self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
+
+
+class RangeOffsetsDivergeUITests(TestCase):
+    """ADR 0025 decision 5's read-only UI markers — mirroring
+    ``HostnameDivergesMarkerTests``'s shape above: the index tile badge,
+    the rack_detail per-column offsets, and the rack-level divergence
+    note.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.vlan_a = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.vlan_b = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
+        self.admin_user = User.objects.create_user("range-ui-admin", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.login(username="range-ui-admin", password="testpass123")
+
+    def test_index_marks_a_diverging_rack(self) -> None:
+        rack = Rack.objects.create(name="Diverging Rack", slot_count=30)
+        RackVlanRange.objects.create(rack=rack, vlan=self.vlan_a, address_range="10.200.0.0/27")
+        RackVlanRange.objects.create(rack=rack, vlan=self.vlan_b, address_range="10.201.0.32/27")
+        response = self.client.get("/")
+        tile = _index_tile_html(response.content.decode(), rack.name)
+        self.assertIn("offsets diverge", tile)
+
+    def test_index_does_not_mark_an_aligned_rack(self) -> None:
+        rack = Rack.objects.create(name="Aligned Rack", slot_count=30)
+        RackVlanRange.objects.create(rack=rack, vlan=self.vlan_a, address_range="10.200.0.32/27")
+        RackVlanRange.objects.create(rack=rack, vlan=self.vlan_b, address_range="10.201.0.32/27")
+        response = self.client.get("/")
+        tile = _index_tile_html(response.content.decode(), rack.name)
+        self.assertNotIn("offsets diverge", tile)
+
+    def test_rack_detail_shows_each_columns_offset(self) -> None:
+        rack = Rack.objects.create(name="Rack", slot_count=30)
+        RackVlanRange.objects.create(rack=rack, vlan=self.vlan_a, address_range="10.200.0.0/27")
+        RackVlanRange.objects.create(rack=rack, vlan=self.vlan_b, address_range="10.201.0.32/27")
+        response = self.client.get(f"/racks/{rack.pk}/")
+        content = response.content.decode()
+        header_a = _column_header_html(content, self.vlan_a.vlan_id)
+        header_b = _column_header_html(content, self.vlan_b.vlan_id)
+        self.assertIn("offset 0", header_a)
+        self.assertIn("offset 32", header_b)
+
+    def test_rack_detail_shows_divergence_note_when_diverging(self) -> None:
+        rack = Rack.objects.create(name="Rack", slot_count=30)
+        RackVlanRange.objects.create(rack=rack, vlan=self.vlan_a, address_range="10.200.0.0/27")
+        RackVlanRange.objects.create(rack=rack, vlan=self.vlan_b, address_range="10.201.0.32/27")
+        response = self.client.get(f"/racks/{rack.pk}/")
+        self.assertContains(response, "don't all share one address offset")
+
+    def test_rack_detail_omits_divergence_note_when_aligned(self) -> None:
+        rack = Rack.objects.create(name="Rack", slot_count=30)
+        RackVlanRange.objects.create(rack=rack, vlan=self.vlan_a, address_range="10.200.0.32/27")
+        RackVlanRange.objects.create(rack=rack, vlan=self.vlan_b, address_range="10.201.0.32/27")
+        response = self.client.get(f"/racks/{rack.pk}/")
+        self.assertNotContains(response, "don't all share one address offset")
 
 
 class DerivedPortHostnameRenderingTests(TestCase):

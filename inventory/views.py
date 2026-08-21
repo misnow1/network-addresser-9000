@@ -1034,6 +1034,13 @@ def spare_pool(request: HttpRequest) -> HttpResponse:
         "inventory.view_vlan",
         "inventory.view_networkswitch",
         "inventory.view_networkdevice",
+        # ADR 0025 — the rack tile marker reads Rack.range_offsets_diverge,
+        # which reads every RackVlanRange.offset (address_range and its
+        # own vlan). The same gap rack_detail's own codename list already
+        # closed once (Codex review round 2/3 there; this is the same
+        # rule — "each view declares the full set of codenames it
+        # actually reads" — applied incompletely to this view).
+        "inventory.view_rackvlanrange",
     ],
     raise_exception=True,
 )
@@ -1051,10 +1058,17 @@ def index(request: HttpRequest) -> HttpResponse:
     the nav bar itself short (one more static link, "Audit", is all it
     gains) rather than growing it with every registry entry.
     """
-    racks = Rack.objects.annotate(
-        switch_count=Count("switches", distinct=True),
-        device_count=Count("devices", distinct=True),
-    ).order_by("name")
+    racks = (
+        Rack.objects.annotate(
+            switch_count=Count("switches", distinct=True),
+            device_count=Count("devices", distinct=True),
+        )
+        # range_offsets_diverge (ADR 0025), read by the index tile marker
+        # below, needs every range's own vlan — without this, an N+1
+        # across the rack list.
+        .prefetch_related("vlan_ranges__vlan")
+        .order_by("name")
+    )
     vlans = VLAN.objects.annotate(
         switch_address_count=Count("switch_addresses", distinct=True),
         device_address_count=Count(
