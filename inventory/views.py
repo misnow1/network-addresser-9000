@@ -1034,6 +1034,13 @@ def spare_pool(request: HttpRequest) -> HttpResponse:
         "inventory.view_vlan",
         "inventory.view_networkswitch",
         "inventory.view_networkdevice",
+        # ADR 0025 — the rack tile marker reads Rack.range_offsets_diverge,
+        # which reads every RackVlanRange.offset (address_range and its
+        # own vlan). The same gap rack_detail's own codename list already
+        # closed once (Codex review round 2/3 there; this is the same
+        # rule — "each view declares the full set of codenames it
+        # actually reads" — applied incompletely to this view).
+        "inventory.view_rackvlanrange",
     ],
     raise_exception=True,
 )

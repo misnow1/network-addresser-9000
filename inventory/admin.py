@@ -204,9 +204,40 @@ class RackVlanRangeInlineFormSet(BaseInlineFormSet):
         rediscover it after the fact; see that method's docstring for the
         other half of this trick. Anything short of a winning offset
         leaves every blank row's already-computed first-fit value alone
-        and records an advisory (decision 3 — fall back, and say so).
+        and records an advisory naming each blank row's own outcome
+        (decision 3 — fall back, and say so; the template's own rows get
+        their own advisory from ``_apply_template()`` itself, once it
+        decides their fallback addresses, since this method runs before
+        those rows even exist).
+
+        ``self.instance._aligned_offset_attempted`` is set unconditionally
+        below, before any of this method's own early returns — it tells
+        ``_apply_template()`` whether a joint search over the *union*
+        already ran and, if so, forbids it from quietly narrowing to a
+        fresh search over just the template's own VLANs when that union
+        search failed (Codex review finding 2). Without it, a failed
+        three-way search (template VLANs A/B plus inline VLAN C, say)
+        would let A and B end up aligned with each other while C alone
+        goes independent — exactly the "a subset gets quietly aligned"
+        outcome decisions 2 and 3 forbid; the fix is that when nothing
+        common exists across everything being allocated, *everything*
+        falls back independently, not just the part this method can't see.
+
+        Any advisory already on ``self.instance`` is cleared first (Codex
+        review finding 4): a blank row's own ``full_clean()`` — which,
+        on an existing rack, runs the sticky rule (``RackVlanRange.
+        clean()``) — always happens before this method, so anything
+        already recorded here was written by a sticky check against
+        *pre-this-submission* data (e.g. a sibling range that a DELETE
+        checkbox elsewhere in this very submission is about to remove).
+        This method's own decision, made with full knowledge of every
+        row's fate in this submission, supersedes that — an advisory
+        describing a rack that no longer disagrees with itself once the
+        deleted row is excluded is worse than none at all.
         """
         rack = self.instance
+        rack._range_alignment_advisories.clear()
+        rack._aligned_offset_attempted = True
         anchors: list[tuple[VLAN, str]] = []
         blank_forms = []
         represented_pks: set[int] = set()
@@ -260,6 +291,19 @@ class RackVlanRangeInlineFormSet(BaseInlineFormSet):
                     return False
             return True
 
+        def blank_row_outcomes() -> str:
+            """ "<vlan>: <address_range>" for every blank row, joined — what
+            this method actually has to report (decision 3: name the
+            outcome, not blame a VLAN) at the moment it falls back: each
+            blank row's own already-computed first-fit value. Empty when
+            there are no blank rows at all — a template-only fallback has
+            nothing here to add, since the template's own rows don't exist
+            yet; ``_apply_template()`` reports those once it creates them.
+            """
+            return "; ".join(
+                f"{form.cleaned_data['vlan']}: {form.instance.address_range}" for form in blank_forms
+            )
+
         anchor_offsets = set()
         for anchor_vlan, anchor_range in anchors:
             try:
@@ -273,21 +317,27 @@ class RackVlanRangeInlineFormSet(BaseInlineFormSet):
             if offset_fits_every_vlan(candidate_offset):
                 offset = candidate_offset
             else:
+                outcomes = blank_row_outcomes()
+                suffix = f": {outcomes}." if outcomes else "."
                 rack._range_alignment_advisories.append(
                     f"This rack's anchored offset ({candidate_offset}) isn't free on every VLAN "
-                    "being allocated here — allocated per VLAN instead."
+                    f"being allocated here — allocated per VLAN instead{suffix}"
                 )
         elif not anchors:
             offset = suggest_aligned_offset([info for _vlan, info in vlans_input], rack.slot_count)
             if offset is None:
+                outcomes = blank_row_outcomes()
+                suffix = f": {outcomes}." if outcomes else "."
                 rack._range_alignment_advisories.append(
                     "No single offset is free on every VLAN this rack is being given a range on "
-                    "— allocated per VLAN instead of jointly."
+                    f"— allocated per VLAN instead{suffix}"
                 )
         elif len(anchor_offsets) > 1:
+            outcomes = blank_row_outcomes()
+            suffix = f": {outcomes}." if outcomes else "."
             rack._range_alignment_advisories.append(
                 "This rack's existing/entered ranges don't all share one offset, so none could "
-                "be inherited for the new rows — allocated per VLAN instead."
+                f"be inherited for the new rows — allocated per VLAN instead{suffix}"
             )
 
         if offset is None:

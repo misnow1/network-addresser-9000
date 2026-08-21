@@ -689,7 +689,16 @@ class PartialGrantAccessTests(TestCase):
 
     def test_index_requires_every_declared_codename(self) -> None:
         self._assert_403_when_missing_each(
-            "/", ["view_rack", "view_vlan", "view_networkswitch", "view_networkdevice"]
+            "/",
+            [
+                "view_rack",
+                "view_vlan",
+                "view_networkswitch",
+                "view_networkdevice",
+                # ADR 0025 — Codex review finding 1: the rack tile marker
+                # reads Rack.range_offsets_diverge -> RackVlanRange.offset.
+                "view_rackvlanrange",
+            ],
         )
 
     def test_rack_detail_requires_every_declared_codename(self) -> None:

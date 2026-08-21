@@ -7879,6 +7879,50 @@ class RackVlanRangeInlineFormSetAlignedOffsetTests(TestCase):
         fourth_row_offset = range_offset(vlan_c.subnet, formset.forms[0].instance.address_range)
         self.assertEqual(fourth_row_offset, range_a.offset)
 
+    def test_failed_union_search_falls_back_for_every_vlan_not_just_the_inline_one(self) -> None:
+        # Codex review finding 2. Template VLANs A/B plus inline VLAN C:
+        # A has offset 0 occupied, B is empty, C's subnet is exactly one
+        # /27 (so C only ever offers offset 0). No offset is common to
+        # A, B and C together — free(A) starts at 32, free(C) is {0}
+        # only, and they never agree. The bug this guards against: A and
+        # B quietly aligning with *each other* (both landing on 32, since
+        # that pair alone *does* have a common offset) while C goes it
+        # alone — a subset getting aligned after the real (three-way)
+        # search already failed, which decisions 2/3 forbid. The fix
+        # means B must get its own honest first-fit (offset 0, since B
+        # has nothing of its own occupying it) rather than 32.
+        vlan_c = VLAN.objects.create(name="Dante Secondary", vlan_id=202, subnet="10.202.0.0/27")
+        sibling = Rack.objects.create(name="Sibling", slot_count=30)
+        RackVlanRange.objects.create(rack=sibling, vlan=self.vlan_a, address_range="10.200.0.0/27")
+        template = RackTemplate.objects.create(name="Audio Rack")
+        RackTemplateVlan.objects.create(template=template, vlan=self.vlan_a)
+        RackTemplateVlan.objects.create(template=template, vlan=self.vlan_b)
+        form = RackAddForm(data={"name": "Rack", "slot_count": "30", "template": str(template.pk)})
+        self.assertTrue(form.is_valid(), form.errors)
+        formset = self._formset(form.instance, [{"vlan": str(vlan_c.pk), "address_range": ""}])
+        self.assertTrue(formset.is_valid(), formset.errors)
+
+        rack = form.save(commit=False)
+        rack.save()  # triggers _apply_template()
+
+        range_a = RackVlanRange.objects.get(rack=rack, vlan=self.vlan_a)
+        range_b = RackVlanRange.objects.get(rack=rack, vlan=self.vlan_b)
+        self.assertEqual(range_a.address_range, "10.200.0.32/27")  # A's own first-fit (0 is taken)
+        self.assertEqual(range_b.address_range, "10.201.0.0/27")  # B's own first-fit — NOT 32
+        self.assertEqual(formset.forms[0].instance.address_range, "10.202.0.0/27")  # C unaffected
+
+        # Two advisories, not one silently-successful subset alignment:
+        # the formset's own (about C, the only VLAN it could report on at
+        # clean() time — A/B's RackVlanRange rows don't exist yet) and
+        # _apply_template()'s own (about A and B, once it creates them).
+        self.assertEqual(len(rack._range_alignment_advisories), 2)
+        formset_advisory = next(a for a in rack._range_alignment_advisories if str(vlan_c) in a)
+        apply_advisory = next(a for a in rack._range_alignment_advisories if str(self.vlan_a) in a)
+        self.assertIn("10.202.0.0/27", formset_advisory)
+        self.assertIn(str(self.vlan_b), apply_advisory)
+        self.assertIn("10.200.0.32/27", apply_advisory)
+        self.assertIn("10.201.0.0/27", apply_advisory)
+
     def test_agreeing_anchor_sets_the_offset_for_blank_rows(self) -> None:
         form = RackAddForm(data={"name": "Rack", "slot_count": "30"})
         self.assertTrue(form.is_valid(), form.errors)
@@ -7907,7 +7951,13 @@ class RackVlanRangeInlineFormSetAlignedOffsetTests(TestCase):
         self.assertTrue(formset.is_valid(), formset.errors)
         self.assertEqual(formset.forms[2].instance.address_range, "10.202.0.0/27")
         self.assertEqual(len(form.instance._range_alignment_advisories), 1)
-        self.assertIn("don't all share one offset", form.instance._range_alignment_advisories[0])
+        advisory = form.instance._range_alignment_advisories[0]
+        self.assertIn("don't all share one offset", advisory)
+        # Codex review finding 3 — the advisory must name the outcome
+        # (which VLAN landed on which offset), not just assert generically
+        # that something fell back.
+        self.assertIn(str(vlan_c), advisory)
+        self.assertIn("10.202.0.0/27", advisory)
 
     def test_unavailable_anchored_offset_falls_back(self) -> None:
         sibling = Rack.objects.create(name="Sibling", slot_count=30)
@@ -7924,7 +7974,11 @@ class RackVlanRangeInlineFormSetAlignedOffsetTests(TestCase):
         self.assertTrue(formset.is_valid(), formset.errors)
         self.assertEqual(formset.forms[1].instance.address_range, "10.201.0.0/27")
         self.assertEqual(len(form.instance._range_alignment_advisories), 1)
-        self.assertIn("isn't free", form.instance._range_alignment_advisories[0])
+        advisory = form.instance._range_alignment_advisories[0]
+        self.assertIn("isn't free", advisory)
+        # Codex review finding 3 — name the outcome, not just "it failed".
+        self.assertIn(str(self.vlan_b), advisory)
+        self.assertIn("10.201.0.0/27", advisory)
 
     def test_no_common_offset_at_all_falls_back_with_advisory(self) -> None:
         small_vlan_a = VLAN.objects.create(name="Small A", vlan_id=210, subnet="10.210.0.0/24")
@@ -7952,6 +8006,13 @@ class RackVlanRangeInlineFormSetAlignedOffsetTests(TestCase):
         self.assertEqual(formset.forms[0].instance.address_range, "10.210.0.32/27")
         self.assertEqual(formset.forms[1].instance.address_range, "10.211.0.0/27")
         self.assertEqual(len(form.instance._range_alignment_advisories), 1)
+        advisory = form.instance._range_alignment_advisories[0]
+        # Codex review finding 3 — both VLANs' own outcomes named, since
+        # neither VLAN "caused" the empty intersection on its own.
+        self.assertIn(str(small_vlan_a), advisory)
+        self.assertIn("10.210.0.32/27", advisory)
+        self.assertIn(str(small_vlan_b), advisory)
+        self.assertIn("10.211.0.0/27", advisory)
 
     def test_unchanged_existing_row_counts_as_anchor_on_change_page(self) -> None:
         rack = Rack.objects.create(name="Existing", slot_count=30)
@@ -7999,6 +8060,47 @@ class RackVlanRangeInlineFormSetAlignedOffsetTests(TestCase):
         # to its own independent first-fit (offset 0) rather than
         # inheriting the soon-to-be-deleted row's offset (32).
         self.assertEqual(formset.forms[1].instance.address_range, "10.201.0.0/27")
+
+    def test_stale_sticky_advisory_does_not_survive_delete_plus_add(self) -> None:
+        # Codex review finding 4. The rack's two existing ranges disagree
+        # (offsets 0 and 32) — genuinely divergent. The submission deletes
+        # the offset-0 one and adds a blank row on a third VLAN in the
+        # same request. RackVlanRange.clean() runs on the new blank row
+        # *before* this formset's own clean() and, reading the database
+        # as it still stands before the deletion takes effect, sees both
+        # existing ranges disagreeing — and records a "ranges disagree"
+        # advisory to that effect. Once this formset's own clean() runs,
+        # it correctly excludes the deleted row from anchors, leaving a
+        # single (no-longer-disagreeing) anchor at offset 32, which the
+        # blank row successfully inherits. The now-false "ranges
+        # disagree" advisory must not survive to the operator.
+        vlan_c = VLAN.objects.create(name="Dante Secondary", vlan_id=202, subnet="10.202.0.0/21")
+        rack = Rack.objects.create(name="Existing", slot_count=30)
+        range_a = RackVlanRange.objects.create(rack=rack, vlan=self.vlan_a, address_range="10.200.0.0/27")
+        range_b = RackVlanRange.objects.create(rack=rack, vlan=self.vlan_b, address_range="10.201.0.32/27")
+        self.assertTrue(rack.range_offsets_diverge)  # sanity: genuinely divergent to start
+
+        formset = self._formset(
+            rack,
+            [
+                {
+                    "id": str(range_a.pk),
+                    "vlan": str(self.vlan_a.pk),
+                    "address_range": "10.200.0.0/27",
+                    "DELETE": "on",
+                },
+                {
+                    "id": str(range_b.pk),
+                    "vlan": str(self.vlan_b.pk),
+                    "address_range": "10.201.0.32/27",
+                },
+                {"vlan": str(vlan_c.pk), "address_range": ""},
+            ],
+            initial=2,
+        )
+        self.assertTrue(formset.is_valid(), formset.errors)
+        self.assertEqual(formset.forms[2].instance.address_range, "10.202.0.32/27")
+        self.assertEqual(rack._range_alignment_advisories, [])
 
 
 class RangeOffsetsDivergeTests(TestCase):

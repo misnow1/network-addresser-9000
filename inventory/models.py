@@ -1384,6 +1384,23 @@ class Rack(AuditedModel):
     #: reasoning as ``_template`` above.
     _aligned_offset: "int | None" = None
 
+    #: Set alongside ``_aligned_offset`` above, unconditionally, whenever
+    #: ``RackVlanRangeInlineFormSet._align_offsets()`` runs (Codex review
+    #: finding 2) — distinguishes "the formset never ran, so
+    #: ``_resolve_template_offset()`` should compute its own search
+    #: restricted to the template's VLANs" from "the formset ran a joint
+    #: search over the *union* of the template's VLANs and its own blank
+    #: rows, and that search failed." Collapsing those two into one
+    #: ``_aligned_offset is None`` check would let ``_apply_template()``
+    #: quietly fall back to a *narrower* search over just the template's
+    #: own subset after the wider one already failed — exactly the "a
+    #: subset gets silently aligned while the rest goes independent"
+    #: outcome decisions 2 and 3 forbid. ``False`` (the default) only for
+    #: a programmatic ``Rack.objects.create(template=...)`` call with no
+    #: admin form/formset involved at all, where there is no "union" to
+    #: have tried and failed in the first place.
+    _aligned_offset_attempted: bool = False
+
     #: True only while ``_apply_template()`` is actively looping over its
     #: own template's VLANs. Read by ``RackVlanRange.clean()``'s sticky
     #: rule (ADR 0025 decision 1) to suppress itself: by the time
@@ -1557,15 +1574,28 @@ class Rack(AuditedModel):
         """The joint offset ``_apply_template()`` should use across
         ``links``' VLANs (ADR 0025 decision 1's "batch" half).
 
-        Prefers ``self._aligned_offset`` — stashed by
-        ``RackVlanRangeInlineFormSet.clean()`` when this rack is being
-        created with a template *and* manually-entered inline blanks on
-        the same submission — if it's still free on every listed VLAN.
-        Otherwise runs a fresh joint search restricted to exactly this
-        template's VLANs (decision 6: never the whole VLAN set). ``None``
-        when no offset is free on all of them, which
-        ``_apply_template()`` reads as "fall back to independent
-        first-fit, and say so."
+        ``self._aligned_offset_attempted`` (Codex review finding 2) is the
+        load-bearing branch here: when it's ``True``,
+        ``RackVlanRangeInlineFormSet._align_offsets()`` already ran one
+        joint search over the *union* of the template's VLANs and its own
+        blank rows, and this method must not run a *second*, narrower
+        search restricted to just the template's own subset — using
+        ``self._aligned_offset`` if that union search succeeded and is
+        still free here, otherwise ``None``, full stop. Silently
+        recomputing over the subset after the union failed is exactly the
+        bug this branch exists to prevent: template VLANs A and B could
+        agree with each other on an offset that the union (including a
+        third, inline VLAN C) had already rejected — decisions 2 and 3
+        say that when nothing is common to everything being allocated,
+        *everything* falls back independently, not that a subset gets
+        quietly aligned while the rest goes it alone.
+
+        Only when ``_aligned_offset_attempted`` is ``False`` — no formset
+        ran at all, i.e. a programmatic ``Rack.objects.create(template=
+        ...)`` call with no admin form involved — does this method run
+        its own fresh search, restricted to exactly this template's VLANs
+        (decision 6: never the whole VLAN set), because in that case
+        there is no wider union that could have already failed.
         """
         vlans_input = []
         for link in links:
@@ -1580,19 +1610,22 @@ class Rack(AuditedModel):
             vlans_input.append(info)
         if not vlans_input:
             return None
-        stashed = self._aligned_offset
-        if stashed is not None:
+        if self._aligned_offset_attempted:
+            stashed = self._aligned_offset
+            if stashed is None:
+                return None  # the formset's own union search already failed; never narrow it
             try:
                 candidates = [
                     range_at_offset(subnet, stashed, self.slot_count) for subnet, _, _ in vlans_input
                 ]
             except ValueError:
-                candidates = None
-            if candidates is not None and all(
+                return None
+            if all(
                 _candidate_range_is_free(cidr, subnet, used, dhcp)
                 for cidr, (subnet, used, dhcp) in zip(candidates, vlans_input, strict=True)
             ):
                 return stashed
+            return None
         return suggest_aligned_offset(vlans_input, self.slot_count)
 
     def _apply_template(self) -> None:
@@ -1626,7 +1659,15 @@ class Rack(AuditedModel):
         range is built blank exactly as before ADR 0025, and one advisory
         names which VLAN landed on which offset (decision 3 — the outcome
         is reported, not blamed on a VLAN, since no single VLAN "caused"
-        an empty intersection of free offsets).
+        an empty intersection of free offsets). ``_resolve_template_offset()``
+        never narrows that miss to a fresh search over just this
+        template's own subset when a wider search already ran and failed
+        (``self._aligned_offset_attempted`` — Codex review finding 2; see
+        that method's own docstring) — a submission combining a template
+        with inline VLANs can therefore end up with *two* advisories, this
+        one (about the template's own rows) and the inline formset's
+        (about its own blank rows), since neither can see the other's
+        VLANs at the point it has to report.
 
         ``self._applying_template`` brackets the loop below so
         ``RackVlanRange.clean()``'s sticky rule stays quiet for its
