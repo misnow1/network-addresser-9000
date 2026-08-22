@@ -1,0 +1,25 @@
+# Pull-based deploy: overrides the `app` service to consume a published GHCR
+# image instead of building from source. Everything else (db, healthcheck,
+# env plumbing, port binding) is inherited from docker-compose.yml.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.release.yml up -d
+#
+# Requires Compose >= 2.24 for the `!reset` tag below (see README). Bump the
+# version here explicitly to deploy a new release — it is pinned literally,
+# never floated to `latest`, so a deploy is reproducible and a version bump
+# is a visible edit.
+#
+# `build: !reset null` removes the base file's `build:` key entirely rather
+# than merging over it. Compose merges mappings, so an override that sets
+# only `image:` would still inherit `build: { context: . }` from
+# docker-compose.yml, leaving Compose free to build locally instead of
+# pulling — confirmed by running `docker compose config` and seeing both
+# keys emitted. The `!reset` tag must be on the *value* (`build: !reset
+# null`); written as `!reset build: null` it does not work — that form was
+# observed to drop only the nested `dockerfile:` key while leaving
+# `build.context` in place. See docs/adr/0009-docker-deployment-shape.md's
+# postscript.
+services:
+  app:
+    build: !reset null
+    image: ghcr.io/misnow1/network-addresser-9000:<version>

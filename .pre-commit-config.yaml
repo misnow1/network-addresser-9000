@@ -5,6 +5,16 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+        # docker-compose.release.yml uses Compose's `!reset` tag (see its own
+        # comment, and ADR 0009's postscript) — a custom YAML tag that the
+        # default constructor-based check can't load, even though the file
+        # is syntactically valid. Exclude it here and check it syntax-only
+        # below instead of weakening the check for every other YAML file.
+        exclude: ^docker-compose\.release\.yml$
+      - id: check-yaml
+        name: check yaml (syntax-only, for Compose's !reset tag)
+        args: [--unsafe]
+        files: ^docker-compose\.release\.yml$
       - id: check-toml
       - id: check-merge-conflict
       - id: check-added-large-files

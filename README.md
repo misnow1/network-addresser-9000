@@ -32,6 +32,32 @@ A few things worth knowing before relying on this in practice:
 - **Changing `.env` credentials doesn't change an already-initialized database.** `MARIADB_*` variables only take effect the first time the `db_data` volume is created; rotating `DB_PASSWORD`/`MARIADB_ROOT_PASSWORD` afterward requires changing the password inside MariaDB itself (or removing the volume, which destroys data).
 - **Rebuild periodically to pick up base-image security fixes** — the Dockerfile pins specific Python and MariaDB versions for reproducibility, which also means they don't update automatically.
 
+### Deploying a published image instead of building from source
+
+Release tags (`v*`) are built, multi-arch (amd64 + arm64), and published to
+[GHCR](https://github.com/misnow1/network-addresser-9000/pkgs/container/network-addresser-9000)
+by `.github/workflows/publish.yml` — see [ADR 0009](./docs/adr/0009-docker-deployment-shape.md)'s
+postscript. To deploy a pinned, prebuilt image instead of building locally, add the release
+override and set a real version in place of `<version>`:
+
+```
+docker compose -f docker-compose.yml -f docker-compose.release.yml up -d
+```
+
+`docker-compose.release.yml` pins the image tag literally — never `latest` — so a deploy is
+reproducible and bumping the version is a visible edit to that file.
+
+- **Requires Docker Compose >= 2.24.** The override relies on Compose's `!reset` tag to remove
+  `docker-compose.yml`'s `build:` key entirely rather than merging over it; on an older Compose
+  that tag isn't recognized, and Compose falls back to building from source anyway — quietly,
+  without an error, so it looks like it worked. Check your version with `docker compose version`
+  before relying on the pull path.
+- **`import_prod_data` needs the CSVs mounted explicitly.** `.dockerignore` excludes `prod/` (real
+  production network data has no business in a public image), so a published image never has it.
+  The importer defaults to `--data-dir prod`; running it inside a container built or pulled after
+  this phase means mounting the CSV directory yourself and passing `--data-dir` to point at it,
+  e.g. `docker compose exec app python manage.py import_prod_data --data-dir /path/inside/container`.
+
 ## Setting up accounts
 
 Create a user via `/admin/auth/user/add/`, then assign them to one of the three groups — Viewer, Editor, or Admin (see CONTEXT.md's "Roles") — from the user's own admin page. **Staff status** depends on the role: leave it **unchecked** for a Viewer, who reads through the purpose-built UI at `/` and never needs the admin at all (it refuses non-staff users entirely — see [ADR 0020](./docs/adr/0020-read-only-purpose-built-ui.md)); check it for an Editor or Admin, since every mutation in this app is a deep link into the admin and reaching one requires admin access. Under Docker, those groups are created automatically on every container start (see "Running with Docker"). Outside Docker, run `python manage.py sync_roles` once after `migrate` (safe to re-run any time, e.g. after adding a model). Also run `python manage.py seed_defaults` after `migrate` — it re-seeds the system Default VLAN/Switch Port VLAN Profile (ADR 0012) if they're ever missing; `migrate` seeds them once already, but can't repair them if removed some other way (e.g. `manage.py flush`).
