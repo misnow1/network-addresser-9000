@@ -25,6 +25,22 @@ on:
 permissions:
   contents: read
 
+# Serializes every run of this workflow so two releases (or a release and a
+# manual smoke test) can never interleave: without this, two publish runs
+# started close together finish in whichever order the runners happen to
+# schedule them, not the order the tags were pushed in, and whichever run
+# finishes last repoints `latest` -- regardless of which version is
+# actually newer (codex review round 3, finding 2). A single fixed group
+# name (not partitioned by ref, unlike ci.yml's `ci-${{ github.ref }}`)
+# means every publish run queues against every other one. Never cancel a
+# run that's already started, unlike ci.yml's PR runs: a cancelled publish
+# mid-flight can leave digests pushed to the registry with no manifest
+# ever created to reference them, which is worse than a second run waiting
+# its turn.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
 env:
   IMAGE_NAME: ghcr.io/misnow1/network-addresser-9000
 
@@ -60,6 +76,17 @@ jobs:
               echo "::error::image_tag '$tag' must match ^test-[a-z0-9][a-z0-9-]*\$ -- dispatch is a namespaced smoke-test path and must not be able to move 'latest', a released version, or an existing 'sha-*' tag."
               exit 1
             fi
+            # Docker enforces a 128-character tag limit. The format regex
+            # above has no length bound of its own, so a long enough
+            # image_tag would otherwise sail through here and only fail at
+            # manifest-creation time in the merge job -- after both
+            # platform digests are already pushed (review round 3,
+            # finding 3). Verified locally with grep -E against 127/128/129
+            # character boundary cases before relying on it.
+            if ! echo "$tag" | grep -qE '^.{1,128}$'; then
+              echo "::error::image_tag '$tag' is ${#tag} characters, over Docker's 128-character tag limit -- rejecting before anything gets pushed."
+              exit 1
+            fi
             echo "Dispatch tag '$tag' is valid."
             exit 0
           fi
@@ -84,19 +111,20 @@ jobs:
             echo "::error::tag '$ref' is not valid SemVer 2.0.0 (expected vMAJOR.MINOR.PATCH[-prerelease], no leading zeros, no build metadata) -- refusing to publish 'latest'/'sha-*' from a malformed or non-canonical version tag."
             exit 1
           fi
+
+          # Same 128-character Docker tag limit as the dispatch path above,
+          # checked against what actually gets published (the ref with its
+          # `v` stripped) -- an unbounded prerelease identifier (e.g.
+          # `v1.2.3-` plus 125 letters) is valid SemVer grammar and passes
+          # the check above, but is still too long for Docker to accept as
+          # a tag (review round 3, finding 3; verified with grep -E against
+          # this exact case before relying on it).
+          version="${ref#v}"
+          if ! echo "$version" | grep -qE '^.{1,128}$'; then
+            echo "::error::tag '$ref' publishes as '$version', which is ${#version} characters -- over Docker's 128-character tag limit. Rejecting before anything gets pushed: an over-length tag would otherwise only be caught at manifest-creation time, after both platform digests are already pushed to the registry."
+            exit 1
+          fi
           echo "Tag '$ref' is valid semver."
-
-      - name: Set up Docker Buildx
-        if: github.event_name != 'workflow_dispatch'
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
-
-      - name: Log in to GHCR
-        if: github.event_name != 'workflow_dispatch'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Refuse to overwrite an existing version tag
         if: github.event_name != 'workflow_dispatch'
@@ -104,42 +132,57 @@ jobs:
           # See the previous step's comment -- ref names are attacker-shaped
           # input and must not be spliced directly into the script text.
           REF_NAME: ${{ github.ref_name }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           version="$REF_NAME"
           version="${version#v}"
-          image_ref="$IMAGE_NAME:$version"
+          image_path="${IMAGE_NAME#ghcr.io/}"
 
-          # `imagetools inspect` exits non-zero on ANY failure -- a genuine
-          # "this tag doesn't exist" 404, but also a transient registry
-          # error, an auth hiccup, or a network blip. Treating every
-          # non-zero exit as "safe to publish" fails open: a flaky check
-          # would silently let a build overwrite an already-released tag
-          # (review round 2, finding 5). So capture the output and only
-          # treat a confirmed not-found as green; anything else fails
-          # closed and stops the run for a human to look at. Verified
-          # locally what buildx actually prints for a real missing tag
-          # (`... not found`) vs. an auth/network failure (`failed to
-          # authorize: ...` / `failed to do request: ...` -- neither
-          # contains "not found"), so the grep below only fires on the
-          # genuine case.
-          set +e
-          inspect_output=$(docker buildx imagetools inspect "$image_ref" 2>&1)
-          inspect_status=$?
-          set -e
-
-          if [ "$inspect_status" -eq 0 ]; then
-            echo "::error::$image_ref already exists on GHCR. Tags there are mutable, but a re-run of a tag build must not silently replace what consumers already pulled -- delete the existing package version first if that's really what's intended, or cut a new version."
+          # A direct registry status check, not a parsed `imagetools
+          # inspect` error message: the previous fix narrowed the original
+          # fail-open bug ("any error" means "safe to publish") down to
+          # "any error saying 'not found' means safe to publish" -- which
+          # is still too broad. An existing multi-platform index with one
+          # missing child manifest, or an unrelated tooling error that
+          # happens to contain that phrase, would both misread as "tag
+          # absent" and reopen the overwrite path (review round 3,
+          # finding 1, same class of bug one layer in). A plain GET
+          # against the registry's own manifest endpoint resolves only the
+          # exact reference named in the URL and never recurses into child
+          # manifests, so its HTTP status means exactly one thing --
+          # verified directly against a real public GHCR image before
+          # relying on it: 200 for a tag that exists, 404 for one that
+          # doesn't.
+          token_response=$(curl -fsSL -u "${GH_ACTOR}:${GH_TOKEN}" \
+            "https://ghcr.io/token?scope=repository:${image_path}:pull&service=ghcr.io") || {
+            echo "::error::could not obtain a GHCR registry token to check whether ${IMAGE_NAME}:${version} already exists -- failing closed rather than risking an overwrite."
+            exit 1
+          }
+          token=$(echo "$token_response" | jq -r '.token // empty')
+          if [ -z "$token" ]; then
+            echo "::error::GHCR token response had no 'token' field -- failing closed. Response was: $token_response"
             exit 1
           fi
 
-          if echo "$inspect_output" | grep -qi 'not found'; then
-            echo "$image_ref does not exist yet -- OK to publish."
-            exit 0
-          fi
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${token}" \
+            -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
+            "https://ghcr.io/v2/${image_path}/manifests/${version}")
 
-          echo "::error::could not confirm whether $image_ref already exists on GHCR -- 'imagetools inspect' failed with something other than a clean not-found response, so failing closed rather than risking a silent overwrite. This is also what a genuinely first-ever publish (package doesn't exist at all yet) can look like if GHCR responds with something other than a plain 404 for an unknown package; if that's what happened here, re-run once you've confirmed it by hand. Output was:"
-          echo "$inspect_output"
-          exit 1
+          case "$status" in
+            200)
+              echo "::error::${IMAGE_NAME}:${version} already exists on GHCR. Tags there are mutable, but a re-run of a tag build must not silently replace what consumers already pulled -- delete the existing package version first if that's really what's intended, or cut a new version."
+              exit 1
+              ;;
+            404)
+              echo "${IMAGE_NAME}:${version} does not exist yet -- OK to publish."
+              ;;
+            *)
+              echo "::error::could not confirm whether ${IMAGE_NAME}:${version} already exists on GHCR -- the registry responded with HTTP ${status} (expected 200 for 'exists' or 404 for 'absent'). Failing closed rather than risking a silent overwrite. This can also happen on a genuinely first-ever publish if GHCR responds with something other than a plain 404 for a package that doesn't exist at all yet; if that's what happened here, re-run once you've confirmed it by hand."
+              exit 1
+              ;;
+          esac
 
   # A matrix over one job per architecture, each on a runner native to that
   # architecture -- not QEMU, because the builder stage compiles mysqlclient
