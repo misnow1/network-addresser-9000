@@ -1,0 +1,23 @@
+Manufacturer,Model,Description,Hostname Slug
+Allen & Heath,SQ-5,,sq5
+Amphenol,RJD1212-0050,Dante Interface with 2x Analogue XLR Output,rjd1212
+Amphenol,RJD2203-0050,Dante Interface with 2x Analogue XLR Input,rjd2203
+Amphenol,RJD32A3-0050,Dante Interface with AES3 I/O,rjd32a3
+Amphenol,RJD32U1-0050,Dante Interface with USB-A,rjd32u1
+Audinate,AVIO-AO2,Dante Interface with 2x Analogue XLR Output,avioao2
+DiGiCo,DMI-DANTE,,dmidante
+DiGiCo,SD9,,sd9
+DiGiCo,SD11,,sd11
+DiGiCo,SD12,,sd12
+Lab.Gruppen,LM26,"2-input, 6-output Loudspeaker Processor with Dante",lm26
+Lab.Gruppen,LM44,,lm44
+Lab.Gruppen,PLM20000Q,4-channel 20000-Watt Power Amplifier with Lake processing and Dante I/O,plm20q
+Martin Audio,IK-42,,ik42
+Martin Audio,IK-81,,ik81
+Neutrik,NA2-DLINE,,na2dline
+Radial,DiNET DAN-RX,,danrx
+Radial,DiNET DAN-TX,,dantx
+Yamaha,DM3,,dm3
+Yamaha,DM7-EX,,dm7ex
+Yamaha,DM7C,,dm7c
+Yamaha,Tio1608-D2,,tio1608d2
