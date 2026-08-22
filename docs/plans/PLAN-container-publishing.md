@@ -1,3 +1,6 @@
+> **Revision 3** — amends decision 5 so `latest` is prerelease-aware, enabling
+> release-candidate tags. See "Revision 3: release candidates".
+>
 > **Revision 2** — incorporates review notes from `REVIEW-1-PLAN-container-publishing.md`.
 > See "Review response" for the mapping.
 
@@ -57,7 +60,7 @@ Resolved with Mike, 2026-08-21. Out of scope to relitigate.
    `sha-<short>`. No floating `0.2`, and emphatically no floating `0`: under semver a `0.x`
    line permits breaking changes in a *minor* bump, so a `0` tag would actively mislead. The
    release override pins the exact version, so the floating tags are human convenience, not
-   load-bearing.
+   load-bearing. **Amended by revision 3** — `latest` moves only for a non-prerelease tag.
 6. **`.dockerignore` is tightened in this phase** — `prod/`, `.env.deployment`,
    `docker-compose.env`.
 7. **`workflow_dispatch` with a tag input**, so the publish path can be exercised on demand
@@ -86,6 +89,49 @@ Resolved with Mike, 2026-08-21. Out of scope to relitigate.
 | 7 (P2) — `type=gha` cache setup incomplete | **Accepted.** `docker/setup-buildx-action` is now named and SHA-pinned (the GHA cache backend does not work on the default driver), cache scope is per-platform so the two matrix jobs stop overwriting each other, and `mode=max` retains the builder stage's compiled wheels — the expensive part. | `publish.yml` |
 | 8 (P2) — the smoke test cannot run before merge | **Accepted; a real sequencing error.** `workflow_dispatch` is only offered for workflows present on the default branch, so the plan required a pre-merge step that is impossible. The Definition of Done is now split into pre-merge and post-merge gates, with the smoke test and the visibility flip in the latter, plus explicit rollback criteria. | Definition of done |
 | 9 (P2) — supply-chain verification missing | **Split.** Accepted: a guard refusing to overwrite an existing version tag, recording the manifest digest in the run log and the release, and build provenance attestation (~5 lines, and the documented default for public images). **Rejected: vulnerability scanning.** It is a new, ongoing deliverable whose failure mode is release builds going red on third-party CVEs in a base image this phase does not otherwise touch, and it belongs with a decision about *policy* (what severity blocks a release) that nobody has taken. Noted in ROADMAP as a follow-up instead of silently absorbed here. | `publish.yml`, ROADMAP |
+
+## Revision 3: release candidates
+
+Raised by Mike after the review chain completed, while the branch was still unpushed: should
+image builds be enabled outside `main`, so release-candidate branches can be tagged and
+workflows like this one rehearsed?
+
+**Two thirds of that already work, and needed nothing.** `ci.yml`'s `docker` job already builds
+on every code PR and every push to `main`, so branch builds exist — they simply do not push.
+And **git tags are not branch-scoped**: `push: tags: ['v*']` fires for a tag on any commit,
+whatever branch it sits on, so tagging a release-candidate branch already publishes. The
+SemVer grammar adopted in revision 2 accepts prerelease identifiers — verified against
+`v0.2.0-rc.1`, `v0.2.0-alpha`, `v0.2.0-rc.1.2` and `v1.0.0-beta.3`, all accepted, with `vfoo`
+still rejected.
+
+**The third part was a real defect.** `type=raw,value=latest` was gated on
+`github.event_name == 'push'` alone, with no notion of a prerelease. So a `v0.2.0-rc.1` tag
+would republish `latest` pointing at an unreleased candidate, built from a commit that need
+not be on `main` — and an ordinary `docker pull` with no tag would serve it.
+
+This is decision 5's caveat coming due rather than a new discovery. The original grilling
+noted that `latest` would track prereleases "while every release is alpha" and accepted it.
+That reasoning held precisely *because* prereleases were the releases; it stops holding the
+moment `v0.2.0-rc.1` and `v0.2.0` can both exist, which is exactly what release-candidate
+tagging introduces.
+
+**Decision: make `latest` prerelease-aware; do not broaden the triggers.** `latest` moves only
+for a tag with no prerelease identifier. Everything else about decision 5 stands.
+
+- `v0.2.0-rc.1` → publishes `0.2.0-rc.1` and `sha-<short>`; `latest` untouched.
+- `v0.2.0` → publishes `0.2.0` and `sha-<short>`; `latest` moves.
+
+Because revision 2 rejects build metadata outright, a `-` after the patch component is an
+unambiguous prerelease marker — the grammar admits `-` nowhere else — so the test is provable
+from the regex rather than heuristic.
+
+**Branch-triggered publishing is declined**, and recorded here so it is not re-proposed.
+Auto-publishing from `rc/*` branches reintroduces exactly what decision 1 rejected — moving
+images nobody pulls — while an RC tag gives the same capability as a deliberate act rather than
+a side effect of merging. It is also how the release-shaped path gets rehearsed at all: the
+`test-` dispatch namespace cannot exercise `type=semver`, `latest` or `sha-*`, so an RC tag is
+the only way to test that path short of cutting a real release. That argument only works if RC
+tags are safe, which is what this revision makes them.
 
 ## The build
 
@@ -270,6 +316,10 @@ note 8).
   shows **both** `linux/amd64` and `linux/arm64` in one manifest.
 - `latest` must **not** have moved, and no new `sha-*` tag exists. Check both explicitly.
 - A dispatch with `image_tag: latest` is **rejected** by the validate job.
+- **Release-candidate path (revision 3).** Push a `v0.2.0-rc.1` tag: it publishes
+  `0.2.0-rc.1` and `sha-<short>`, and `latest` does **not** move. Then a `v0.2.0` tag
+  publishes `0.2.0` and **does** move `latest`. Assert the non-movement explicitly — a
+  `latest` that happens to already point at the right digest proves nothing.
 - Flip the package to public, then `docker logout ghcr.io` and pull the literal published tag
   **anonymously**. A pull that only works while logged in means the visibility flip did not
   take.
