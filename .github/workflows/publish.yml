@@ -54,10 +54,18 @@ jobs:
     permissions:
       contents: read
       packages: read
+    # `is_prerelease` is consumed by the `merge` job's `latest` gate below --
+    # `validate` already parses and structurally validates the tag, so a
+    # named output is more legible there than repeating the parse as a
+    # compound expression in `merge` (PLAN rev 3, "Revision 3: release
+    # candidates").
+    outputs:
+      is_prerelease: ${{ steps.parse.outputs.is_prerelease }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Validate ref / dispatch input
+        id: parse
         env:
           # Passed via env, not interpolated with `${{ }}` directly into the
           # script: a git ref name is attacker-shaped input (git allows `"`,
@@ -88,6 +96,11 @@ jobs:
               exit 1
             fi
             echo "Dispatch tag '$tag' is valid."
+            # Dispatch can never move `latest` regardless of this value
+            # (gated on event_name below), but the output must be defined
+            # on every path or a run that took this branch leaves
+            # `needs.validate.outputs.is_prerelease` empty for `merge`.
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -124,7 +137,26 @@ jobs:
             echo "::error::tag '$ref' publishes as '$version', which is ${#version} characters -- over Docker's 128-character tag limit. Rejecting before anything gets pushed: an over-length tag would otherwise only be caught at manifest-creation time, after both platform digests are already pushed to the registry."
             exit 1
           fi
-          echo "Tag '$ref' is valid semver."
+
+          # A tag with no prerelease identifier moves `latest`; one with a
+          # prerelease identifier does not (PLAN rev 3, decision 5
+          # amendment) -- `v0.2.0-rc.1` publishes `0.2.0-rc.1` and
+          # `sha-<short>` but must never republish `latest` over an
+          # unreleased candidate. Detected as "does $version contain a
+          # `-`", which reads like a fragile string test but is provable
+          # here rather than heuristic: the SemVer regex above already
+          # rejected build metadata (`+...`) outright, and prerelease is
+          # the *only* remaining place that grammar admits a `-` at all --
+          # it cannot appear in major/minor/patch (digits only) or as a
+          # separator elsewhere. So by the time this line runs, `$version`
+          # already passed a regex where a `-` occurring at all means
+          # "has a prerelease identifier", full stop.
+          case "$version" in
+            *-*) is_prerelease=true ;;
+            *) is_prerelease=false ;;
+          esac
+          echo "is_prerelease=$is_prerelease" >> "$GITHUB_OUTPUT"
+          echo "Tag '$ref' is valid semver (is_prerelease=$is_prerelease)."
 
       - name: Refuse to overwrite an existing version tag
         if: github.event_name != 'workflow_dispatch'
@@ -303,11 +335,20 @@ jobs:
           # influenced by which ref a dispatch targets, so it's the only
           # gate that actually holds regardless of ref (codex review
           # round 2, finding 1, plus the compounding path it named).
+          #
+          # `latest` carries one more condition than `semver`/`sha-*`:
+          # `needs.validate.outputs.is_prerelease == 'false'`. Release-
+          # candidate tags (`v0.2.0-rc.1`) are a real `push` tag event and
+          # do publish their own version tag and `sha-*`, but must never
+          # republish `latest` over an unreleased candidate built from a
+          # commit that need not even be on `main` (PLAN rev 3, decision 5
+          # amendment -- see `validate`'s own comment for why the
+          # prerelease test is provable, not heuristic).
           flavor: |
             latest=false
           tags: |
             type=semver,pattern={{version}},enable=${{ github.event_name == 'push' }}
-            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' && needs.validate.outputs.is_prerelease == 'false' }}
             type=sha,prefix=sha-,enable=${{ github.event_name == 'push' }}
             type=raw,value=${{ inputs.image_tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
