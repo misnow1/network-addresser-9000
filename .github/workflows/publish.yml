@@ -42,9 +42,20 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Validate ref / dispatch input
+        env:
+          # Passed via env, not interpolated with `${{ }}` directly into the
+          # script: a git ref name is attacker-shaped input (git allows `"`,
+          # `;`, `#`, `$` in tag names), and `${{ }}` is substituted as raw
+          # text before bash ever sees the script, so a tag like `v";exit;#`
+          # would splice into the script rather than being treated as data.
+          # Routing through `env:` keeps it a plain variable value instead
+          # (codex review round 2, finding 2).
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tag="${{ inputs.image_tag }}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$IMAGE_TAG_INPUT"
             if ! echo "$tag" | grep -qE '^test-[a-z0-9][a-z0-9-]*$'; then
               echo "::error::image_tag '$tag' must match ^test-[a-z0-9][a-z0-9-]*\$ -- dispatch is a namespaced smoke-test path and must not be able to move 'latest', a released version, or an existing 'sha-*' tag."
               exit 1
@@ -53,14 +64,24 @@ jobs:
             exit 0
           fi
 
-          ref="${{ github.ref_name }}"
-          # vMAJOR.MINOR.PATCH with optional -prerelease and +build metadata
-          # (SemVer 2.0.0, `v` prefix required by the trigger above). `vfoo`
+          ref="$REF_NAME"
+          # vMAJOR.MINOR.PATCH with an optional -prerelease, full SemVer 2.0.0
+          # grammar (`v` prefix required by the trigger above): no leading
+          # zeros in any numeric identifier (major/minor/patch or a purely-
+          # numeric prerelease identifier), no empty identifiers. `vfoo`
           # matches the `v*` push trigger but yields no `type=semver` tag
           # from metadata-action -- without this gate 'latest' and 'sha-*'
           # would still get published from a malformed tag (review note 5).
-          if ! echo "$ref" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
-            echo "::error::tag '$ref' is not valid semver (expected vMAJOR.MINOR.PATCH[-prerelease][+build]) -- refusing to publish 'latest'/'sha-*' from a malformed version tag."
+          #
+          # Build metadata (`+...`) is rejected outright rather than
+          # accepted and stripped: metadata-action's `{{version}}` pattern
+          # drops build metadata from the published tag, so validating a
+          # ref that still has `+...` on it would check a different string
+          # than what the overwrite guard below (and the merge job) ever
+          # touches -- see the plan's round-2 review response (finding 4)
+          # for why this is a reject, not a silent-strip.
+          if ! echo "$ref" | grep -qE '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*)?$'; then
+            echo "::error::tag '$ref' is not valid SemVer 2.0.0 (expected vMAJOR.MINOR.PATCH[-prerelease], no leading zeros, no build metadata) -- refusing to publish 'latest'/'sha-*' from a malformed or non-canonical version tag."
             exit 1
           fi
           echo "Tag '$ref' is valid semver."
@@ -79,14 +100,46 @@ jobs:
 
       - name: Refuse to overwrite an existing version tag
         if: github.event_name != 'workflow_dispatch'
+        env:
+          # See the previous step's comment -- ref names are attacker-shaped
+          # input and must not be spliced directly into the script text.
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          version="${{ github.ref_name }}"
+          version="$REF_NAME"
           version="${version#v}"
-          if docker buildx imagetools inspect "${{ env.IMAGE_NAME }}:${version}" > /dev/null 2>&1; then
-            echo "::error::${{ env.IMAGE_NAME }}:${version} already exists on GHCR. Tags there are mutable, but a re-run of a tag build must not silently replace what consumers already pulled -- delete the existing package version first if that's really what's intended, or cut a new version."
+          image_ref="$IMAGE_NAME:$version"
+
+          # `imagetools inspect` exits non-zero on ANY failure -- a genuine
+          # "this tag doesn't exist" 404, but also a transient registry
+          # error, an auth hiccup, or a network blip. Treating every
+          # non-zero exit as "safe to publish" fails open: a flaky check
+          # would silently let a build overwrite an already-released tag
+          # (review round 2, finding 5). So capture the output and only
+          # treat a confirmed not-found as green; anything else fails
+          # closed and stops the run for a human to look at. Verified
+          # locally what buildx actually prints for a real missing tag
+          # (`... not found`) vs. an auth/network failure (`failed to
+          # authorize: ...` / `failed to do request: ...` -- neither
+          # contains "not found"), so the grep below only fires on the
+          # genuine case.
+          set +e
+          inspect_output=$(docker buildx imagetools inspect "$image_ref" 2>&1)
+          inspect_status=$?
+          set -e
+
+          if [ "$inspect_status" -eq 0 ]; then
+            echo "::error::$image_ref already exists on GHCR. Tags there are mutable, but a re-run of a tag build must not silently replace what consumers already pulled -- delete the existing package version first if that's really what's intended, or cut a new version."
             exit 1
           fi
-          echo "${{ env.IMAGE_NAME }}:${version} does not exist yet -- OK to publish."
+
+          if echo "$inspect_output" | grep -qi 'not found'; then
+            echo "$image_ref does not exist yet -- OK to publish."
+            exit 0
+          fi
+
+          echo "::error::could not confirm whether $image_ref already exists on GHCR -- 'imagetools inspect' failed with something other than a clean not-found response, so failing closed rather than risking a silent overwrite. This is also what a genuinely first-ever publish (package doesn't exist at all yet) can look like if GHCR responds with something other than a plain 404 for an unknown package; if that's what happened here, re-run once you've confirmed it by hand. Output was:"
+          echo "$inspect_output"
+          exit 1
 
   # A matrix over one job per architecture, each on a runner native to that
   # architecture -- not QEMU, because the builder stage compiles mysqlclient
@@ -193,12 +246,26 @@ jobs:
           # metadata-action's automatic `latest` handling can't express
           # "tags only, never dispatch" -- `latest` is added explicitly
           # below instead, gated to tag events only.
+          #
+          # All three release-shaped tag types are gated on
+          # `github.event_name == 'push'`, not on `github.ref`/`startsWith`.
+          # `workflow_dispatch` can be launched against *any* ref, including
+          # an existing `refs/tags/v...` -- a ref-pattern gate would then be
+          # true on a dispatch too, and `type=semver` has no ref-pattern
+          # gate at all by default, so it would silently republish the real
+          # version tag on a dispatch aimed at a release tag, bypassing the
+          # `validate` job's overwrite guard entirely (that guard only runs
+          # `if: github.event_name != 'workflow_dispatch'`). `event_name` is
+          # set by GitHub itself from how the run was triggered and can't be
+          # influenced by which ref a dispatch targets, so it's the only
+          # gate that actually holds regardless of ref (codex review
+          # round 2, finding 1, plus the compounding path it named).
           flavor: |
             latest=false
           tags: |
-            type=semver,pattern={{version}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=sha,prefix=sha-,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{version}},enable=${{ github.event_name == 'push' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
+            type=sha,prefix=sha-,enable=${{ github.event_name == 'push' }}
             type=raw,value=${{ inputs.image_tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Create manifest list and push
