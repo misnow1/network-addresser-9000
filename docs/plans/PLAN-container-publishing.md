@@ -1,3 +1,6 @@
+> **Revision 2** — incorporates review notes from `REVIEW-1-PLAN-container-publishing.md`.
+> See "Review response" for the mapping.
+
 # Phase 7 — Container publishing
 
 ## Context
@@ -70,6 +73,20 @@ Resolved with Mike, 2026-08-21. Out of scope to relitigate.
    the ruleset is fiddly enough (PUT-not-PATCH, `rules` replaces wholesale) to deserve its own
    change.
 
+## Review response
+
+| Note | Resolution | Section |
+|---|---|---|
+| 1 (P1) — release override does not remove `build` | **Accepted, verified by running it.** `docker compose -f docker-compose.yml -f <override> config` was confirmed to emit **both** `build:` (with `context:` and `dockerfile:`) and `image:` for the `app` service, so Compose could still build locally. Also confirmed the fix: `build: !reset null` — the tag on the *value*, not the key — removes `build` entirely, leaving only `image`. (`!reset build: null` does **not** work; it silently dropped only `dockerfile:`.) Minimum Compose version documented. | `docker-compose.release.yml` |
+| 2 (P1) — no registry authentication | **Accepted.** `packages: write` authorises the token but does not log Docker in. `docker/login-action` added to both matrix build jobs and the merge job — every job that touches the registry. | `publish.yml` |
+| 3 (P1) — job permissions replace, not widen | **Accepted; the plan's wording was wrong.** Job-level `permissions` replaces the top-level block wholesale, so declaring only `packages: write` sets `contents` to `none` and breaks checkout. Registry jobs now declare **both** `contents: read` and `packages: write` explicitly. | `publish.yml` |
+| 4 (P1) — dispatch can overwrite release tags | **Accepted.** The free-text input accepted `latest` or `0.2.0`. Dispatch tags are now constrained to a `test-` namespace and validated before any push, and `type=sha` is gated to tag events so a dispatch cannot emit an unclean-up-able `sha-*` tag. | `publish.yml` |
+| 5 (P1) — malformed `v*` tag can still move `latest` | **Accepted.** `type=semver` yields no version tag for `vfoo`, but the `startsWith(refs/tags/v)` gate would still publish `latest` and `sha-*`. A validation step now rejects any tag that is not valid semver before any digest is pushed. | `publish.yml` |
+| 6 (P1) — verification can pass while the feature is unusable | **Accepted, and it is the most important finding.** The original Verification leant on `docker compose config`, which happily resolves a tag that does not exist, and never ran the image. Verification now requires an anonymous pull of the literal published tag and running that image through Compose against MariaDB with an HTTP check. This is precisely the failure mode the plan's own Context warns about. | Verification |
+| 7 (P2) — `type=gha` cache setup incomplete | **Accepted.** `docker/setup-buildx-action` is now named and SHA-pinned (the GHA cache backend does not work on the default driver), cache scope is per-platform so the two matrix jobs stop overwriting each other, and `mode=max` retains the builder stage's compiled wheels — the expensive part. | `publish.yml` |
+| 8 (P2) — the smoke test cannot run before merge | **Accepted; a real sequencing error.** `workflow_dispatch` is only offered for workflows present on the default branch, so the plan required a pre-merge step that is impossible. The Definition of Done is now split into pre-merge and post-merge gates, with the smoke test and the visibility flip in the latter, plus explicit rollback criteria. | Definition of done |
+| 9 (P2) — supply-chain verification missing | **Split.** Accepted: a guard refusing to overwrite an existing version tag, recording the manifest digest in the run log and the release, and build provenance attestation (~5 lines, and the documented default for public images). **Rejected: vulnerability scanning.** It is a new, ongoing deliverable whose failure mode is release builds going red on third-party CVEs in a base image this phase does not otherwise touch, and it belongs with a decision about *policy* (what severity blocks a release) that nobody has taken. Noted in ROADMAP as a follow-up instead of silently absorbed here. | `publish.yml`, ROADMAP |
+
 ## The build
 
 One PR. The pieces are interdependent — the docs describe the workflow, the override pins the
@@ -81,33 +98,62 @@ exist.
 Triggers: `push` on `tags: ['v*']`, plus `workflow_dispatch` with a required `image_tag`
 input.
 
-Top-level `permissions: contents: read`. Only the jobs that touch the registry widen this to
-`packages: write` — least privilege, matching `ci.yml`'s existing top-level `contents: read`.
+Top-level `permissions: contents: read`. Every job that touches the registry declares **both**
+`contents: read` and `packages: write` — job-level permissions *replace* the top-level block
+rather than adding to it, so declaring `packages: write` alone would set `contents` to `none`
+and break `actions/checkout` (review note 3).
 
 Every action pinned by **full commit SHA with a `# vN` comment**, matching the convention every
 `uses:` line in `ci.yml` already follows. Reuse the SHAs already pinned there for
 `actions/checkout` rather than introducing a second pin for the same action.
 
+**`validate` job** — runs first, and everything else `needs` it.
+
+- On a tag push: assert the ref is valid semver (`v<major>.<minor>.<patch>` with optional
+  prerelease/build metadata). `vfoo` matches the `v*` trigger but yields no `type=semver` tag,
+  and without this gate would still publish `latest` and `sha-*` (review note 5). Fail the run.
+- On `workflow_dispatch`: assert `image_tag` matches `^test-[a-z0-9][a-z0-9-]*$`. This stops a
+  dispatch from moving `latest`, a released version, or an existing `sha-*` (review note 4).
+- On a tag push: query the registry and **fail if the exact version tag already exists**. GHCR
+  tags are mutable; a re-run of a tag build should not silently replace what consumers already
+  pulled (review note 9).
+
 **`build` job** — a matrix over `{platform: linux/amd64, runner: ubuntu-latest}` and
 `{platform: linux/arm64, runner: <ARM runner label>}`, so each architecture builds natively.
-Per the distribute-across-runners pattern: build and push **by digest** rather than by tag
-(`outputs: type=image,push-by-digest=true,name-canonical=true,push=true`), write each digest
-to a file, and upload it as an artifact. Layer caching via `type=gha` so repeat builds do not
-recompile `mysqlclient` from scratch.
 
-**`merge` job** — `needs: build`. Downloads the digest artifacts and joins them into a single
-multi-arch manifest with `docker buildx imagetools create`, tagged from
-`docker/metadata-action`:
+- `docker/setup-buildx-action` (SHA-pinned) — required, because the `type=gha` cache backend is
+  not supported on the default Docker driver (review note 7).
+- `docker/login-action` against `ghcr.io` with `github.actor` and `secrets.GITHUB_TOKEN`
+  (review note 2).
+- `docker/build-push-action` building and pushing **by digest**, not by tag
+  (`outputs: type=image,push-by-digest=true,name-canonical=true,push=true`).
+- Cache `type=gha` with a **per-platform `scope`** and `mode=max`. A shared default scope lets
+  the two concurrent matrix jobs overwrite each other's cache, and `mode=min` drops the builder
+  stage's compiled `mysqlclient` wheels — the only expensive part of this build (review note 7).
+- Write each digest to a file and upload it as an artifact.
+
+**`merge` job** — `needs: build`. Logs in again (a different runner), downloads the digest
+artifacts, and joins them into a single multi-arch manifest with `docker buildx imagetools
+create`, tagged from `docker/metadata-action`:
 
 - `type=semver,pattern={{version}}` — `v0.2.0` → `0.2.0`. Fires only on tag events.
-- `type=raw,value=latest`, enabled only when the ref is a `v*` tag.
-- `type=sha,prefix=sha-`.
+- `type=raw,value=latest`, enabled only on a `v*` tag event.
+- `type=sha,prefix=sha-`, **enabled only on a tag event** — an unconditional `type=sha` means a
+  `test-1` dispatch also publishes a `sha-*` tag that the documented cleanup would miss
+  (review note 4).
 - `type=raw,value=${{ inputs.image_tag }}`, enabled only on `workflow_dispatch`.
 
-Set `flavor: latest=false` and add `latest` explicitly through the gated `type=raw` above —
+Set `flavor: latest=false` and add `latest` through the gated `type=raw` above —
 metadata-action's automatic `latest` handling does not express "tags only, never dispatch",
-and a manual smoke-test publish must not move `latest`. Finish with an
-`imagetools inspect` so the run's log records what was actually published.
+and a manual smoke-test publish must not move `latest`.
+
+Finish with `imagetools inspect`, and **record the resulting manifest digest** in the job
+summary so there is a durable record of what was published under each tag (review note 9).
+
+**Provenance attestation** — `actions/attest-build-provenance` on the merge job, so a public
+consumer can verify the image was built by this workflow from this repository. Requires
+`id-token: write` and `attestations: write` on that job, in addition to `contents: read` and
+`packages: write`.
 
 ### `.github/workflows/ci.yml` — build validation
 
@@ -125,12 +171,27 @@ No registry login, no `packages:` permission — this job never touches GHCR.
 
 ### `docker-compose.release.yml` — new
 
-Overrides the `app` service to `image: ghcr.io/misnow1/network-addresser-9000:<version>`, with
-no `build:` key. Everything else — `db`, the healthcheck, the env plumbing, the port binding —
-is inherited from `docker-compose.yml`.
+```yaml
+services:
+  app:
+    build: !reset null
+    image: ghcr.io/misnow1/network-addresser-9000:<version>
+```
 
-The version is pinned literally, not floated to `latest`, so a deploy is reproducible and
-bumping it is a visible edit. Document the two-file invocation:
+**`build: !reset null` is load-bearing, and its exact form matters.** Compose merges mappings,
+so an override that sets only `image:` inherits the base file's `build:` — verified by running
+`docker compose config`, which emitted both keys, leaving Compose free to build locally instead
+of pulling. The `!reset` tag must be applied to the *value* (`build: !reset null`); written as
+`!reset build: null` it does not work, and was observed to drop only the nested `dockerfile:`
+key while leaving `build.context` in place (review note 1).
+
+`!reset` requires **Compose ≥ 2.24**; state this in the README next to the invocation, since a
+too-old Compose fails in the worst possible way — by quietly building from source and appearing
+to work.
+
+Everything else — `db`, the healthcheck, the env plumbing, the port binding — is inherited from
+`docker-compose.yml`. The version is pinned literally, not floated to `latest`, so a deploy is
+reproducible and bumping it is a visible edit:
 
 ```
 docker compose -f docker-compose.yml -f docker-compose.release.yml up -d
@@ -156,13 +217,15 @@ building from source. Explicitly note that no new ADR was created because no new
 decision was taken.
 
 **`README.md`** — document the pull-based deploy alongside the existing build-from-source
-instructions, including the two-file compose invocation and the `--data-dir` consequence
-above.
+instructions: the two-file compose invocation, the **Compose ≥ 2.24** requirement and why it
+matters, and the `--data-dir` consequence above.
 
 **`ROADMAP.md`** — check phase 7's box and rewrite its wording. The recorded scope is "on
 `main` merges", which decision 1 changed; leaving it would put the roadmap in contradiction
 with the workflow. Preserve the existing note about the phase having been scoped-then-skipped
-and deliberately left out of order — that history stays true and is worth keeping.
+and deliberately left out of order — that history stays true and is worth keeping. Add
+**image vulnerability scanning as a follow-up item**, per the rejected half of review note 9,
+so it is recorded rather than forgotten.
 
 ## Risks and unknowns
 
@@ -179,31 +242,64 @@ and deliberately left out of order — that history stays true and is worth keep
   user-namespace package needing separate access management.
 - **`latest` will track prereleases** while every release is alpha. Accepted for now, per
   decision 5; worth revisiting when a stable line exists.
-- **Cache growth.** `type=gha` caching is capped per repository, and two architectures share
-  that budget. Not a launch concern; a thing to notice if build times regress.
+- **Cache growth.** `type=gha` caching is capped per repository, and two architectures with
+  `mode=max` and separate scopes will use more of that budget than one shared `mode=min` cache
+  would. Not a launch concern; a thing to notice if build times regress.
 
 ## Verification
+
+Split by what can actually be checked when — `workflow_dispatch` is only offered for workflows
+already on the default branch, so no dispatch-based check is available pre-merge (review
+note 8).
+
+**Pre-merge, on the PR:**
 
 - A pull request touching only `*.md` skips the `docker` job, and `lint`/`test` still report,
   so `main`'s by-name required checks are unaffected.
 - A pull request touching code runs the `docker` job and it builds green.
+- `docker compose -f docker-compose.yml -f docker-compose.release.yml config` shows the `app`
+  service with `image:` and **no `build:` key at all**. Assert the absence explicitly — this is
+  the exact defect review note 1 found, and it is invisible unless looked for.
+- `pre-commit run --all-files` passes.
+- The full suite passes: `set -a; source .env; set +a; python manage.py test inventory`.
+
+**Post-merge, once the workflow is on `main`:**
+
 - `workflow_dispatch` with `image_tag: test-1` publishes
   `ghcr.io/misnow1/network-addresser-9000:test-1`, and `docker buildx imagetools inspect`
-  shows **both** `linux/amd64` and `linux/arm64` in one manifest. `latest` must **not** move.
-- The published image contains no `prod/` directory and no `.env.deployment` /
-  `docker-compose.env` — verify by inspecting the image filesystem, not by assuming.
-- `docker compose -f docker-compose.yml -f docker-compose.release.yml config` resolves to the
-  pinned image with no `build:` key.
-- Delete the `test-1` tag from GHCR afterwards.
-- The full suite still passes: `set -a; source .env; set +a; python manage.py test inventory`.
+  shows **both** `linux/amd64` and `linux/arm64` in one manifest.
+- `latest` must **not** have moved, and no new `sha-*` tag exists. Check both explicitly.
+- A dispatch with `image_tag: latest` is **rejected** by the validate job.
+- Flip the package to public, then `docker logout ghcr.io` and pull the literal published tag
+  **anonymously**. A pull that only works while logged in means the visibility flip did not
+  take.
+- **Run the pulled image.** Point `docker-compose.release.yml` at `test-1`, bring it up against
+  MariaDB, and confirm the entrypoint's `migrate`/`sync_roles` complete and an HTTP request to
+  `/` returns a login redirect rather than a 500. `docker compose config` proves nothing about
+  whether the image runs — it resolves tags that do not exist.
+- Confirm the image contains **no `prod/` directory** and no `.env.deployment` /
+  `docker-compose.env`, by inspecting the container filesystem rather than assuming.
+- Delete the `test-1` tag from GHCR.
 
 ## Definition of done
 
+**Pre-merge:**
+
 - `publish.yml` and the `ci.yml` `docker` job exist, with every action SHA-pinned.
-- `docker-compose.release.yml` pins an explicit version.
+- `docker-compose.release.yml` pins an explicit version and uses `build: !reset null`.
 - `.dockerignore` excludes `prod/`, `.env.deployment`, `docker-compose.env`.
-- ADR 0009 carries the postscript; README documents the pull path and the `--data-dir`
-  consequence; ROADMAP phase 7 is checked and its wording matches decision 1.
-- A `workflow_dispatch` smoke test has produced a real multi-arch manifest, been inspected,
-  and been cleaned up.
-- The package is public, and `docker pull` works with no credentials.
+- ADR 0009 carries the postscript; README documents the pull path, the Compose ≥ 2.24
+  requirement and the `--data-dir` consequence; ROADMAP phase 7 is checked, its wording matches
+  decision 1, and vulnerability scanning is recorded as a follow-up.
+- Every pre-merge verification item above passes.
+
+**Post-merge (Mike, or a follow-up session):**
+
+- The smoke test has produced a real multi-arch manifest, been inspected, and been cleaned up.
+- The package is public and pulls anonymously.
+- The pulled image has been run and serves HTTP.
+
+**Rollback criteria.** If the smoke test fails after merge, the exposure is limited: nothing
+consumes the published image until `docker-compose.release.yml` is pointed at a real version,
+and no release tag has been cut. Revert the merge commit, or delete the offending package
+version and fix forward — there is no deployed state to unwind.
