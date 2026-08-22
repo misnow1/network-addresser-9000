@@ -2,7 +2,7 @@
 
 High-level phases only — day-to-day task tracking belongs in GitHub Issues once there's code to file issues against. This file exists so it's obvious what phase the project is in and what's next, even after a fresh start.
 
-**Current phase: 20 — addressing per `(device, VLAN)` instead of per port. Phases 1–6, 8–19 and 22 done (22 landed out of numeric order — ADR 0024 needed none of phases 19–21's machinery); phase 7 scoped but skipped. Phases 20–21 remain outstanding.**
+**Current phase: 20 — addressing per `(device, VLAN)` instead of per port. Phases 1–19 and 22 done (7 and 22 both landed out of numeric order — 7 was scoped, skipped, then closed later; ADR 0024 needed none of phases 19–21's machinery for 22). Phases 20–21 remain outstanding.**
 
 ## 1. Foundation — done
 
@@ -42,12 +42,23 @@ High-level phases only — day-to-day task tracking belongs in GitHub Issues onc
 - [x] GitHub Actions CI (tests, lint)
 - [x] Branch protection on `main` — require PRs, block direct pushes
 
-## 7. Container publishing
+## 7. Container publishing — done
 
-- [ ] GitHub Actions workflow: build and publish the Docker image to GHCR on `main` merges
+- [x] GitHub Actions workflow: build the Docker image on pull requests and `main` merges to
+      prove it still builds (`ci.yml`'s `docker` job); push it to GHCR only on `v*` release
+      tags, multi-arch (amd64 + arm64), not on every `main` merge — see ADR 0009's postscript
+      and `docs/plans/PLAN-container-publishing.md` for why "on `main` merges" (the scope this
+      phase originally recorded) was dropped in favor of tags: it would publish moving images
+      nobody pulls.
 
-Deliberately left unchecked and out of order rather than renumbered — it was scoped, then
-skipped, and hiding that would only make it harder to notice.
+Left out of order rather than renumbered when it was originally scoped, then skipped — hiding
+that would only have made it harder to notice. That history stays true even now that the phase
+is done.
+
+**Follow-up, not yet scoped:** image vulnerability scanning. Rejected from this phase's own
+review because it's a new, ongoing deliverable whose failure mode (release builds going red on
+third-party CVEs in a base image this phase doesn't otherwise touch) needs a policy decision —
+what severity actually blocks a release — that nobody has taken yet.
 
 ## 8. Port profiles & materialization — done
 

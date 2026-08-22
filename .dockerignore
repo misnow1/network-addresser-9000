@@ -15,5 +15,12 @@ db.sqlite3
 .env
 .env.example
 .env.compose.example
+.env.deployment
+docker-compose.env
 docs
 *.md
+
+# Real production network data (IP addressing, Dante devices, switch ports)
+# for the MPS Audio Network Standards — gitignored, and must never end up
+# baked into an image. See ADR 0009's postscript and phase 7 of ROADMAP.md.
+prod/

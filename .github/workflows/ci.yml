@@ -191,3 +191,30 @@ jobs:
           fi
 
           echo "Discovered $found_count test(s) (floor: $min_tests) — OK."
+
+  # Build-validation only: proves the Dockerfile still builds on every PR
+  # and push, without publishing anything. Publishing itself lives in
+  # publish.yml and only fires on a `v*` tag — see ADR 0009's postscript and
+  # phase 7 of ROADMAP.md. This job never touches GHCR: no login, no
+  # `packages:` permission, and `push: false`.
+  docker:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # linux/amd64 only — deliberate. The point is catching a broken
+      # Dockerfile, which is architecture-independent in every realistic
+      # case; building both architectures on every PR would double the cost
+      # of the project's most common CI event to re-prove something the
+      # release path (publish.yml) already proves.
+      - name: Build image (validation only, not pushed)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false

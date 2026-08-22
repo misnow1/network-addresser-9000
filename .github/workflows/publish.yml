@@ -1,0 +1,396 @@
+name: Publish
+
+# Push to GHCR only happens here, and only from a `v*` tag (or a namespaced
+# manual smoke test) — never from a `main` merge. See ADR 0009's postscript
+# and phase 7 of ROADMAP.md for why: `ci.yml`'s `docker` job already proves
+# the image builds on every PR and push, so this workflow's only job is
+# publishing something a consumer would actually pull.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: >-
+          Tag to publish. Must match ^test-[a-z0-9][a-z0-9-]*$ — this is a
+          namespaced smoke-test path and cannot move `latest`, a released
+          version, or an existing `sha-*` tag.
+        required: true
+        type: string
+
+# Every job that touches the registry re-declares this explicitly alongside
+# `packages: write` — job-level `permissions` REPLACES this block wholesale
+# rather than adding to it, so a job that only declared `packages: write`
+# would silently set `contents: none` and break `actions/checkout`.
+permissions:
+  contents: read
+
+# Serializes every run of this workflow so two releases (or a release and a
+# manual smoke test) can never interleave: without this, two publish runs
+# started close together finish in whichever order the runners happen to
+# schedule them, not the order the tags were pushed in, and whichever run
+# finishes last repoints `latest` -- regardless of which version is
+# actually newer (codex review round 3, finding 2). A single fixed group
+# name (not partitioned by ref, unlike ci.yml's `ci-${{ github.ref }}`)
+# means every publish run queues against every other one. Never cancel a
+# run that's already started, unlike ci.yml's PR runs: a cancelled publish
+# mid-flight can leave digests pushed to the registry with no manifest
+# ever created to reference them, which is worse than a second run waiting
+# its turn.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/misnow1/network-addresser-9000
+
+jobs:
+  # Runs first; build and merge both `needs` it. Rejects anything that would
+  # publish under a tag it shouldn't (review notes 4, 5) and refuses to
+  # clobber an already-published version (review note 9).
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: read
+    # `is_prerelease` is consumed by the `merge` job's `latest` gate below --
+    # `validate` already parses and structurally validates the tag, so a
+    # named output is more legible there than repeating the parse as a
+    # compound expression in `merge` (PLAN rev 3, "Revision 3: release
+    # candidates").
+    outputs:
+      is_prerelease: ${{ steps.parse.outputs.is_prerelease }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Validate ref / dispatch input
+        id: parse
+        env:
+          # Passed via env, not interpolated with `${{ }}` directly into the
+          # script: a git ref name is attacker-shaped input (git allows `"`,
+          # `;`, `#`, `$` in tag names), and `${{ }}` is substituted as raw
+          # text before bash ever sees the script, so a tag like `v";exit;#`
+          # would splice into the script rather than being treated as data.
+          # Routing through `env:` keeps it a plain variable value instead
+          # (codex review round 2, finding 2).
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$IMAGE_TAG_INPUT"
+            if ! echo "$tag" | grep -qE '^test-[a-z0-9][a-z0-9-]*$'; then
+              echo "::error::image_tag '$tag' must match ^test-[a-z0-9][a-z0-9-]*\$ -- dispatch is a namespaced smoke-test path and must not be able to move 'latest', a released version, or an existing 'sha-*' tag."
+              exit 1
+            fi
+            # Docker enforces a 128-character tag limit. The format regex
+            # above has no length bound of its own, so a long enough
+            # image_tag would otherwise sail through here and only fail at
+            # manifest-creation time in the merge job -- after both
+            # platform digests are already pushed (review round 3,
+            # finding 3). Verified locally with grep -E against 127/128/129
+            # character boundary cases before relying on it.
+            if ! echo "$tag" | grep -qE '^.{1,128}$'; then
+              echo "::error::image_tag '$tag' is ${#tag} characters, over Docker's 128-character tag limit -- rejecting before anything gets pushed."
+              exit 1
+            fi
+            echo "Dispatch tag '$tag' is valid."
+            # Dispatch can never move `latest` regardless of this value
+            # (gated on event_name below), but the output must be defined
+            # on every path or a run that took this branch leaves
+            # `needs.validate.outputs.is_prerelease` empty for `merge`.
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ref="$REF_NAME"
+          # vMAJOR.MINOR.PATCH with an optional -prerelease, full SemVer 2.0.0
+          # grammar (`v` prefix required by the trigger above): no leading
+          # zeros in any numeric identifier (major/minor/patch or a purely-
+          # numeric prerelease identifier), no empty identifiers. `vfoo`
+          # matches the `v*` push trigger but yields no `type=semver` tag
+          # from metadata-action -- without this gate 'latest' and 'sha-*'
+          # would still get published from a malformed tag (review note 5).
+          #
+          # Build metadata (`+...`) is rejected outright rather than
+          # accepted and stripped: metadata-action's `{{version}}` pattern
+          # drops build metadata from the published tag, so validating a
+          # ref that still has `+...` on it would check a different string
+          # than what the overwrite guard below (and the merge job) ever
+          # touches -- see the plan's round-2 review response (finding 4)
+          # for why this is a reject, not a silent-strip.
+          if ! echo "$ref" | grep -qE '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*)?$'; then
+            echo "::error::tag '$ref' is not valid SemVer 2.0.0 (expected vMAJOR.MINOR.PATCH[-prerelease], no leading zeros, no build metadata) -- refusing to publish 'latest'/'sha-*' from a malformed or non-canonical version tag."
+            exit 1
+          fi
+
+          # Same 128-character Docker tag limit as the dispatch path above,
+          # checked against what actually gets published (the ref with its
+          # `v` stripped) -- an unbounded prerelease identifier (e.g.
+          # `v1.2.3-` plus 125 letters) is valid SemVer grammar and passes
+          # the check above, but is still too long for Docker to accept as
+          # a tag (review round 3, finding 3; verified with grep -E against
+          # this exact case before relying on it).
+          version="${ref#v}"
+          if ! echo "$version" | grep -qE '^.{1,128}$'; then
+            echo "::error::tag '$ref' publishes as '$version', which is ${#version} characters -- over Docker's 128-character tag limit. Rejecting before anything gets pushed: an over-length tag would otherwise only be caught at manifest-creation time, after both platform digests are already pushed to the registry."
+            exit 1
+          fi
+
+          # A tag with no prerelease identifier moves `latest`; one with a
+          # prerelease identifier does not (PLAN rev 3, decision 5
+          # amendment) -- `v0.2.0-rc.1` publishes `0.2.0-rc.1` and
+          # `sha-<short>` but must never republish `latest` over an
+          # unreleased candidate. Detected as "does $version contain a
+          # `-`", which reads like a fragile string test but is provable
+          # here rather than heuristic: the SemVer regex above already
+          # rejected build metadata (`+...`) outright, and prerelease is
+          # the *only* remaining place that grammar admits a `-` at all --
+          # it cannot appear in major/minor/patch (digits only) or as a
+          # separator elsewhere. So by the time this line runs, `$version`
+          # already passed a regex where a `-` occurring at all means
+          # "has a prerelease identifier", full stop.
+          case "$version" in
+            *-*) is_prerelease=true ;;
+            *) is_prerelease=false ;;
+          esac
+          echo "is_prerelease=$is_prerelease" >> "$GITHUB_OUTPUT"
+          echo "Tag '$ref' is valid semver (is_prerelease=$is_prerelease)."
+
+      - name: Refuse to overwrite an existing version tag
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          # See the previous step's comment -- ref names are attacker-shaped
+          # input and must not be spliced directly into the script text.
+          REF_NAME: ${{ github.ref_name }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="$REF_NAME"
+          version="${version#v}"
+          image_path="${IMAGE_NAME#ghcr.io/}"
+
+          # A direct registry status check, not a parsed `imagetools
+          # inspect` error message: the previous fix narrowed the original
+          # fail-open bug ("any error" means "safe to publish") down to
+          # "any error saying 'not found' means safe to publish" -- which
+          # is still too broad. An existing multi-platform index with one
+          # missing child manifest, or an unrelated tooling error that
+          # happens to contain that phrase, would both misread as "tag
+          # absent" and reopen the overwrite path (review round 3,
+          # finding 1, same class of bug one layer in). A plain GET
+          # against the registry's own manifest endpoint resolves only the
+          # exact reference named in the URL and never recurses into child
+          # manifests, so its HTTP status means exactly one thing --
+          # verified directly against a real public GHCR image before
+          # relying on it: 200 for a tag that exists, 404 for one that
+          # doesn't.
+          token_response=$(curl -fsSL -u "${GH_ACTOR}:${GH_TOKEN}" \
+            "https://ghcr.io/token?scope=repository:${image_path}:pull&service=ghcr.io") || {
+            echo "::error::could not obtain a GHCR registry token to check whether ${IMAGE_NAME}:${version} already exists -- failing closed rather than risking an overwrite."
+            exit 1
+          }
+          token=$(echo "$token_response" | jq -r '.token // empty')
+          if [ -z "$token" ]; then
+            echo "::error::GHCR token response had no 'token' field -- failing closed. Response was: $token_response"
+            exit 1
+          fi
+
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${token}" \
+            -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
+            "https://ghcr.io/v2/${image_path}/manifests/${version}")
+
+          case "$status" in
+            200)
+              echo "::error::${IMAGE_NAME}:${version} already exists on GHCR. Tags there are mutable, but a re-run of a tag build must not silently replace what consumers already pulled -- delete the existing package version first if that's really what's intended, or cut a new version."
+              exit 1
+              ;;
+            404)
+              echo "${IMAGE_NAME}:${version} does not exist yet -- OK to publish."
+              ;;
+            *)
+              echo "::error::could not confirm whether ${IMAGE_NAME}:${version} already exists on GHCR -- the registry responded with HTTP ${status} (expected 200 for 'exists' or 404 for 'absent'). Failing closed rather than risking a silent overwrite. This can also happen on a genuinely first-ever publish if GHCR responds with something other than a plain 404 for a package that doesn't exist at all yet; if that's what happened here, re-run once you've confirmed it by hand."
+              exit 1
+              ;;
+          esac
+
+  # A matrix over one job per architecture, each on a runner native to that
+  # architecture -- not QEMU, because the builder stage compiles mysqlclient
+  # from source and doing that under emulation is the slowest option
+  # available. Pushes by digest, not by tag; `merge` joins the digests into
+  # one multi-arch manifest.
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Compute cache/artifact scope for this platform
+        run: |
+          platform="${{ matrix.platform }}"
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+
+      # Required: the `type=gha` cache backend below isn't supported on the
+      # default docker driver (review note 7).
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          # Per-platform scope: a shared default scope would let the two
+          # concurrent matrix jobs overwrite each other's cache.
+          # mode=max keeps the builder stage's compiled mysqlclient wheels
+          # -- the only expensive part of this build (review note 7).
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Joins the per-architecture digests into one multi-arch manifest and
+  # tags it. Runs on a different runner than `build`, so it logs in again.
+  merge:
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          # metadata-action's automatic `latest` handling can't express
+          # "tags only, never dispatch" -- `latest` is added explicitly
+          # below instead, gated to tag events only.
+          #
+          # All three release-shaped tag types are gated on
+          # `github.event_name == 'push'`, not on `github.ref`/`startsWith`.
+          # `workflow_dispatch` can be launched against *any* ref, including
+          # an existing `refs/tags/v...` -- a ref-pattern gate would then be
+          # true on a dispatch too, and `type=semver` has no ref-pattern
+          # gate at all by default, so it would silently republish the real
+          # version tag on a dispatch aimed at a release tag, bypassing the
+          # `validate` job's overwrite guard entirely (that guard only runs
+          # `if: github.event_name != 'workflow_dispatch'`). `event_name` is
+          # set by GitHub itself from how the run was triggered and can't be
+          # influenced by which ref a dispatch targets, so it's the only
+          # gate that actually holds regardless of ref (codex review
+          # round 2, finding 1, plus the compounding path it named).
+          #
+          # `latest` carries one more condition than `semver`/`sha-*`:
+          # `needs.validate.outputs.is_prerelease == 'false'`. Release-
+          # candidate tags (`v0.2.0-rc.1`) are a real `push` tag event and
+          # do publish their own version tag and `sha-*`, but must never
+          # republish `latest` over an unreleased candidate built from a
+          # commit that need not even be on `main` (PLAN rev 3, decision 5
+          # amendment -- see `validate`'s own comment for why the
+          # prerelease test is provable, not heuristic).
+          flavor: |
+            latest=false
+          tags: |
+            type=semver,pattern={{version}},enable=${{ github.event_name == 'push' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' && needs.validate.outputs.is_prerelease == 'false' }}
+            type=sha,prefix=sha-,enable=${{ github.event_name == 'push' }}
+            type=raw,value=${{ inputs.image_tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          # Word-splitting is the point here: each expands to multiple
+          # separate `-t <tag>` / `<image>@<digest>` arguments, not one
+          # quoted string.
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: Inspect manifest and record digest
+        id: inspect
+        run: |
+          docker buildx imagetools inspect "${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}" \
+            --format '{{json .Manifest}}' > /tmp/manifest.json
+          digest=$(jq -r '.digest' /tmp/manifest.json)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Published \`${{ env.IMAGE_NAME }}\`"
+            echo
+            echo "**Tags:**"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo
+            echo "**Manifest digest:** \`$digest\`"
+            echo
+            echo "**Platforms:**"
+            echo '```'
+            docker buildx imagetools inspect "${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # So a public consumer can verify the image was actually built by this
+      # workflow from this repository, not injected some other way.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.inspect.outputs.digest }}
+          push-to-registry: true
