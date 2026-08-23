@@ -48,6 +48,7 @@ from .admin import (
     NetworkDevicePortForm,
     NetworkDevicePortInline,
     NetworkDeviceTypeAdmin,
+    NetworkDeviceTypeChoiceField,
     NetworkDeviceTypePortInline,
     NetworkSwitchAddForm,
     NetworkSwitchAddressInline,
@@ -78,6 +79,7 @@ from .models import (
     VLAN,
     Department,
     NetworkDevice,
+    NetworkDeviceModel,
     NetworkDevicePort,
     NetworkDeviceType,
     NetworkDeviceTypePort,
@@ -141,14 +143,37 @@ def _make_switch_type(port_count: int = 0, **kwargs) -> NetworkSwitchType:
     return switch_type
 
 
+def _device_model(manufacturer: str, model: str) -> NetworkDeviceModel:
+    """Get-or-create the ``NetworkDeviceModel`` a fixture needs (ADR 0026)
+    — every direct ``NetworkDeviceType(...)``/``.objects.create(...)`` call
+    in this file that used to pass ``manufacturer=``/``model=`` directly
+    now builds its ``device_model`` through this helper instead. Tests
+    here don't care about deduplicating model rows across cases, so
+    ``get_or_create`` is correct and simple.
+    """
+    return NetworkDeviceModel.objects.get_or_create(manufacturer=manufacturer, model=model)[0]
+
+
 def _make_device_type(port_count: int = 0, vlan: VLAN | None = None, **kwargs) -> NetworkDeviceType:
     """See ``_make_switch_type`` — same reasoning for
     ``NetworkDeviceType``/``NetworkDeviceTypePort``/``NetworkDevicePort``.
+
+    ADR 0026 — the hardware identity moved to ``NetworkDeviceModel``.
+    Callers may still pass ``manufacturer=``/``model=`` (the common case:
+    a fixture that doesn't care about the model row) and this builds the
+    ``device_model`` for them via ``_device_model()``, or pass
+    ``device_model=`` directly to reuse/inspect a specific row.
     """
-    kwargs.setdefault("manufacturer", "Martin Audio")
-    kwargs.setdefault("model", "IK-42")
+    device_model = kwargs.pop("device_model", None)
+    if device_model is None:
+        manufacturer = kwargs.pop("manufacturer", "Martin Audio")
+        model = kwargs.pop("model", "IK-42")
+        device_model = _device_model(manufacturer, model)
+    else:
+        kwargs.pop("manufacturer", None)
+        kwargs.pop("model", None)
     kwargs.setdefault("name", "Default")
-    device_type = NetworkDeviceType.objects.create(port_count=port_count, **kwargs)
+    device_type = NetworkDeviceType.objects.create(port_count=port_count, device_model=device_model, **kwargs)
     for n in range(1, port_count + 1):
         assert vlan is not None, "vlan is required when port_count > 0"
         NetworkDeviceTypePort.objects.create(
@@ -290,7 +315,7 @@ class NetworkDeviceTypePortTests(TestCase):
     def setUp(self) -> None:
         self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
         self.device_type = NetworkDeviceType.objects.create(
-            manufacturer="Martin Audio", model="IK-42", name="Default", port_count=0
+            device_model=_device_model("Martin Audio", "IK-42"), name="Default", port_count=0
         )
 
     def test_blank_description_rejected_via_clean(self) -> None:
@@ -1424,6 +1449,17 @@ class RemovalSemanticsTests(TestCase):
         with self.assertRaises(ProtectedError):
             self.device_type.delete()
 
+    def test_device_model_removal_blocked_while_profile_exists(self) -> None:
+        # ADR 0026 — device_model is PROTECT; a NetworkDeviceType profile
+        # still points at it.
+        with self.assertRaises(ProtectedError):
+            self.device_type.device_model.delete()
+
+    def test_device_model_removal_succeeds_without_profiles(self) -> None:
+        device_model = NetworkDeviceModel.objects.create(manufacturer="Orphan", model="Model")
+        device_model.delete()
+        self.assertFalse(NetworkDeviceModel.objects.filter(pk=device_model.pk).exists())
+
     def test_deleting_switch_unassigns_rather_than_deletes_connected_device_port(self) -> None:
         switch = NetworkSwitch.objects.create(switch_type=self.switch_type)
         switch_port = NetworkSwitchPort.objects.create(switch=switch, port_number=1)
@@ -1678,7 +1714,7 @@ class TypePortAuditTests(TestCase):
 
     def test_device_type_port_creation_is_logged(self) -> None:
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Martin Audio", model="IK-42", name="Default", port_count=0
+            device_model=_device_model("Martin Audio", "IK-42"), name="Default", port_count=0
         )
         type_port = NetworkDeviceTypePort.objects.create(
             device_type=device_type, description="Dante Primary", port_type=PortType.GBE_RJ45, vlan=self.vlan
@@ -1767,9 +1803,11 @@ class DeleteConfirmationTests(TestCase):
 
 
 class TypeProfileNameTests(TestCase):
-    """ADR 0010: a Type's identity is (manufacturer, model, name), not just
-    (manufacturer, model) — multiple purpose-profiles for one hardware
-    model is the whole point.
+    """ADR 0010: a Switch Type's identity is (manufacturer, model, name),
+    not just (manufacturer, model) — multiple purpose-profiles for one
+    hardware model is the whole point. A Device Type's identity is the
+    ADR 0026 equivalent, (device_model, name) — the two Type models
+    deliberately diverge until switches are aligned (issue #78).
     """
 
     def test_switch_type_unique_per_manufacturer_model_name(self) -> None:
@@ -1794,17 +1832,27 @@ class TypeProfileNameTests(TestCase):
             )
 
     def test_device_type_allows_multiple_profiles_for_same_model(self) -> None:
-        NetworkDeviceType.objects.create(
-            manufacturer="Martin Audio", model="IK-42", name="with Dante Card", port_count=0
-        )
-        NetworkDeviceType.objects.create(
-            manufacturer="Martin Audio", model="IK-42", name="without Dante Card", port_count=0
+        """ADR 0026 — the IK-42 shape: two profiles collapse to one
+        ``NetworkDeviceModel``, and ``(device_model, name)`` still rejects
+        a duplicate profile name for that model.
+        """
+        model = _device_model("Martin Audio", "IK-42")
+        with_card = NetworkDeviceType.objects.create(device_model=model, name="with Dante Card", port_count=0)
+        without_card = NetworkDeviceType.objects.create(
+            device_model=model, name="without Dante Card", port_count=0
         )  # must not raise
+        self.assertEqual(with_card.device_model_id, without_card.device_model_id)
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            NetworkDeviceType.objects.create(device_model=model, name="with Dante Card", port_count=0)
 
     def test_device_type_name_cannot_be_blank(self) -> None:
         with self.assertRaises(IntegrityError), transaction.atomic():
             NetworkDeviceType.objects.bulk_create(
-                [NetworkDeviceType(manufacturer="Martin Audio", model="IK-42", name="", port_count=0)]
+                [
+                    NetworkDeviceType(
+                        device_model=_device_model("Martin Audio", "IK-42"), name="", port_count=0
+                    )
+                ]
             )
 
 
@@ -1869,7 +1917,7 @@ class PortProfileMaterializationTests(TestCase):
 
     def test_incomplete_device_profile_rejected(self) -> None:
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Martin Audio", model="IK-42", name="Default", port_count=2
+            device_model=_device_model("Martin Audio", "IK-42"), name="Default", port_count=2
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type, description="Port 1", port_type=PortType.GBE_RJ45, vlan=self.vlan_a
@@ -1953,7 +2001,7 @@ class StaticPortAddressingTests(TestCase):
         shape every device except Switched Mode satisfies.
         """
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Martin Audio", model="IK-42", port_count=2, **kwargs
+            device_model=_device_model("Martin Audio", "IK-42"), port_count=2, **kwargs
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type, description="Control", port_type=PortType.GBE_RJ45, vlan=self.vlan_a
@@ -2008,7 +2056,7 @@ class StaticPortAddressingTests(TestCase):
 
     def test_l2_only_port_stays_dhcp_other_port_goes_static(self) -> None:
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Martin Audio", model="IK-42", name="Mixed VLAN", port_count=2
+            device_model=_device_model("Martin Audio", "IK-42"), name="Mixed VLAN", port_count=2
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type, description="Control", port_type=PortType.GBE_RJ45, vlan=self.vlan_a
@@ -2031,7 +2079,7 @@ class StaticPortAddressingTests(TestCase):
         admin's clean()-time one) catches it.
         """
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Shure", model="ULXD4Q", name="Switched", port_count=2
+            device_model=_device_model("Shure", "ULXD4Q"), name="Switched", port_count=2
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type, description="Dante A", port_type=PortType.GBE_RJ45, vlan=self.vlan_b
@@ -2049,7 +2097,7 @@ class StaticPortAddressingTests(TestCase):
     def test_missing_rack_vlan_range_refused_atomically(self) -> None:
         no_range_vlan = VLAN.objects.create(name="No Range", vlan_id=202, subnet="10.202.0.0/21")
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Martin Audio", model="IK-42", name="No Range Type", port_count=1
+            device_model=_device_model("Martin Audio", "IK-42"), name="No Range Type", port_count=1
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type, description="Port A", port_type=PortType.GBE_RJ45, vlan=no_range_vlan
@@ -2060,7 +2108,7 @@ class StaticPortAddressingTests(TestCase):
 
     def test_collision_with_existing_address_refused_atomically(self) -> None:
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Martin Audio", model="IK-42", name="Collision Type", port_count=1
+            device_model=_device_model("Martin Audio", "IK-42"), name="Collision Type", port_count=1
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type, description="Port A", port_type=PortType.GBE_RJ45, vlan=self.vlan_a
@@ -2154,7 +2202,7 @@ class StaticPortAddressingTests(TestCase):
         admin_user.groups.add(Group.objects.get(name="Admin"))
         self.client.login(username="adminrole2", password="testpass123")
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Shure", model="ULXD4Q", name="Admin Switched", port_count=2
+            device_model=_device_model("Shure", "ULXD4Q"), name="Admin Switched", port_count=2
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type, description="Dante A", port_type=PortType.GBE_RJ45, vlan=self.vlan_b
@@ -2212,7 +2260,7 @@ class StaticPortAddressingTests(TestCase):
         )
         NetworkSwitchAddress.objects.create(switch=switch, vlan=self.vlan_a, address="10.200.1.2")
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Martin Audio", model="IK-42", name="Collision Admin Type", port_count=1
+            device_model=_device_model("Martin Audio", "IK-42"), name="Collision Admin Type", port_count=1
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type, description="Port A", port_type=PortType.GBE_RJ45, vlan=self.vlan_a
@@ -2280,7 +2328,7 @@ class SlotOffsetAddressingTests(TestCase):
         console-with-derived-engine shape the ADR exists to represent.
         """
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="DiGiCo", model="SD12", port_count=2, **kwargs
+            device_model=_device_model("DiGiCo", "SD12"), port_count=2, **kwargs
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type,
@@ -2304,7 +2352,7 @@ class SlotOffsetAddressingTests(TestCase):
         addressing path (plan review note 4), not only the static one.
         """
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Test", model="Orphan", port_count=1, **kwargs
+            device_model=_device_model("Test", "Orphan"), port_count=1, **kwargs
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type,
@@ -2441,7 +2489,7 @@ class SlotOffsetAddressingTests(TestCase):
 
     def test_type_with_zero_ports_yields_span_one(self) -> None:
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Generic", model="Empty", name="Zero Ports", port_count=0
+            device_model=_device_model("Generic", "Empty"), name="Zero Ports", port_count=0
         )
         self.assertEqual(device_type.slot_span, 1)
 
@@ -2479,7 +2527,7 @@ class SlotOffsetAddressingTests(TestCase):
     # the pre-flight narrowed, not lost, this case.
     def test_switched_mode_still_refused_same_vlan_same_offset(self) -> None:
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Shure", model="ULXD4Q", name="Switched Offset Check", port_count=2
+            device_model=_device_model("Shure", "ULXD4Q"), name="Switched Offset Check", port_count=2
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type,
@@ -3373,7 +3421,7 @@ class PortProfileAtomicityTests(TestCase):
     def test_failed_device_materialization_rolls_back_parent(self) -> None:
         vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Martin Audio", model="IK-42", name="Default", port_count=2
+            device_model=_device_model("Martin Audio", "IK-42"), name="Default", port_count=2
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type, description="Port 1", port_type=PortType.GBE_RJ45, vlan=vlan
@@ -3396,7 +3444,7 @@ class PortProfileTypeImmutabilityTests(TestCase):
         )
         self.device_type_a = _make_device_type()
         self.device_type_b = NetworkDeviceType.objects.create(
-            manufacturer="Martin Audio", model="IK-42", name="Other Profile", port_count=0
+            device_model=_device_model("Martin Audio", "IK-42"), name="Other Profile", port_count=0
         )
 
     def test_switch_type_cannot_change_via_plain_save(self) -> None:
@@ -3439,6 +3487,155 @@ class PortProfileTypeImmutabilityTests(TestCase):
         device = NetworkDevice.objects.create(device_type=self.device_type_a)
         admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
         self.assertIn("device_type", admin.get_readonly_fields(RequestFactory().get("/"), device))
+
+
+class NetworkDeviceModelTests(TestCase):
+    """ADR 0026 — the bare hardware identity."""
+
+    def test_unique_constraint_is_case_insensitive(self) -> None:
+        # Measured against MariaDB 11.8 utf8mb4_uca1400_ai_ci (ADR 0026) —
+        # collation-dependent, pinned here so a database change would be
+        # caught rather than silently passing.
+        NetworkDeviceModel.objects.create(manufacturer="DiGiCo", model="SD12")
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            NetworkDeviceModel.objects.create(manufacturer="Digico", model="SD12")
+
+    def test_unique_constraint_is_punctuation_sensitive(self) -> None:
+        # Only punctuation/spacing can produce two rows for one box under
+        # this collation — case does not (see the test above).
+        NetworkDeviceModel.objects.create(manufacturer="Lab.Gruppen", model="LM26")
+        NetworkDeviceModel.objects.create(manufacturer="Lab Gruppen", model="LM26")  # must not raise
+
+    def test_manufacturer_cannot_be_blank(self) -> None:
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            NetworkDeviceModel.objects.bulk_create([NetworkDeviceModel(manufacturer="", model="X")])
+
+    def test_model_cannot_be_blank(self) -> None:
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            NetworkDeviceModel.objects.bulk_create([NetworkDeviceModel(manufacturer="X", model="")])
+
+    def test_str_is_manufacturer_and_model(self) -> None:
+        device_model = NetworkDeviceModel.objects.create(manufacturer="Amphenol", model="RJD32A3-0050")
+        self.assertEqual(str(device_model), "Amphenol RJD32A3-0050")
+
+    def test_description_blank_by_default(self) -> None:
+        device_model = NetworkDeviceModel.objects.create(manufacturer="Amphenol", model="RJD32A3-0050")
+        self.assertEqual(device_model.description, "")
+
+
+class NetworkDeviceTypeStrTests(TestCase):
+    """ADR 0026 settled decision 4 — ``NetworkDeviceType.__str__`` stays
+    byte-identical to its pre-ADR-0026 form for every existing row. This
+    is load-bearing: it's what keeps every template site and both
+    operator-addressed error messages (``models.py:308``/``4261``, see
+    ``OperatorSetPortTests`` above) unchanged with no edit.
+    """
+
+    def test_str_is_byte_identical_to_pre_adr_0026_format(self) -> None:
+        device_type = _make_device_type(manufacturer="Amphenol", model="RJD32A3-0050", name="Default")
+        self.assertEqual(str(device_type), "Amphenol RJD32A3-0050 — Default")
+
+    def test_str_reflects_edited_model_row(self) -> None:
+        # Decision 3's payoff, in __str__ terms — editing the model row
+        # changes what every one of its profiles renders as.
+        device_model = NetworkDeviceModel.objects.create(manufacturer="Lab.Gruppen", model="LM26")
+        device_type = NetworkDeviceType.objects.create(
+            device_model=device_model, name="Switched", port_count=0
+        )
+        device_model.manufacturer = "Lab Gruppen"
+        device_model.save()
+        device_type.refresh_from_db()
+        self.assertEqual(str(device_type), "Lab Gruppen LM26 — Switched")
+
+
+class DeviceModelLockTests(TestCase):
+    """ADR 0026 settled decision 5 — ``device_model_id`` joins
+    ``NetworkDeviceType._locked_snapshot()`` in place of ``manufacturer``/
+    ``model``: re-pointing a profile at a *different* model once instances
+    exist stays forbidden, exactly as ADR 0010's original two-string lock
+    did.
+
+    Review note 8 pinned down where a naive test would pass under a wrong
+    snapshot key (``"device_model_id"`` instead of ``"device_model"``): a
+    bare ``save()``/``clean()`` catches it either way, but
+    ``save(update_fields=["device_model"])`` does not, because
+    ``_check_locked_fields_unchanged``'s docstring says ``update_fields``
+    is normalized to field names before comparison — a snapshot keyed
+    ``"device_model_id"`` would then intersect nothing and the helper
+    would return early as a silent no-op. So both spellings are driven
+    here, and every raising case re-reads from the database to prove the
+    FK didn't move, not just that something raised.
+    """
+
+    def setUp(self) -> None:
+        self.model_a = NetworkDeviceModel.objects.create(manufacturer="Martin Audio", model="IK-42")
+        self.model_b = NetworkDeviceModel.objects.create(manufacturer="DiGiCo", model="SD12")
+        self.device_type = NetworkDeviceType.objects.create(
+            device_model=self.model_a, name="Default", port_count=0
+        )
+
+    def test_plain_save_blocked_once_instance_exists(self) -> None:
+        NetworkDevice.objects.create(device_type=self.device_type)
+        self.device_type.device_model = self.model_b
+        with self.assertRaises(ValidationError):
+            self.device_type.save()
+        self.device_type.refresh_from_db()
+        self.assertEqual(self.device_type.device_model_id, self.model_a.pk)
+
+    def test_clean_blocked_once_instance_exists(self) -> None:
+        NetworkDevice.objects.create(device_type=self.device_type)
+        self.device_type.device_model = self.model_b
+        with self.assertRaises(ValidationError):
+            self.device_type.full_clean()
+        self.device_type.refresh_from_db()
+        self.assertEqual(self.device_type.device_model_id, self.model_a.pk)
+
+    def test_save_update_fields_device_model_blocked_once_instance_exists(self) -> None:
+        NetworkDevice.objects.create(device_type=self.device_type)
+        self.device_type.device_model = self.model_b
+        with self.assertRaises(ValidationError):
+            self.device_type.save(update_fields=["device_model"])
+        self.device_type.refresh_from_db()
+        self.assertEqual(self.device_type.device_model_id, self.model_a.pk)
+
+    def test_save_update_fields_device_model_id_blocked_once_instance_exists(self) -> None:
+        """Django accepts both the field name and its attname in
+        ``update_fields`` — this is the spelling that would silently pass
+        under a wrong ``"device_model_id"`` snapshot key (review note 8).
+        """
+        NetworkDevice.objects.create(device_type=self.device_type)
+        self.device_type.device_model = self.model_b
+        with self.assertRaises(ValidationError):
+            self.device_type.save(update_fields=["device_model_id"])
+        self.device_type.refresh_from_db()
+        self.assertEqual(self.device_type.device_model_id, self.model_a.pk)
+
+    def test_device_model_editable_before_any_instance(self) -> None:
+        self.device_type.device_model = self.model_b
+        self.device_type.save()  # no instances yet -> must not raise
+        self.device_type.full_clean()
+        self.device_type.save(update_fields=["device_model"])
+        self.device_type.save(update_fields=["device_model_id"])
+        self.device_type.refresh_from_db()
+        self.assertEqual(self.device_type.device_model_id, self.model_b.pk)
+
+    def test_editing_the_model_row_itself_is_not_locked_and_updates_every_profile(self) -> None:
+        """ADR 0026 decision 3's payoff — the behaviour ADR 0010 forbade
+        and this ADR deliberately allows: editing ``manufacturer`` on a
+        model row whose profiles have instances succeeds, and every
+        profile reads the new value through the FK.
+        """
+        other_profile = NetworkDeviceType.objects.create(
+            device_model=self.model_a, name="Other Profile", port_count=0
+        )
+        NetworkDevice.objects.create(device_type=self.device_type)
+        self.model_a.manufacturer = "Lab Gruppen"
+        self.model_a.full_clean()
+        self.model_a.save()  # must not raise -- the model row itself isn't locked
+        self.device_type.refresh_from_db()
+        other_profile.refresh_from_db()
+        self.assertEqual(self.device_type.device_model.manufacturer, "Lab Gruppen")
+        self.assertEqual(other_profile.device_model.manufacturer, "Lab Gruppen")
 
 
 class PortProfileLockedFieldTests(TestCase):
@@ -3591,8 +3788,7 @@ class PortProfileTemplateLockTests(TestCase):
         NetworkDevice.objects.create(device_type=device_type)
         admin = NetworkDeviceTypeAdmin(NetworkDeviceType, AdminSite())
         readonly = admin.get_readonly_fields(RequestFactory().get("/"), device_type)
-        self.assertIn("manufacturer", readonly)
-        self.assertIn("model", readonly)
+        self.assertIn("device_model", readonly)  # ADR 0026 — replaces manufacturer/model
         self.assertIn("name", readonly)
 
     def test_two_new_device_type_ports_in_one_submission_get_distinct_ordinals(self) -> None:
@@ -4948,6 +5144,36 @@ class DepartmentAuditTests(TestCase):
         self.assertIn("department", entries.first().changes_dict)
 
 
+class NetworkDeviceModelAuditTests(TestCase):
+    """ADR 0026 — ``NetworkDeviceModel`` is registered bare in
+    ``AUDITLOG_INCLUDE_TRACKING_MODELS`` (following ``Department``/
+    ``Owner``). A settings-tuple string is a typo or an omission away from
+    silently tracking nothing, so this proves create/update/delete
+    coverage directly rather than trusting the registration.
+    """
+
+    def test_creation_produces_create_log_entry(self) -> None:
+        device_model = NetworkDeviceModel.objects.create(manufacturer="Amphenol", model="RJD32A3-0050")
+        self.assertTrue(
+            LogEntry.objects.filter(object_pk=str(device_model.pk), action=LogEntry.Action.CREATE).exists()
+        )
+
+    def test_edit_produces_update_log_entry(self) -> None:
+        device_model = NetworkDeviceModel.objects.create(manufacturer="Amphenol", model="RJD32A3-0050")
+        LogEntry.objects.filter(object_pk=str(device_model.pk)).delete()
+        device_model.description = "Dante Interface with AES3 I/O"
+        device_model.save()
+        entries = LogEntry.objects.filter(object_pk=str(device_model.pk), action=LogEntry.Action.UPDATE)
+        self.assertEqual(entries.count(), 1)
+        self.assertIn("description", entries.first().changes_dict)
+
+    def test_deletion_produces_delete_log_entry(self) -> None:
+        device_model = NetworkDeviceModel.objects.create(manufacturer="Amphenol", model="RJD32A3-0050")
+        pk = device_model.pk
+        device_model.delete()
+        self.assertTrue(LogEntry.objects.filter(object_pk=str(pk), action=LogEntry.Action.DELETE).exists())
+
+
 class OwnerModelTests(TestCase):
     """ADR 0023 decision 1 / PLAN-hostname-ingredients.md settled decision 4:
     ``Owner`` is a slug+name table, both required and unique, ``slug``
@@ -5113,12 +5339,12 @@ class TypeHostnameSlugTests(TestCase):
         NetworkDevice.objects.create(device_type=device_type, hostname="dev1")
         admin = NetworkDeviceTypeAdmin(NetworkDeviceType, AdminSite())
         readonly = admin.get_readonly_fields(RequestFactory().get("/"), device_type)
-        self.assertIn("manufacturer", readonly)  # sanity — the lock is real
+        self.assertIn("device_model", readonly)  # sanity — the lock is real (ADR 0026)
         self.assertNotIn("hostname_slug", readonly)
 
     def test_invalid_hostname_slug_rejected(self) -> None:
         device_type = NetworkDeviceType(
-            manufacturer="M", model="M", name="Default", port_count=0, hostname_slug="-bad"
+            device_model=_device_model("M", "M"), name="Default", port_count=0, hostname_slug="-bad"
         )
         with self.assertRaises(ValidationError):
             device_type.full_clean()
@@ -5529,7 +5755,7 @@ def _make_console_type_for_hostname_suffix() -> NetworkDeviceType:
     """
     vlan = VLAN.objects.create(name="Control HN", vlan_id=6011, subnet="10.202.0.0/27")
     device_type = NetworkDeviceType.objects.create(
-        manufacturer="Test", model="Console-HN", name="Default", port_count=1
+        device_model=_device_model("Test", "Console-HN"), name="Default", port_count=1
     )
     NetworkDeviceTypePort.objects.create(
         device_type=device_type,
@@ -6401,6 +6627,88 @@ class HostnameDivergesAdminFilterTests(TestCase):
         self.assertIn("mps-wpcsrl-ik42", content)
 
 
+class NetworkDeviceTypeAdminSearchTests(TestCase):
+    """ADR 0026 / Codex review note 3 — ``search_fields`` names
+    ``device_model__manufacturer``/``device_model__model``, not the bare
+    FK (which raises ``FieldError`` the moment an operator types in the
+    search box). Exercised by actually hitting the changelist with a
+    ``?q=`` term, not by asserting the tuple's contents — that assertion
+    is exactly what would have let the bug through.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.admin_user = User.objects.create_user("search-admin", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.force_login(self.admin_user)
+        self.matching = _make_device_type(manufacturer="Amphenol", model="RJD32A3-0050", name="Default")
+        self.other = _make_device_type(manufacturer="DiGiCo", model="SD12", name="Default")
+
+    def test_search_by_manufacturer_does_not_raise_and_filters(self) -> None:
+        response = self.client.get("/admin/inventory/networkdevicetype/?q=Amphenol")
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode()
+        self.assertIn("RJD32A3-0050", content)
+        self.assertNotIn("SD12", content)
+
+    def test_search_by_model_does_not_raise_and_filters(self) -> None:
+        response = self.client.get("/admin/inventory/networkdevicetype/?q=RJD32A3-0050")
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode()
+        self.assertIn("RJD32A3-0050", content)
+        self.assertNotIn("SD12", content)
+
+
+class NetworkDeviceModelAdminSearchTests(TestCase):
+    """The new model's own changelist search."""
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.admin_user = User.objects.create_user(
+            "model-search-admin", password="testpass123", is_staff=True
+        )
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.force_login(self.admin_user)
+        NetworkDeviceModel.objects.create(
+            manufacturer="Amphenol", model="RJD32A3-0050", description="Dante Interface with AES3 I/O"
+        )
+        NetworkDeviceModel.objects.create(manufacturer="DiGiCo", model="SD12")
+
+    def test_search_by_description_does_not_raise_and_filters(self) -> None:
+        response = self.client.get("/admin/inventory/networkdevicemodel/?q=AES3")
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode()
+        self.assertIn("RJD32A3-0050", content)
+        self.assertNotIn("SD12", content)
+
+
+class NetworkDeviceTypeChoiceFieldTests(TestCase):
+    """ADR 0026 settled decision 1 — the picker label carries the
+    description, and plain ``str(type)`` (no empty parentheses) when it's
+    blank.
+    """
+
+    def test_label_includes_description_when_present(self) -> None:
+        device_type = _make_device_type(manufacturer="Amphenol", model="RJD32A3-0050", name="Default")
+        device_type.device_model.description = "Dante Interface with AES3 I/O"
+        device_type.device_model.save()
+        field = NetworkDeviceTypeChoiceField(
+            queryset=NetworkDeviceType.objects.select_related("device_model")
+        )
+        self.assertEqual(
+            field.label_from_instance(device_type),
+            "Amphenol RJD32A3-0050 — Default (Dante Interface with AES3 I/O)",
+        )
+
+    def test_label_is_plain_str_when_description_blank(self) -> None:
+        device_type = _make_device_type(manufacturer="Amphenol", model="RJD32A3-0050", name="Default")
+        field = NetworkDeviceTypeChoiceField(
+            queryset=NetworkDeviceType.objects.select_related("device_model")
+        )
+        self.assertEqual(field.label_from_instance(device_type), "Amphenol RJD32A3-0050 — Default")
+        self.assertNotIn("(", field.label_from_instance(device_type))
+
+
 class HostnameNormaliseMigrationTests(TransactionTestCase):
     """``0017_hostname_normalise`` (PLAN-hostname-computation.md PR 1) —
     reconstructs the schema as of ``0016_hostname_ingredients`` (immediately
@@ -6660,6 +6968,190 @@ class SeedHostnameSlugsMigrationTests(TransactionTestCase):
         amphenol.refresh_from_db()
         self.assertEqual(switch_type.hostname_slug, "sg300-10mp")
         self.assertEqual(amphenol.hostname_slug, "rjd1212")
+
+
+class DeviceModelBackfillDataTests(TransactionTestCase):
+    """``0021_device_model_backfill``'s ``collapse_and_repoint`` (PLAN-adr-
+    0026.md settled decision 6) — reconstructs the schema as of
+    ``0020_networkdevicemodel`` (immediately before this migration's own
+    operations run — the table and the nullable FK exist, the old
+    ``manufacturer``/``model`` columns and the old ``unique_device_type``
+    constraint still do too), same shape as
+    ``HostnameNormaliseMigrationTests``/``SeedHostnameSlugsMigrationTests``.
+
+    This validates data logic only — see
+    ``DeviceModelBackfillMigrationExecutorTests`` below for the real-DDL
+    forward+reverse coverage the independent review required (finding 9):
+    a ``_FakeSchemaEditor`` test like this one cannot see DDL ordering,
+    which is where both migration defects the review caught actually
+    lived.
+    """
+
+    apps: Any
+    _migration_module: Any
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        executor = MigrationExecutor(connection)
+        executor.migrate([("inventory", "0020_networkdevicemodel")])
+        executor.loader.build_graph()
+        cls.apps = executor.loader.project_state(("inventory", "0020_networkdevicemodel")).apps
+        cls._migration_module = importlib.import_module("inventory.migrations.0021_device_model_backfill")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        call_command("migrate", "inventory", verbosity=0)
+        super().tearDownClass()
+
+    def setUp(self) -> None:
+        self.schema_editor = _FakeSchemaEditor(connection.alias)
+
+    def _run(self) -> None:
+        self._migration_module.collapse_and_repoint(self.apps, self.schema_editor)
+
+    def test_three_types_across_two_models_collapse_and_repoint(self) -> None:
+        NetworkDeviceType = self.apps.get_model("inventory", "NetworkDeviceType")
+        HistoricalDeviceModel = self.apps.get_model("inventory", "NetworkDeviceModel")
+        with_card = NetworkDeviceType.objects.create(
+            manufacturer="Martin Audio", model="IK-42", name="with Dante Card", port_count=0
+        )
+        without_card = NetworkDeviceType.objects.create(
+            manufacturer="Martin Audio", model="IK-42", name="without Dante Card", port_count=0
+        )
+        other = NetworkDeviceType.objects.create(
+            manufacturer="DiGiCo", model="SD12", name="Default", port_count=0
+        )
+
+        self._run()
+
+        self.assertEqual(HistoricalDeviceModel.objects.count(), 2)
+        with_card.refresh_from_db()
+        without_card.refresh_from_db()
+        other.refresh_from_db()
+        self.assertEqual(with_card.device_model_id, without_card.device_model_id)
+        self.assertNotEqual(with_card.device_model_id, other.device_model_id)
+        ik42_model = HistoricalDeviceModel.objects.get(pk=with_card.device_model_id)
+        self.assertEqual(ik42_model.manufacturer, "Martin Audio")
+        self.assertEqual(ik42_model.model, "IK-42")
+        self.assertEqual(ik42_model.description, "")
+        sd12_model = HistoricalDeviceModel.objects.get(pk=other.device_model_id)
+        self.assertEqual(sd12_model.manufacturer, "DiGiCo")
+        self.assertEqual(sd12_model.model, "SD12")
+
+    def test_ik42_regression_two_profiles_one_model_does_not_crash(self) -> None:
+        """Without ``.order_by()`` on the backfill's ``values_list().
+        distinct()`` query, ``Meta.ordering`` (still ``["manufacturer",
+        "model", "name"]`` at this point in the migration graph) leaks
+        ``name`` into the ``SELECT DISTINCT``, so this two-profile,
+        one-model fixture yields two rows and the second ``create()``
+        violates ``unique_device_model`` — precisely the bug revision 1
+        shipped (settled decision 6). This test fails with an
+        ``IntegrityError`` without ``.order_by()`` and passes with it.
+        """
+        NetworkDeviceType = self.apps.get_model("inventory", "NetworkDeviceType")
+        HistoricalDeviceModel = self.apps.get_model("inventory", "NetworkDeviceModel")
+        NetworkDeviceType.objects.create(
+            manufacturer="Martin Audio", model="IK-42", name="with Dante Card", port_count=0
+        )
+        NetworkDeviceType.objects.create(
+            manufacturer="Martin Audio", model="IK-42", name="without Dante Card", port_count=0
+        )
+
+        self._run()
+
+        self.assertEqual(
+            HistoricalDeviceModel.objects.filter(manufacturer="Martin Audio", model="IK-42").count(), 1
+        )
+
+
+class DeviceModelBackfillMigrationExecutorTests(TransactionTestCase):
+    """A ``MigrationExecutor`` test that migrates ``0019 -> 0021`` and back
+    to ``0019`` for **real** — ``tests.py``'s other
+    ``MigrationExecutor``-driven tests (``RetireCompanionsMigrationTests``,
+    ``HostnameNormaliseMigrationTests``) are the precedent for driving the
+    executor forward against real DDL; this is PLAN-adr-0026.md's Tests
+    section review note 9: the ``_FakeSchemaEditor``-based tests above
+    validate data logic and **cannot** validate DDL ordering or reversal,
+    which is exactly where both migration defects the independent review
+    caught actually lived (constraint-vs-column ordering forward, and the
+    constraint returning before the data on reverse).
+
+    Fixture carries two ``"Default"``-named profiles of two *different*
+    models (DiGiCo/SD12, Yamaha/DM7C) alongside the IK-42 pair — the shape
+    that would collide on reverse under the ``unique_device_type`` this
+    migration used to declare (``(manufacturer, model, name)``) if step
+    5's repopulation didn't run *before* step 3's constraint returns
+    reversed: two rows both named "Default" with blank manufacturer/model
+    (Django's empty-string effective default) are exactly the estate's
+    real 22-way "Default" collision, scaled down to two.
+    """
+
+    def test_forward_and_reverse_with_multi_profile_data(self) -> None:
+        self.addCleanup(lambda: call_command("migrate", "inventory", verbosity=0))
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([("inventory", "0019_dante_unit_id")])
+        executor.loader.build_graph()
+        apps_0019 = executor.loader.project_state(("inventory", "0019_dante_unit_id")).apps
+        HistoricalDeviceType = apps_0019.get_model("inventory", "NetworkDeviceType")
+        with_card = HistoricalDeviceType.objects.create(
+            manufacturer="Martin Audio", model="IK-42", name="with Dante Card", port_count=0
+        )
+        without_card = HistoricalDeviceType.objects.create(
+            manufacturer="Martin Audio", model="IK-42", name="without Dante Card", port_count=0
+        )
+        sd12 = HistoricalDeviceType.objects.create(
+            manufacturer="DiGiCo", model="SD12", name="Default", port_count=0
+        )
+        dm7c = HistoricalDeviceType.objects.create(
+            manufacturer="Yamaha", model="DM7C", name="Default", port_count=0
+        )
+
+        # Forward: 0019 -> 0021. Proves the DDL ordering itself (steps 3/4
+        # before 6) is correct, not just the RunPython data logic.
+        executor = MigrationExecutor(connection)
+        executor.migrate([("inventory", "0021_device_model_backfill")])
+
+        self.assertEqual(NetworkDeviceModel.objects.count(), 3)
+        with_card_live = NetworkDeviceType.objects.get(pk=with_card.pk)
+        without_card_live = NetworkDeviceType.objects.get(pk=without_card.pk)
+        sd12_live = NetworkDeviceType.objects.get(pk=sd12.pk)
+        dm7c_live = NetworkDeviceType.objects.get(pk=dm7c.pk)
+        self.assertEqual(with_card_live.device_model_id, without_card_live.device_model_id)
+        self.assertEqual(with_card_live.device_model.manufacturer, "Martin Audio")
+        self.assertEqual(with_card_live.device_model.model, "IK-42")
+        self.assertEqual(sd12_live.device_model.manufacturer, "DiGiCo")
+        self.assertEqual(dm7c_live.device_model.manufacturer, "Yamaha")
+        self.assertEqual(sd12_live.name, "Default")
+        self.assertEqual(dm7c_live.name, "Default")
+
+        # Reverse: the only leg that would have caught the
+        # constraint-before-data defect (step 5 must sit between steps 3
+        # and 6, not after 3 alone) — two "Default"-named profiles of
+        # different models would collide on the old constraint the moment
+        # it's restored over still-blank manufacturer/model columns.
+        executor = MigrationExecutor(connection)
+        executor.migrate([("inventory", "0019_dante_unit_id")])
+        executor.loader.build_graph()
+        apps_0019_again = executor.loader.project_state(("inventory", "0019_dante_unit_id")).apps
+        ReversedDeviceType = apps_0019_again.get_model("inventory", "NetworkDeviceType")
+
+        reversed_with_card = ReversedDeviceType.objects.get(pk=with_card.pk)
+        reversed_without_card = ReversedDeviceType.objects.get(pk=without_card.pk)
+        reversed_sd12 = ReversedDeviceType.objects.get(pk=sd12.pk)
+        reversed_dm7c = ReversedDeviceType.objects.get(pk=dm7c.pk)
+        self.assertEqual(reversed_with_card.manufacturer, "Martin Audio")
+        self.assertEqual(reversed_with_card.model, "IK-42")
+        self.assertEqual(reversed_without_card.manufacturer, "Martin Audio")
+        self.assertEqual(reversed_without_card.model, "IK-42")
+        self.assertEqual(reversed_sd12.manufacturer, "DiGiCo")
+        self.assertEqual(reversed_sd12.model, "SD12")
+        self.assertEqual(reversed_dm7c.manufacturer, "Yamaha")
+        self.assertEqual(reversed_dm7c.model, "DM7C")
+        # Lossy, by design (settled decision 6) — description has no
+        # column to go back to on NetworkDeviceType, so nothing here
+        # asserts it survived reversal.
 
 
 class AssembleHostnameTests(TestCase):
@@ -8383,9 +8875,8 @@ class RackSlotSuggestionTests(TestCase):
         (ADR 0017's SD12-shaped example — see ``SlotOffsetAddressingTests``).
         """
         vlan = vlan or self.vlan
-        kwargs.setdefault("manufacturer", "DiGiCo")
-        kwargs.setdefault("model", "SD12")
-        device_type = NetworkDeviceType.objects.create(port_count=2, **kwargs)
+        device_model = kwargs.pop("device_model", None) or _device_model("DiGiCo", "SD12")
+        device_type = NetworkDeviceType.objects.create(port_count=2, device_model=device_model, **kwargs)
         NetworkDeviceTypePort.objects.create(
             device_type=device_type,
             description="Control",
@@ -8590,7 +9081,7 @@ class OperatorSetPortTests(TestCase):
         both on ``self.vlan`` — the exact shape issue #42 exists for.
         """
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Yamaha", model="DM7C", port_count=2, **kwargs
+            device_model=_device_model("Yamaha", "DM7C"), port_count=2, **kwargs
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type, description="Dante Primary", port_type=PortType.GBE_RJ45, vlan=self.vlan
@@ -8629,6 +9120,10 @@ class OperatorSetPortTests(TestCase):
         with self.assertRaises(ValidationError) as ctx:
             NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=5)
         self.assertIn("Device Control", str(ctx.exception))
+        # ADR 0026 settled decision 4 — this message reads through
+        # device_type's __str__ too; byte-identical to its pre-ADR-0026
+        # form is what keeps this assertion (and the message) unchanged.
+        self.assertIn(f"{device_type}'s 'Device Control' port is operator-addressed", str(ctx.exception))
         self.assertEqual(NetworkDevicePort.objects.count(), 0)  # nothing written
 
     def test_two_ports_one_vlan_accepted_when_one_is_operator(self) -> None:
@@ -8657,7 +9152,7 @@ class OperatorSetPortTests(TestCase):
         RackVlanRange.objects.create(rack=self.rack, vlan=control_vlan, address_range="10.200.6.0/27")
         RackVlanRange.objects.create(rack=self.rack, vlan=secondary_vlan, address_range="10.202.6.0/27")
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Yamaha", model="DM7C", name="Full Console Shape", port_count=4
+            device_model=_device_model("Yamaha", "DM7C"), name="Full Console Shape", port_count=4
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type, description="Control", port_type=PortType.GBE_RJ45, vlan=control_vlan
@@ -8702,7 +9197,7 @@ class OperatorSetPortTests(TestCase):
         5, untouched by this ADR).
         """
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Shure", model="ULXD4Q", name="Two Slot Ports", port_count=2
+            device_model=_device_model("Shure", "ULXD4Q"), name="Two Slot Ports", port_count=2
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type, description="A", port_type=PortType.GBE_RJ45, vlan=self.vlan
@@ -8739,7 +9234,7 @@ class OperatorSetPortTests(TestCase):
         ``SlotOffsetAddressingTests``' orphan-offset case 12).
         """
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Test", model="Bad Offset", name="Bad Offset", port_count=1
+            device_model=_device_model("Test", "Bad Offset"), name="Bad Offset", port_count=1
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type,
@@ -8749,8 +9244,14 @@ class OperatorSetPortTests(TestCase):
             address_source=PortAddressSource.OPERATOR,
             slot_offset=1,
         )
-        with self.assertRaises(ValidationError):
+        # ADR 0026 settled decision 4 — this operator-addressed error
+        # message reads through device_type's __str__, which stays
+        # byte-identical to its pre-ADR-0026 form ("Test Bad Offset —
+        # Bad Offset"); asserting the prefix here is what proves that,
+        # not just that something raised.
+        with self.assertRaises(ValidationError) as ctx:
             NetworkDevice.objects.create(device_type=device_type)
+        self.assertIn(f"{device_type}'s 'Bad' port is operator-addressed", str(ctx.exception))
 
     def test_unracked_device_materializes_operator_port_dhcp(self) -> None:
         device_type = self._make_console_type(name="DM7C Unracked")
@@ -8805,7 +9306,7 @@ class IsOperatorAddressedTests(TestCase):
         self.rack = Rack.objects.create(name="Rack 1", slot_count=10)
         RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.201.6.0/27")
         self.device_type = NetworkDeviceType.objects.create(
-            manufacturer="Yamaha", model="DM7C", name="Operator Addressed", port_count=2
+            device_model=_device_model("Yamaha", "DM7C"), name="Operator Addressed", port_count=2
         )
         NetworkDeviceTypePort.objects.create(
             device_type=self.device_type,
@@ -8870,7 +9371,7 @@ class IsOperatorAddressedTests(TestCase):
         # involved, so source_type_port is None from the start rather than
         # cleared after the fact (which _locked_fields() would refuse).
         bare_type = NetworkDeviceType.objects.create(
-            manufacturer="Test", model="Bare", name="Bare Port Device", port_count=0
+            device_model=_device_model("Test", "Bare"), name="Bare Port Device", port_count=0
         )
         bare_device = NetworkDevice.objects.create(device_type=bare_type)
         port = NetworkDevicePort.objects.create(
@@ -8896,7 +9397,7 @@ class OperatorPortDeriveCascadeIsolationTests(TestCase):
         self.rack = Rack.objects.create(name="Rack 1", slot_count=10)
         RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.201.6.0/27")
         self.device_type = NetworkDeviceType.objects.create(
-            manufacturer="Yamaha", model="DM7C+Engine", name="Cascade Isolation", port_count=3
+            device_model=_device_model("Yamaha", "DM7C+Engine"), name="Cascade Isolation", port_count=3
         )
         NetworkDeviceTypePort.objects.create(
             device_type=self.device_type,
@@ -8960,7 +9461,7 @@ class OperatorAddressSelfCollisionTests(TestCase):
 
     def test_operator_address_colliding_with_slot_suggestion_rejected(self) -> None:
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Yamaha", model="DM7C", name="Self Collision Slot", port_count=2
+            device_model=_device_model("Yamaha", "DM7C"), name="Self Collision Slot", port_count=2
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type, description="Dante Primary", port_type=PortType.GBE_RJ45, vlan=self.vlan
@@ -8985,7 +9486,7 @@ class OperatorAddressSelfCollisionTests(TestCase):
 
     def test_two_operator_ports_given_same_address_rejected(self) -> None:
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Yamaha", model="DM7C", name="Self Collision Operator", port_count=2
+            device_model=_device_model("Yamaha", "DM7C"), name="Self Collision Operator", port_count=2
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type,
@@ -9147,7 +9648,7 @@ class DerivedPortHostnameTests(TestCase):
         port with ``hostname_suffix="engine"``.
         """
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="DiGiCo", model="SD12", port_count=2, **kwargs
+            device_model=_device_model("DiGiCo", "SD12"), port_count=2, **kwargs
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type, description="Control", port_type=PortType.GBE_RJ45, vlan=self.vlan
@@ -9199,7 +9700,7 @@ class OperatorAddressAddFormTests(TestCase):
         self.rack = Rack.objects.create(name="Rack 1", slot_count=10)
         RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.201.6.0/27")
         self.device_type = NetworkDeviceType.objects.create(
-            manufacturer="Yamaha", model="DM7C", name="DM7C Form", port_count=2
+            device_model=_device_model("Yamaha", "DM7C"), name="DM7C Form", port_count=2
         )
         NetworkDeviceTypePort.objects.create(
             device_type=self.device_type,
@@ -9283,7 +9784,7 @@ class OperatorAddressAdminViewTests(TestCase):
         self.rack = Rack.objects.create(name="Rack 1", slot_count=10)
         RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.201.6.0/27")
         self.device_type = NetworkDeviceType.objects.create(
-            manufacturer="Yamaha", model="DM7C", name="DM7C Admin View", port_count=2
+            device_model=_device_model("Yamaha", "DM7C"), name="DM7C Admin View", port_count=2
         )
         NetworkDeviceTypePort.objects.create(
             device_type=self.device_type,
@@ -9312,7 +9813,7 @@ class OperatorAddressAdminViewTests(TestCase):
 
     def test_get_omits_operator_field_for_a_type_with_none(self) -> None:
         plain_type = NetworkDeviceType.objects.create(
-            manufacturer="Test", model="Plain", name="Plain Admin View", port_count=1
+            device_model=_device_model("Test", "Plain"), name="Plain Admin View", port_count=1
         )
         NetworkDeviceTypePort.objects.create(
             device_type=plain_type, description="Only Port", port_type=PortType.GBE_RJ45, vlan=self.vlan
@@ -9439,7 +9940,7 @@ class HostnameSuffixNormalizationTests(TestCase):
     def setUp(self) -> None:
         self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
         self.device_type = NetworkDeviceType.objects.create(
-            manufacturer="Test", model="Norm", name="Norm", port_count=1
+            device_model=_device_model("Test", "Norm"), name="Norm", port_count=1
         )
 
     def test_suffix_lowercased_and_stripped_on_save(self) -> None:
@@ -9659,7 +10160,7 @@ class AddInCardModelTests(TestCase):
 
     def test_is_add_in_card_editable_before_any_instance_exists(self) -> None:
         fresh_type = NetworkDeviceType.objects.create(
-            manufacturer="Fresh", model="Type", name="Default", port_count=0
+            device_model=_device_model("Fresh", "Type"), name="Default", port_count=0
         )
         fresh_type.is_add_in_card = True
         fresh_type.full_clean()
@@ -9675,7 +10176,7 @@ class AddInCardAdminReadonlyTests(TestCase):
 
     def setUp(self) -> None:
         self.card_type = NetworkDeviceType.objects.create(
-            manufacturer="RO", model="Card", name="Default", port_count=0, is_add_in_card=True
+            device_model=_device_model("RO", "Card"), name="Default", port_count=0, is_add_in_card=True
         )
 
     def test_is_add_in_card_readonly_once_instances_exist(self) -> None:
@@ -10198,7 +10699,10 @@ class FitAndPullAdminTests(TestCase):
         operator_vlan = VLAN.objects.create(name="Fit Operator VLAN", vlan_id=814, subnet="10.214.0.0/24")
         RackVlanRange.objects.create(rack=self.rack, vlan=operator_vlan, address_range="10.214.0.0/27")
         operator_card_type = NetworkDeviceType.objects.create(
-            manufacturer="Fit", model="OperatorCard", name="Default", port_count=1, is_add_in_card=True
+            device_model=_device_model("Fit", "OperatorCard"),
+            name="Default",
+            port_count=1,
+            is_add_in_card=True,
         )
         type_port = NetworkDeviceTypePort.objects.create(
             device_type=operator_card_type,

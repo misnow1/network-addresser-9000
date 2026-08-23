@@ -280,6 +280,13 @@ AUDITLOG_INCLUDE_TRACKING_MODELS = (
     "inventory.Owner",
     "inventory.Rack",
     "inventory.NetworkSwitchType",
+    # ADR 0026 — bare, like Department/Owner above: a descriptive vocabulary
+    # table (manufacturer/model/description) with no per-field scoping
+    # needed. Registering it is what keeps audit coverage whole rather than
+    # merely equivalent-looking: NetworkDeviceType was registered bare, so
+    # manufacturer/model were tracked audit fields on *it* until this phase
+    # moved them onto this new model.
+    "inventory.NetworkDeviceModel",
     "inventory.NetworkDeviceType",
     "inventory.NetworkDeviceTypePort",
     "inventory.NetworkSwitchTypePort",

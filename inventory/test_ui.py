@@ -51,6 +51,7 @@ from .models import (
     VLAN,
     Department,
     NetworkDevice,
+    NetworkDeviceModel,
     NetworkDevicePort,
     NetworkDeviceType,
     NetworkDeviceTypePort,
@@ -93,12 +94,23 @@ def _make_switch_type(port_count: int = 0, **kwargs) -> NetworkSwitchType:
     return switch_type
 
 
+def _device_model(manufacturer: str, model: str) -> NetworkDeviceModel:
+    """See ``tests.py``'s helper of the same name — identical shape."""
+    return NetworkDeviceModel.objects.get_or_create(manufacturer=manufacturer, model=model)[0]
+
+
 def _make_device_type(port_count: int = 0, vlan: VLAN | None = None, **kwargs) -> NetworkDeviceType:
     """See ``tests.py``'s helper of the same name — identical shape."""
-    kwargs.setdefault("manufacturer", "Martin Audio")
-    kwargs.setdefault("model", "IK-42")
+    device_model = kwargs.pop("device_model", None)
+    if device_model is None:
+        manufacturer = kwargs.pop("manufacturer", "Martin Audio")
+        model = kwargs.pop("model", "IK-42")
+        device_model = _device_model(manufacturer, model)
+    else:
+        kwargs.pop("manufacturer", None)
+        kwargs.pop("model", None)
     kwargs.setdefault("name", "Default")
-    device_type = NetworkDeviceType.objects.create(port_count=port_count, **kwargs)
+    device_type = NetworkDeviceType.objects.create(port_count=port_count, device_model=device_model, **kwargs)
     for n in range(1, port_count + 1):
         assert vlan is not None, "vlan is required when port_count > 0"
         NetworkDeviceTypePort.objects.create(
@@ -412,8 +424,7 @@ class ParityFixtureMixin:
         self.switch_address = self.switch.addresses.get()
 
         self.device_type = NetworkDeviceType.objects.create(
-            manufacturer="StageB Device Mfr",
-            model="SBDeviceModel",
+            device_model=_device_model("StageB Device Mfr", "SBDeviceModel"),
             name="StageB Device Type",
             port_count=1,
             hostname_slug="sbdevtype",
@@ -471,6 +482,7 @@ class ParityFixtureMixin:
             "rack": self.rack.pk,
             "networkswitchtype": self.switch_type.pk,
             "networkswitch": self.switch.pk,
+            "networkdevicemodel": self.device_type.device_model.pk,
             "networkdevicetype": self.device_type.pk,
             "networkdevice": self.device.pk,
         }
@@ -749,13 +761,24 @@ class PartialGrantAccessTests(TestCase):
                 # source_type_port, a Network Device Type Port.
                 "view_networkdevicetypeport",
                 "view_owner",
+                # ADR 0026 — the type string dereferences device_model, and
+                # this page renders the model's description directly.
+                "view_networkdevicemodel",
             ],
         )
 
     def test_spare_pool_requires_every_declared_codename(self) -> None:
         self._assert_403_when_missing_each(
             "/spares/",
-            ["view_networkswitch", "view_networkdevice", "view_networkswitchtype", "view_networkdevicetype"],
+            [
+                "view_networkswitch",
+                "view_networkdevice",
+                "view_networkswitchtype",
+                "view_networkdevicetype",
+                # ADR 0026 — the device column is a NetworkDeviceType
+                # string, which now dereferences device_model.
+                "view_networkdevicemodel",
+            ],
         )
 
 
@@ -842,6 +865,8 @@ class WritesNothingTests(TestCase):
             f"/models/networkswitchtype/{self.switch_type.pk}/",
             "/models/networkswitch/",
             f"/models/networkswitch/{self.switch.pk}/",
+            "/models/networkdevicemodel/",
+            f"/models/networkdevicemodel/{self.device_type.device_model.pk}/",
             "/models/networkdevicetype/",
             f"/models/networkdevicetype/{self.device_type.pk}/",
             "/models/networkdevice/",
@@ -913,7 +938,7 @@ class ElevationEncodingTests(TestCase):
         # at offset 1, both on vlan_a — the console-with-derived-engine
         # shape the ADR exists to represent. Occupies ordinals 5-6.
         self.bracket_type = NetworkDeviceType.objects.create(
-            manufacturer="DiGiCo", model="SD12", name="Default", port_count=2
+            device_model=_device_model("DiGiCo", "SD12"), name="Default", port_count=2
         )
         NetworkDeviceTypePort.objects.create(
             device_type=self.bracket_type,
@@ -1043,7 +1068,7 @@ class TakenAddressMarkerTests(TestCase):
         (``DM7C-1``/``10.201.6.4`` in production).
         """
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Yamaha", model="DM7C", port_count=2, **kwargs
+            device_model=_device_model("Yamaha", "DM7C"), port_count=2, **kwargs
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type,
@@ -1170,7 +1195,7 @@ class TakenAddressMarkerTests(TestCase):
 
     def test_taken_address_on_a_continuation_ordinal_keeps_its_state_and_no_marker(self) -> None:
         bracket_type = NetworkDeviceType.objects.create(
-            manufacturer="DiGiCo", model="SD12", name="Continuation Bracket", port_count=2
+            device_model=_device_model("DiGiCo", "SD12"), name="Continuation Bracket", port_count=2
         )
         NetworkDeviceTypePort.objects.create(
             device_type=bracket_type,
@@ -1223,7 +1248,7 @@ class TakenAddressMarkerTests(TestCase):
         # Primary (offset 0) and an Engine (offset 1) — vlan_a's Control
         # port sits at offset 0 only, with nothing on vlan_a at offset 1.
         span_type = NetworkDeviceType.objects.create(
-            manufacturer="Test", model="Split VLAN Span", name="Blank Cell Span", port_count=3
+            device_model=_device_model("Test", "Split VLAN Span"), name="Blank Cell Span", port_count=3
         )
         NetworkDeviceTypePort.objects.create(
             device_type=span_type,
@@ -1344,7 +1369,7 @@ class TakenAddressMarkerTests(TestCase):
         # the map ever ignored VLAN identity, this would wrongly mark it.
         collision_address = suggest_slot_address(self.range_a.address_range, 6)
         bare_type = NetworkDeviceType.objects.create(
-            manufacturer="Test", model="Bare", name="No Range Bare", port_count=0
+            device_model=_device_model("Test", "Bare"), name="No Range Bare", port_count=0
         )
         device = NetworkDevice.objects.create(
             device_type=bare_type, rack=self.rack, rack_slot=9, hostname="NoRangeDevice"
@@ -1360,7 +1385,7 @@ class TakenAddressMarkerTests(TestCase):
 
     def test_address_outside_the_racks_range_marks_nothing(self) -> None:
         bare_type = NetworkDeviceType.objects.create(
-            manufacturer="Test", model="Bare", name="Outside Range Bare", port_count=0
+            device_model=_device_model("Test", "Bare"), name="Outside Range Bare", port_count=0
         )
         device = NetworkDevice.objects.create(
             device_type=bare_type, rack=self.rack, rack_slot=9, hostname="OutsideRangeDevice"
@@ -1375,7 +1400,7 @@ class TakenAddressMarkerTests(TestCase):
 
     def test_operator_address_equal_to_its_own_ordinal_marks_nothing(self) -> None:
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="Test", model="Solo Operator", name="Solo Operator", port_count=1
+            device_model=_device_model("Test", "Solo Operator"), name="Solo Operator", port_count=1
         )
         NetworkDeviceTypePort.objects.create(
             device_type=device_type,
@@ -1434,7 +1459,7 @@ class OccupancyConflictTests(TestCase):
         # A span-2 device (offset0 + offset1 on the same VLAN) at slot 5,
         # occupying ordinals 5-6.
         self.bracket_type = NetworkDeviceType.objects.create(
-            manufacturer="DiGiCo", model="SD12", name="Default", port_count=2
+            device_model=_device_model("DiGiCo", "SD12"), name="Default", port_count=2
         )
         NetworkDeviceTypePort.objects.create(
             device_type=self.bracket_type,
@@ -1798,8 +1823,9 @@ class QueryBudgetTests(TestCase):
         switch_type = NetworkSwitchType.objects.create(
             manufacturer="QB", model="M", name="QB Switch Type", port_count=0
         )
+        qb_device_model = NetworkDeviceModel.objects.create(manufacturer="QB", model="M")
         device_type = NetworkDeviceType.objects.create(
-            manufacturer="QB", model="M", name="QB Device Type", port_count=0
+            device_model=qb_device_model, name="QB Device Type", port_count=0
         )
         # A non-null owner and rack for the switch/device rows below (code
         # review finding 5c) — hostname_diverges (#54) reads both, and a
@@ -1835,8 +1861,11 @@ class QueryBudgetTests(TestCase):
                 rack=qb_relations_rack,
                 rack_slot=i + 1,
             ),
+            "networkdevicemodel": lambda i: NetworkDeviceModel.objects.create(
+                manufacturer="QB", model=f"QB Model {i}"
+            ),
             "networkdevicetype": lambda i: NetworkDeviceType.objects.create(
-                manufacturer="QB", model="M", name=f"QB DeviceType {i}", port_count=0
+                device_model=qb_device_model, name=f"QB DeviceType {i}", port_count=0
             ),
             "networkdevice": lambda i: NetworkDevice.objects.create(
                 device_type=device_type,
@@ -1904,11 +1933,11 @@ class QueryBudgetTests(TestCase):
         vlan = VLAN.objects.create(name="QB Hostname VLAN", vlan_id=291, subnet="10.209.0.0/21")
 
         card_type = NetworkDeviceType.objects.create(
-            manufacturer="QB", model="M", name="QB Card Type", port_count=0, is_add_in_card=True
+            device_model=_device_model("QB", "M"), name="QB Card Type", port_count=0, is_add_in_card=True
         )
 
         small_type = NetworkDeviceType.objects.create(
-            manufacturer="QB", model="M", name="QB Small Device Type", port_count=1
+            device_model=_device_model("QB", "M"), name="QB Small Device Type", port_count=1
         )
         NetworkDeviceTypePort.objects.create(
             device_type=small_type,
@@ -1923,7 +1952,7 @@ class QueryBudgetTests(TestCase):
         NetworkDevice.objects.create(device_type=card_type, hostname="qb-small-card-1", host=small_device)
 
         big_type = NetworkDeviceType.objects.create(
-            manufacturer="QB", model="M", name="QB Big Device Type", port_count=40
+            device_model=_device_model("QB", "M"), name="QB Big Device Type", port_count=40
         )
         for n in range(1, 41):
             NetworkDeviceTypePort.objects.create(
@@ -1956,10 +1985,13 @@ class QueryBudgetTests(TestCase):
         than the small-vs-big idiom above.
         """
         card_type = NetworkDeviceType.objects.create(
-            manufacturer="QB", model="M", name="QB Host-select Card Type", port_count=0, is_add_in_card=True
+            device_model=_device_model("QB", "M"),
+            name="QB Host-select Card Type",
+            port_count=0,
+            is_add_in_card=True,
         )
         anchor_type = NetworkDeviceType.objects.create(
-            manufacturer="QB", model="M", name="QB Host-select Anchor Type", port_count=0
+            device_model=_device_model("QB", "M"), name="QB Host-select Anchor Type", port_count=0
         )
         anchor_host = NetworkDevice.objects.create(device_type=anchor_type, hostname="qb-anchor-host")
         hostless_card = NetworkDevice.objects.create(device_type=card_type, hostname="qb-hostless-card")
@@ -2416,20 +2448,22 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         )
 
     def test_networkdevicetype_renders_every_declared_column_and_inline(self) -> None:
+        # ADR 0026 — Manufacturer/Model collapsed into one "Device model"
+        # relation column; the description moved to the detail page only.
         list_response = self.client.get(self._list_url("networkdevicetype"))
         self.assertEqual(
             _list_row_cells(list_response.content.decode(), "StageB Device Type"),
-            ["StageB Device Mfr", "SBDeviceModel", "StageB Device Type", "1", "No", "sbdevtype", "Details"],
+            ["StageB Device Mfr SBDeviceModel", "StageB Device Type", "1", "No", "sbdevtype", "Details"],
         )
 
         detail_response = self.client.get(self._detail_url("networkdevicetype"))
         content = detail_response.content.decode()
-        self.assertEqual(_detail_field_text(content, "Manufacturer"), "StageB Device Mfr")
-        self.assertEqual(_detail_field_text(content, "Model"), "SBDeviceModel")
+        self.assertEqual(_detail_field_text(content, "Device model"), "StageB Device Mfr SBDeviceModel")
         self.assertEqual(_detail_field_text(content, "Name"), "StageB Device Type")
         self.assertEqual(_detail_field_text(content, "Port count"), "1")
         self.assertEqual(_detail_field_text(content, "Add-in card"), "No")
         self.assertEqual(_detail_field_text(content, "Hostname slug"), "sbdevtype")
+        self.assertEqual(_detail_field_text(content, "Description"), "—")  # blank by default
         self.assertEqual(
             _inline_row_cells(content, "Type ports", "StageB Device Port"),
             [
@@ -2441,6 +2475,27 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
                 "From the device&#x27;s rack slot",
                 "—",
             ],
+        )
+
+    def test_networkdevicemodel_renders_every_declared_column_and_inline(self) -> None:
+        device_model = self.device_type.device_model
+        device_model.description = "StageB Model Description"
+        device_model.save()
+
+        list_response = self.client.get(self._list_url("networkdevicemodel"))
+        self.assertEqual(
+            _list_row_cells(list_response.content.decode(), "SBDeviceModel"),
+            ["StageB Device Mfr", "SBDeviceModel", "StageB Model Description", "Details"],
+        )
+
+        detail_response = self.client.get(self._detail_url("networkdevicemodel"))
+        content = detail_response.content.decode()
+        self.assertEqual(_detail_field_text(content, "Manufacturer"), "StageB Device Mfr")
+        self.assertEqual(_detail_field_text(content, "Model"), "SBDeviceModel")
+        self.assertEqual(_detail_field_text(content, "Description"), "StageB Model Description")
+        self.assertEqual(
+            _inline_row_cells(content, "Profiles", "StageB Device Type"),
+            ["StageB Device Type", "1", "No"],
         )
 
     def test_networkdevice_list_renders_every_declared_column_and_detail_redirects(self) -> None:
@@ -2821,7 +2876,7 @@ class DerivedPortHostnameRenderingTests(TestCase):
         self.client.login(username="hostnameadmin", password="testpass123")
         self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
         self.device_type = NetworkDeviceType.objects.create(
-            manufacturer="DiGiCo", model="SD12", name="SD12 UI", port_count=2
+            device_model=_device_model("DiGiCo", "SD12"), name="SD12 UI", port_count=2
         )
         NetworkDeviceTypePort.objects.create(
             device_type=self.device_type, description="Control", port_type=PortType.GBE_RJ45, vlan=self.vlan
@@ -2866,7 +2921,7 @@ class OperatorSetTagRenderingTests(TestCase):
         self.rack = Rack.objects.create(name="OpTag Rack", slot_count=10)
         RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.201.6.0/27")
         self.device_type = NetworkDeviceType.objects.create(
-            manufacturer="Yamaha", model="DM7C", name="OpTag Console", port_count=2
+            device_model=_device_model("Yamaha", "DM7C"), name="OpTag Console", port_count=2
         )
         NetworkDeviceTypePort.objects.create(
             device_type=self.device_type,
@@ -2912,7 +2967,7 @@ class OperatorSetTagRenderingTests(TestCase):
 
     def test_tag_absent_for_port_with_no_source_type_port(self) -> None:
         bare_type = NetworkDeviceType.objects.create(
-            manufacturer="Test", model="Bare", name="OpTag Bare", port_count=0
+            device_model=_device_model("Test", "Bare"), name="OpTag Bare", port_count=0
         )
         bare_device = NetworkDevice.objects.create(device_type=bare_type, hostname="optag-bare")
         NetworkDevicePort.objects.create(
@@ -2935,10 +2990,10 @@ class AddInCardRenderingTests(TestCase):
         self.client.login(username="cardui-admin", password="testpass123")
 
         self.host_type = NetworkDeviceType.objects.create(
-            manufacturer="CardUI", model="Console", name="Default", port_count=0
+            device_model=_device_model("CardUI", "Console"), name="Default", port_count=0
         )
         self.card_type = NetworkDeviceType.objects.create(
-            manufacturer="CardUI", model="Card", name="Default", port_count=0, is_add_in_card=True
+            device_model=_device_model("CardUI", "Card"), name="Default", port_count=0, is_add_in_card=True
         )
         self.host = NetworkDevice.objects.create(device_type=self.host_type, hostname="cardui-host")
         self.card = NetworkDevice.objects.create(
@@ -3326,6 +3381,8 @@ class AdminLockoutTests(ParityFixtureMixin, TestCase):
             self._detail_url("networkswitchtype"): "StageB Switch Type",
             self._list_url("networkswitch"): "stageb-switch1",
             self._detail_url("networkswitch"): "stageb-switch1",
+            self._list_url("networkdevicemodel"): "SBDeviceModel",
+            self._detail_url("networkdevicemodel"): "SBDeviceModel",
             self._list_url("networkdevicetype"): "StageB Device Type",
             self._detail_url("networkdevicetype"): "StageB Device Type",
             self._list_url("networkdevice"): "stageb-device1",

@@ -30,6 +30,7 @@ from django.db.models import Q
 from inventory.models import (
     VLAN,
     NetworkDevice,
+    NetworkDeviceModel,
     NetworkDevicePort,
     NetworkDeviceType,
     NetworkDeviceTypePort,
@@ -44,9 +45,11 @@ from inventory.suggestions import suggest_slot_address
 
 from ._prod_import_csv import (
     AddressingRow,
+    DeviceModelRow,
     SwitchPortRow,
     SwitchPortTable,
     parse_addressing_rows,
+    parse_device_models,
     parse_rack_offsets,
     parse_switch_port_tables,
     parse_vlan_table,
@@ -56,6 +59,8 @@ from ._prod_import_csv import (
 ADDRESSING_CSV_NAME = "MPS Audio Network Standards - IP Addressing mk2.csv"
 CALC_LOOKUPS_CSV_NAME = "MPS Audio Network Standards - IP Calc Lookups.csv"
 SWITCH_PORTS_CSV_NAME = "MPS Audio Network Standards - Switch Ports.csv"
+#: Optional, like the importer's own copy — checked only when present.
+DEVICE_MODELS_CSV_NAME = "MPS Audio Network Standards - Device Models.csv"
 
 FN_CONTROL = "Audio Control"
 FN_DANTE_PRIMARY = "Dante Primary"
@@ -385,7 +390,11 @@ class _Findings:
 def _check_device_type_identity(
     findings: _Findings, label: str, actual: NetworkDevice, expected_identity: tuple[str, str, str]
 ) -> None:
-    actual_identity = (actual.device_type.manufacturer, actual.device_type.model, actual.device_type.name)
+    actual_identity = (
+        actual.device_type.device_model.manufacturer,
+        actual.device_type.device_model.model,
+        actual.device_type.name,
+    )
     if actual_identity != expected_identity:
         findings.fail("type_assignment", f"{label}: device type {actual_identity} != {expected_identity}.")
 
@@ -414,6 +423,12 @@ class Command(BaseCommand):
         addressing_rows = _dedupe(parse_addressing_rows(read_csv_rows(addressing_path)))
         switch_port_tables = {t.name: t for t in parse_switch_port_tables(read_csv_rows(switch_ports_path))}
 
+        # ADR 0026 decision 5 — optional, like the importer's own copy.
+        device_models_path = data_dir / DEVICE_MODELS_CSV_NAME
+        device_model_rows = (
+            parse_device_models(read_csv_rows(device_models_path)) if device_models_path.is_file() else []
+        )
+
         vlan_id_by_function = {row.function: row.vlan_id for row in vlan_rows}
         vlan_subnet_by_id = {row.vlan_id: row.subnet for row in vlan_rows}
 
@@ -421,6 +436,7 @@ class Command(BaseCommand):
         _check_rack_ranges(findings, rack_offset_rows, vlan_rows)
         _check_owner_seeding(findings, rack_offset_rows)
         _check_hostname_slugs(findings)
+        _check_device_model_descriptions(findings, device_model_rows)
         _check_no_equipment_hostname_seeding(findings)
         _check_hostnames_and_types_and_addresses(
             findings,
@@ -559,7 +575,12 @@ def _check_hostname_slugs(findings: _Findings) -> None:
     checked = 0
     for (manufacturer, model), expected_slug in HOSTNAME_SLUGS.items():
         switch_matches = list(NetworkSwitchType.objects.filter(manufacturer=manufacturer, model=model))
-        device_matches = list(NetworkDeviceType.objects.filter(manufacturer=manufacturer, model=model))
+        # ADR 0026 — the identity moved off NetworkDeviceType onto its FK.
+        device_matches = list(
+            NetworkDeviceType.objects.filter(
+                device_model__manufacturer=manufacturer, device_model__model=model
+            )
+        )
         matches = switch_matches + device_matches
         if not matches:
             findings.fail(
@@ -575,6 +596,37 @@ def _check_hostname_slugs(findings: _Findings) -> None:
                     f"{expected_slug!r}, got {type_row.hostname_slug!r}.",
                 )
     findings.count("hostname_slugs_checked", checked)
+
+
+def _check_device_model_descriptions(findings: _Findings, device_model_rows: list[DeviceModelRow]) -> None:
+    """ADR 0026 decision 5 — when the Device Models CSV is present, every
+    row's description matches the ``NetworkDeviceModel`` row it names.
+
+    Reads the CSV rows handed in directly, never
+    ``import_prod_data.py``'s own parsing/helpers, per this module's
+    docstring: a check sharing the importer's own reading proves nothing.
+    A no-op (not a failure) when the CSV wasn't found at all — the
+    importer treats absence as valid, and so does this check.
+    """
+    checked = 0
+    for row in device_model_rows:
+        try:
+            device_model = NetworkDeviceModel.objects.get(manufacturer=row.manufacturer, model=row.model)
+        except NetworkDeviceModel.DoesNotExist:
+            findings.fail(
+                "device_model_descriptions",
+                f"{row.manufacturer!r}/{row.model!r}: no NetworkDeviceModel found for a Device "
+                "Models CSV row.",
+            )
+            continue
+        checked += 1
+        if device_model.description != row.description:
+            findings.fail(
+                "device_model_descriptions",
+                f"{row.manufacturer!r}/{row.model!r}: expected description {row.description!r}, "
+                f"got {device_model.description!r}.",
+            )
+    findings.count("device_model_descriptions_checked", checked)
 
 
 def _check_no_equipment_hostname_seeding(findings: _Findings) -> None:
@@ -780,7 +832,7 @@ def _check_hostnames_and_types_and_addresses(
             actual_switches[(s.rack.name, s.rack_slot)] = s
 
     actual_devices: dict[tuple[str, int], NetworkDevice] = {}
-    for d in NetworkDevice.objects.select_related("rack", "device_type", "host"):
+    for d in NetworkDevice.objects.select_related("rack", "device_type__device_model", "host"):
         if d.rack is not None and d.rack_slot is not None:
             actual_devices[(d.rack.name, d.rack_slot)] = d
 
@@ -1249,8 +1301,10 @@ def _check_device_type_ports(findings: _Findings, vlan_id_by_function: dict[str,
     with a corrupted stored ``port_count`` is exactly the state that
     checking only ``len(actual_ports)`` sails past.
     """
-    for device_type in NetworkDeviceType.objects.prefetch_related("type_ports__vlan"):
-        identity = (device_type.manufacturer, device_type.model, device_type.name)
+    for device_type in NetworkDeviceType.objects.select_related("device_model").prefetch_related(
+        "type_ports__vlan"
+    ):
+        identity = (device_type.device_model.manufacturer, device_type.device_model.model, device_type.name)
         expected_ports = EXPECTED_DEVICE_TYPE_PORTS.get(identity)
         if expected_ports is None:
             findings.fail(

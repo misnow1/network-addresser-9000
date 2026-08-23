@@ -13,6 +13,11 @@
     {% endif %}
   </h1>
   <p class="tile__meta">{{ device.device_type }}</p>
+  {# ADR 0026 — a device's hardware model can carry a one-line description #}
+  {# of what it actually is; blank means nothing has been entered for it. #}
+  {% if device.device_type.device_model.description %}
+    <p class="tile__meta">{{ device.device_type.device_model.description }}</p>
+  {% endif %}
 
   <div class="panel">
     <h2 class="panel__heading">Placement</h2>

@@ -52,6 +52,7 @@ from .management.commands.verify_prod_import import _check_cross_vlan_alignment,
 from .models import (
     VLAN,
     NetworkDevice,
+    NetworkDeviceModel,
     NetworkDevicePort,
     NetworkDeviceType,
     NetworkDeviceTypePort,
@@ -465,7 +466,7 @@ class ImportProdDataTests(TestCase):
     def test_duplicate_row_collapses_to_one_device(self) -> None:
         devices = NetworkDevice.objects.filter(rack__name="AMPRACK1", rack_slot=3)
         self.assertEqual(devices.count(), 1)
-        self.assertEqual(devices.get().device_type.model, "IK-42")
+        self.assertEqual(devices.get().device_type.device_model.model, "IK-42")
         self.assertEqual(devices.get().device_type.name, "with Dante Card")
 
     def test_sd12_slot_offset_and_dmi_dante_card(self) -> None:
@@ -473,7 +474,7 @@ class ImportProdDataTests(TestCase):
         # Lowercase — ADR 0023 decision 8 (amended): hostname is normalised
         # on write.
         self.assertEqual(console.hostname, "sd12-test-1")
-        self.assertEqual(console.device_type.model, "SD12")
+        self.assertEqual(console.device_type.device_model.model, "SD12")
         control_port = console.ports.get(slot_offset=0)
         engine_port = console.ports.get(slot_offset=1)
         self.assertEqual(control_port.address, addr(FN_CONTROL, "CONSOLES", 1))
@@ -487,7 +488,7 @@ class ImportProdDataTests(TestCase):
         # occupants (slots 1, 2, 4) are nowhere near it, so this also proves
         # the pin isn't just an accident of "highest slot + 1" here.
         card = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=17)
-        self.assertEqual(card.device_type.model, "DMI-DANTE")
+        self.assertEqual(card.device_type.device_model.model, "DMI-DANTE")
         # ADR 0022 PR 3 — linked to the console whose row carried the
         # marker, read from the data rather than guessed (settled decision
         # 7). #41 stays open: no address changes from this link.
@@ -580,10 +581,12 @@ class ImportProdDataTests(TestCase):
         self.assertEqual(primary.hostname_slug, "sg300-10mp")
         self.assertEqual(secondary.hostname_slug, "sg300-10mp")
         with_card = NetworkDeviceType.objects.get(
-            manufacturer="Martin Audio", model="IK-42", name="with Dante Card"
+            device_model__manufacturer="Martin Audio", device_model__model="IK-42", name="with Dante Card"
         )
         without_card = NetworkDeviceType.objects.get(
-            manufacturer="Martin Audio", model="IK-42", name="without Dante Card"
+            device_model__manufacturer="Martin Audio",
+            device_model__model="IK-42",
+            name="without Dante Card",
         )
         self.assertEqual(with_card.hostname_slug, "ik42")
         self.assertEqual(without_card.hostname_slug, "ik42")
@@ -650,7 +653,9 @@ class ImportProdDataTests(TestCase):
         # complete expected device-slot set, not silently ignored because
         # no CSV row names that key to check "expected device" against.
         rack = Rack.objects.get(name="CONSOLES")
-        device_type = NetworkDeviceType.objects.get(manufacturer="DiGiCo", model="SD9")
+        device_type = NetworkDeviceType.objects.get(
+            device_model__manufacturer="DiGiCo", device_model__model="SD9"
+        )
         NetworkDevice.objects.create(  # type: ignore[misc]
             device_type=device_type, rack=rack, rack_slot=5, hostname="stale", port_addressing="dhcp"
         )
@@ -677,7 +682,7 @@ class ImportProdDataTests(TestCase):
         # materialize identical addresses — only the type identity differs.
         lm26 = NetworkDevice.objects.get(rack__name="W8LMTEST", rack_slot=2)
         lm44_type = NetworkDeviceType.objects.get(
-            manufacturer="Lab.Gruppen", model="LM44", name="Redundant Mode"
+            device_model__manufacturer="Lab.Gruppen", device_model__model="LM44", name="Redundant Mode"
         )
         NetworkDevice.objects.filter(pk=lm26.pk).update(device_type=lm44_type)
         with self.assertRaises(CommandError):
@@ -697,7 +702,9 @@ class ImportProdDataTests(TestCase):
     def test_verify_catches_a_wrong_device_type_port(self) -> None:
         # A wrong port_type in the catalog is exactly what a slot_offset-only
         # check would miss.
-        type_port = NetworkDeviceTypePort.objects.get(device_type__model="LM26", description="Dante Primary")
+        type_port = NetworkDeviceTypePort.objects.get(
+            device_type__device_model__model="LM26", description="Dante Primary"
+        )
         NetworkDeviceTypePort.objects.filter(pk=type_port.pk).update(port_type="1gbe_sfp")
         with self.assertRaises(CommandError):
             call_command("verify_prod_import", data_dir=str(self.data_dir))
@@ -708,7 +715,7 @@ class ImportProdDataTests(TestCase):
         # actual rows (matching the expected count either way) sails past
         # this; the stored field has to be compared too.
         device_type = NetworkDeviceType.objects.get(
-            manufacturer="Lab.Gruppen", model="LM26", name="Redundant Mode"
+            device_model__manufacturer="Lab.Gruppen", device_model__model="LM26", name="Redundant Mode"
         )
         NetworkDeviceType.objects.filter(pk=device_type.pk).update(port_count=device_type.port_count + 1)
         with self.assertRaises(CommandError):
@@ -1037,8 +1044,9 @@ class CrossVlanAlignmentExemptionTests(TestCase):
             rng = RackVlanRange(rack=self.rack, vlan=vlan, address_range=base, created_by=self.user)
             rng.full_clean()
             rng.save()
+        device_model = NetworkDeviceModel.objects.create(manufacturer="Test", model="Alignment")
         self.device_type = NetworkDeviceType(
-            manufacturer="Test", model="Alignment", name="Default", port_count=3, created_by=self.user
+            device_model=device_model, name="Default", port_count=3, created_by=self.user
         )
         self.device_type.full_clean()
         self.device_type.save()
@@ -1131,6 +1139,64 @@ class ImportUserIdentityTests(TestCase):
         with self.assertRaises(CommandError):
             call_command("import_prod_data", data_dir=str(self.data_dir))
         self.assertFalse(Rack.objects.exists())  # refused before any writes committed
+
+
+class DeviceModelsCsvImportTests(TestCase):
+    """ADR 0026 decision 5 — the Device Models CSV is optional. Every other
+    test class in this module already exercises the "absent" branch (none
+    of them write this file, and the importer must still succeed with
+    every description blank — see ``write_fixture_csvs()``), so this class
+    covers the "present" branch specifically.
+    """
+
+    def test_import_with_the_csv_lands_descriptions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_fixture_csvs(data_dir)
+            _write_csv(
+                data_dir / "MPS Audio Network Standards - Device Models.csv",
+                [
+                    ["Manufacturer", "Model", "Description", "Hostname Slug"],
+                    ["Martin Audio", "IK-42", "Amp Rack Processor", "ik42"],
+                ],
+            )
+            call_command("import_prod_data", data_dir=str(data_dir))
+
+        ik42 = NetworkDeviceModel.objects.get(manufacturer="Martin Audio", model="IK-42")
+        self.assertEqual(ik42.description, "Amp Rack Processor")
+        # A model the CSV doesn't mention still gets created, blank.
+        other = NetworkDeviceModel.objects.exclude(pk=ik42.pk).first()
+        assert other is not None
+        self.assertEqual(other.description, "")
+
+    def test_import_without_the_csv_succeeds_with_blank_descriptions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_fixture_csvs(data_dir)
+            call_command("import_prod_data", data_dir=str(data_dir))
+
+        self.assertEqual(
+            NetworkDeviceModel.objects.count(), NetworkDeviceModel.objects.filter(description="").count()
+        )
+        self.assertTrue(NetworkDeviceModel.objects.exists())
+
+    def test_verify_catches_a_description_mismatch_against_the_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_fixture_csvs(data_dir)
+            _write_csv(
+                data_dir / "MPS Audio Network Standards - Device Models.csv",
+                [
+                    ["Manufacturer", "Model", "Description", "Hostname Slug"],
+                    ["Martin Audio", "IK-42", "Amp Rack Processor", "ik42"],
+                ],
+            )
+            call_command("import_prod_data", data_dir=str(data_dir))
+            NetworkDeviceModel.objects.filter(manufacturer="Martin Audio", model="IK-42").update(
+                description="Hand-edited after import"
+            )
+            with self.assertRaises(CommandError):
+                call_command("verify_prod_import", data_dir=str(data_dir))
 
 
 class HostnameSlugsConstantTests(TestCase):

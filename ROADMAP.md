@@ -2,7 +2,7 @@
 
 High-level phases only — day-to-day task tracking belongs in GitHub Issues once there's code to file issues against. This file exists so it's obvious what phase the project is in and what's next, even after a fresh start.
 
-**Current phase: 20 — addressing per `(device, VLAN)` instead of per port. Phases 1–19 and 22 done (7 and 22 both landed out of numeric order — 7 was scoped, skipped, then closed later; ADR 0024 needed none of phases 19–21's machinery for 22). Phases 20–21 remain outstanding.**
+**Current phase: 20 — addressing per `(device, VLAN)` instead of per port. Phases 1–19 and 22 done (7 and 22 both landed out of numeric order — 7 was scoped, skipped, then closed later; ADR 0024 needed none of phases 19–21's machinery for 22). Phases 20–21 remain outstanding. Phase 23 also landed out of order (PR 1 only — ADR 0026 needed none of 19–21's machinery either; its PR 2 remains outstanding).**
 
 ## 1. Foundation — done
 
@@ -314,6 +314,12 @@ both carry `ik42` and must be set to match by hand. That small duplication is ac
 than inventing a bare hardware-model entity ADR 0010 deliberately doesn't have. Same-model
 collisions are routine, and phase 18 is what resolves them.
 
+> **2026-08-22 update.** Superseded by [ADR 0026](./docs/adr/0026-device-model-entity.md) and
+> phase 23, below: `NetworkDeviceModel` is now a real entity on the device side, and PR 2 of that
+> phase moves `hostname_slug` onto it, retiring the duplication this paragraph describes. Left in
+> place rather than deleted — it was true when written, the same way ADR 0015's page keeps a wrong
+> prediction visible.
+
 ## 18. Hostname computation
 
 Assembles phase 17's components at creation, enforces uniqueness, and resolves collisions.
@@ -568,6 +574,66 @@ Dante device's name is *unique on the Dante network*, because the tool cannot id
 structurally. Deriving that — "has a port on a VLAN whose *role* is Dante Primary" — is what ADR 0021
 designed VLAN role for, and role is phase 21. If it ships, this gap closes with no schema change.
 
+## 23. A device model is an entity
+
+`docs/Device Model Description.md` asked for something small — a sentence saying what an
+`Amphenol RJD32A3-0050` *is*, because the part number alone means nothing to someone who doesn't
+already know the catalog. Answering it turned out to need a structural change: ADR 0010 made
+`(manufacturer, model, name)` the whole identity of a `NetworkDeviceType`, with no bare
+hardware-model entity behind it, so there was nowhere model-level to put the text — the fork this
+roadmap used to describe under "Later / not yet designed" between a `description` field on the Type
+plus a convention against drift, versus a real model row that profiles hang off. `docs/adr/0026-
+device-model-entity.md` resolves that fork: the second option, built as `NetworkDeviceModel`.
+
+Delivery is split into two PRs (`docs/plans/PLAN-adr-0026.md`), because `hostname_slug` is live and
+in use since phase 18 and moving it deserves its own review separate from creating the table.
+
+- [x] `NetworkDeviceModel(AuditedModel)` — `manufacturer`, `model` (unique together,
+      case-insensitive under this database's collation, punctuation-sensitive), `description`
+      (`CharField(255, blank=True)`, matching `NetworkDeviceTypePort.description`'s shape).
+      **Not locked** after instances exist, unlike every other field this phase touches — decision 3
+      is that correcting a model's manufacturer/model spelling should update every profile of that
+      model coherently, the opposite of ADR 0010's reasoning for locking the two strings it replaces
+- [x] `NetworkDeviceType.device_model` (`ForeignKey`, `PROTECT`) replaces its own `manufacturer`/
+      `model` fields; `unique_device_type` becomes `(device_model, name)`; the FK joins the
+      existing instance-lock (`_locked_snapshot()`) in their place
+- [x] Migration `0020`/`0021` — schema then data, in that order, so the DDL review and the backfill
+      review are separate. The backfill collapses each distinct `(manufacturer, model)` pair already
+      in the database into one model row and re-points every profile at it; deterministic, no
+      re-import, every description ships blank (new metadata nothing can infer). Reversible, though
+      reversing destroys every description — there is no column on the Type for it to go back to
+- [x] The admin picker's dropdown label carries the description (`Amphenol RJD32A3-0050 — Default
+      (Dante Interface with AES3 I/O)`), plain `str(type)` when it's blank. `NetworkDeviceType.
+      __str__` itself is unchanged — byte-identical to before, so no template, audit-log entry, or
+      `str()`-asserting test needed to move
+- [x] Read-only UI: a new `Network Device Model` registry entry (manufacturer/model/description,
+      with a "Profiles" inline listing its Types), and the existing `Network Device Type` entry
+      collapses its Manufacturer/Model columns into one `Device Model` relation column, gaining a
+      `Description` field on the detail page. `device_detail.html` gains the description as a
+      second line, hidden when blank
+- [x] The importer reads an optional fourth CSV (`MPS Audio Network Standards - Device Models.csv`)
+      for descriptions — absent is valid, every description ships blank, no existing import path
+      breaks. The verifier checks descriptions against the same CSV independently, never through the
+      importer's own catalog
+- [x] Tests: the collapse's case-insensitive/punctuation-sensitive uniqueness; the IK-42 two-
+      profile-one-model shape end to end, including a `MigrationExecutor` test driving the real DDL
+      forward *and back*; `PROTECT`; the lock, driven through `save(update_fields=[...])` with both
+      the field name and its attname, not just a bare `save()`; decision 3's payoff (editing a model
+      row updates every profile); the admin changelist search (`?q=`), not just `search_fields`'
+      contents; audit coverage; partial-grant 403s on every surface that now reads the new model
+- [ ] **PR 2** — `hostname_slug` moves from `NetworkDeviceType` onto `NetworkDeviceModel`, the same
+      class of model-not-profile fact as the description, but blocking (ADR 0023 decision 1) where
+      the description is cosmetic: a divergent slug between two profiles of one model silently
+      computes different hostnames for identical hardware. Retires the device half of
+      `HOSTNAME_SLUGS` (both live copies; migration `0018`'s frozen copy stays, since it must keep
+      running against old databases) and amends ADR 0023 decision 1's placement table
+
+Consequences accepted, not solved: duplicate models are creatable and not mergeable (issue #79,
+nothing to merge in the live estate today); the two Type models diverge until switches get the same
+treatment (issue #78); a post-import model rename now makes `verify_prod_import.py` stop matching,
+which is correct — the verifier's job is proving the import reproduced the sheet, and a rename
+genuinely is a divergence from it.
+
 
 ## Later / not yet designed
 
@@ -648,20 +714,6 @@ work.
 - Slot moves don't re-suggest an already-static device port's address (armed by default now that static materializes by default, ADR 0013; follows from ADR 0003's "stored, not immutable") — see #28. Its hostname sibling **#54 is closed by phase 18**, which ships a stateless `hostname_diverges` indicator (ADR 0023). #28 is the same staleness *class* but a different mechanism — it compares a stored address against what the allocator would now suggest, which carries its own decisions about derived, offset and operator-set addresses, so it was deliberately not folded into a naming phase. One UI treatment should eventually serve both — report, don't enforce, as in phase 19
 - **Dante device names and Martin Vu-Net names are separate namespaces** from the hostname — see #64. The production Dante sheet carries both, and they share the hostname vocabulary while differing in shape, case and uniqueness scope: Vu-Net drops owner and model, is uppercase, and is unique only per model (`SPARE-1` appears twice, for the IK42 and IK81 spares). Both are names configured on the hardware itself, like an address, so the interesting behaviour is reconciling what is configured against what the components say — not generating them. Pointless before ADR 0023 lands, since they borrow its component fields
 - Multicast configuration: port-level filtering plus switch-level IGMP snooping — see #22
-- **A device model has no description** — see `docs/Device Model Description.md`. Nothing records
-  what an `Amphenol RJD32A3-0050` *is* ("Dante interface with AES3 I/O"), so a Type is legible only
-  to someone who already knows the part numbers. The doc's load-bearing claim is that the
-  description belongs to the **model**, not the profile: a Lab Gruppen LM26 is the same box whether
-  its profile is Switched or Redundant, and hanging the text on the profile invites two profiles of
-  one model describing themselves differently — which the doc names as the anti-pattern to prevent
-  - **There is no model-level place to put it.** ADR 0010 makes `(manufacturer, model, name)` the
-    whole identity, with no bare hardware-model entity behind it — phase 17 hit the same wall and
-    accepted the duplication for `hostname_slug` rather than inventing one. So the fork is a
-    `description` field on the Type plus a convention (and possibly validation) against drift,
-    versus a real model row that profiles hang off. The second changes ADR 0010's identity and
-    needs its own ADR; the first is a field and a `help_text`
-  - Nearest neighbour is the Dante-mode entry below — the same complaint from the other side, that
-    the profile label carries facts which aren't profile facts
 - **Dante mode as something the tool reasons about, not just records.** A device's Dante networking mode (Switched / Redundant / Split) currently lives inside `NetworkDeviceType.name` — the free-text *profile label* ADR 0010 defines — alongside a second, orthogonal axis (whether a Dante card is fitted). That is tolerable only while nothing reads it. It stops being tolerable as soon as the tool should enforce a rule that depends on it, and there is now a concrete one: Shure receivers integrating with Yamaha consoles **must not** be in Split mode — *"Do not use SPLIT mode. This is not compatible with control from the Yamaha consoles"* (`docs/Shure Devices.md`, and the Shure/Yamaha integration guide it links). A rule cannot be enforced against a substring of a label. Making mode a first-class field is a substantially larger change than it looks — it splits one identity axis into two, touches every Type profile in the estate, and interacts with ADR 0010's `(manufacturer, model, name)` identity and its seed-once port materialization — so it needs its own ADR rather than riding along with another phase
 - Populated rack templates: slot layouts that materialize equipment (needs Type `PROTECT`, unlike the VLAN-only feature) — see #30. **No longer blocks hostnames** (phase 17); it would *enhance* them by prefilling the purpose component, and it does gate the rack creation wizard
 - Rack *slot* occupancy has no DB-level overlap guarantee once a device spans several ordinals (ADR 0017's known gap) — see #40. `RackSlotAssignmentMixin`'s docstring defers this to phase 3's "Overlap validation", but that item shipped covering rack-range-vs-range and DHCP overlap only — the deferral still has no live home and the pointer is still stale
