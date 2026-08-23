@@ -607,6 +607,32 @@ reference to the removed columns, `admin.py` having neither `label_from_instance
 name, and `sync_roles` enumerating models dynamically (plus running after migrate in
 `docker/entrypoint.sh:32–34`). Those needed no change.
 
+### Code review of PR 1, after implementation
+
+A second independent codex review ran against the implemented diff with the same untouchables
+briefing (`REVIEW-2-PLAN-adr-0026.md`, not committed). It found **no P0 and no P1**, and explicitly
+confirmed the migration ordering and backfill, the lock key, the admin search traversal, the
+importer, the verifier and the read-only permission changes as sound — i.e. every trap the plan
+review had flagged was actually handled in the code, not merely commented about.
+
+Two P2 findings, both the same class as plan-review note 4, both verified and fixed in `495552b`:
+
+| Note | Resolution |
+|---|---|
+| P2 — the changelist **filter sidebar** N+1s. `list_filter` includes `"device_type"`, and Django's `RelatedFieldListFilter` builds its choices through a separate `Field.get_choices()` queryset that `list_select_related` never touches. | **Fixed.** `NetworkDeviceTypeRelatedFilter` overrides `field_choices()` with `.select_related("device_model")` — `get_choices()` has no queryset-injection hook, so overriding is the only option. 13 queries → 10. |
+| P2 — `existing_cards` in `_render_fit_card_page` kept a bare `.select_related("device_type")` while the `create_form` queryset three lines above it was correctly widened. One query per hostless card. | **Fixed.** Widened to `device_type__device_model`. 12 queries → 9. |
+
+Both carry `assertNumQueries` regression tests, each confirmed to fail with its fix reverted. That
+shape is deliberate: a comment reading "select_related to avoid an N+1" is exactly what let these two
+through the first fold-in.
+
+**One census gap the plan owns.** The blast-radius count (106 factory calls, 67 direct constructors)
+missed a *second* kwargs-forwarding helper — `_make_spanning_type`, used by two
+`RackSlotSuggestionTests` — which defaulted `manufacturer=`/`model=` straight into
+`NetworkDeviceType.objects.create()`. The census looked for the factory and for direct constructors
+and did not consider that another passthrough helper might sit between them. Worth remembering the
+next time a plan here counts call sites.
+
 ## Consequences accepted, not solved
 
 - **Duplicate models are creatable.** ADR decision 4. The picker makes selection the default path;
