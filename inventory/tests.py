@@ -6627,6 +6627,71 @@ class HostnameDivergesAdminFilterTests(TestCase):
         self.assertIn("mps-wpcsrl-ik42", content)
 
 
+class NetworkDeviceChangelistFilterQueryCountTests(TestCase):
+    """Codex review of ADR 0026's PR 1, finding 1 — the "By device type"
+    changelist filter sidebar builds its choices via ``RelatedFieldList
+    Filter.field_choices()``, a queryset entirely separate from
+    ``NetworkDeviceAdmin.list_select_related`` — that select_related never
+    reaches it. Without ``NetworkDeviceTypeRelatedFilter``, rendering the
+    sidebar calls ``str(type)`` (which dereferences ``device_model``) once
+    per ``NetworkDeviceType`` row with no join at all, an N+1 invisible to
+    any test that only measures the row listing's own query count.
+
+    Several device types, not one — a single extra query from one row
+    could coincide with an unrelated fixed count by accident; several
+    rows make an N+1's effect on the total unambiguous.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        for i in range(3):
+            _make_device_type(manufacturer=f"Filter Mfr {i}", model=f"Filter Model {i}", name="Default")
+        self.admin_user = User.objects.create_user("filter-qc-admin", password="testpass123", is_staff=True)
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.force_login(self.admin_user)
+
+    def test_changelist_query_count_is_fixed_with_several_device_types(self) -> None:
+        # 10 measured against this tree with the select_related fix in
+        # place — without it, each of the 3 NetworkDeviceType rows in the
+        # filter sidebar costs one extra query fetching its device_model.
+        with self.assertNumQueries(10):
+            response = self.client.get("/admin/inventory/networkdevice/")
+        self.assertEqual(response.status_code, 200)
+
+
+class FitCardPageQueryCountTests(TestCase):
+    """Codex review of ADR 0026's PR 1, finding 2 — ``existing_cards`` in
+    ``NetworkDeviceAdmin._render_fit_card_page`` only
+    ``select_related("device_type")``, while ``fit_card.html`` renders
+    ``card.device_type`` per row — which now dereferences ``device_model``
+    — one extra query per hostless card the page lists.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.host_type = _make_device_type(manufacturer="QC Host Mfr", model="QC Host Model", name="Default")
+        self.host = NetworkDevice.objects.create(device_type=self.host_type, hostname="qc-host")
+        for i in range(3):
+            card_type = _make_device_type(
+                manufacturer=f"QC Card Mfr {i}",
+                model=f"QC Card Model {i}",
+                name="Default",
+                is_add_in_card=True,
+            )
+            NetworkDevice.objects.create(device_type=card_type, hostname=f"qc-card-{i}")
+        self.editor = User.objects.create_user("fit-qc-editor", password="testpass123", is_staff=True)
+        self.editor.groups.add(Group.objects.get(name="Editor"))
+        self.client.force_login(self.editor)
+
+    def test_fit_card_page_query_count_is_fixed_with_several_hostless_cards(self) -> None:
+        # 9 measured against this tree with the select_related fix in
+        # place — without it, each of the 3 hostless cards costs one extra
+        # query fetching its device_type's device_model.
+        with self.assertNumQueries(9):
+            response = self.client.get(f"/admin/inventory/networkdevice/{self.host.pk}/fit-card/")
+        self.assertEqual(response.status_code, 200)
+
+
 class NetworkDeviceTypeAdminSearchTests(TestCase):
     """ADR 0026 / Codex review note 3 — ``search_fields`` names
     ``device_model__manufacturer``/``device_model__model``, not the bare

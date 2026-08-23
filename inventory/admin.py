@@ -1999,6 +1999,34 @@ class NetworkDeviceHostnameDivergesFilter(_HostnameDivergesFilterBase):
     _type_field = "device_type"
 
 
+class NetworkDeviceTypeRelatedFilter(admin.RelatedFieldListFilter):
+    """Codex review of ADR 0026's PR 1 — ``RelatedFieldListFilter`` builds
+    its sidebar choices via ``Field.get_choices()``, a queryset entirely
+    separate from ``ModelAdmin.get_queryset()`` — ``list_select_related``
+    on ``NetworkDeviceAdmin`` never touches it. Rendering the "By device
+    type" filter therefore called ``str(type)`` (which now dereferences
+    ``device_model``) once per ``NetworkDeviceType`` row with no join at
+    all — an N+1 on every changelist page load, not just once.
+
+    ``field_choices()`` is the hook ``RelatedFieldListFilter.__init__``
+    actually calls; ``Field.get_choices()`` itself has no queryset-
+    injection parameter in this Django version, so this reimplements it
+    (mirroring ``Field.get_choices()``'s own body) rather than trying to
+    wrap it. ``device_type``'s target field is the model's plain ``pk``
+    (no ``to_field``), so ``x.pk`` is correct without needing
+    ``get_related_field()``'s extra indirection.
+    """
+
+    def field_choices(self, field, request, model_admin):
+        ordering = self.field_admin_ordering(field, request, model_admin)
+        queryset = field.remote_field.model._default_manager.complex_filter(
+            field.get_limit_choices_to()
+        ).select_related("device_model")
+        if ordering:
+            queryset = queryset.order_by(*ordering)
+        return [(obj.pk, str(obj)) for obj in queryset]
+
+
 @admin.register(NetworkSwitch)
 class NetworkSwitchAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
     list_display = [
@@ -2167,9 +2195,13 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
     # ("host", EmptyFieldListFilter) gives fitted/unfitted as the filter
     # choices (ADR 0022 PR 3) — a plain "host" filter would instead list
     # every individual host, which isn't the question this filter answers.
+    # ("device_type", NetworkDeviceTypeRelatedFilter) — Codex review of
+    # ADR 0026's PR 1: the sidebar's own choices queryset is separate from
+    # list_select_related below and needs its own select_related, or the
+    # filter dropdown is an N+1 across every NetworkDeviceType row.
     list_filter = [
         "rack",
-        "device_type",
+        ("device_type", NetworkDeviceTypeRelatedFilter),
         ("host", admin.EmptyFieldListFilter),
         "owner",
         NetworkDeviceHostnameDivergesFilter,
@@ -2499,10 +2531,14 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
         create_form.fields["device_type"].queryset = NetworkDeviceType.objects.filter(  # type: ignore[attr-defined]
             is_add_in_card=True
         ).select_related("device_model")
+        # device_type__device_model (Codex review of ADR 0026's PR 1) — the
+        # template renders card.device_type per row, which now
+        # dereferences device_model; a bare "device_type" here left one
+        # extra query per hostless card.
         existing_cards = (
             NetworkDevice.objects.filter(device_type__is_add_in_card=True, host__isnull=True)
             .exclude(pk=host.pk)
-            .select_related("device_type")
+            .select_related("device_type__device_model")
             .order_by("hostname")
         )
         context = {
