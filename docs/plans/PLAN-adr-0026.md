@@ -766,6 +766,65 @@ The reviewer also confirmed the core add → copy → drop direction sound, that
 genuinely share one `"ik42"` mapping today, and that no serializer, fixture, constraint, index or
 `Meta.ordering` names the Type's slug field.
 
+### Code review of PR 2, after implementation
+
+**The stage-4 review was not codex.** Its account ran out of API credits mid-run and a minimal probe
+confirmed exhaustion, so PR 2 got a five-specialist Claude council instead — security, performance,
+logic, regression, and robustness run **blind** (diff only, no intent briefing). Recorded plainly
+because it matters: this is **five of seven streams with both vendor-independent reviewers missing**
+(codex out of credits, gemini not installed here). Five Claude agents reviewing Claude's output share
+blindspots a different model family would not. PR 2 has had a real review, but not the cross-family
+check PR 1 got.
+
+**No P0.** Logic verified all seven of the plan's claims — by *mutating* the code, not just reading
+it: rewriting `_slug_sets_by_model` into the naive `.distinct()` form produced 5/5 test failures with
+exactly the predicted `Martin Audio IK-42: ['ik42', 'ik42']`, proving the centrepiece test guards
+rather than merely passes. Regression confirmed the PR 1 bug class did **not** recur — no surviving
+reader of `NetworkDeviceType.hostname_slug` anywhere.
+
+Nine findings, all verified against the code, all fixed in `553b7a6`, none rebutted:
+
+| Finding | Flagged by | Resolution |
+|---|---|---|
+| The `owner` ModelSpec (`views.py:1290-1315`) both prefetched one hop short **and** omitted `view_networkdevicemodel` | **security + performance, independently** | Fixed both. Measured 9 queries at 2 device types, 17 at 10 — ~23 extra on the real estate. Now `devices__device_type__device_model`, with a 2-vs-10 equal-counts probe. |
+| `rack_detail` dereferences the model via `hostname_diverges` but never declared it | security | Codename added; partial-grant test extended. |
+| **The migration-test pinning recurred, twice.** `tests.py:7461-7462`, `:7527`, `:7597-7603` pin the DB to `0022` *by name* then query live classes — they pass only because `0022` is head, and `0023` would break them | regression | Executor test uses `project_state(...).apps`; the live-reader test migrates to **head** instead of naming a migration. |
+| `recompute_hostnames` (`admin.py:2393`) N+1 **inside held row locks** — 61 devices, 61 extra round trips | performance + regression | Slug map built before the loop. `_lock_devices_by_pk`'s queryset deliberately **not** widened: adding `select_related` to a `select_for_update` would make MariaDB lock the joined rows too, and that helper is shared with the fit-card and delete paths. |
+| `parse_device_models` silently skips rows and assumes a header | robustness (blind) | Header validated; skipped rows warn with line numbers. See the note below on severity. |
+| Verifier compares a raw CSV cell against a lowercased DB value (`verify_prod_import.py:643`) | logic | Comparison normalized. Latent — the committed sheet is all lowercase. |
+| `_make_device_type(hostname_slug=…)` silently mutated a shared model row, blanking three fixtures' own slugs | regression | Helper now **raises** rather than overwriting, so the class cannot reappear. |
+| `ROADMAP.md:5` said PR 2 outstanding while `:624` ticked it done | logic | Corrected. |
+| `0022`'s docstring overclaimed resumability | regression | Scoped to the preflight-abort path. A failure in `copy_slugs`/`RemoveField` still leaves `AddField` committed and the migration unrecorded. |
+
+**On the parser finding's severity.** The blind reviewer reported that 15 of 22 rows would vanish, and
+that figure is *not* true of the committed sheet — every row repeats its manufacturer, so nothing is
+dropped today. It measured a sheet it had reshaped itself. Recorded as a latent trap with a plausible
+trigger (a human tidying the CSV into manufacturer groups), not a live bug.
+
+What survives that correction is architectural, and is the finding worth keeping: `verify_prod_import.py`
+imports the *same* parser (`:52`, called `:414`), justified in its own docstring as "pure I/O, no
+domain judgement". `if not manufacturer or not model: continue` **is** domain judgement — it decides
+which rows count. So a dropped row is invisible to the importer *and* to the independent check that
+exists to catch exactly that, which then reports "All verification checks passed". The verifier's
+independence boundary is drawn in the wrong place.
+
+**A council split worth recording.** Logic marked verifier independence *verified* (it imports nothing
+from `import_prod_data` — the stated rule holds). Robustness called the shared parser a shared
+blindspot. Both are right on their own terms; robustness questioned whether the rule is drawn
+correctly rather than whether it is followed. Only a blind reviewer could raise it, because the intent
+briefing declared the CSV shape settled.
+
+**Two findings deliberately not fixed** — see Consequences below. Both would have reversed a decision
+rather than corrected a defect.
+
+**The structural finding, which outlives this PR.** The nested-FK N+1 has now been found at **five**
+sites across the two PRs. The reason is measurable: before this round the suite had exactly *one*
+query-count assertion (`test_ui.py:2836`). Site-by-site fixing has not converged and will not; the
+defect class needs standing query-count coverage on every surface that renders a device type. Related:
+`test_ui.py:724-738` restates each view's permission list verbatim, so every partial-grant test proves
+*enforcement* and none prove *completeness* — which is why two missing codenames survived to this
+review.
+
 ## Consequences accepted, not solved
 
 - **Duplicate models are creatable.** ADR decision 4. The picker makes selection the default path;
@@ -778,6 +837,16 @@ genuinely share one `"ik42"` mapping today, and that no serializer, fixture, con
   database. ADR decision 3 makes normalizing them a one-row edit whenever that is wanted; doing it
   here would mean changing the importer catalog and the verifier in the same breath.
 - **`/models/networkdevicemodel/`** reads oddly. Settled decision 2.
+- **The CSV-absent import path has no independent device-slug verification.** Flagged by three of the
+  five council reviewers, and they are right that coverage regressed: the verifier previously checked
+  all 22 device slugs unconditionally, and now checks none when the Device Models CSV is missing —
+  which is precisely the path where `DEVICE_MODEL_SLUGS` is load-bearing. Closing it would mean giving
+  the verifier its own copy of the 22 device entries, which is exactly what PR 2 settled decision A
+  removed. Accepted rather than reversed; worth an issue if CSV-less rebuilds become routine.
+- **The example CSV is untested and outranks the tested constant.** No test parses
+  `docs/examples/MPS Audio Network Standards - Device Models.csv`, yet at import time its values win
+  over `DEVICE_MODEL_SLUGS`, which has three tests. They agree exactly today (verified). Noted by the
+  blind reviewer.
 - **A post-import model rename breaks `verify_prod_import.py`.** Settled decision 7 — correct, but a
   behaviour change worth stating rather than discovering.
 
