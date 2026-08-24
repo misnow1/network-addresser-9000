@@ -118,13 +118,13 @@ A Type's port list is fixed once any instance (switch/device) exists — editing
     * Manufacturer
     * Model
     * Description — what this hardware *is*, e.g. "Dante Interface with AES3 I/O". Blank is a first-class state; nothing depends on it being filled. Belongs here, not on the Type, so two profiles of one model can never describe the hardware differently
+    * Hostname Slug (ADR 0023, moved here in ADR 0026 PR 2) — optional, operator-set hostname abbreviation, e.g. "sg300-10mp". Never auto-filled; blank means no profile of this model offers a computed hostname. Model-level, not profile-level, for the same reason as Description: two profiles of one model sharing one hardware identity must compute the same hostname, and after this move there is only one value to read
     * Unlike a Type profile, **not locked** after instances exist — editing manufacturer/model here updates every profile of that model coherently, which is the reason for extracting this entity rather than just adding a field to the Type. Duplicate models are creatable (not deduplicated); nothing here has a Network Switch Model equivalent yet (issue #78)
 * Network Device Type (amp, processor, mixer, etc.) — also a purpose profile; see above. e.g. "Martin Audio IK-42 — with Dante Card" vs "— without Dante Card", or "Shure ULXD4Q — Split Mode" vs "— Redundant Mode".
     * Device Model (FK to Network Device Model, above) — locked once any instance exists, replacing what used to be this Type's own Manufacturer/Model fields
     * Name (profile label, required)
     * Ports: a list of "Network Device Type Port"
     * Add-in Card (`BooleanField`, default false) — this type's instances are cards fitted inside another device and routinely moved between hosts (a DMI-DANTE, an X-Dante); leave off for ordinary equipment. Joins the profile's other locked fields once any instance exists — flipping it afterward would either strand fitted devices or retroactively offer ordinary equipment to the fit picker. See [ADR 0022](./docs/adr/0022-add-in-cards-and-operator-set-ports.md) tier 3.
-    * Hostname Slug (ADR 0023) — same shape as Network Switch Type's, above
 * Network Device Type Port (a port definition for the port(s) that an instance of this device will always have)
     * Port Number (optional - most devices have fixed numbers of ports with fixed purpose that aren't numbered)
     * Port Description (required — this is the port's identity/purpose, e.g. "Dante Primary"; not optional the way Port Number is)

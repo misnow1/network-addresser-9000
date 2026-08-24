@@ -109,6 +109,10 @@ def _make_device_type(port_count: int = 0, vlan: VLAN | None = None, **kwargs) -
     else:
         kwargs.pop("manufacturer", None)
         kwargs.pop("model", None)
+    hostname_slug = kwargs.pop("hostname_slug", None)
+    if hostname_slug is not None and device_model.hostname_slug != hostname_slug:
+        device_model.hostname_slug = hostname_slug
+        device_model.save(update_fields=["hostname_slug"])
     kwargs.setdefault("name", "Default")
     device_type = NetworkDeviceType.objects.create(port_count=port_count, device_model=device_model, **kwargs)
     for n in range(1, port_count + 1):
@@ -423,11 +427,15 @@ class ParityFixtureMixin:
         self.switch_port = self.switch.ports.get()
         self.switch_address = self.switch.addresses.get()
 
+        # hostname_slug lives on the model, not the profile, since ADR
+        # 0026 PR 2 — set it there before creating the profile.
+        sb_device_model = _device_model("StageB Device Mfr", "SBDeviceModel")
+        sb_device_model.hostname_slug = "sbdevtype"
+        sb_device_model.save()
         self.device_type = NetworkDeviceType.objects.create(
-            device_model=_device_model("StageB Device Mfr", "SBDeviceModel"),
+            device_model=sb_device_model,
             name="StageB Device Type",
             port_count=1,
-            hostname_slug="sbdevtype",
         )
         NetworkDeviceTypePort.objects.create(
             device_type=self.device_type,
@@ -2485,7 +2493,9 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         list_response = self.client.get(self._list_url("networkdevicemodel"))
         self.assertEqual(
             _list_row_cells(list_response.content.decode(), "SBDeviceModel"),
-            ["StageB Device Mfr", "SBDeviceModel", "StageB Model Description", "Details"],
+            # "sbdevtype" — set on this fixture's device_model in setUp
+            # (ADR 0026 PR 2: hostname_slug lives here, not on the profile).
+            ["StageB Device Mfr", "SBDeviceModel", "StageB Model Description", "sbdevtype", "Details"],
         )
 
         detail_response = self.client.get(self._detail_url("networkdevicemodel"))
@@ -2493,6 +2503,7 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         self.assertEqual(_detail_field_text(content, "Manufacturer"), "StageB Device Mfr")
         self.assertEqual(_detail_field_text(content, "Model"), "SBDeviceModel")
         self.assertEqual(_detail_field_text(content, "Description"), "StageB Model Description")
+        self.assertEqual(_detail_field_text(content, "Hostname slug"), "sbdevtype")
         self.assertEqual(
             _inline_row_cells(content, "Profiles", "StageB Device Type"),
             ["StageB Device Type", "1", "No"],
@@ -2804,6 +2815,27 @@ class HostnameDivergesMarkerTests(TestCase):
         self.assertEqual(small_response.status_code, 200)
         self.assertEqual(big_response.status_code, 200)
         self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
+
+    def test_elevation_query_count_is_fixed_with_several_devices(self) -> None:
+        """ADR 0026 PR 2 review note 11 — ``rack_detail``'s ``device_qs``
+        widened to ``device_type__device_model`` once ``hostname_diverges``
+        started traversing that extra FK. A fixed ``assertNumQueries``, not
+        just the equal-counts shape above, per the PR 2 tests section.
+        """
+        for slot in range(1, 6):
+            NetworkDevice.objects.create(
+                device_type=self.device_type,
+                rack=self.rack,
+                rack_slot=slot,
+                owner=self.owner,
+                hostname="hand-typed" if slot % 2 else "mps-wpcsrl-ik42",
+            )
+        # 12 measured against this tree with device_type__device_model in
+        # place — without it, each of the 5 devices costs one extra query
+        # fetching its device_model.
+        with self.assertNumQueries(12):
+            response = self.client.get(f"/racks/{self.rack.pk}/")
+        self.assertEqual(response.status_code, 200)
 
 
 class RangeOffsetsDivergeUITests(TestCase):

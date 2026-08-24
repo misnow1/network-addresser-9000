@@ -31,6 +31,7 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import IntegrityError, connection, transaction
 from django.db.migrations.executor import MigrationExecutor
+from django.db.migrations.recorder import MigrationRecorder
 from django.db.models import ProtectedError
 from django.forms import inlineformset_factory
 from django.template.defaultfilters import capfirst
@@ -45,6 +46,7 @@ from .admin import (
     NetworkDeviceAddForm,
     NetworkDeviceAdmin,
     NetworkDeviceChangeForm,
+    NetworkDeviceModelAdmin,
     NetworkDevicePortForm,
     NetworkDevicePortInline,
     NetworkDeviceTypeAdmin,
@@ -163,6 +165,15 @@ def _make_device_type(port_count: int = 0, vlan: VLAN | None = None, **kwargs) -
     a fixture that doesn't care about the model row) and this builds the
     ``device_model`` for them via ``_device_model()``, or pass
     ``device_model=`` directly to reuse/inspect a specific row.
+
+    ADR 0026 PR 2 — ``hostname_slug`` also moved to the model. Callers may
+    still pass it here (many pre-PR-2 call sites do); it's applied to
+    ``device_model`` rather than forwarded to
+    ``NetworkDeviceType.objects.create()``, which no longer has that
+    field. Two profiles of one model built via two ``_make_device_type()``
+    calls sharing a ``(manufacturer, model)``/``device_model`` therefore
+    end up sharing one slug automatically, the same way the live schema
+    now requires.
     """
     device_model = kwargs.pop("device_model", None)
     if device_model is None:
@@ -172,6 +183,10 @@ def _make_device_type(port_count: int = 0, vlan: VLAN | None = None, **kwargs) -
     else:
         kwargs.pop("manufacturer", None)
         kwargs.pop("model", None)
+    hostname_slug = kwargs.pop("hostname_slug", None)
+    if hostname_slug is not None and device_model.hostname_slug != hostname_slug:
+        device_model.hostname_slug = hostname_slug
+        device_model.save(update_fields=["hostname_slug"])
     kwargs.setdefault("name", "Default")
     device_type = NetworkDeviceType.objects.create(port_count=port_count, device_model=device_model, **kwargs)
     for n in range(1, port_count + 1):
@@ -5300,13 +5315,24 @@ class TypeHostnameSlugTests(TestCase):
         self.assertEqual(switch_type.hostname_slug, "sg300")
 
     def test_device_type_hostname_slug_normalizes_on_save(self) -> None:
+        # ADR 0026 PR 2 — hostname_slug lives on device_model now;
+        # _make_device_type() applies it there (see its docstring).
         device_type = _make_device_type(hostname_slug=" IK42 ")
-        self.assertEqual(device_type.hostname_slug, "ik42")
+        self.assertEqual(device_type.device_model.hostname_slug, "ik42")
 
-    def test_hostname_slug_not_unique_across_two_profiles_of_one_model(self) -> None:
-        _make_device_type(name="Default", hostname_slug="ik42")
-        second = _make_device_type(name="with Dante Card", hostname_slug="ik42")  # must not raise
-        self.assertEqual(second.hostname_slug, "ik42")
+    def test_device_model_hostname_slug_normalizes_by_full_clean(self) -> None:
+        device_model = NetworkDeviceModel(manufacturer="Cisco", model="X", hostname_slug=" IK42 ")
+        device_model.full_clean()
+        self.assertEqual(device_model.hostname_slug, "ik42")
+
+    def test_hostname_slug_shared_across_two_profiles_of_one_model(self) -> None:
+        # Structurally shared now (ADR 0026 PR 2), not merely "not
+        # unique" — both profiles point at the one model row that
+        # actually carries the slug.
+        first = _make_device_type(name="Default", hostname_slug="ik42")
+        second = _make_device_type(name="with Dante Card")  # same default model as first
+        self.assertEqual(first.device_model_id, second.device_model_id)
+        self.assertEqual(second.device_model.hostname_slug, "ik42")
 
     def test_switch_type_hostname_slug_editable_after_instances_exist(self) -> None:
         switch_type = _make_switch_type(hostname_slug="sg300")
@@ -5325,29 +5351,59 @@ class TypeHostnameSlugTests(TestCase):
         self.assertIn("manufacturer", readonly)  # sanity — the lock is real
         self.assertNotIn("hostname_slug", readonly)
 
-    def test_device_type_hostname_slug_editable_after_instances_exist(self) -> None:
-        device_type = _make_device_type(hostname_slug="ik42")
-        NetworkDevice.objects.create(device_type=device_type, hostname="dev1")
-        device_type.hostname_slug = "ik-42"
-        device_type.full_clean()
-        device_type.save()
-        device_type.refresh_from_db()
-        self.assertEqual(device_type.hostname_slug, "ik-42")
+    def test_device_model_hostname_slug_editable_after_instances_exist_and_affects_every_profile(
+        self,
+    ) -> None:
+        """ADR 0026 PR 2 review note 10 — after the move this edit happens
+        on a wholly unlocked ``NetworkDeviceModel`` and affects *every*
+        profile of it, not one Type in isolation (the pre-PR-2 version of
+        this test only had one profile to check). Uses the IK-42 shape:
+        two profiles of one model, an instance on one of them, editing the
+        model's slug directly.
+        """
+        with_card = _make_device_type(name="with Dante Card", hostname_slug="ik42")
+        without_card = _make_device_type(name="without Dante Card")  # same default model
+        NetworkDevice.objects.create(device_type=with_card, hostname="dev1")
+        device_model = with_card.device_model
+        device_model.hostname_slug = "ik-42"
+        device_model.full_clean()
+        device_model.save()
+        with_card.refresh_from_db()
+        without_card.refresh_from_db()
+        self.assertEqual(with_card.device_model.hostname_slug, "ik-42")
+        self.assertEqual(without_card.device_model.hostname_slug, "ik-42")
 
-    def test_device_type_hostname_slug_not_locked_by_get_readonly_fields(self) -> None:
+    def test_device_model_hostname_slug_not_locked_by_get_readonly_fields(self) -> None:
         device_type = _make_device_type(hostname_slug="ik42")
         NetworkDevice.objects.create(device_type=device_type, hostname="dev1")
-        admin = NetworkDeviceTypeAdmin(NetworkDeviceType, AdminSite())
-        readonly = admin.get_readonly_fields(RequestFactory().get("/"), device_type)
-        self.assertIn("device_model", readonly)  # sanity — the lock is real (ADR 0026)
+        device_model = device_type.device_model
+        # Sanity — NetworkDeviceType's own lock is still real (ADR 0026).
+        type_admin = NetworkDeviceTypeAdmin(NetworkDeviceType, AdminSite())
+        self.assertIn("device_model", type_admin.get_readonly_fields(RequestFactory().get("/"), device_type))
+        # The payoff: NetworkDeviceModelAdmin has no get_readonly_fields
+        # override at all, so hostname_slug (and everything else) stays
+        # editable regardless of instances existing.
+        model_admin = NetworkDeviceModelAdmin(NetworkDeviceModel, AdminSite())
+        readonly = model_admin.get_readonly_fields(RequestFactory().get("/"), device_model)
         self.assertNotIn("hostname_slug", readonly)
 
     def test_invalid_hostname_slug_rejected(self) -> None:
-        device_type = NetworkDeviceType(
-            device_model=_device_model("M", "M"), name="Default", port_count=0, hostname_slug="-bad"
-        )
+        device_model = NetworkDeviceModel(manufacturer="M", model="M", hostname_slug="-bad")
         with self.assertRaises(ValidationError):
-            device_type.full_clean()
+            device_model.full_clean()
+
+    def test_networkdevicetype_clean_fields_override_is_gone(self) -> None:
+        """ADR 0026 PR 2 review note 7 — ``clean_fields()`` did nothing but
+        normalize the slug, so it was deleted outright; ``clean()`` was
+        *not*, because it also holds the instance lock
+        (``DeviceModelLockTests.test_clean_blocked_once_instance_exists``
+        proves that half). Asserted structurally, not just by absence of
+        an ``AttributeError``: deleting an override is easy to over-apply,
+        and a stray no-op override left behind would pass every other test
+        here silently.
+        """
+        self.assertNotIn("clean_fields", NetworkDeviceType.__dict__)
+        self.assertIn("clean", NetworkDeviceType.__dict__)
 
 
 class HostnamePurposeSequenceTests(TestCase):
@@ -6627,6 +6683,51 @@ class HostnameDivergesAdminFilterTests(TestCase):
         self.assertIn("mps-wpcsrl-ik42", content)
 
 
+class HostnameDivergesFilterQueryCountTests(TestCase):
+    """ADR 0026 PR 2 review note 11 — ``NetworkDeviceHostnameDivergesFilter
+    .queryset()`` scans every row in Python, so its own ``select_related``
+    (``_type_field``) has to widen to ``device_type__device_model`` once
+    ``hostname_diverges`` traverses that extra FK, or applying the filter
+    itself becomes an N+1 across the changelist's row count. Several
+    device types, not one, so an added join per row shows up as an added
+    query rather than being lost against an unrelated fixed count.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.owner = Owner.objects.create(slug="mps", name="MPS")
+        self.rack = Rack.objects.create(
+            name="Rack 1", slot_count=10, owner=self.owner, location_slug="wpcsrl"
+        )
+        for i in range(3):
+            device_type = _make_device_type(
+                manufacturer=f"QC Divergence Mfr {i}",
+                model=f"QC Divergence Model {i}",
+                name="Default",
+                hostname_slug=f"qcd{i}",
+            )
+            NetworkDevice.objects.create(
+                device_type=device_type,
+                rack=self.rack,
+                rack_slot=i + 1,
+                owner=self.owner,
+                hostname="hand-typed",
+            )
+        self.admin_user = User.objects.create_user(
+            "diverge-filter-qc-admin", password="testpass123", is_staff=True
+        )
+        self.admin_user.groups.add(Group.objects.get(name="Admin"))
+        self.client.force_login(self.admin_user)
+
+    def test_filtered_changelist_query_count_is_fixed_with_several_device_types(self) -> None:
+        # 11 measured against this tree with device_type__device_model in
+        # place — without it, each of the 3 rows the filter's Python scan
+        # visits costs one extra query fetching its device_model.
+        with self.assertNumQueries(11):
+            response = self.client.get("/admin/inventory/networkdevice/", {"hostname_diverges": "yes"})
+        self.assertEqual(response.status_code, 200)
+
+
 class NetworkDeviceChangelistFilterQueryCountTests(TestCase):
     """Codex review of ADR 0026's PR 1, finding 1 — the "By device type"
     changelist filter sidebar builds its choices via ``RelatedFieldList
@@ -7175,14 +7276,27 @@ class DeviceModelBackfillMigrationExecutorTests(TransactionTestCase):
 
         # Forward: 0019 -> 0021. Proves the DDL ordering itself (steps 3/4
         # before 6) is correct, not just the RunPython data logic.
+        #
+        # Historical models at the 0021 project state (like the reverse
+        # leg below already uses), not the directly-imported live
+        # NetworkDeviceType/NetworkDeviceModel — ADR 0026 PR 2's own
+        # 0022_hostname_slug_to_device_model.py adds a column to
+        # NetworkDeviceModel that does not exist yet at 0021, and the live
+        # model class (which reflects the current code, including PR 2's
+        # field) would otherwise try to select it against a database this
+        # test has deliberately migrated only partway.
         executor = MigrationExecutor(connection)
         executor.migrate([("inventory", "0021_device_model_backfill")])
+        executor.loader.build_graph()
+        apps_0021 = executor.loader.project_state(("inventory", "0021_device_model_backfill")).apps
+        HistoricalDeviceModelAt0021 = apps_0021.get_model("inventory", "NetworkDeviceModel")
+        HistoricalDeviceTypeAt0021 = apps_0021.get_model("inventory", "NetworkDeviceType")
 
-        self.assertEqual(NetworkDeviceModel.objects.count(), 3)
-        with_card_live = NetworkDeviceType.objects.get(pk=with_card.pk)
-        without_card_live = NetworkDeviceType.objects.get(pk=without_card.pk)
-        sd12_live = NetworkDeviceType.objects.get(pk=sd12.pk)
-        dm7c_live = NetworkDeviceType.objects.get(pk=dm7c.pk)
+        self.assertEqual(HistoricalDeviceModelAt0021.objects.count(), 3)
+        with_card_live = HistoricalDeviceTypeAt0021.objects.get(pk=with_card.pk)
+        without_card_live = HistoricalDeviceTypeAt0021.objects.get(pk=without_card.pk)
+        sd12_live = HistoricalDeviceTypeAt0021.objects.get(pk=sd12.pk)
+        dm7c_live = HistoricalDeviceTypeAt0021.objects.get(pk=dm7c.pk)
         self.assertEqual(with_card_live.device_model_id, without_card_live.device_model_id)
         self.assertEqual(with_card_live.device_model.manufacturer, "Martin Audio")
         self.assertEqual(with_card_live.device_model.model, "IK-42")
@@ -7217,6 +7331,346 @@ class DeviceModelBackfillMigrationExecutorTests(TransactionTestCase):
         # Lossy, by design (settled decision 6) — description has no
         # column to go back to on NetworkDeviceType, so nothing here
         # asserts it survived reversal.
+
+
+class HostnameSlugMoveDataTests(TransactionTestCase):
+    """``0022_hostname_slug_to_device_model``'s ``assert_profiles_agree``
+    (PLAN-adr-0026.md PR 2) — reconstructs the schema as of
+    ``0021_device_model_backfill`` (immediately before this migration's
+    own operations run), same shape as ``DeviceModelBackfillDataTests``.
+
+    Only ``assert_profiles_agree`` is exercised directly here — it is
+    this migration's *first* operation and reads only columns that
+    already exist at 0021 (``device_model_id``, the Type's still-present
+    ``hostname_slug``), so a historical model at 0021 is enough.
+    ``copy_slugs``/``copy_back`` read and write
+    ``NetworkDeviceModel.hostname_slug``, a column this migration's own
+    ``AddField`` creates *mid*-migration — no named migration boundary
+    corresponds to that state, so those two are only exercised by the
+    real-DDL ``MigrationExecutor`` test below, the same reasoning
+    ``DeviceModelBackfillMigrationExecutorTests`` already documents for
+    ``0021``'s own reverse leg.
+    """
+
+    apps: Any
+    _migration_module: Any
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        executor = MigrationExecutor(connection)
+        executor.migrate([("inventory", "0021_device_model_backfill")])
+        executor.loader.build_graph()
+        cls.apps = executor.loader.project_state(("inventory", "0021_device_model_backfill")).apps
+        cls._migration_module = importlib.import_module(
+            "inventory.migrations.0022_hostname_slug_to_device_model"
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        call_command("migrate", "inventory", verbosity=0)
+        super().tearDownClass()
+
+    def setUp(self) -> None:
+        self.schema_editor = _FakeSchemaEditor(connection.alias)
+
+    def _run(self) -> None:
+        self._migration_module.assert_profiles_agree(self.apps, self.schema_editor)
+
+    def test_agreeing_profiles_of_one_model_do_not_raise(self) -> None:
+        """The IK-42 shape — two profiles, not one (review note 4): a
+        single-profile fixture can't exercise the agreement path
+        (``len(slugs) > 1``) at all.
+        """
+        NetworkDeviceModel = self.apps.get_model("inventory", "NetworkDeviceModel")
+        NetworkDeviceType = self.apps.get_model("inventory", "NetworkDeviceType")
+        device_model = NetworkDeviceModel.objects.create(manufacturer="Martin Audio", model="IK-42")
+        NetworkDeviceType.objects.create(
+            device_model=device_model, name="with Dante Card", port_count=0, hostname_slug="ik42"
+        )
+        NetworkDeviceType.objects.create(
+            device_model=device_model, name="without Dante Card", port_count=0, hostname_slug="ik42"
+        )
+        self._run()  # must not raise
+
+    def test_disagreeing_profiles_raise_naming_the_model(self) -> None:
+        """The centrepiece (PR 2 tests): a production-shaped fixture
+        agrees by construction and would pass against a broken
+        ``.first()`` implementation that silently picks a winner, so this
+        fixture constructs disagreement on purpose.
+        """
+        NetworkDeviceModel = self.apps.get_model("inventory", "NetworkDeviceModel")
+        NetworkDeviceType = self.apps.get_model("inventory", "NetworkDeviceType")
+        device_model = NetworkDeviceModel.objects.create(manufacturer="Martin Audio", model="IK-42")
+        NetworkDeviceType.objects.create(
+            device_model=device_model, name="with Dante Card", port_count=0, hostname_slug="ik42"
+        )
+        NetworkDeviceType.objects.create(
+            device_model=device_model, name="without Dante Card", port_count=0, hostname_slug="ik-42"
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run()
+        self.assertIn("Martin Audio", str(ctx.exception))
+        self.assertIn("IK-42", str(ctx.exception))
+
+    def test_orphan_model_is_not_a_disagreement(self) -> None:
+        """Settled decision C — a ``NetworkDeviceModel`` with no profiles
+        at all raises nothing; there is nothing to agree or disagree
+        about.
+        """
+        NetworkDeviceModel = self.apps.get_model("inventory", "NetworkDeviceModel")
+        NetworkDeviceModel.objects.create(manufacturer="Orphan Mfr", model="Orphan Model")
+        self._run()  # must not raise
+
+
+class HostnameSlugMoveMigrationExecutorTests(TransactionTestCase):
+    """A ``MigrationExecutor`` test that migrates ``0021 -> 0022`` and back
+    for **real** — covers what ``HostnameSlugMoveDataTests``' ``_FakeSchema
+    Editor`` harness cannot: that the preflight genuinely runs *before*
+    ``AddField`` (review note 2's non-transactional-DDL reasoning), and
+    ``copy_slugs``/``copy_back``, which need the ``AddField``'d column to
+    actually exist on ``NetworkDeviceModel``.
+    """
+
+    def test_forward_and_reverse_with_multi_profile_data(self) -> None:
+        self.addCleanup(lambda: call_command("migrate", "inventory", verbosity=0))
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([("inventory", "0021_device_model_backfill")])
+        executor.loader.build_graph()
+        apps_0021 = executor.loader.project_state(("inventory", "0021_device_model_backfill")).apps
+        HistoricalDeviceModel = apps_0021.get_model("inventory", "NetworkDeviceModel")
+        HistoricalDeviceType = apps_0021.get_model("inventory", "NetworkDeviceType")
+
+        ik42 = HistoricalDeviceModel.objects.create(manufacturer="Martin Audio", model="IK-42")
+        with_card = HistoricalDeviceType.objects.create(
+            device_model=ik42, name="with Dante Card", port_count=0, hostname_slug="ik42"
+        )
+        without_card = HistoricalDeviceType.objects.create(
+            device_model=ik42, name="without Dante Card", port_count=0, hostname_slug="ik42"
+        )
+        # Settled decision C — an orphan model, no profiles at all.
+        orphan = HistoricalDeviceModel.objects.create(manufacturer="Orphan Mfr", model="Orphan Model")
+
+        # Forward: 0021 -> 0022. Real DDL, not a direct function call —
+        # proves the preflight really runs before AddField, not just that
+        # the data logic is right in isolation.
+        executor = MigrationExecutor(connection)
+        executor.migrate([("inventory", "0022_hostname_slug_to_device_model")])
+
+        ik42_live = NetworkDeviceModel.objects.get(pk=ik42.pk)
+        orphan_live = NetworkDeviceModel.objects.get(pk=orphan.pk)
+        self.assertEqual(ik42_live.hostname_slug, "ik42")
+        self.assertEqual(orphan_live.hostname_slug, "")  # settled decision C
+
+        # Reverse: proves copy_back repopulates *every* profile, not just
+        # one — a rollback that only touched one would silently blank the
+        # other's slug on rollback.
+        executor = MigrationExecutor(connection)
+        executor.migrate([("inventory", "0021_device_model_backfill")])
+        executor.loader.build_graph()
+        apps_0021_again = executor.loader.project_state(("inventory", "0021_device_model_backfill")).apps
+        ReversedDeviceType = apps_0021_again.get_model("inventory", "NetworkDeviceType")
+        reversed_with_card = ReversedDeviceType.objects.get(pk=with_card.pk)
+        reversed_without_card = ReversedDeviceType.objects.get(pk=without_card.pk)
+        self.assertEqual(reversed_with_card.hostname_slug, "ik42")
+        self.assertEqual(reversed_without_card.hostname_slug, "ik42")
+
+    def test_forward_migration_raises_before_adding_the_column_on_disagreement(self) -> None:
+        """Settled decision A's non-transactional-DDL reasoning (review
+        note 2) — the preflight must raise *before* ``AddField``, so a
+        failed migration leaves nothing behind: no column stranded on
+        ``NetworkDeviceModel``, and 0022 never recorded as applied.
+        """
+        self.addCleanup(lambda: call_command("migrate", "inventory", verbosity=0))
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([("inventory", "0021_device_model_backfill")])
+        executor.loader.build_graph()
+        apps_0021 = executor.loader.project_state(("inventory", "0021_device_model_backfill")).apps
+        HistoricalDeviceModel = apps_0021.get_model("inventory", "NetworkDeviceModel")
+        HistoricalDeviceType = apps_0021.get_model("inventory", "NetworkDeviceType")
+
+        device_model = HistoricalDeviceModel.objects.create(manufacturer="Martin Audio", model="IK-42")
+        HistoricalDeviceType.objects.create(
+            device_model=device_model, name="with Dante Card", port_count=0, hostname_slug="ik42"
+        )
+        HistoricalDeviceType.objects.create(
+            device_model=device_model, name="without Dante Card", port_count=0, hostname_slug="ik-42"
+        )
+
+        executor = MigrationExecutor(connection)
+        with self.assertRaises(RuntimeError):
+            executor.migrate([("inventory", "0022_hostname_slug_to_device_model")])
+
+        self.assertFalse(
+            MigrationRecorder(connection)
+            .migration_qs.filter(app="inventory", name="0022_hostname_slug_to_device_model")
+            .exists()
+        )
+        # MariaDB is this project's target (config/settings.py) — a raw
+        # SHOW COLUMNS is the direct way to prove AddField never ran,
+        # rather than trusting the ORM's view of a schema that may not
+        # match the database if this assertion is wrong. MySQLdb's
+        # fetchall() returns a tuple of rows, not a list.
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW COLUMNS FROM inventory_networkdevicemodel LIKE 'hostname_slug'")
+            self.assertEqual(cursor.fetchall(), ())
+
+        # Recovery is real, not just "migrate() doesn't crash": fix the
+        # disagreement and prove a normal forward migrate can now proceed
+        # from this exact database — it must not be stuck on a
+        # half-applied state left over from the failed attempt above.
+        HistoricalDeviceType.objects.filter(device_model=device_model).update(hostname_slug="ik42")
+        executor = MigrationExecutor(connection)
+        executor.migrate([("inventory", "0022_hostname_slug_to_device_model")])
+        self.assertEqual(NetworkDeviceModel.objects.get(pk=device_model.pk).hostname_slug, "ik42")
+
+
+class HostnameSlugMoveLiveReaderTests(TransactionTestCase):
+    """PLAN-adr-0026.md PR 2 tests, review note 8 — "before and after" is
+    not a test until it names which reader. Historical migration models
+    carry neither live model methods nor admin forms, so a pure-function
+    comparison of the old Type value against the new Model value could
+    pass while every live path stayed broken.
+
+    Drives the real migration ``0019 -> 0022`` with the IK-42 shape (two
+    profiles agreeing on ``hostname_slug="ik42"``), binds a device to the
+    **second** profile (``"without Dante Card"``) so the multi-profile
+    path is covered, computes the stem from the old Type value before
+    migrating and the new Model value after, and then exercises each live
+    reader named in the plan separately: the divergence reader
+    (``models.py:4241``), the recompute action (``admin.py:2372``), and
+    the add-form reader (``admin.py:650``).
+    """
+
+    def setUp(self) -> None:
+        self.addCleanup(lambda: call_command("migrate", "inventory", verbosity=0))
+        call_command("sync_roles", stdout=io.StringIO())
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([("inventory", "0019_dante_unit_id")])
+        executor.loader.build_graph()
+        apps_0019 = executor.loader.project_state(("inventory", "0019_dante_unit_id")).apps
+        HistoricalDeviceType = apps_0019.get_model("inventory", "NetworkDeviceType")
+        HistoricalDevice = apps_0019.get_model("inventory", "NetworkDevice")
+        HistoricalOwner = apps_0019.get_model("inventory", "Owner")
+        HistoricalRack = apps_0019.get_model("inventory", "Rack")
+
+        HistoricalDeviceType.objects.create(
+            manufacturer="Martin Audio",
+            model="IK-42",
+            name="with Dante Card",
+            port_count=0,
+            hostname_slug="ik42",
+        )
+        without_card = HistoricalDeviceType.objects.create(
+            manufacturer="Martin Audio",
+            model="IK-42",
+            name="without Dante Card",
+            port_count=0,
+            hostname_slug="ik42",
+        )
+        owner = HistoricalOwner.objects.create(slug="mps", name="MPS")
+        rack = HistoricalRack.objects.create(name="Rack 1", slot_count=4, owner=owner, location_slug="wpcsrl")
+        # Bound to the SECOND profile (review notes 4/8) — the
+        # multi-profile path, not the trivially-correct single-profile one.
+        old_stem = assemble_hostname(
+            HostnameComponents(
+                owner_slug="mps",
+                location_slug="wpcsrl",
+                type_slug=without_card.hostname_slug,
+                purpose="",
+                sequence=None,
+            )
+        )
+        assert old_stem is not None
+        self.old_stem = old_stem
+        self.device_pk = HistoricalDevice.objects.create(
+            device_type=without_card, rack=rack, rack_slot=1, owner=owner, hostname=old_stem
+        ).pk
+
+        # Forward, all the way through PR 2's own migration.
+        executor = MigrationExecutor(connection)
+        executor.migrate([("inventory", "0022_hostname_slug_to_device_model")])
+
+        self.device_model = NetworkDeviceModel.objects.get(manufacturer="Martin Audio", model="IK-42")
+        self.without_card = NetworkDeviceType.objects.get(
+            device_model=self.device_model, name="without Dante Card"
+        )
+        self.device = NetworkDevice.objects.get(pk=self.device_pk)
+        self.owner = Owner.objects.get(slug="mps")
+        self.rack = Rack.objects.get(name="Rack 1")
+
+    def _request(self):
+        request = RequestFactory().post("/admin/inventory/networkdevice/")
+        request.session = {}
+        request._messages = FallbackStorage(request)
+        request.user = User.objects.create_user("hsm-live-reader-admin", password="x")
+        return request
+
+    def test_new_stem_matches_old_stem(self) -> None:
+        """The migration must not have changed what the stem computes to
+        — same owner/location/purpose/sequence, only the ``hostname_slug``
+        reader moved.
+        """
+        new_stem = assemble_hostname(
+            HostnameComponents(
+                owner_slug="mps",
+                location_slug="wpcsrl",
+                type_slug=self.device_model.hostname_slug,
+                purpose="",
+                sequence=None,
+            )
+        )
+        self.assertEqual(new_stem, self.old_stem)
+        self.assertEqual(new_stem, "mps-wpcsrl-ik42")
+
+    def test_divergence_reader_reads_through_device_model(self) -> None:
+        """``models.py:4241`` — the migrated device's hostname was set to
+        exactly the computed stem, so it must not diverge until it's
+        hand-edited.
+        """
+        self.assertFalse(self.device.hostname_diverges)
+        self.device.hostname = "hand-typed"
+        self.device.save()
+        self.assertTrue(self.device.hostname_diverges)
+
+    def test_recompute_action_reads_through_device_model(self) -> None:
+        """``admin.py:2372`` — the recompute action must read the stem's
+        type component through ``device_type.device_model.hostname_slug``.
+
+        Expected value carries "-1", not the bare stem: ADR 0023's blank-
+        purpose amendment makes ``choose_sequence()`` start numbering at 1
+        unconditionally, so the *real* recompute path never reproduces a
+        bare ``mps-wpcsrl-ik42`` — only a direct ORM write (as this
+        fixture's own historical creation used, matching
+        ``RecomputeHostnameActionTests.test_fills_blank_owner_from_rack_
+        and_stores_it``'s identical shape) can.
+        """
+        self.device.hostname = "hand-typed"
+        self.device.save()
+        device_admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+        device_admin.recompute_hostnames(self._request(), NetworkDevice.objects.filter(pk=self.device.pk))
+        self.device.refresh_from_db()
+        self.assertEqual(self.device.hostname, "mps-wpcsrl-ik42-1")
+
+    def test_add_form_reader_suggests_through_device_model(self) -> None:
+        """``admin.py:650`` — a *new* device of the same (migrated)
+        profile, added with no explicit hostname, must get its suggestion
+        from ``device_type.device_model.hostname_slug``.
+        """
+        form = NetworkDeviceAddForm(
+            data={
+                "device_type": str(self.without_card.pk),
+                "hostname": "",
+                "rack": str(self.rack.pk),
+                "rack_slot": "2",
+                "port_addressing": "dhcp",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.instance.hostname, "mps-wpcsrl-ik42-1")
 
 
 class AssembleHostnameTests(TestCase):

@@ -42,6 +42,7 @@ from django.core.management.base import CommandError
 from django.test import TestCase
 
 from .management.commands.import_prod_data import (
+    DEVICE_MODEL_SLUGS,
     DEVICE_TYPES,
     PRIMARY_SWITCH_TABLES,
     SECONDARY_DERIVED_TABLES,
@@ -566,11 +567,15 @@ class ImportProdDataTests(TestCase):
         )
 
     def test_import_applies_hostname_slugs_to_created_types(self) -> None:
-        """ADR 0023 decision 10, amended (phase 18 PR 4) — every Type this
-        import creates gets its ``hostname_slug`` from ``HOSTNAME_SLUGS``,
-        including a switch type (0 of which carried one on the live
-        database, unlike the device side) and one two-profile device
-        model (``IK-42`` — both profiles must agree).
+        """ADR 0023 decision 10, amended (phase 18 PR 4) — every switch
+        Type this import creates gets its ``hostname_slug`` from
+        ``HOSTNAME_SLUGS`` (0 of which carried one on the live database).
+
+        ADR 0026 PR 2 — the device side moved to ``NetworkDeviceModel``,
+        seeded from ``DEVICE_MODEL_SLUGS`` by ``_create_device_models()``:
+        one two-profile device model (``IK-42``) proves both profiles
+        share the model's single value, not two independently-set ones
+        that happen to agree.
         """
         primary = NetworkSwitchType.objects.get(
             manufacturer="Cisco", model="SG300-10MP", name="For 3xAmp Rack Primary"
@@ -588,8 +593,9 @@ class ImportProdDataTests(TestCase):
             device_model__model="IK-42",
             name="without Dante Card",
         )
-        self.assertEqual(with_card.hostname_slug, "ik42")
-        self.assertEqual(without_card.hostname_slug, "ik42")
+        self.assertEqual(with_card.device_model_id, without_card.device_model_id)
+        self.assertEqual(with_card.device_model.hostname_slug, "ik42")
+        self.assertEqual(without_card.device_model.hostname_slug, "ik42")
 
     def test_dm7c_and_dm3_device_control_ports(self) -> None:
         # ADR 0022: the importer's Device Control pre-pass folds each
@@ -1199,6 +1205,129 @@ class DeviceModelsCsvImportTests(TestCase):
                 call_command("verify_prod_import", data_dir=str(data_dir))
 
 
+class DeviceModelsCsvHostnameSlugPrecedenceTests(TestCase):
+    """ADR 0026 PR 2 settled decision B — the three CSV-vs-seed-catalog
+    cases for ``hostname_slug``, each requiring its own fixture since they
+    disagree on what the CSV even contains:
+
+    | case | behaviour |
+    |---|---|
+    | CSV absent entirely | seed catalog (``DEVICE_MODEL_SLUGS``) supplies every slug |
+    | CSV present, row missing for a model | seed catalog fills that model in |
+    | CSV present, row present, cell blank | blank wins over the catalog |
+
+    ``DEVICE_TYPES`` (the real production catalog, unlike the synthetic
+    VLAN/addressing scheme the rest of this module builds) is what these
+    fixtures import, so ``Martin Audio``/``IK-42`` and
+    ``Lab.Gruppen``/``LM26`` are real catalog entries with known
+    ``DEVICE_MODEL_SLUGS`` values (``"ik42"``/``"lm26"``) to assert against.
+    """
+
+    def test_csv_absent_falls_back_to_seed_catalog_for_every_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_fixture_csvs(data_dir)  # no Device Models CSV written
+            call_command("import_prod_data", data_dir=str(data_dir))
+
+        for (manufacturer, model), expected_slug in DEVICE_MODEL_SLUGS.items():
+            device_model = NetworkDeviceModel.objects.get(manufacturer=manufacturer, model=model)
+            self.assertEqual(device_model.hostname_slug, expected_slug, f"{manufacturer}/{model}")
+
+    def test_csv_present_but_row_missing_falls_back_to_seed_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_fixture_csvs(data_dir)
+            # Names a row for IK-42 only — every other model, including
+            # Lab.Gruppen/LM26, has no row in this CSV at all.
+            _write_csv(
+                data_dir / "MPS Audio Network Standards - Device Models.csv",
+                [
+                    ["Manufacturer", "Model", "Description", "Hostname Slug"],
+                    ["Martin Audio", "IK-42", "", "ik42"],
+                ],
+            )
+            call_command("import_prod_data", data_dir=str(data_dir))
+
+        lm26 = NetworkDeviceModel.objects.get(manufacturer="Lab.Gruppen", model="LM26")
+        self.assertEqual(lm26.hostname_slug, DEVICE_MODEL_SLUGS[("Lab.Gruppen", "LM26")])
+
+    def test_csv_row_present_with_blank_cell_wins_over_the_seed_catalog(self) -> None:
+        """The decisive case (review note 5): an explicit blank cell means
+        "no hostname for this model" and must not be silently overwritten
+        by ``DEVICE_MODEL_SLUGS["Lab.Gruppen", "LM26"] == "lm26"``.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_fixture_csvs(data_dir)
+            _write_csv(
+                data_dir / "MPS Audio Network Standards - Device Models.csv",
+                [
+                    ["Manufacturer", "Model", "Description", "Hostname Slug"],
+                    ["Lab.Gruppen", "LM26", "", ""],
+                ],
+            )
+            call_command("import_prod_data", data_dir=str(data_dir))
+
+        lm26 = NetworkDeviceModel.objects.get(manufacturer="Lab.Gruppen", model="LM26")
+        self.assertEqual(lm26.hostname_slug, "")
+
+    def test_csv_row_present_with_a_non_blank_cell_overrides_the_seed_catalog(self) -> None:
+        """The CSV wins even when it disagrees with the catalog, not just
+        when it agrees or is blank.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_fixture_csvs(data_dir)
+            _write_csv(
+                data_dir / "MPS Audio Network Standards - Device Models.csv",
+                [
+                    ["Manufacturer", "Model", "Description", "Hostname Slug"],
+                    ["Martin Audio", "IK-42", "", "operator-override"],
+                ],
+            )
+            call_command("import_prod_data", data_dir=str(data_dir))
+
+        ik42 = NetworkDeviceModel.objects.get(manufacturer="Martin Audio", model="IK-42")
+        self.assertNotEqual(DEVICE_MODEL_SLUGS[("Martin Audio", "IK-42")], "operator-override")
+        self.assertEqual(ik42.hostname_slug, "operator-override")
+
+    def test_verify_catches_a_hostname_slug_mismatch_against_the_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_fixture_csvs(data_dir)
+            _write_csv(
+                data_dir / "MPS Audio Network Standards - Device Models.csv",
+                [
+                    ["Manufacturer", "Model", "Description", "Hostname Slug"],
+                    ["Martin Audio", "IK-42", "", "ik42"],
+                ],
+            )
+            call_command("import_prod_data", data_dir=str(data_dir))
+            NetworkDeviceModel.objects.filter(manufacturer="Martin Audio", model="IK-42").update(
+                hostname_slug="hand-edited"
+            )
+            with self.assertRaises(CommandError):
+                call_command("verify_prod_import", data_dir=str(data_dir))
+
+    def test_verify_passes_when_blank_cell_matches_blank_database_value(self) -> None:
+        """The blank-wins case, verified independently — proves the
+        verifier's own oracle agrees with the importer's precedence
+        rather than expecting the catalog value.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_fixture_csvs(data_dir)
+            _write_csv(
+                data_dir / "MPS Audio Network Standards - Device Models.csv",
+                [
+                    ["Manufacturer", "Model", "Description", "Hostname Slug"],
+                    ["Lab.Gruppen", "LM26", "", ""],
+                ],
+            )
+            call_command("import_prod_data", data_dir=str(data_dir))
+            call_command("verify_prod_import", data_dir=str(data_dir))  # must not raise
+
+
 class HostnameSlugsConstantTests(TestCase):
     """PLAN-hostname-computation.md PR 4 "Seeding" — ``HOSTNAME_SLUGS``
     covers every ``(manufacturer, model)`` the importer's own catalog
@@ -1210,30 +1339,50 @@ class HostnameSlugsConstantTests(TestCase):
     copies (neither imports the other, on purpose) agree with each other
     exactly (still equality — the two are meant to describe the same
     rebuild-time catalog).
+
+    ADR 0026 PR 2, settled decision A — ``HOSTNAME_SLUGS`` (importer and
+    verifier) is switch-only now; the device side moved to
+    ``import_prod_data.DEVICE_MODEL_SLUGS``, which has no verifier-side
+    counterpart at all (the verifier checks the CSV against
+    ``NetworkDeviceModel.hostname_slug`` directly instead — see
+    ``DeviceModelsCsvImportTests`` for that coverage). Every test below
+    that used to check one combined constant now checks the two
+    separately.
     """
 
-    def test_every_importer_type_pair_has_a_hostname_slugs_entry(self) -> None:
+    def test_every_importer_switch_pair_has_a_hostname_slugs_entry(self) -> None:
         """A subset check (code review finding 2), not equality — the
-        importer's own HOSTNAME_SLUGS must cover every pair the importer
-        actually creates, but is allowed to carry no more than that (the
-        migration's *separate* copy carries one additional, live-only
-        pair — ("Cisco", "SG350-10P") — that the current importer catalog
-        no longer creates at all; equality here would force that pair
-        into a constant where it would be dead weight).
+        importer's own HOSTNAME_SLUGS must cover every switch pair the
+        importer actually creates, but is allowed to carry no more than
+        that (the migration's *separate* copy carries one additional,
+        live-only pair — ("Cisco", "SG350-10P") — that the current
+        importer catalog no longer creates at all; equality here would
+        force that pair into a constant where it would be dead weight).
         """
-        device_pairs = {(spec.manufacturer, spec.model) for spec in DEVICE_TYPES}
         switch_pairs = {
             (manufacturer, model) for manufacturer, model, _name in PRIMARY_SWITCH_TABLES.values()
         } | {(manufacturer, model) for manufacturer, model, _name in SECONDARY_DERIVED_TABLES.values()}
         self.assertTrue(
-            (device_pairs | switch_pairs) <= set(IMPORTER_HOSTNAME_SLUGS),
-            (device_pairs | switch_pairs) - set(IMPORTER_HOSTNAME_SLUGS),
+            switch_pairs <= set(IMPORTER_HOSTNAME_SLUGS),
+            switch_pairs - set(IMPORTER_HOSTNAME_SLUGS),
+        )
+
+    def test_every_importer_device_pair_has_a_device_model_slugs_entry(self) -> None:
+        """Same subset shape as the switch-side test above, but against
+        ``DEVICE_MODEL_SLUGS`` — the seed catalog ``_create_device_models()``
+        falls back to (ADR 0026 PR 2 settled decision B) when the Device
+        Models CSV supplies no row for a model.
+        """
+        device_pairs = {(spec.manufacturer, spec.model) for spec in DEVICE_TYPES}
+        self.assertTrue(
+            device_pairs <= set(DEVICE_MODEL_SLUGS),
+            device_pairs - set(DEVICE_MODEL_SLUGS),
         )
 
     def test_importer_and_verifier_copies_agree(self) -> None:
         self.assertEqual(IMPORTER_HOSTNAME_SLUGS, VERIFIER_HOSTNAME_SLUGS)
 
-    def test_migration_copy_covers_every_importer_pair(self) -> None:
+    def test_migration_copy_covers_every_importer_switch_pair(self) -> None:
         """Not asked for by either review round, but noted and left to
         judgement: relaxing the importer-catalog check (above) to a
         subset removed the last structural pressure keeping the
@@ -1255,11 +1404,43 @@ class HostnameSlugsConstantTests(TestCase):
         }
         self.assertEqual(mismatched, {})
 
+    def test_migration_copy_covers_every_device_model_slugs_pair(self) -> None:
+        """Same restoration as the switch-side test above, for
+        ``DEVICE_MODEL_SLUGS`` — migration 0018's frozen copy predates the
+        PR 2 split and still carries both halves undifferentiated, so it
+        must still cover (with matching values) everything the device
+        side's seed catalog now carries on its own.
+        """
+        self.assertTrue(
+            set(DEVICE_MODEL_SLUGS) <= set(MIGRATION_HOSTNAME_SLUGS),
+            set(DEVICE_MODEL_SLUGS) - set(MIGRATION_HOSTNAME_SLUGS),
+        )
+        mismatched = {
+            pair: (slug, MIGRATION_HOSTNAME_SLUGS[pair])
+            for pair, slug in DEVICE_MODEL_SLUGS.items()
+            if MIGRATION_HOSTNAME_SLUGS.get(pair) != slug
+        }
+        self.assertEqual(mismatched, {})
+
     def test_amphenol_entries_are_corrected_not_the_live_typo(self) -> None:
         """Settled with Mike: the live ``rdj…`` slugs against models
         spelled ``RJD…`` are a typo. The constant carries the correction,
-        not the typo.
+        not the typo. Amphenol is a device manufacturer, so this checks
+        ``DEVICE_MODEL_SLUGS`` (ADR 0026 PR 2), not ``HOSTNAME_SLUGS``.
         """
         for model in ("RJD1212-0050", "RJD2203-0050", "RJD32A3-0050", "RJD32U1-0050"):
-            slug = IMPORTER_HOSTNAME_SLUGS[("Amphenol", model)]
+            slug = DEVICE_MODEL_SLUGS[("Amphenol", model)]
+            self.assertTrue(slug.startswith("rjd"), f"{model}: {slug!r} does not start with 'rjd'")
+
+    def test_amphenol_absent_from_both_live_hostname_slugs_but_present_in_frozen_migration(self) -> None:
+        """ADR 0026 PR 2 settled decision A, review note 14 — after the
+        switch-only conversion, neither live ``HOSTNAME_SLUGS`` copy
+        (importer or verifier) names an Amphenol pair at all; migration
+        0018's frozen copy is history and keeps all four, corrected.
+        """
+        amphenol_models = ("RJD1212-0050", "RJD2203-0050", "RJD32A3-0050", "RJD32U1-0050")
+        for model in amphenol_models:
+            self.assertNotIn(("Amphenol", model), IMPORTER_HOSTNAME_SLUGS)
+            self.assertNotIn(("Amphenol", model), VERIFIER_HOSTNAME_SLUGS)
+            slug = MIGRATION_HOSTNAME_SLUGS[("Amphenol", model)]
             self.assertTrue(slug.startswith("rjd"), f"{model}: {slug!r} does not start with 'rjd'")

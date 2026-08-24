@@ -147,36 +147,34 @@ RACK_LOCATION_SLUG_EXCEPTIONS: dict[str, str | None] = {
     "CONTROL": None,
 }
 
-#: ADR 0023 decision 10, amended (phase 18 PR 4) — ``(manufacturer, model)``
-#: -> ``NetworkSwitchType``/``NetworkDeviceType.hostname_slug``. Keyed on
-#: the model, not the profile, so both ``IK-42`` profiles get ``ik42``
-#: (ADR 0023 decision 1's own requirement).
+#: ADR 0026 PR 2, settled decision A — the device half of the old,
+#: unified ``HOSTNAME_SLUGS`` moved here and was renamed: ``hostname_slug``
+#: now lives on ``NetworkDeviceModel``, a real entity, so a seed catalog
+#: keyed the same way it always was (``(manufacturer, model)``, not the
+#: profile — both ``IK-42`` profiles share one model row and therefore one
+#: slug automatically now) is no longer simulating the entity, just
+#: seeding it. Applied by ``_create_device_models()``, not
+#: ``_stage7_device_types()`` — see settled decision B for the CSV
+#: precedence this catalog only fills gaps in.
 #:
-#: Every device-side entry (all but ``Neutrik``/``NA2-DLINE``) is copied
-#: verbatim from the live database's already hand-set values, not
-#: invented — several are not what a naive ``slugify()`` would produce:
-#: ``PLM20000Q`` -> ``plm20q`` (not ``plm20000q``), ``AVIO-AO2`` ->
-#: ``avioao2`` (dash dropped), ``DiNET DAN-TX``/``DiNET DAN-RX`` ->
-#: ``dantx``/``danrx``. The four Amphenol entries are corrected here, not
-#: copied: the live rows read ``rdj1212``/``rdj2203``/``rdj32a3``/
-#: ``rdj32u1`` against models spelled ``RJD…`` — a transposition typo,
-#: settled with Mike as exactly that. ``Neutrik``/``NA2-DLINE`` is new:
-#: the live row is still blank, and ``na2dline`` (not ``na2-dline``)
-#: matches the dash-dropping convention ADR 0023 decision 10's amendment
-#: already documents for this exact model.
+#: Every entry (all but ``Neutrik``/``NA2-DLINE``) is copied verbatim from
+#: the live database's already hand-set values, not invented — several are
+#: not what a naive ``slugify()`` would produce: ``PLM20000Q`` ->
+#: ``plm20q`` (not ``plm20000q``), ``AVIO-AO2`` -> ``avioao2`` (dash
+#: dropped), ``DiNET DAN-TX``/``DiNET DAN-RX`` -> ``dantx``/``danrx``. The
+#: four Amphenol entries are corrected here, not copied: the live rows
+#: read ``rdj1212``/``rdj2203``/``rdj32a3``/``rdj32u1`` against models
+#: spelled ``RJD…`` — a transposition typo, settled with Mike as exactly
+#: that. ``Neutrik``/``NA2-DLINE`` is new: the live row is still blank,
+#: and ``na2dline`` (not ``na2-dline``) matches the dash-dropping
+#: convention ADR 0023 decision 10's amendment already documents for this
+#: exact model.
 #:
-#: The four ``Cisco``/``TP-Link`` switch entries have no live value to
-#: copy at all — 0 of the importer's switch types carry a slug yet, on
-#: the live database or anywhere else — so these are new, following the
-#: one convention ``ROADMAP.md``/ADR 0023 already establish by example
-#: (component 3's own worked example is ``"sg300-10mp"``, dash kept): a
-#: Cisco/TP-Link catalog number's dash is a genuine series/variant
-#: separator, not decorative catalog styling the way ``IK-42``'s is, so
-#: it survives here where it doesn't for the device-side entries above.
-#:
-#: ``verify_prod_import.py`` re-derives its own copy rather than
-#: importing this one — see that module's docstring.
-HOSTNAME_SLUGS: dict[tuple[str, str], str] = {
+#: ``verify_prod_import.py`` does not carry an equivalent of this
+#: constant at all (settled decision A) — it checks the Device Models CSV
+#: against ``NetworkDeviceModel.hostname_slug`` directly instead, reading
+#: the CSV, never this catalog.
+DEVICE_MODEL_SLUGS: dict[tuple[str, str], str] = {
     ("Allen & Heath", "SQ-5"): "sq5",
     ("Amphenol", "RJD1212-0050"): "rjd1212",
     ("Amphenol", "RJD2203-0050"): "rjd2203",
@@ -199,6 +197,25 @@ HOSTNAME_SLUGS: dict[tuple[str, str], str] = {
     ("Yamaha", "DM7-EX"): "dm7ex",
     ("Yamaha", "DM7C"): "dm7c",
     ("Yamaha", "Tio1608-D2"): "tio1608d2",
+}
+
+#: ADR 0023 decision 10, amended (phase 18 PR 4) — ``(manufacturer, model)``
+#: -> ``NetworkSwitchType.hostname_slug``. Switch-only since ADR 0026 PR 2
+#: (settled decision A) — the device entries this constant used to also
+#: carry moved to ``DEVICE_MODEL_SLUGS``, above.
+#:
+#: These four have no live value to copy at all — 0 of the importer's
+#: switch types carry a slug yet, on the live database or anywhere else —
+#: so they're new, following the one convention ``ROADMAP.md``/ADR 0023
+#: already establish by example (component 3's own worked example is
+#: ``"sg300-10mp"``, dash kept): a Cisco/TP-Link catalog number's dash is
+#: a genuine series/variant separator, not decorative catalog styling the
+#: way ``IK-42``'s is, so it survives here where it doesn't for
+#: ``DEVICE_MODEL_SLUGS``.
+#:
+#: ``verify_prod_import.py`` re-derives its own copy rather than
+#: importing this one — see that module's docstring.
+HOSTNAME_SLUGS: dict[tuple[str, str], str] = {
     ("Cisco", "SG300-10MP"): "sg300-10mp",
     ("Cisco", "SG300-26P"): "sg300-26p",
     ("Cisco", "SG350-10"): "sg350-10",
@@ -593,7 +610,9 @@ class Command(BaseCommand):
         switch_port_tables = {t.name: t for t in parse_switch_port_tables(read_csv_rows(switch_ports_path))}
 
         # ADR 0026 decision 5 — optional. Missing must not fail the import;
-        # blank descriptions are valid by design.
+        # blank descriptions are valid by design. PR 2 settled decision B —
+        # absence also means every hostname_slug falls back to the
+        # DEVICE_MODEL_SLUGS seed catalog rather than landing blank.
         device_models_path = data_dir / DEVICE_MODELS_CSV_NAME
         if device_models_path.is_file():
             device_model_rows = parse_device_models(read_csv_rows(device_models_path))
@@ -601,7 +620,8 @@ class Command(BaseCommand):
             self.stdout.write(
                 self.style.WARNING(
                     f"No {DEVICE_MODELS_CSV_NAME} found in {data_dir} — every device model "
-                    "will be created with a blank description."
+                    "will be created with a blank description, and hostname slugs will fall "
+                    "back to the built-in seed catalog."
                 )
             )
             device_model_rows = []
@@ -1039,16 +1059,32 @@ class _Importer:
         applied — every distinct ``(manufacturer, model)`` in the catalog
         gets exactly one row, description filled from the CSV where a row
         matches and blank otherwise (ADR 0026 decision 5).
+
+        ``hostname_slug`` follows ADR 0026 PR 2 settled decision B's CSV
+        precedence, not a plain ``dict.get(key, "")`` fallback like
+        ``description`` above: a row *present* in the CSV wins even when
+        its ``Hostname Slug`` cell is blank — an explicit blank means
+        "no hostname" and must not be silently overwritten by
+        ``DEVICE_MODEL_SLUGS``. Only a genuinely *missing* row (no CSV at
+        all, or the CSV has no row for this model) falls back to the seed
+        catalog. ``rows_by_key`` and ``descriptions`` are built from the
+        same ``self.device_model_rows`` but read differently on purpose —
+        description has no "blank wins" rule to preserve, so its simpler
+        ``.get(key, "")`` stays as it was in PR 1.
         """
         descriptions = {(row.manufacturer, row.model): row.description for row in self.device_model_rows}
+        rows_by_key = {(row.manufacturer, row.model): row for row in self.device_model_rows}
         for spec in DEVICE_TYPES:
             key = (spec.manufacturer, spec.model)
             if key in self.device_models_by_key:
                 continue
+            row = rows_by_key.get(key)
+            hostname_slug = row.hostname_slug if row is not None else DEVICE_MODEL_SLUGS.get(key, "")
             device_model = NetworkDeviceModel(
                 manufacturer=spec.manufacturer,
                 model=spec.model,
                 description=descriptions.get(key, ""),
+                hostname_slug=hostname_slug,
                 created_by=self.user,
             )
             device_model.full_clean()
@@ -1064,7 +1100,6 @@ class _Importer:
                 name=spec.name,
                 port_count=len(spec.ports),
                 is_add_in_card=spec.is_add_in_card,
-                hostname_slug=HOSTNAME_SLUGS.get((spec.manufacturer, spec.model), ""),
                 created_by=self.user,
             )
             device_type.full_clean()

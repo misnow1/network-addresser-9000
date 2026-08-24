@@ -621,12 +621,17 @@ in use since phase 18 and moving it deserves its own review separate from creati
       the field name and its attname, not just a bare `save()`; decision 3's payoff (editing a model
       row updates every profile); the admin changelist search (`?q=`), not just `search_fields`'
       contents; audit coverage; partial-grant 403s on every surface that now reads the new model
-- [ ] **PR 2** — `hostname_slug` moves from `NetworkDeviceType` onto `NetworkDeviceModel`, the same
+- [x] **PR 2** — `hostname_slug` moves from `NetworkDeviceType` onto `NetworkDeviceModel`, the same
       class of model-not-profile fact as the description, but blocking (ADR 0023 decision 1) where
       the description is cosmetic: a divergent slug between two profiles of one model silently
-      computes different hostnames for identical hardware. Retires the device half of
-      `HOSTNAME_SLUGS` (both live copies; migration `0018`'s frozen copy stays, since it must keep
-      running against old databases) and amends ADR 0023 decision 1's placement table
+      computes different hostnames for identical hardware. Migration `0018`'s frozen copy of
+      `HOSTNAME_SLUGS` stays, since it must keep running against old databases; ADR 0023 decision 1's
+      placement table is amended in place, dated. **Corrected against the line above, written before
+      the plan review**: "retires the device half of `HOSTNAME_SLUGS` (both live copies)" turned out
+      to be wrong — the importer needed a seed catalog for a CSV-less rebuild, so it keeps the 22
+      device entries renamed `DEVICE_MODEL_SLUGS`; only the *verifier*'s copy retires, replaced by an
+      independent CSV → `NetworkDeviceModel.hostname_slug` check (resolved with Mike, see
+      `PLAN-adr-0026.md` PR 2 settled decision A)
 
 Consequences accepted, not solved: duplicate models are creatable and not mergeable (issue #79,
 nothing to merge in the live estate today); the two Type models diverge until switches get the same

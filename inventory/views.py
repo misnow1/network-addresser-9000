@@ -643,11 +643,15 @@ def rack_detail(request: HttpRequest, pk: int) -> HttpResponse:
     # hostname_diverges (#54, ADR 0023 phase 18 PR 4) — the registry's own
     # select_related hints never reach this shaped view, so its query
     # budget has to declare them itself or the marker is an N+1 across the
-    # rack's occupants.
+    # rack's occupants. device_type__device_model, not a bare device_type
+    # (ADR 0026 PR 2) — hostname_diverges now reads hostname_slug off the
+    # device_model FK, one hop further than before.
     switch_qs = NetworkSwitch.objects.select_related("switch_type", "owner", "rack").prefetch_related(
         Prefetch("addresses", queryset=NetworkSwitchAddress.objects.select_related("vlan"))
     )
-    device_qs = NetworkDevice.objects.select_related("device_type", "owner", "rack").prefetch_related(
+    device_qs = NetworkDevice.objects.select_related(
+        "device_type__device_model", "owner", "rack"
+    ).prefetch_related(
         Prefetch("ports", queryset=NetworkDevicePort.objects.select_related("vlan")),
     )
     rack = get_object_or_404(
@@ -1554,11 +1558,14 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Manufacturer", "manufacturer"),
             FieldSpec("Model", "model"),
             FieldSpec("Description", "description"),
+            # ADR 0026 PR 2 — moved here from Network Device Type.
+            FieldSpec("Hostname slug", "hostname_slug"),
         ),
         detail_fields=(
             FieldSpec("Manufacturer", "manufacturer"),
             FieldSpec("Model", "model"),
             FieldSpec("Description", "description"),
+            FieldSpec("Hostname slug", "hostname_slug"),
         ),
         inlines=(
             # ADR 0026 decision 4's payoff on screen — two near-identical
@@ -1591,14 +1598,15 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Name", "name"),
             FieldSpec("Port count", "port_count"),
             FieldSpec("Add-in card", "is_add_in_card", render="boolean"),
-            FieldSpec("Hostname slug", "hostname_slug"),
+            # Dotted — ADR 0026 PR 2 moved hostname_slug onto device_model.
+            FieldSpec("Hostname slug", "device_model.hostname_slug"),
         ),
         detail_fields=(
             FieldSpec("Device model", "device_model", render="relation"),
             FieldSpec("Name", "name"),
             FieldSpec("Port count", "port_count"),
             FieldSpec("Add-in card", "is_add_in_card", render="boolean"),
-            FieldSpec("Hostname slug", "hostname_slug"),
+            FieldSpec("Hostname slug", "device_model.hostname_slug"),
             # ADR 0026 decision 6 — the changelist already carries six
             # columns and the description is long, so it stays off the
             # list page and shows only here.

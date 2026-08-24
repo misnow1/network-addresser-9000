@@ -3511,16 +3511,25 @@ class NetworkDeviceModel(AuditedModel):
     ``NetworkDeviceTypePort.description``, which is a *port's* purpose
     label, not a statement about the hardware as a whole.
 
-    **Deliberately not locked, and carries no ``save()``/``_locked_
-    snapshot()`` override** — the one place this model departs from every
-    locked-after-instances neighbour in this module. ADR 0010 locked a
-    profile's ``manufacturer``/``model`` because a denormalized copy going
-    stale on one profile while its siblings kept the old value was a real
-    hazard; with the hardware identity in one row, editing it updates
-    every profile of that model coherently, which is correct behaviour,
-    not drift (ADR 0026 decision 3). Duplicate models (e.g. `Lab Gruppen
-    LM26` alongside `Lab.Gruppen LM26`) are creatable and not merged here
-    — decision 4, issue #79.
+    ``hostname_slug`` moved here from ``NetworkDeviceType`` in ADR 0026 PR
+    2, for the same reason as ``description``: it is a fact about the
+    hardware, not the profile, and ADR 0023 decision 1 makes it
+    *blocking* — a divergent value between two profiles of one model used
+    to silently compute different hostnames for identical hardware, and
+    now can't, because there is only one value to read.
+
+    **Deliberately not locked** — the one place this model departs from
+    every locked-after-instances neighbour in this module. ADR 0010
+    locked a profile's ``manufacturer``/``model`` because a denormalized
+    copy going stale on one profile while its siblings kept the old value
+    was a real hazard; with the hardware identity in one row, editing it
+    updates every profile of that model coherently, which is correct
+    behaviour, not drift (ADR 0026 decision 3). Duplicate models (e.g.
+    `Lab Gruppen LM26` alongside `Lab.Gruppen LM26`) are creatable and not
+    merged here — decision 4, issue #79. ``save()``/``clean_fields()``/
+    ``clean()`` below exist only to normalize ``hostname_slug`` (the
+    ``Owner`` shape, not the locked-profile shape) — there is no
+    ``_locked_snapshot()`` and no lock check anywhere on this model.
     """
 
     manufacturer = models.CharField(max_length=100)
@@ -3532,6 +3541,16 @@ class NetworkDeviceModel(AuditedModel):
             'What this hardware is, e.g. "Dante Interface with AES3 I/O" — a model-level fact, '
             "not a profile's port purpose (see NetworkDeviceTypePort.description). Blank is fine; "
             "nothing depends on it being filled."
+        ),
+    )
+    hostname_slug = models.CharField(
+        max_length=63,
+        blank=True,
+        validators=[validate_dns_label],
+        help_text=(
+            'Operator-set hostname abbreviation, e.g. "ik42". Never auto-filled — '
+            'slugify("IK-42") gives "ik-42" where the name in use might be "ik42". Blank means '
+            "no profile of this model offers a computed hostname (ADR 0023)."
         ),
     )
 
@@ -3547,6 +3566,30 @@ class NetworkDeviceModel(AuditedModel):
 
     def __str__(self) -> str:
         return f"{self.manufacturer} {self.model}"
+
+    def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
+        # hostname_slug moved here from NetworkDeviceType (ADR 0026 PR 2) —
+        # normalized on save exactly as it was there, and as Owner.save()
+        # normalizes its own slug: this model is deliberately unlocked
+        # (see the class docstring), so there is no lock check to run
+        # alongside it, unlike NetworkDeviceType.save().
+        if self.hostname_slug:
+            self.hostname_slug = self.hostname_slug.strip().lower()
+        super().save(
+            force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
+        )
+
+    def clean_fields(self, exclude=None) -> None:
+        # Normalize *before* the field validators run — see
+        # Owner.clean_fields() for why this can't wait for clean().
+        if self.hostname_slug:
+            self.hostname_slug = self.hostname_slug.strip().lower()
+        super().clean_fields(exclude=exclude)
+
+    def clean(self) -> None:
+        super().clean()
+        if self.hostname_slug:
+            self.hostname_slug = self.hostname_slug.strip().lower()
 
 
 class NetworkDeviceType(AuditedModel):
@@ -3574,17 +3617,6 @@ class NetworkDeviceType(AuditedModel):
             "between hosts — a DMI-DANTE, an X-Dante. Leave off for ordinary equipment."
         ),
     )
-    hostname_slug = models.CharField(
-        max_length=63,
-        blank=True,
-        validators=[validate_dns_label],
-        help_text=(
-            'Operator-set hostname abbreviation, e.g. "ik42". Never auto-filled — '
-            'slugify("IK-42") gives "ik-42" where the name in use might be "ik42" — and '
-            "deliberately not unique: two profiles of one model both carry the same abbreviation. "
-            "Blank means this Type offers no computed hostnames (ADR 0023)."
-        ),
-    )
 
     class Meta:
         constraints = [
@@ -3597,12 +3629,6 @@ class NetworkDeviceType(AuditedModel):
         return f"{self.device_model} — {self.name}"
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
-        # hostname_slug is normalized here, outside _locked_snapshot() —
-        # it deliberately never joins the lock (settled decision 3): a
-        # typo'd abbreviation must stay fixable without creating a new
-        # named profile.
-        if self.hostname_slug:
-            self.hostname_slug = self.hostname_slug.strip().lower()
         with transaction.atomic():
             if self.pk is not None:
                 _lock_type_rows(NetworkDeviceType, self.pk)
@@ -3633,17 +3659,8 @@ class NetworkDeviceType(AuditedModel):
         max_offset = self.type_ports.aggregate(models.Max("slot_offset"))["slot_offset__max"]
         return (max_offset or 0) + 1
 
-    def clean_fields(self, exclude=None) -> None:
-        # Normalize *before* the field validators run — see
-        # Owner.clean_fields() for why this can't wait for clean().
-        if self.hostname_slug:
-            self.hostname_slug = self.hostname_slug.strip().lower()
-        super().clean_fields(exclude=exclude)
-
     def clean(self) -> None:
         super().clean()
-        if self.hostname_slug:
-            self.hostname_slug = self.hostname_slug.strip().lower()
         if self.pk is not None and self.devices.exists():
             _check_locked_fields_unchanged(
                 NetworkDeviceType, self.pk, self._locked_snapshot(), update_fields=None
@@ -4235,10 +4252,14 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         owner = _get_related(self, "owner")
         rack = _get_related(self, "rack")
         device_type = _get_related(self, "device_type")
+        # ADR 0026 PR 2 — hostname_slug moved from device_type onto its
+        # device_model FK, so this reads one hop further than
+        # NetworkSwitch.hostname_diverges' switch_type.hostname_slug.
+        device_model = _get_related(device_type, "device_model") if device_type is not None else None
         computed = _assemble_hostname_stem(
             owner_slug=owner.slug if owner is not None else None,
             location_slug=rack.location_slug if rack is not None else None,
-            type_slug=device_type.hostname_slug if device_type is not None else None,
+            type_slug=device_model.hostname_slug if device_model is not None else None,
             purpose=self.hostname_purpose,
             sequence=self.hostname_sequence,
         )
