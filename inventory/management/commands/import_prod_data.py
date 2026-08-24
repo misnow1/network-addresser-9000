@@ -41,6 +41,7 @@ from django.db import transaction
 from inventory.models import (
     VLAN,
     NetworkDevice,
+    NetworkDeviceModel,
     NetworkDeviceType,
     NetworkDeviceTypePort,
     NetworkSwitch,
@@ -61,9 +62,11 @@ from inventory.validators import validate_dns_label
 
 from ._prod_import_csv import (
     AddressingRow,
+    DeviceModelRow,
     SwitchPortRow,
     SwitchPortTable,
     parse_addressing_rows,
+    parse_device_models,
     parse_rack_offsets,
     parse_switch_port_tables,
     parse_vlan_table,
@@ -75,6 +78,9 @@ IMPORT_USERNAME = "prod-import"
 ADDRESSING_CSV_NAME = "MPS Audio Network Standards - IP Addressing mk2.csv"
 CALC_LOOKUPS_CSV_NAME = "MPS Audio Network Standards - IP Calc Lookups.csv"
 SWITCH_PORTS_CSV_NAME = "MPS Audio Network Standards - Switch Ports.csv"
+#: Optional (ADR 0026 decision 5) — if absent, every NetworkDeviceModel is
+#: created with a blank description and the import still succeeds.
+DEVICE_MODELS_CSV_NAME = "MPS Audio Network Standards - Device Models.csv"
 
 #: VLAN table "Function" names this site's scheme keys off of. Everything
 #: else (Lighting Control/Protocol, Video, NDI) is created as an ordinary
@@ -586,8 +592,24 @@ class Command(BaseCommand):
         addressing_rows = parse_addressing_rows(read_csv_rows(addressing_path))
         switch_port_tables = {t.name: t for t in parse_switch_port_tables(read_csv_rows(switch_ports_path))}
 
+        # ADR 0026 decision 5 — optional. Missing must not fail the import;
+        # blank descriptions are valid by design.
+        device_models_path = data_dir / DEVICE_MODELS_CSV_NAME
+        if device_models_path.is_file():
+            device_model_rows = parse_device_models(read_csv_rows(device_models_path))
+        else:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"No {DEVICE_MODELS_CSV_NAME} found in {data_dir} — every device model "
+                    "will be created with a blank description."
+                )
+            )
+            device_model_rows = []
+
         with transaction.atomic():
-            importer = _Importer(self, vlan_rows, rack_offset_rows, addressing_rows, switch_port_tables)
+            importer = _Importer(
+                self, vlan_rows, rack_offset_rows, addressing_rows, switch_port_tables, device_model_rows
+            )
             importer.run()
 
         self.stdout.write(self.style.SUCCESS("Production data import complete."))
@@ -642,12 +664,14 @@ class _Importer:
         rack_offset_rows: list[Any],
         addressing_rows: list[AddressingRow],
         switch_port_tables: dict[str, SwitchPortTable],
+        device_model_rows: list[DeviceModelRow],
     ) -> None:
         self.command = command
         self.vlan_rows = vlan_rows
         self.rack_offset_rows = rack_offset_rows
         self.addressing_rows = addressing_rows
         self.switch_port_tables = switch_port_tables
+        self.device_model_rows = device_model_rows
 
         self.user: Any = None
         self.owners_by_slug: dict[str, Owner] = {}
@@ -658,6 +682,9 @@ class _Importer:
         #: primary table backs both a switch's own type and its derived
         #: Secondary type (§3/§6), so the table name alone isn't unique.
         self.switch_types_by_table: dict[tuple[str, bool], NetworkSwitchType] = {}
+        #: ADR 0026 — keyed by (manufacturer, model), populated by
+        #: _create_device_models() before _stage7_device_types() reads it.
+        self.device_models_by_key: dict[tuple[str, str], NetworkDeviceModel] = {}
         self.device_types_by_key: dict[str, NetworkDeviceType] = {}
 
     def run(self) -> None:
@@ -668,6 +695,7 @@ class _Importer:
         template = self._stage4_rack_template()
         self._stage5_racks(template)
         self._stage6_switch_types()
+        self._create_device_models()
         self._stage7_device_types()
         switch_entries, device_entries = self._classify_addressing_rows()
         self._stage8_switches(switch_entries)
@@ -1001,13 +1029,38 @@ class _Importer:
             f"(mode={port.mode}, native={port.native_vlan_id})."
         )
 
+    # -- Device models (ADR 0026) ------------------------------------------------------
+
+    def _create_device_models(self) -> None:
+        """Create every ``NetworkDeviceModel`` row ``DEVICE_TYPES``'s specs
+        need, before ``_stage7_device_types()`` creates the profiles that
+        point at them. Cleaner than a ``get_or_create`` inside that loop,
+        and it gives the optional Device Models CSV a single place to be
+        applied — every distinct ``(manufacturer, model)`` in the catalog
+        gets exactly one row, description filled from the CSV where a row
+        matches and blank otherwise (ADR 0026 decision 5).
+        """
+        descriptions = {(row.manufacturer, row.model): row.description for row in self.device_model_rows}
+        for spec in DEVICE_TYPES:
+            key = (spec.manufacturer, spec.model)
+            if key in self.device_models_by_key:
+                continue
+            device_model = NetworkDeviceModel(
+                manufacturer=spec.manufacturer,
+                model=spec.model,
+                description=descriptions.get(key, ""),
+                created_by=self.user,
+            )
+            device_model.full_clean()
+            device_model.save()
+            self.device_models_by_key[key] = device_model
+
     # -- Stage 7: device types ---------------------------------------------------------
 
     def _stage7_device_types(self) -> None:
         for spec in DEVICE_TYPES:
             device_type = NetworkDeviceType(
-                manufacturer=spec.manufacturer,
-                model=spec.model,
+                device_model=self.device_models_by_key[(spec.manufacturer, spec.model)],
                 name=spec.name,
                 port_count=len(spec.ports),
                 is_add_in_card=spec.is_add_in_card,

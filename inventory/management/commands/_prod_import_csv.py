@@ -93,6 +93,18 @@ class SwitchPortRow:
 
 
 @dataclass(frozen=True)
+class DeviceModelRow:
+    """One row of the (optional) Device Models CSV (ADR 0026 decision 5)."""
+
+    manufacturer: str
+    model: str
+    description: str
+    #: Parsed but ignored by PR 1 — the column exists in the sheet from the
+    #: start so it's authored once; PR 2 starts reading it.
+    hostname_slug: str
+
+
+@dataclass(frozen=True)
 class SwitchPortTable:
     """One named table (one switch profile's worth of ports) from the
     Switch Ports CSV.
@@ -161,6 +173,30 @@ def parse_addressing_rows(rows: list[list[str]]) -> list[AddressingRow]:
                 dante_primary=dante_primary,
                 dante_secondary=dante_secondary,
                 notes=notes,
+            )
+        )
+    return result
+
+
+def parse_device_models(rows: list[list[str]]) -> list[DeviceModelRow]:
+    """The Device Models CSV: ``Manufacturer, Model, Description, Hostname
+    Slug``. Tolerates the ``Hostname Slug`` column being present but unused
+    (PR 1 reads only the first three columns; PR 2 starts reading it) —
+    and tolerates it being absent altogether, so a sheet authored before
+    PR 2 lands doesn't need a phantom column either way.
+    """
+    result = []
+    for row in rows[1:]:  # row 0 is the header
+        if len(row) < 2:
+            continue
+        manufacturer, model = row[0].strip(), row[1].strip()
+        if not manufacturer or not model:
+            continue
+        description = row[2].strip() if len(row) > 2 else ""
+        hostname_slug = row[3].strip() if len(row) > 3 else ""
+        result.append(
+            DeviceModelRow(
+                manufacturer=manufacturer, model=model, description=description, hostname_slug=hostname_slug
             )
         )
     return result

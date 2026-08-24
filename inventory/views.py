@@ -56,6 +56,7 @@ from .models import (
     VLAN,
     Department,
     NetworkDevice,
+    NetworkDeviceModel,
     NetworkDevicePort,
     NetworkDeviceType,
     NetworkDeviceTypePort,
@@ -918,6 +919,9 @@ def vlan_map(request: HttpRequest, pk: int) -> HttpResponse:
         "inventory.view_networkdevicetypeport",
         # ADR 0023 — this page now renders the device's owner.
         "inventory.view_owner",
+        # ADR 0026 — the type string now dereferences device_model, and
+        # this page renders the model's description directly.
+        "inventory.view_networkdevicemodel",
     ],
     raise_exception=True,
 )
@@ -950,7 +954,12 @@ def device_detail(request: HttpRequest, pk: int) -> HttpResponse:
     review note 8).
     """
     device = get_object_or_404(
-        NetworkDevice.objects.select_related("device_type", "rack", "host", "owner").prefetch_related(
+        # device_type__device_model (ADR 0026 review note 4) — the type
+        # string and the description line both dereference device_model;
+        # a bare "device_type" leaves that an N+1.
+        NetworkDevice.objects.select_related(
+            "device_type__device_model", "rack", "host", "owner"
+        ).prefetch_related(
             Prefetch(
                 "ports",
                 # source_type_port (ADR 0022) — port.hostname reads it on
@@ -962,7 +971,9 @@ def device_detail(request: HttpRequest, pk: int) -> HttpResponse:
             ),
             Prefetch(
                 "installed_cards",
-                queryset=NetworkDevice.objects.select_related("device_type", "rack").order_by("hostname"),
+                queryset=NetworkDevice.objects.select_related("device_type__device_model", "rack").order_by(
+                    "hostname"
+                ),
             ),
         ),
         pk=pk,
@@ -996,6 +1007,9 @@ def device_detail(request: HttpRequest, pk: int) -> HttpResponse:
         # themselves (Codex review round 2, finding 2).
         "inventory.view_networkswitchtype",
         "inventory.view_networkdevicetype",
+        # ADR 0026 — the device column is a NetworkDeviceType string, which
+        # now dereferences device_model.
+        "inventory.view_networkdevicemodel",
     ],
     raise_exception=True,
 )
@@ -1014,8 +1028,10 @@ def spare_pool(request: HttpRequest) -> HttpResponse:
         "spare_switches": NetworkSwitch.objects.filter(rack__isnull=True)
         .select_related("switch_type", "owner")
         .order_by("hostname"),
+        # device_type__device_model (ADR 0026 review note 4) — the type
+        # column reads device_type's __str__, which now dereferences it.
         "spare_devices": NetworkDevice.objects.filter(rack__isnull=True)
-        .select_related("device_type", "owner")
+        .select_related("device_type__device_model", "owner")
         .order_by("hostname"),
     }
     return render(request, "inventory/spare_pool.html", context)
@@ -1529,26 +1545,64 @@ REGISTRY: dict[str, ModelSpec] = {
             "inventory.view_switchportvlanprofile",
         ),
     ),
+    "networkdevicemodel": ModelSpec(
+        slug="networkdevicemodel",
+        model=NetworkDeviceModel,
+        label="Network Device Model",
+        label_plural="Network Device Models",
+        list_columns=(
+            FieldSpec("Manufacturer", "manufacturer"),
+            FieldSpec("Model", "model"),
+            FieldSpec("Description", "description"),
+        ),
+        detail_fields=(
+            FieldSpec("Manufacturer", "manufacturer"),
+            FieldSpec("Model", "model"),
+            FieldSpec("Description", "description"),
+        ),
+        inlines=(
+            # ADR 0026 decision 4's payoff on screen — two near-identical
+            # profiles of one model sit adjacent in one inline, rather than
+            # each carrying its own possibly-diverging manufacturer/model
+            # spelling the way pre-ADR-0026 rows could.
+            InlineSpec(
+                label="Profiles",
+                accessor="profiles",
+                columns=(
+                    FieldSpec("Name", "name"),
+                    FieldSpec("Port count", "port_count"),
+                    FieldSpec("Add-in card", "is_add_in_card", render="boolean"),
+                ),
+                ordering=("name",),
+                permissions=("inventory.view_networkdevicetype",),
+            ),
+        ),
+        ordering=("manufacturer", "model"),
+        list_permissions=("inventory.view_networkdevicemodel",),
+        detail_permissions=("inventory.view_networkdevicemodel", "inventory.view_networkdevicetype"),
+    ),
     "networkdevicetype": ModelSpec(
         slug="networkdevicetype",
         model=NetworkDeviceType,
         label="Network Device Type",
         label_plural="Network Device Types",
         list_columns=(
-            FieldSpec("Manufacturer", "manufacturer"),
-            FieldSpec("Model", "model"),
+            FieldSpec("Device model", "device_model", render="relation"),
             FieldSpec("Name", "name"),
             FieldSpec("Port count", "port_count"),
             FieldSpec("Add-in card", "is_add_in_card", render="boolean"),
             FieldSpec("Hostname slug", "hostname_slug"),
         ),
         detail_fields=(
-            FieldSpec("Manufacturer", "manufacturer"),
-            FieldSpec("Model", "model"),
+            FieldSpec("Device model", "device_model", render="relation"),
             FieldSpec("Name", "name"),
             FieldSpec("Port count", "port_count"),
             FieldSpec("Add-in card", "is_add_in_card", render="boolean"),
             FieldSpec("Hostname slug", "hostname_slug"),
+            # ADR 0026 decision 6 — the changelist already carries six
+            # columns and the description is long, so it stays off the
+            # list page and shows only here.
+            FieldSpec("Description", "device_model.description"),
         ),
         inlines=(
             InlineSpec(
@@ -1567,11 +1621,14 @@ REGISTRY: dict[str, ModelSpec] = {
                 permissions=("inventory.view_networkdevicetypeport",),
             ),
         ),
-        ordering=("manufacturer", "model", "name"),
+        ordering=("device_model__manufacturer", "device_model__model", "name"),
+        list_select_related=("device_model",),
+        detail_select_related=("device_model",),
         detail_prefetch_related=("type_ports__vlan",),
-        list_permissions=("inventory.view_networkdevicetype",),
+        list_permissions=("inventory.view_networkdevicetype", "inventory.view_networkdevicemodel"),
         detail_permissions=(
             "inventory.view_networkdevicetype",
+            "inventory.view_networkdevicemodel",
             "inventory.view_networkdevicetypeport",
             "inventory.view_vlan",
         ),
@@ -1636,10 +1693,13 @@ REGISTRY: dict[str, ModelSpec] = {
         ),
         canonical_detail_view="inventory:device",
         ordering=("hostname",),
-        list_select_related=("device_type", "rack", "host", "owner"),
+        # device_type__device_model (ADR 0026 review note 4) — the Type
+        # column renders device_type's __str__, which now dereferences it.
+        list_select_related=("device_type__device_model", "rack", "host", "owner"),
         list_permissions=(
             "inventory.view_networkdevice",
             "inventory.view_networkdevicetype",
+            "inventory.view_networkdevicemodel",
             "inventory.view_rack",
             "inventory.view_owner",
         ),

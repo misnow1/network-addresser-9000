@@ -3496,15 +3496,70 @@ def switch_port_profile_summary(port: "NetworkSwitchPort") -> str:
     return f"{summary}, allowed {allowed}" if allowed else summary
 
 
+class NetworkDeviceModel(AuditedModel):
+    """The bare hardware identity a ``NetworkDeviceType`` profile is built
+    on (ADR 0026) — "an Amphenol RJD32A3-0050", independent of what any
+    particular profile's ports are wired for. Several ``NetworkDeviceType``
+    rows (``related_name="profiles"``) can share one model: a Martin Audio
+    IK-42 "with Dante Card" and "without Dante Card" are the same box.
+
+    ``description`` is what an `Amphenol RJD32A3-0050` *is* to someone who
+    doesn't already know the part number ("Dante Interface with AES3
+    I/O") — model-level, not profile-level, because two profiles of one
+    model describing the hardware differently would be the exact drift
+    ADR 0026 was written to prevent. Distinct from
+    ``NetworkDeviceTypePort.description``, which is a *port's* purpose
+    label, not a statement about the hardware as a whole.
+
+    **Deliberately not locked, and carries no ``save()``/``_locked_
+    snapshot()`` override** — the one place this model departs from every
+    locked-after-instances neighbour in this module. ADR 0010 locked a
+    profile's ``manufacturer``/``model`` because a denormalized copy going
+    stale on one profile while its siblings kept the old value was a real
+    hazard; with the hardware identity in one row, editing it updates
+    every profile of that model coherently, which is correct behaviour,
+    not drift (ADR 0026 decision 3). Duplicate models (e.g. `Lab Gruppen
+    LM26` alongside `Lab.Gruppen LM26`) are creatable and not merged here
+    — decision 4, issue #79.
+    """
+
+    manufacturer = models.CharField(max_length=100)
+    model = models.CharField(max_length=100)
+    description = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text=(
+            'What this hardware is, e.g. "Dante Interface with AES3 I/O" — a model-level fact, '
+            "not a profile's port purpose (see NetworkDeviceTypePort.description). Blank is fine; "
+            "nothing depends on it being filled."
+        ),
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["manufacturer", "model"], name="unique_device_model"),
+            models.CheckConstraint(
+                condition=~models.Q(manufacturer=""), name="networkdevicemodel_manufacturer_not_blank"
+            ),
+            models.CheckConstraint(condition=~models.Q(model=""), name="networkdevicemodel_model_not_blank"),
+        ]
+        ordering = ["manufacturer", "model"]
+
+    def __str__(self) -> str:
+        return f"{self.manufacturer} {self.model}"
+
+
 class NetworkDeviceType(AuditedModel):
     """A device make/model *profile* (ADR 0010) — see ``NetworkSwitchType``
     for what "profile" means here. E.g. "Martin Audio IK-42 — with Dante
     Card" vs "— without Dante Card", or "Shure ULXD4Q — Split Mode" vs
     "— Redundant Mode": identical hardware, different port sets/purposes.
+
+    The hardware identity itself lives on ``NetworkDeviceModel`` (ADR
+    0026) — this class is a *profile of* one, not the bare hardware model.
     """
 
-    manufacturer = models.CharField(max_length=100)
-    model = models.CharField(max_length=100)
+    device_model = models.ForeignKey(NetworkDeviceModel, on_delete=models.PROTECT, related_name="profiles")
     name = models.CharField(
         max_length=100,
         help_text='Profile label, e.g. "with Dante Card", or "Default" for a single-profile model.',
@@ -3533,13 +3588,13 @@ class NetworkDeviceType(AuditedModel):
 
     class Meta:
         constraints = [
-            models.UniqueConstraint(fields=["manufacturer", "model", "name"], name="unique_device_type"),
+            models.UniqueConstraint(fields=["device_model", "name"], name="unique_device_type"),
             models.CheckConstraint(condition=~models.Q(name=""), name="networkdevicetype_name_not_blank"),
         ]
-        ordering = ["manufacturer", "model", "name"]
+        ordering = ["device_model__manufacturer", "device_model__model", "name"]
 
     def __str__(self) -> str:
-        return f"{self.manufacturer} {self.model} — {self.name}"
+        return f"{self.device_model} — {self.name}"
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
         # hostname_slug is normalized here, outside _locked_snapshot() —
@@ -3601,8 +3656,7 @@ class NetworkDeviceType(AuditedModel):
         # or retroactively offer ordinary equipment to the fit picker
         # (turning it on under stock that was never meant to be fitted).
         return {
-            "manufacturer": self.manufacturer,
-            "model": self.model,
+            "device_model": self.device_model_id,
             "name": self.name,
             "port_count": self.port_count,
             "is_add_in_card": self.is_add_in_card,

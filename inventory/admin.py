@@ -24,6 +24,7 @@ from .models import (
     AuditedModel,
     Department,
     NetworkDevice,
+    NetworkDeviceModel,
     NetworkDevicePort,
     NetworkDeviceType,
     NetworkDeviceTypePort,
@@ -958,6 +959,29 @@ def _suggest_dante_unit_id() -> UnitIdSuggestion | None:
     return dante.suggest_unit_id(assigned)
 
 
+class NetworkDeviceTypeChoiceField(forms.ModelChoiceField):
+    """The device-type picker's label, carrying the model's description
+    (ADR 0026 decision 6) — ``str(type)`` plus `` (description)``, and
+    plain ``str(type)`` when the description is blank (no empty
+    parentheses), so 15 of today's 22 models render exactly as they do
+    now.
+
+    One declaration covers every picker (PLAN-adr-0026.md settled decision
+    1): the ordinary add form below installs it via ``Meta.field_classes``,
+    and the two card-fit call sites (``_render_fit_card_page``,
+    ``_fit_new_card``) only ever reassign ``.queryset`` on an
+    already-constructed field, which preserves the field instance's class.
+    ``admin.py`` has no ``label_from_instance``/``formfield_for_foreignkey``
+    anywhere else, and ``device_type`` is read-only on change (fixed at
+    creation, ADR 0010), so this is the whole picker surface.
+    """
+
+    def label_from_instance(self, obj: NetworkDeviceType) -> str:
+        label = str(obj)
+        description = obj.device_model.description
+        return f"{label} ({description})" if description else label
+
+
 class NetworkDeviceAddForm(forms.ModelForm):
     """Carries the creation-time-only ``port_addressing`` choice (ADR 0013)
     — not a model field, so it can't be expressed via ``Meta.fields``
@@ -1036,9 +1060,18 @@ class NetworkDeviceAddForm(forms.ModelForm):
             "hostname_sequence",
             "dante_unit_id",
         ]
+        # ADR 0026 settled decision 1 — the ordinary picker's hook for the
+        # model description in the dropdown label.
+        field_classes = {"device_type": NetworkDeviceTypeChoiceField}
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        # ADR 0026 — the description in every dropdown label reads
+        # device_type.device_model, so this must be select_related or the
+        # dropdown is an N+1 across every device type.
+        self.fields["device_type"].queryset = NetworkDeviceType.objects.select_related(  # type: ignore[attr-defined]
+            "device_model"
+        )
         # One field per OPERATOR-sourced type port on the chosen type (ADR
         # 0022) — self.data (bound: a submission) takes priority over
         # self.initial (unbound: a prefilled GET), matching how every
@@ -1966,6 +1999,34 @@ class NetworkDeviceHostnameDivergesFilter(_HostnameDivergesFilterBase):
     _type_field = "device_type"
 
 
+class NetworkDeviceTypeRelatedFilter(admin.RelatedFieldListFilter):
+    """Codex review of ADR 0026's PR 1 — ``RelatedFieldListFilter`` builds
+    its sidebar choices via ``Field.get_choices()``, a queryset entirely
+    separate from ``ModelAdmin.get_queryset()`` — ``list_select_related``
+    on ``NetworkDeviceAdmin`` never touches it. Rendering the "By device
+    type" filter therefore called ``str(type)`` (which now dereferences
+    ``device_model``) once per ``NetworkDeviceType`` row with no join at
+    all — an N+1 on every changelist page load, not just once.
+
+    ``field_choices()`` is the hook ``RelatedFieldListFilter.__init__``
+    actually calls; ``Field.get_choices()`` itself has no queryset-
+    injection parameter in this Django version, so this reimplements it
+    (mirroring ``Field.get_choices()``'s own body) rather than trying to
+    wrap it. ``device_type``'s target field is the model's plain ``pk``
+    (no ``to_field``), so ``x.pk`` is correct without needing
+    ``get_related_field()``'s extra indirection.
+    """
+
+    def field_choices(self, field, request, model_admin):
+        ordering = self.field_admin_ordering(field, request, model_admin)
+        queryset = field.remote_field.model._default_manager.complex_filter(
+            field.get_limit_choices_to()
+        ).select_related("device_model")
+        if ordering:
+            queryset = queryset.order_by(*ordering)
+        return [(obj.pk, str(obj)) for obj in queryset]
+
+
 @admin.register(NetworkSwitch)
 class NetworkSwitchAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
     list_display = [
@@ -2071,23 +2132,44 @@ class NetworkSwitchAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
             messages.warning(request, f"Skipped {len(skipped)}: {'; '.join(skipped)}.")
 
 
+@admin.register(NetworkDeviceModel)
+class NetworkDeviceModelAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
+    """ADR 0026 — the bare hardware identity. Unlike ``NetworkDeviceTypeAdmin``
+    below, no ``get_readonly_fields`` override: decision 3 makes this row
+    editable even once its profiles have instances — the whole point of
+    the extraction is that correcting a manufacturer/model string here
+    updates every profile of that model coherently.
+    """
+
+    list_display = ["manufacturer", "model", "description"]
+    search_fields = ["manufacturer", "model", "description"]
+    show_auditlog_history_link = True
+
+
 @admin.register(NetworkDeviceType)
 class NetworkDeviceTypeAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
-    list_display = ["manufacturer", "model", "name", "port_count", "is_add_in_card", "hostname_slug"]
+    list_display = ["device_model", "name", "port_count", "is_add_in_card", "hostname_slug"]
     list_filter = ["is_add_in_card"]
-    search_fields = ["manufacturer", "model", "name"]
+    # Not "device_model" (Codex review note 3) — a bare FK name here
+    # becomes `device_model__icontains`, which raises `FieldError:
+    # Unsupported lookup 'icontains' for ForeignKey or join on the field
+    # not permitted` the moment an operator types in the search box.
+    # Verified against this tree.
+    search_fields = ["device_model__manufacturer", "device_model__model", "name"]
+    list_select_related = ["device_model"]
     inlines = [NetworkDeviceTypePortInline]
     show_auditlog_history_link = True
 
     def get_readonly_fields(self, request: HttpRequest, obj: Any = None) -> list[str]:
-        # ADR 0010's lock on manufacturer/model/name/port_count once the
-        # profile has instances: NetworkDeviceType.save()/clean() lock it
-        # identically. is_add_in_card joins the lock (ADR 0022 PR 3) —
-        # flipping it after instances exist would either strand fitted
+        # ADR 0026 decision 3 replaces ADR 0010's lock on
+        # manufacturer/model with a lock on the device_model FK itself —
+        # NetworkDeviceType.save()/clean() lock it identically, via
+        # _locked_snapshot(). is_add_in_card joins the lock (ADR 0022 PR 3)
+        # — flipping it after instances exist would either strand fitted
         # devices or retroactively offer ordinary equipment to the fit
         # picker.
         if _profile_locked(obj, "devices"):
-            return ["manufacturer", "model", "name", "port_count", "is_add_in_card"]
+            return ["device_model", "name", "port_count", "is_add_in_card"]
         return []
 
 
@@ -2113,14 +2195,21 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
     # ("host", EmptyFieldListFilter) gives fitted/unfitted as the filter
     # choices (ADR 0022 PR 3) — a plain "host" filter would instead list
     # every individual host, which isn't the question this filter answers.
+    # ("device_type", NetworkDeviceTypeRelatedFilter) — Codex review of
+    # ADR 0026's PR 1: the sidebar's own choices queryset is separate from
+    # list_select_related below and needs its own select_related, or the
+    # filter dropdown is an N+1 across every NetworkDeviceType row.
     list_filter = [
         "rack",
-        "device_type",
+        ("device_type", NetworkDeviceTypeRelatedFilter),
         ("host", admin.EmptyFieldListFilter),
         "owner",
         NetworkDeviceHostnameDivergesFilter,
     ]
-    list_select_related = ["device_type", "rack", "host", "owner"]
+    # device_type__device_model (ADR 0026 review note 4) — __str__ now
+    # dereferences device_model, so a bare "device_type" leaves an N+1
+    # across every row once the changelist renders it.
+    list_select_related = ["device_type__device_model", "rack", "host", "owner"]
     inlines = [NetworkDevicePortInline]
     show_auditlog_history_link = True
     # "recompute_hostnames" must be named here explicitly (settled decision
@@ -2441,11 +2530,15 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
             create_form = NetworkDeviceAddForm.with_operator_fields(None)(instance=NetworkDevice(host=host))
         create_form.fields["device_type"].queryset = NetworkDeviceType.objects.filter(  # type: ignore[attr-defined]
             is_add_in_card=True
-        )
+        ).select_related("device_model")
+        # device_type__device_model (Codex review of ADR 0026's PR 1) — the
+        # template renders card.device_type per row, which now
+        # dereferences device_model; a bare "device_type" here left one
+        # extra query per hostless card.
         existing_cards = (
             NetworkDevice.objects.filter(device_type__is_add_in_card=True, host__isnull=True)
             .exclude(pk=host.pk)
-            .select_related("device_type")
+            .select_related("device_type__device_model")
             .order_by("hostname")
         )
         context = {
@@ -2535,7 +2628,7 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
             form = form_cls(data=request.POST, instance=NetworkDevice(host=locked_host))
             form.fields["device_type"].queryset = NetworkDeviceType.objects.filter(  # type: ignore[attr-defined]
                 is_add_in_card=True
-            )
+            ).select_related("device_model")
             if not form.is_valid():
                 return self._render_fit_card_page(request, locked_host, create_form=form)
             form.instance.created_by = request.user
