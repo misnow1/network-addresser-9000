@@ -605,6 +605,12 @@ def _build_elevation_rows(
         # A previous Codex review caught this view under-declaring its
         # codenames; the rule stands — declare the full set actually read.
         "inventory.view_owner",
+        # ADR 0026 PR 2 — hostname_diverges (the #54 marker) now reads
+        # device_type.device_model.hostname_slug; the queryset's join was
+        # widened for this (device_type__device_model, below) but the
+        # codename list was not — same "declare the full set actually
+        # read" rule as every entry above.
+        "inventory.view_networkdevicemodel",
     ],
     raise_exception=True,
 )
@@ -1299,7 +1305,12 @@ REGISTRY: dict[str, ModelSpec] = {
             ),
         ),
         ordering=("name",),
-        detail_prefetch_related=("racks", "switches__switch_type", "devices__device_type"),
+        # devices__device_type__device_model, not a bare devices__device_type
+        # (review council finding 1) — the Network Devices inline renders
+        # str(device_type), which dereferences device_model since ADR 0026;
+        # without the extra hop, each distinct device type on this owner
+        # costs one more query.
+        detail_prefetch_related=("racks", "switches__switch_type", "devices__device_type__device_model"),
         list_permissions=("inventory.view_owner",),
         # InlineSpec.permissions is declared but read nowhere — _render_inline()
         # does no permission check and model_detail() renders every inline
@@ -1312,6 +1323,9 @@ REGISTRY: dict[str, ModelSpec] = {
             "inventory.view_rack",
             "inventory.view_networkswitch",
             "inventory.view_networkdevice",
+            # ADR 0026 — the Network Devices inline's Type column renders
+            # device_type, which dereferences device_model.
+            "inventory.view_networkdevicemodel",
         ),
     ),
     "switchportvlanprofile": ModelSpec(

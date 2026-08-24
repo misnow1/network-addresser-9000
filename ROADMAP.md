@@ -2,7 +2,7 @@
 
 High-level phases only — day-to-day task tracking belongs in GitHub Issues once there's code to file issues against. This file exists so it's obvious what phase the project is in and what's next, even after a fresh start.
 
-**Current phase: 20 — addressing per `(device, VLAN)` instead of per port. Phases 1–19 and 22 done (7 and 22 both landed out of numeric order — 7 was scoped, skipped, then closed later; ADR 0024 needed none of phases 19–21's machinery for 22). Phases 20–21 remain outstanding. Phase 23 also landed out of order (PR 1 only — ADR 0026 needed none of 19–21's machinery either; its PR 2 remains outstanding).**
+**Current phase: 20 — addressing per `(device, VLAN)` instead of per port. Phases 1–19, 22 and 23 done (7, 22 and 23 all landed out of numeric order — 7 was scoped, skipped, then closed later; ADR 0024 needed none of phases 19–21's machinery for 22, and neither did ADR 0026 for 23). Phases 20–21 remain outstanding.**
 
 ## 1. Foundation — done
 

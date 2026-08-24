@@ -41,6 +41,7 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import TestCase
 
+from .management.commands._prod_import_csv import parse_device_models
 from .management.commands.import_prod_data import (
     DEVICE_MODEL_SLUGS,
     DEVICE_TYPES,
@@ -1147,6 +1148,84 @@ class ImportUserIdentityTests(TestCase):
         self.assertFalse(Rack.objects.exists())  # refused before any writes committed
 
 
+class ParseDeviceModelsTests(TestCase):
+    """Unit tests for ``_prod_import_csv.parse_device_models()`` directly —
+    no management command, no database. Review council finding 5: a
+    malformed/missing header used to be treated exactly like a well-formed
+    one (silently discarding what was actually a data row), and a skipped
+    body row (blank Manufacturer or Model) went uncounted and unwarned —
+    invisible to both the importer and to ``verify_prod_import.py``'s
+    independent check, since both read this same parser.
+    """
+
+    def test_valid_header_parses_normally(self) -> None:
+        rows = parse_device_models(
+            [
+                ["Manufacturer", "Model", "Description", "Hostname Slug"],
+                ["Martin Audio", "IK-42", "Amp Rack Processor", "ik42"],
+            ]
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].manufacturer, "Martin Audio")
+
+    def test_empty_file_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_device_models([])
+
+    def test_malformed_header_raises_instead_of_silently_dropping_the_first_row(self) -> None:
+        """The defect this guards against: an unconditional ``rows[1:]``
+        would have treated this real data row as a header and discarded it.
+        """
+        with self.assertRaises(ValueError):
+            parse_device_models([["Martin Audio", "IK-42", "Amp Rack Processor", "ik42"]])
+
+    def test_header_matching_is_case_and_whitespace_insensitive(self) -> None:
+        rows = parse_device_models(
+            [
+                [" manufacturer ", " MODEL ", "Description", "Hostname Slug"],
+                ["Martin Audio", "IK-42", "", ""],
+            ]
+        )
+        self.assertEqual(len(rows), 1)
+
+    def test_blank_manufacturer_row_is_skipped_and_warned_with_its_line_number(self) -> None:
+        with self.assertWarns(UserWarning) as ctx:
+            rows = parse_device_models(
+                [
+                    ["Manufacturer", "Model", "Description", "Hostname Slug"],
+                    ["", "IK-42", "", ""],
+                    ["Martin Audio", "IK-42", "", ""],
+                ]
+            )
+        self.assertEqual(len(rows), 1)
+        # Line 2 — the header is line 1, the blank row is the first data row.
+        self.assertIn("2", str(ctx.warning))
+
+    def test_blank_model_row_is_skipped_and_warned(self) -> None:
+        with self.assertWarns(UserWarning):
+            rows = parse_device_models(
+                [
+                    ["Manufacturer", "Model", "Description", "Hostname Slug"],
+                    ["Martin Audio", "", "", ""],
+                ]
+            )
+        self.assertEqual(rows, [])
+
+    def test_no_warning_when_nothing_is_skipped(self) -> None:
+        import warnings as warnings_module
+
+        with warnings_module.catch_warnings():
+            warnings_module.simplefilter("error")
+            # Must not raise — simplefilter("error") turns any warning
+            # fired here into an exception.
+            parse_device_models(
+                [
+                    ["Manufacturer", "Model", "Description", "Hostname Slug"],
+                    ["Martin Audio", "IK-42", "", ""],
+                ]
+            )
+
+
 class DeviceModelsCsvImportTests(TestCase):
     """ADR 0026 decision 5 — the Device Models CSV is optional. Every other
     test class in this module already exercises the "absent" branch (none
@@ -1325,6 +1404,28 @@ class DeviceModelsCsvHostnameSlugPrecedenceTests(TestCase):
                 ],
             )
             call_command("import_prod_data", data_dir=str(data_dir))
+            call_command("verify_prod_import", data_dir=str(data_dir))  # must not raise
+
+    def test_verify_does_not_trip_on_an_uppercase_csv_cell(self) -> None:
+        """Review council finding 6 — ``NetworkDeviceModel.clean_fields()``
+        lowercases ``hostname_slug`` on import while ``parse_device_models()``
+        only strips the cell, so an uppercase CSV value imports correctly
+        (lowercased) but would trip a spurious mismatch if the verifier
+        compared it against its own raw, unlowercased self.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_fixture_csvs(data_dir)
+            _write_csv(
+                data_dir / "MPS Audio Network Standards - Device Models.csv",
+                [
+                    ["Manufacturer", "Model", "Description", "Hostname Slug"],
+                    ["Martin Audio", "IK-42", "", "IK42"],
+                ],
+            )
+            call_command("import_prod_data", data_dir=str(data_dir))
+            ik42 = NetworkDeviceModel.objects.get(manufacturer="Martin Audio", model="IK-42")
+            self.assertEqual(ik42.hostname_slug, "ik42")  # lowercased on import
             call_command("verify_prod_import", data_dir=str(data_dir))  # must not raise
 
 

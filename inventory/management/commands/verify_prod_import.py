@@ -627,6 +627,13 @@ def _check_device_model_hostname_slugs(findings: _Findings, device_model_rows: l
     catalog is not supposed to have overwritten it. A no-op (not a
     failure) when the CSV wasn't found at all — same as the description
     check.
+
+    Compares case-insensitively (review council finding 6): ``NetworkDevice
+    Model.clean_fields()`` lowercases ``hostname_slug`` on import, but
+    ``parse_device_models()`` only strips the cell — an upper/mixed-case
+    CSV value (e.g. ``"IK42"``) imports correctly, lowercased, and would
+    otherwise trip a spurious mismatch here comparing it against its own
+    unlowercased self.
     """
     checked = 0
     for row in device_model_rows:
@@ -640,7 +647,7 @@ def _check_device_model_hostname_slugs(findings: _Findings, device_model_rows: l
             )
             continue
         checked += 1
-        if device_model.hostname_slug != row.hostname_slug:
+        if device_model.hostname_slug != row.hostname_slug.lower():
             findings.fail(
                 "device_model_hostname_slugs",
                 f"{row.manufacturer!r}/{row.model!r}: expected hostname_slug {row.hostname_slug!r}, "

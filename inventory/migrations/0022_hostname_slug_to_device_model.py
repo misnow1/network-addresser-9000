@@ -20,6 +20,13 @@ Four operations, in this exact order — **do not reorder them**:
    now-verified-to-agree slug up from its profiles.
 4. ``RemoveField`` ``hostname_slug`` from ``NetworkDeviceType``.
 
+**Clean-retry is only proven for the preflight-abort path (step 1).** A
+failure in step 3 or 4 instead — after ``AddField`` has already run and
+committed, since MariaDB DDL isn't transactional — leaves that column in
+place while this migration is still unrecorded as applied; a rerun would
+then hit ``AddField`` again and fail with ``Duplicate column name``, not
+recover cleanly the way an aborted preflight does.
+
 **The reverse is simpler than 0021's, and needs no placeholder operation.**
 Reversing runs 4 -> 1. Step 4 reversed (``AddField``) restores the Type
 column as ``NOT NULL`` filled with Django's empty-string effective default

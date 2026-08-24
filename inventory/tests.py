@@ -174,6 +174,18 @@ def _make_device_type(port_count: int = 0, vlan: VLAN | None = None, **kwargs) -
     calls sharing a ``(manufacturer, model)``/``device_model`` therefore
     end up sharing one slug automatically, the same way the live schema
     now requires.
+
+    Review council finding 7 — this used to *mutate* a shared model row
+    unconditionally: since ``manufacturer=``/``model=`` default to one
+    fixed pair ("Martin Audio", "IK-42"), a second call in the same test
+    passing a *different* ``hostname_slug`` (typically ``""``, meaning
+    "give me a type with no slug") silently overwrote the first call's
+    device_model's slug too, corrupting a fixture the same test's
+    ``setUp()`` had already built and was still holding a reference to.
+    Now raises rather than overwriting when the resolved ``device_model``
+    already carries a *different*, non-blank slug — a caller hitting this
+    needs to pass its own distinguishing ``manufacturer=``/``model=`` (a
+    genuinely different piece of hardware), not reuse the implicit default.
     """
     device_model = kwargs.pop("device_model", None)
     if device_model is None:
@@ -184,9 +196,18 @@ def _make_device_type(port_count: int = 0, vlan: VLAN | None = None, **kwargs) -
         kwargs.pop("manufacturer", None)
         kwargs.pop("model", None)
     hostname_slug = kwargs.pop("hostname_slug", None)
-    if hostname_slug is not None and device_model.hostname_slug != hostname_slug:
-        device_model.hostname_slug = hostname_slug
-        device_model.save(update_fields=["hostname_slug"])
+    if hostname_slug is not None:
+        normalized_slug = hostname_slug.strip().lower() if hostname_slug else hostname_slug
+        if device_model.hostname_slug and device_model.hostname_slug != normalized_slug:
+            raise AssertionError(
+                f"_make_device_type(hostname_slug={hostname_slug!r}) would silently overwrite "
+                f"{device_model}'s existing hostname_slug {device_model.hostname_slug!r} — pass an "
+                "explicit manufacturer=/model=/device_model= if this call means a different "
+                "hardware model, not the one an earlier call in this test already built."
+            )
+        if device_model.hostname_slug != normalized_slug:
+            device_model.hostname_slug = hostname_slug
+            device_model.save(update_fields=["hostname_slug"])
     kwargs.setdefault("name", "Default")
     device_type = NetworkDeviceType.objects.create(port_count=port_count, device_model=device_model, **kwargs)
     for n in range(1, port_count + 1):
@@ -6186,6 +6207,63 @@ class RecomputeHostnameActionTests(TestCase):
         names = set(NetworkDevice.objects.filter(pk__in=pks).values_list("hostname", flat=True))
         self.assertEqual(len(names), 17)
 
+    def test_recompute_query_count_is_flat_across_distinct_device_types(self) -> None:
+        """Review council finding 4 —
+        ``current.device_type.device_model.hostname_slug`` used to cost
+        two extra queries per row, read fresh inside the per-device
+        ``SELECT ... FOR UPDATE`` ``_lock_devices_by_pk()`` holds (that
+        helper deliberately carries no ``select_related`` — widening it
+        would make MariaDB lock the joined type/model rows too, and it is
+        shared with the fit-card and delete paths). The slug map built
+        once before the loop replaces that with a single query for the
+        whole batch, so the total must not grow with how many *distinct*
+        device types the batch spans — five devices of one type and five
+        devices of five distinct types cost the same.
+
+        Each device gets its own ``Owner`` (and, for the distinct-type
+        group, its own non-blank ``hostname_slug``) so every computed stem
+        is unique — otherwise ``choose_sequence()``'s legitimate bump-
+        until-free collision scan costs more as more same-stem devices
+        pile up, which is a real, unrelated behaviour that would swamp the
+        one query this test is actually isolating.
+        """
+        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
+
+        same_type_devices = []
+        for i in range(5):
+            owner = Owner.objects.create(slug=f"qc-recompute-same-{i}", name=f"QC Recompute Same {i}")
+            same_type_devices.append(
+                NetworkDevice.objects.create(
+                    device_type=self.device_type, rack=self.rack, rack_slot=i + 1, owner=owner
+                )
+            )
+        with CaptureQueriesContext(connection) as same_type_ctx:
+            admin.recompute_hostnames(
+                self._request(), NetworkDevice.objects.filter(pk__in=[d.pk for d in same_type_devices])
+            )
+
+        distinct_type_devices = []
+        for i in range(5):
+            device_type = _make_device_type(
+                manufacturer=f"QC Recompute Mfr {i}",
+                model=f"QC Recompute Model {i}",
+                name="Default",
+                hostname_slug=f"qcr{i}",
+            )
+            owner = Owner.objects.create(slug=f"qc-recompute-distinct-{i}", name=f"QC Recompute Distinct {i}")
+            distinct_type_devices.append(
+                NetworkDevice.objects.create(
+                    device_type=device_type, rack=self.rack, rack_slot=10 + i, owner=owner
+                )
+            )
+        with CaptureQueriesContext(connection) as distinct_type_ctx:
+            admin.recompute_hostnames(
+                self._request(),
+                NetworkDevice.objects.filter(pk__in=[d.pk for d in distinct_type_devices]),
+            )
+
+        self.assertEqual(len(same_type_ctx.captured_queries), len(distinct_type_ctx.captured_queries))
+
     def test_recompute_over_several_identical_devices_gives_each_its_own_advisory(self) -> None:
         """Change 2's motivating report: the action emits one advisory
         per row, so recomputing a batch of blank-purpose devices used to
@@ -6263,7 +6341,9 @@ class RecomputeHostnameActionTests(TestCase):
         self.assertIn("17", unchanged_messages[0])
 
     def test_skips_and_reports_the_missing_component(self) -> None:
-        no_slug_type = _make_device_type(hostname_slug="", name="No Slug")
+        no_slug_type = _make_device_type(
+            manufacturer="No Slug Mfr", model="No Slug Model", hostname_slug="", name="No Slug"
+        )
         device = NetworkDevice.objects.create(device_type=no_slug_type, rack=self.rack, rack_slot=1)
         admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
         request = self._request()
@@ -6536,7 +6616,9 @@ class HostnameDivergesTests(TestCase):
         self.assertFalse(device.hostname_diverges)
 
     def test_false_when_type_slug_missing(self) -> None:
-        no_slug_type = _make_device_type(hostname_slug="", name="No Slug")
+        no_slug_type = _make_device_type(
+            manufacturer="No Slug Mfr", model="No Slug Model", hostname_slug="", name="No Slug"
+        )
         device = NetworkDevice.objects.create(
             device_type=no_slug_type, rack=self.rack, rack_slot=1, owner=self.owner, hostname="anything"
         )
@@ -7455,11 +7537,23 @@ class HostnameSlugMoveMigrationExecutorTests(TransactionTestCase):
         # Forward: 0021 -> 0022. Real DDL, not a direct function call —
         # proves the preflight really runs before AddField, not just that
         # the data logic is right in isolation.
+        #
+        # Historical models at the 0022 project state, not the directly-
+        # imported live NetworkDeviceModel — review council finding 3: this
+        # migration is pinned by *name*, and a future 0023 touching either
+        # table would give the live model class a field this deliberately-
+        # partial database doesn't have yet, the exact "Unknown column"
+        # failure already repaired once in
+        # DeviceModelBackfillMigrationExecutorTests. The reverse leg below
+        # already used this pattern; the forward leg now matches it.
         executor = MigrationExecutor(connection)
         executor.migrate([("inventory", "0022_hostname_slug_to_device_model")])
+        executor.loader.build_graph()
+        apps_0022 = executor.loader.project_state(("inventory", "0022_hostname_slug_to_device_model")).apps
+        HistoricalDeviceModelAt0022 = apps_0022.get_model("inventory", "NetworkDeviceModel")
 
-        ik42_live = NetworkDeviceModel.objects.get(pk=ik42.pk)
-        orphan_live = NetworkDeviceModel.objects.get(pk=orphan.pk)
+        ik42_live = HistoricalDeviceModelAt0022.objects.get(pk=ik42.pk)
+        orphan_live = HistoricalDeviceModelAt0022.objects.get(pk=orphan.pk)
         self.assertEqual(ik42_live.hostname_slug, "ik42")
         self.assertEqual(orphan_live.hostname_slug, "")  # settled decision C
 
@@ -7521,10 +7615,16 @@ class HostnameSlugMoveMigrationExecutorTests(TransactionTestCase):
         # disagreement and prove a normal forward migrate can now proceed
         # from this exact database — it must not be stuck on a
         # half-applied state left over from the failed attempt above.
+        # Historical model at 0022, not the live class — same reasoning
+        # as the forward leg of test_forward_and_reverse_with_multi_
+        # profile_data, above (review council finding 3).
         HistoricalDeviceType.objects.filter(device_model=device_model).update(hostname_slug="ik42")
         executor = MigrationExecutor(connection)
         executor.migrate([("inventory", "0022_hostname_slug_to_device_model")])
-        self.assertEqual(NetworkDeviceModel.objects.get(pk=device_model.pk).hostname_slug, "ik42")
+        executor.loader.build_graph()
+        apps_0022 = executor.loader.project_state(("inventory", "0022_hostname_slug_to_device_model")).apps
+        HistoricalDeviceModelAt0022 = apps_0022.get_model("inventory", "NetworkDeviceModel")
+        self.assertEqual(HistoricalDeviceModelAt0022.objects.get(pk=device_model.pk).hostname_slug, "ik42")
 
 
 class HostnameSlugMoveLiveReaderTests(TransactionTestCase):
@@ -7590,9 +7690,15 @@ class HostnameSlugMoveLiveReaderTests(TransactionTestCase):
             device_type=without_card, rack=rack, rack_slot=1, owner=owner, hostname=old_stem
         ).pk
 
-        # Forward, all the way through PR 2's own migration.
-        executor = MigrationExecutor(connection)
-        executor.migrate([("inventory", "0022_hostname_slug_to_device_model")])
+        # Forward, all the way to head — not a named "0022" target
+        # (review council finding 3). This class legitimately needs the
+        # *live* model/admin/form classes (it drives real admin forms and
+        # actions below), so it must migrate past whatever the current
+        # head migration is, not stop at a name that will eventually stop
+        # being head — call_command("migrate", "inventory") always reaches
+        # the tree's actual leaf, unlike a hardcoded MigrationExecutor
+        # target.
+        call_command("migrate", "inventory", verbosity=0)
 
         self.device_model = NetworkDeviceModel.objects.get(manufacturer="Martin Audio", model="IK-42")
         self.without_card = NetworkDeviceType.objects.get(
@@ -12383,7 +12489,12 @@ class DanteRecomputeActionTests(TestCase):
         the rack-derived owner for every blocked-stem skip, not just the
         new Dante one.
         """
-        no_slug_type = _make_device_type(hostname_slug="", name="No Slug Recompute")
+        no_slug_type = _make_device_type(
+            manufacturer="No Slug Recompute Mfr",
+            model="No Slug Recompute Model",
+            hostname_slug="",
+            name="No Slug Recompute",
+        )
         device = NetworkDevice.objects.create(
             device_type=no_slug_type, rack=self.rack, rack_slot=10, owner=None
         )

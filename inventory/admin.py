@@ -2380,6 +2380,22 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
         renamed = 0
         unchanged = 0
         skipped: list[str] = []
+        # Built once, outside the per-device lock loop below (review
+        # council finding 4) — reading current.device_type.device_model.
+        # hostname_slug fresh on every iteration would cost two extra
+        # queries per row while that row's SELECT ... FOR UPDATE is held
+        # by _lock_devices_by_pk(), since that helper deliberately carries
+        # no select_related (widening it would make MariaDB also lock the
+        # joined device_type/device_model rows, and the helper is shared
+        # with the fit-card and delete paths, which must not pay that
+        # cost). An ordinary, non-locking read against the whole queryset
+        # up front avoids both problems: no extra query inside the lock,
+        # and no join on the locked row itself.
+        slug_by_device_type_id = dict(
+            NetworkDeviceType.objects.filter(
+                pk__in=queryset.values_list("device_type_id", flat=True)
+            ).values_list("pk", "device_model__hostname_slug")
+        )
         for device in queryset:
             with transaction.atomic():
                 locked = _lock_devices_by_pk(device.pk)
@@ -2389,8 +2405,10 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
                 original_hostname = current.hostname
                 result = _recompute_hostname(
                     current,
-                    # ADR 0026 PR 2 — hostname_slug lives on device_model now.
-                    type_slug=current.device_type.device_model.hostname_slug,
+                    # ADR 0026 PR 2 — hostname_slug lives on device_model
+                    # now; looked up from the map built above, not by
+                    # dereferencing current.device_type.device_model.
+                    type_slug=slug_by_device_type_id[current.device_type_id],
                     exclude_switch_pk=None,
                     exclude_device_pk=current.pk,
                 )

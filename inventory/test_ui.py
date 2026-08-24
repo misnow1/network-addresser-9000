@@ -100,7 +100,10 @@ def _device_model(manufacturer: str, model: str) -> NetworkDeviceModel:
 
 
 def _make_device_type(port_count: int = 0, vlan: VLAN | None = None, **kwargs) -> NetworkDeviceType:
-    """See ``tests.py``'s helper of the same name — identical shape."""
+    """See ``tests.py``'s helper of the same name — identical shape,
+    including review council finding 7's guard against silently
+    overwriting a shared default device_model's hostname_slug.
+    """
     device_model = kwargs.pop("device_model", None)
     if device_model is None:
         manufacturer = kwargs.pop("manufacturer", "Martin Audio")
@@ -110,9 +113,18 @@ def _make_device_type(port_count: int = 0, vlan: VLAN | None = None, **kwargs) -
         kwargs.pop("manufacturer", None)
         kwargs.pop("model", None)
     hostname_slug = kwargs.pop("hostname_slug", None)
-    if hostname_slug is not None and device_model.hostname_slug != hostname_slug:
-        device_model.hostname_slug = hostname_slug
-        device_model.save(update_fields=["hostname_slug"])
+    if hostname_slug is not None:
+        normalized_slug = hostname_slug.strip().lower() if hostname_slug else hostname_slug
+        if device_model.hostname_slug and device_model.hostname_slug != normalized_slug:
+            raise AssertionError(
+                f"_make_device_type(hostname_slug={hostname_slug!r}) would silently overwrite "
+                f"{device_model}'s existing hostname_slug {device_model.hostname_slug!r} — pass an "
+                "explicit manufacturer=/model=/device_model= if this call means a different "
+                "hardware model, not the one an earlier call in this test already built."
+            )
+        if device_model.hostname_slug != normalized_slug:
+            device_model.hostname_slug = hostname_slug
+            device_model.save(update_fields=["hostname_slug"])
     kwargs.setdefault("name", "Default")
     device_type = NetworkDeviceType.objects.create(port_count=port_count, device_model=device_model, **kwargs)
     for n in range(1, port_count + 1):
@@ -734,6 +746,9 @@ class PartialGrantAccessTests(TestCase):
                 "view_networkdeviceport",
                 "view_networkdevicetypeport",
                 "view_owner",
+                # ADR 0026 PR 2 — hostname_diverges reads
+                # device_type.device_model.hostname_slug.
+                "view_networkdevicemodel",
             ],
         )
 
@@ -2060,6 +2075,42 @@ class QueryBudgetTests(TestCase):
 
         with CaptureQueriesContext(connection) as big_ctx:
             big_response = self.client.get("/")
+
+        self.assertEqual(small_response.status_code, 200)
+        self.assertEqual(big_response.status_code, 200)
+        self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
+
+    def test_owner_detail_query_count_independent_of_distinct_device_type_count(self) -> None:
+        """Review council finding 1 — the "owner" registry spec's Network
+        Devices inline renders ``str(device_type)``, which dereferences
+        ``device_model`` since ADR 0026; ``detail_prefetch_related`` must
+        widen to ``devices__device_type__device_model`` or each distinct
+        device type on the owner costs one more query. Several *distinct*
+        types, not several devices of one type — a shared type's
+        ``device_model`` is fetched once regardless.
+        """
+        owner = Owner.objects.create(slug="qb-owner", name="QB Owner")
+        vlan = VLAN.objects.create(name="QB Owner VLAN", vlan_id=294, subnet="10.204.0.0/21")
+        small_type = _make_device_type(
+            port_count=1, vlan=vlan, manufacturer="QB Owner Mfr Small", model="Small", name="Default"
+        )
+        NetworkDevice.objects.create(device_type=small_type, owner=owner, hostname="qb-owner-small")
+
+        with CaptureQueriesContext(connection) as small_ctx:
+            small_response = self.client.get(f"/models/owner/{owner.pk}/")
+
+        for i in range(10):
+            device_type = _make_device_type(
+                port_count=1,
+                vlan=vlan,
+                manufacturer=f"QB Owner Mfr {i}",
+                model=f"Big {i}",
+                name="Default",
+            )
+            NetworkDevice.objects.create(device_type=device_type, owner=owner, hostname=f"qb-owner-big-{i}")
+
+        with CaptureQueriesContext(connection) as big_ctx:
+            big_response = self.client.get(f"/models/owner/{owner.pk}/")
 
         self.assertEqual(small_response.status_code, 200)
         self.assertEqual(big_response.status_code, 200)

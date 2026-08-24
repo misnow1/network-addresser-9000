@@ -17,6 +17,7 @@ text.
 import csv
 import ipaddress
 import re
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -184,13 +185,41 @@ def parse_device_models(rows: list[list[str]]) -> list[DeviceModelRow]:
     (PR 1 reads only the first three columns; PR 2 starts reading it) —
     and tolerates it being absent altogether, so a sheet authored before
     PR 2 lands doesn't need a phantom column either way.
+
+    Raises ``ValueError`` if ``rows`` is empty or its first row doesn't
+    start with ``Manufacturer, Model`` (case/whitespace-insensitive) — the
+    previous unconditional ``rows[1:]`` treated a header-less file, or one
+    with an unrelated first row, exactly like a well-formed one, silently
+    discarding what was actually a data row.
+
+    A row with a blank Manufacturer or Model is still skipped, not an
+    error — a stray blank line, or a partially-authored sheet, is not a
+    reason to fail an import — but every skip is now counted and reported
+    via ``warnings.warn()``, naming the skipped rows' 1-indexed line
+    numbers (header included, so they match what a spreadsheet shows).
+    This module's own docstring calls this file "pure I/O, no domain
+    judgement", but deciding which rows count *is* domain judgement, and
+    this is the one parser here that both ``import_prod_data.py`` and its
+    independent ``verify_prod_import.py`` oracle read from — a row
+    dropped silently here was invisible to both, including to the check
+    built specifically to catch that class of mistake.
     """
+    if not rows or [cell.strip().lower() for cell in rows[0][:2]] != ["manufacturer", "model"]:
+        raise ValueError(
+            "Device Models CSV: expected a header row starting with "
+            f"'Manufacturer, Model, ...', got {rows[0]!r}"
+            if rows
+            else "Device Models CSV: file is empty, expected a header row."
+        )
     result = []
-    for row in rows[1:]:  # row 0 is the header
+    skipped_row_numbers: list[int] = []
+    for row_number, row in enumerate(rows[1:], start=2):  # row 1 is the header
         if len(row) < 2:
+            skipped_row_numbers.append(row_number)
             continue
         manufacturer, model = row[0].strip(), row[1].strip()
         if not manufacturer or not model:
+            skipped_row_numbers.append(row_number)
             continue
         description = row[2].strip() if len(row) > 2 else ""
         hostname_slug = row[3].strip() if len(row) > 3 else ""
@@ -198,6 +227,12 @@ def parse_device_models(rows: list[list[str]]) -> list[DeviceModelRow]:
             DeviceModelRow(
                 manufacturer=manufacturer, model=model, description=description, hostname_slug=hostname_slug
             )
+        )
+    if skipped_row_numbers:
+        warnings.warn(
+            f"Device Models CSV: skipped {len(skipped_row_numbers)} row(s) with a blank "
+            f"Manufacturer or Model — line number(s) {skipped_row_numbers}.",
+            stacklevel=2,
         )
     return result
 
