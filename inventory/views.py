@@ -605,6 +605,12 @@ def _build_elevation_rows(
         # A previous Codex review caught this view under-declaring its
         # codenames; the rule stands — declare the full set actually read.
         "inventory.view_owner",
+        # ADR 0026 PR 2 — hostname_diverges (the #54 marker) now reads
+        # device_type.device_model.hostname_slug; the queryset's join was
+        # widened for this (device_type__device_model, below) but the
+        # codename list was not — same "declare the full set actually
+        # read" rule as every entry above.
+        "inventory.view_networkdevicemodel",
     ],
     raise_exception=True,
 )
@@ -643,11 +649,15 @@ def rack_detail(request: HttpRequest, pk: int) -> HttpResponse:
     # hostname_diverges (#54, ADR 0023 phase 18 PR 4) — the registry's own
     # select_related hints never reach this shaped view, so its query
     # budget has to declare them itself or the marker is an N+1 across the
-    # rack's occupants.
+    # rack's occupants. device_type__device_model, not a bare device_type
+    # (ADR 0026 PR 2) — hostname_diverges now reads hostname_slug off the
+    # device_model FK, one hop further than before.
     switch_qs = NetworkSwitch.objects.select_related("switch_type", "owner", "rack").prefetch_related(
         Prefetch("addresses", queryset=NetworkSwitchAddress.objects.select_related("vlan"))
     )
-    device_qs = NetworkDevice.objects.select_related("device_type", "owner", "rack").prefetch_related(
+    device_qs = NetworkDevice.objects.select_related(
+        "device_type__device_model", "owner", "rack"
+    ).prefetch_related(
         Prefetch("ports", queryset=NetworkDevicePort.objects.select_related("vlan")),
     )
     rack = get_object_or_404(
@@ -1295,7 +1305,12 @@ REGISTRY: dict[str, ModelSpec] = {
             ),
         ),
         ordering=("name",),
-        detail_prefetch_related=("racks", "switches__switch_type", "devices__device_type"),
+        # devices__device_type__device_model, not a bare devices__device_type
+        # (review council finding 1) — the Network Devices inline renders
+        # str(device_type), which dereferences device_model since ADR 0026;
+        # without the extra hop, each distinct device type on this owner
+        # costs one more query.
+        detail_prefetch_related=("racks", "switches__switch_type", "devices__device_type__device_model"),
         list_permissions=("inventory.view_owner",),
         # InlineSpec.permissions is declared but read nowhere — _render_inline()
         # does no permission check and model_detail() renders every inline
@@ -1308,6 +1323,9 @@ REGISTRY: dict[str, ModelSpec] = {
             "inventory.view_rack",
             "inventory.view_networkswitch",
             "inventory.view_networkdevice",
+            # ADR 0026 — the Network Devices inline's Type column renders
+            # device_type, which dereferences device_model.
+            "inventory.view_networkdevicemodel",
         ),
     ),
     "switchportvlanprofile": ModelSpec(
@@ -1554,11 +1572,14 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Manufacturer", "manufacturer"),
             FieldSpec("Model", "model"),
             FieldSpec("Description", "description"),
+            # ADR 0026 PR 2 — moved here from Network Device Type.
+            FieldSpec("Hostname slug", "hostname_slug"),
         ),
         detail_fields=(
             FieldSpec("Manufacturer", "manufacturer"),
             FieldSpec("Model", "model"),
             FieldSpec("Description", "description"),
+            FieldSpec("Hostname slug", "hostname_slug"),
         ),
         inlines=(
             # ADR 0026 decision 4's payoff on screen — two near-identical
@@ -1591,14 +1612,15 @@ REGISTRY: dict[str, ModelSpec] = {
             FieldSpec("Name", "name"),
             FieldSpec("Port count", "port_count"),
             FieldSpec("Add-in card", "is_add_in_card", render="boolean"),
-            FieldSpec("Hostname slug", "hostname_slug"),
+            # Dotted — ADR 0026 PR 2 moved hostname_slug onto device_model.
+            FieldSpec("Hostname slug", "device_model.hostname_slug"),
         ),
         detail_fields=(
             FieldSpec("Device model", "device_model", render="relation"),
             FieldSpec("Name", "name"),
             FieldSpec("Port count", "port_count"),
             FieldSpec("Add-in card", "is_add_in_card", render="boolean"),
-            FieldSpec("Hostname slug", "hostname_slug"),
+            FieldSpec("Hostname slug", "device_model.hostname_slug"),
             # ADR 0026 decision 6 — the changelist already carries six
             # columns and the description is long, so it stays off the
             # list page and shows only here.

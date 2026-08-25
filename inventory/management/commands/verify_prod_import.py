@@ -113,31 +113,16 @@ RACK_LOCATION_SLUG_EXCEPTIONS: dict[str, str | None] = {
 
 #: Re-declared independently of ``import_prod_data.HOSTNAME_SLUGS`` — this
 #: module's own docstring forbids importing that module, on the grounds
-#: that a check sharing the importer's helper proves nothing. See that
-#: module's own constant for the citation of where each value comes from.
+#: that a check sharing the importer's helper proves nothing. Switch-only
+#: since ADR 0026 PR 2 settled decision A: the device entries this
+#: constant used to also carry are gone, not replaced by a
+#: ``DEVICE_MODEL_SLUGS`` equivalent — this module checks the Device
+#: Models CSV against ``NetworkDeviceModel.hostname_slug`` directly
+#: instead (``_check_device_model_hostname_slugs()``, below), which is a
+#: strictly more independent check than re-declaring the importer's own
+#: seed catalog a second time would have been. See that module's own
+#: constant for the citation of where each value comes from.
 HOSTNAME_SLUGS: dict[tuple[str, str], str] = {
-    ("Allen & Heath", "SQ-5"): "sq5",
-    ("Amphenol", "RJD1212-0050"): "rjd1212",
-    ("Amphenol", "RJD2203-0050"): "rjd2203",
-    ("Amphenol", "RJD32A3-0050"): "rjd32a3",
-    ("Amphenol", "RJD32U1-0050"): "rjd32u1",
-    ("Audinate", "AVIO-AO2"): "avioao2",
-    ("DiGiCo", "DMI-DANTE"): "dmidante",
-    ("DiGiCo", "SD11"): "sd11",
-    ("DiGiCo", "SD12"): "sd12",
-    ("DiGiCo", "SD9"): "sd9",
-    ("Lab.Gruppen", "LM26"): "lm26",
-    ("Lab.Gruppen", "LM44"): "lm44",
-    ("Lab.Gruppen", "PLM20000Q"): "plm20q",
-    ("Martin Audio", "IK-42"): "ik42",
-    ("Martin Audio", "IK-81"): "ik81",
-    ("Neutrik", "NA2-DLINE"): "na2dline",
-    ("Radial", "DiNET DAN-RX"): "danrx",
-    ("Radial", "DiNET DAN-TX"): "dantx",
-    ("Yamaha", "DM3"): "dm3",
-    ("Yamaha", "DM7-EX"): "dm7ex",
-    ("Yamaha", "DM7C"): "dm7c",
-    ("Yamaha", "Tio1608-D2"): "tio1608d2",
     ("Cisco", "SG300-10MP"): "sg300-10mp",
     ("Cisco", "SG300-26P"): "sg300-26p",
     ("Cisco", "SG350-10"): "sg350-10",
@@ -437,6 +422,7 @@ class Command(BaseCommand):
         _check_owner_seeding(findings, rack_offset_rows)
         _check_hostname_slugs(findings)
         _check_device_model_descriptions(findings, device_model_rows)
+        _check_device_model_hostname_slugs(findings, device_model_rows)
         _check_no_equipment_hostname_seeding(findings)
         _check_hostnames_and_types_and_addresses(
             findings,
@@ -567,21 +553,18 @@ def _check_owner_seeding(findings: _Findings, rack_offset_rows: list[Any]) -> No
 def _check_hostname_slugs(findings: _Findings) -> None:
     """ADR 0023 decision 10, amended (phase 18 PR 4) — every
     ``(manufacturer, model)`` this independently re-declared
-    ``HOSTNAME_SLUGS`` names has a matching Type row (of either
-    hierarchy) carrying exactly that ``hostname_slug`` — both profiles of
-    a two-profile model included, since the constant is keyed on the
-    model, not the profile.
+    ``HOSTNAME_SLUGS`` names has a matching ``NetworkSwitchType`` row
+    carrying exactly that ``hostname_slug``.
+
+    Switch-only since ADR 0026 PR 2 (settled decision A) — the device side
+    used to be checked here too, against the same constant re-declared for
+    devices; that copy is retired, and the device side is now checked by
+    ``_check_device_model_hostname_slugs()`` against the CSV instead, which
+    is a strictly more independent oracle than a second hardcoded catalog.
     """
     checked = 0
     for (manufacturer, model), expected_slug in HOSTNAME_SLUGS.items():
-        switch_matches = list(NetworkSwitchType.objects.filter(manufacturer=manufacturer, model=model))
-        # ADR 0026 — the identity moved off NetworkDeviceType onto its FK.
-        device_matches = list(
-            NetworkDeviceType.objects.filter(
-                device_model__manufacturer=manufacturer, device_model__model=model
-            )
-        )
-        matches = switch_matches + device_matches
+        matches = list(NetworkSwitchType.objects.filter(manufacturer=manufacturer, model=model))
         if not matches:
             findings.fail(
                 "hostname_slugs", f"{manufacturer!r}/{model!r}: no Type found for a HOSTNAME_SLUGS entry."
@@ -627,6 +610,50 @@ def _check_device_model_descriptions(findings: _Findings, device_model_rows: lis
                 f"got {device_model.description!r}.",
             )
     findings.count("device_model_descriptions_checked", checked)
+
+
+def _check_device_model_hostname_slugs(findings: _Findings, device_model_rows: list[DeviceModelRow]) -> None:
+    """ADR 0026 PR 2 settled decision A — when the Device Models CSV is
+    present, every row's ``hostname_slug`` matches the
+    ``NetworkDeviceModel`` row it names, checked against the CSV directly
+    and never against ``import_prod_data.DEVICE_MODEL_SLUGS`` — the same
+    independence rule ``_check_device_model_descriptions()`` above already
+    follows, and the reason this module carries no device-side
+    ``HOSTNAME_SLUGS`` equivalent at all any more.
+
+    A blank cell is a value, not an absence (settled decision B): a row
+    present with a blank ``Hostname Slug`` must have produced a blank
+    ``NetworkDeviceModel.hostname_slug``, since the importer's seed
+    catalog is not supposed to have overwritten it. A no-op (not a
+    failure) when the CSV wasn't found at all — same as the description
+    check.
+
+    Compares case-insensitively (review council finding 6): ``NetworkDevice
+    Model.clean_fields()`` lowercases ``hostname_slug`` on import, but
+    ``parse_device_models()`` only strips the cell — an upper/mixed-case
+    CSV value (e.g. ``"IK42"``) imports correctly, lowercased, and would
+    otherwise trip a spurious mismatch here comparing it against its own
+    unlowercased self.
+    """
+    checked = 0
+    for row in device_model_rows:
+        try:
+            device_model = NetworkDeviceModel.objects.get(manufacturer=row.manufacturer, model=row.model)
+        except NetworkDeviceModel.DoesNotExist:
+            findings.fail(
+                "device_model_hostname_slugs",
+                f"{row.manufacturer!r}/{row.model!r}: no NetworkDeviceModel found for a Device "
+                "Models CSV row.",
+            )
+            continue
+        checked += 1
+        if device_model.hostname_slug != row.hostname_slug.lower():
+            findings.fail(
+                "device_model_hostname_slugs",
+                f"{row.manufacturer!r}/{row.model!r}: expected hostname_slug {row.hostname_slug!r}, "
+                f"got {device_model.hostname_slug!r}.",
+            )
+    findings.count("device_model_hostname_slugs_checked", checked)
 
 
 def _check_no_equipment_hostname_seeding(findings: _Findings) -> None:

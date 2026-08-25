@@ -640,9 +640,11 @@ def _fill_computed_hostname(cleaned_data: dict[str, Any], rack: Any, type_obj: A
     (review note 6); ``ModelAdmin.save_model()`` emits them once it has
     both.
 
-    ``type_obj`` is ``device_type``/``switch_type`` — whichever the
-    calling form's own field is — passed in explicitly rather than read
-    by a fixed key, since the two forms don't share a field name for it.
+    ``type_obj`` is whatever object carries ``hostname_slug`` for the
+    calling form's own type field — ``switch_type`` for the switch add
+    form, or ``device_type.device_model`` for the device one (ADR 0026 PR
+    2 moved the field there) — passed in explicitly rather than read by a
+    fixed key, since the two forms don't share a field name for it.
     """
     if cleaned_data.get("hostname"):
         return []  # a typed value is never overwritten, and gets no advisories either
@@ -1196,7 +1198,13 @@ class NetworkDeviceAddForm(forms.ModelForm):
         # that case (location is simply absent, not blocking). Stashed
         # rather than emitted — clean() has no request (review note 6);
         # save_model() emits these once it has one.
-        self._hostname_advisories = _fill_computed_hostname(cleaned_data, rack, device_type)
+        # ADR 0026 PR 2 — hostname_slug moved off device_type onto its
+        # device_model FK, so _fill_computed_hostname() (shared with the
+        # switch add form, which still passes switch_type directly) is
+        # handed the model, not the profile.
+        self._hostname_advisories = _fill_computed_hostname(
+            cleaned_data, rack, device_type.device_model if device_type is not None else None
+        )
         if rack is None or device_type is None:
             return cleaned_data
         host_slot = cleaned_data.get("rack_slot")
@@ -1966,9 +1974,12 @@ class _HostnameDivergesFilterBase(admin.SimpleListFilter):
     ``select_related`` here so the scan itself stays one query rather than
     an N+1 across the changelist's own row count.
 
-    ``_type_field`` names the Type FK, since that differs between the two
-    concrete subclasses below (``switch_type``/``device_type``); everything
-    else is identical.
+    ``_type_field`` names the ``select_related()`` path to whatever the
+    property actually reads, since that differs between the two concrete
+    subclasses below — ``switch_type`` still carries its own
+    ``hostname_slug``, but ``device_type`` doesn't since ADR 0026 PR 2, so
+    that one names ``device_type__device_model`` instead. Everything else
+    is identical.
     """
 
     title = "hostname divergence"
@@ -1996,7 +2007,11 @@ class NetworkSwitchHostnameDivergesFilter(_HostnameDivergesFilterBase):
 
 
 class NetworkDeviceHostnameDivergesFilter(_HostnameDivergesFilterBase):
-    _type_field = "device_type"
+    # "device_type__device_model", not "device_type" — ADR 0026 PR 2 moved
+    # hostname_slug onto device_model, so hostname_diverges now traverses
+    # one more FK; select_related() accepts the dotted path directly, and
+    # _type_field is used nowhere except that call.
+    _type_field = "device_type__device_model"
 
 
 class NetworkDeviceTypeRelatedFilter(admin.RelatedFieldListFilter):
@@ -2141,14 +2156,19 @@ class NetworkDeviceModelAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin,
     updates every profile of that model coherently.
     """
 
-    list_display = ["manufacturer", "model", "description"]
-    search_fields = ["manufacturer", "model", "description"]
+    # hostname_slug joined this model in ADR 0026 PR 2 — moved off
+    # NetworkDeviceType, same reasoning as description (ADR 0026 decision
+    # 3): a model-level fact, not a profile-level one.
+    list_display = ["manufacturer", "model", "description", "hostname_slug"]
+    search_fields = ["manufacturer", "model", "description", "hostname_slug"]
     show_auditlog_history_link = True
 
 
 @admin.register(NetworkDeviceType)
 class NetworkDeviceTypeAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admin.ModelAdmin):
-    list_display = ["device_model", "name", "port_count", "is_add_in_card", "hostname_slug"]
+    # hostname_slug is not a column here since ADR 0026 PR 2 — see
+    # NetworkDeviceModelAdmin, above.
+    list_display = ["device_model", "name", "port_count", "is_add_in_card"]
     list_filter = ["is_add_in_card"]
     # Not "device_model" (Codex review note 3) — a bare FK name here
     # becomes `device_model__icontains`, which raises `FieldError:
@@ -2360,6 +2380,22 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
         renamed = 0
         unchanged = 0
         skipped: list[str] = []
+        # Built once, outside the per-device lock loop below (review
+        # council finding 4) — reading current.device_type.device_model.
+        # hostname_slug fresh on every iteration would cost two extra
+        # queries per row while that row's SELECT ... FOR UPDATE is held
+        # by _lock_devices_by_pk(), since that helper deliberately carries
+        # no select_related (widening it would make MariaDB also lock the
+        # joined device_type/device_model rows, and the helper is shared
+        # with the fit-card and delete paths, which must not pay that
+        # cost). An ordinary, non-locking read against the whole queryset
+        # up front avoids both problems: no extra query inside the lock,
+        # and no join on the locked row itself.
+        slug_by_device_type_id = dict(
+            NetworkDeviceType.objects.filter(
+                pk__in=queryset.values_list("device_type_id", flat=True)
+            ).values_list("pk", "device_model__hostname_slug")
+        )
         for device in queryset:
             with transaction.atomic():
                 locked = _lock_devices_by_pk(device.pk)
@@ -2369,7 +2405,10 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
                 original_hostname = current.hostname
                 result = _recompute_hostname(
                     current,
-                    type_slug=current.device_type.hostname_slug,
+                    # ADR 0026 PR 2 — hostname_slug lives on device_model
+                    # now; looked up from the map built above, not by
+                    # dereferencing current.device_type.device_model.
+                    type_slug=slug_by_device_type_id[current.device_type_id],
                     exclude_switch_pk=None,
                     exclude_device_pk=current.pk,
                 )

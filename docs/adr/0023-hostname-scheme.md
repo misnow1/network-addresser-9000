@@ -57,6 +57,16 @@ forced the original question is now a *port* on its console carrying `hostname_s
 > into scheme shape and every prose value is gone — so re-deriving these figures from the CSVs
 > gives answers that are right about the export and wrong about the system. Where a decision turns
 > on a count, the live figure is given alongside.
+>
+> **Amended 2026-08-24, by `docs/adr/0026-device-model-entity.md` PR 2.** Decision 1's table below
+> named `hostname_slug` as living "on both Type models". That stopped being true on the device side:
+> the field moved off `NetworkDeviceType` onto `NetworkDeviceModel` (ADR 0026 decision 2, PR 2), the
+> same model-not-profile reasoning as that ADR's `description` field, but blocking here rather than
+> cosmetic — a divergent slug between two profiles of one model used to silently compute different
+> hostnames for identical hardware, and now can't, since there is only one value to read. The table
+> row is corrected in place rather than left describing a schema that no longer exists. The switch
+> side is unaffected — `NetworkSwitchType.hostname_slug` stays exactly as this ADR describes it,
+> until issue #78 aligns the two Type models.
 
 ## What the production data actually shows
 
@@ -104,7 +114,7 @@ will hit this again.
 |---|---|---|---|
 | 1 | owner | `Owner` FK on `NetworkSwitch` / `NetworkDevice` | **blocks** |
 | 2 | location | `Rack.location_slug` | skipped |
-| 3 | type | `hostname_slug` on both Type models | **blocks** |
+| 3 | type | `hostname_slug` on `NetworkSwitchType`, and on `NetworkDeviceModel` since ADR 0026 PR 2 (amended 2026-08-24, see above) | **blocks** |
 | 4 | purpose | `hostname_purpose` on `NetworkSwitch` / `NetworkDevice` | skipped |
 | 5 | sequence | `hostname_sequence` on `NetworkSwitch` / `NetworkDevice` | skipped |
 

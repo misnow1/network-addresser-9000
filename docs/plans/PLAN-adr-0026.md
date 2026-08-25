@@ -1,8 +1,13 @@
 # Implement ROADMAP phase 23 — a device model is an entity
 
-> **Revision 2** — incorporates review notes from `REVIEW-1-PLAN-adr-0026.md`.
+> **Revision 3** — PR 1 is implemented and merged (`c40de8d`, #87). This revision rewrites the
+> **PR 2** section against a second independent review (`REVIEW-1-PLAN-adr-0026-pr2.md`), which found
+> the PR 2 half internally contradictory: it retired the very dictionary it named as the importer's
+> fallback. Resolved with Mike — see PR 2 settled decision A. PR 1's sections are left as built.
+>
+> **Revision 2** — incorporated review notes from `REVIEW-1-PLAN-adr-0026.md`.
 > See "Review response" for the mapping. Revision 1 shipped a backfill that would have
-> failed on the real IK-42 data; that is fixed in settled decision 6.
+> failed on the real IK-42 data; fixed in settled decision 6.
 
 ## Context
 
@@ -530,53 +535,154 @@ Everything else should fall out of extending `_make_device_type` (`tests.py:148`
 ## PR 2 — `hostname_slug` moves to the model
 
 Deliberately separate: `hostname_slug` feeds live hostname computation, shipped in phase 18 and in
-use since. PR 1 must not carry it.
+use since. PR 1 did not carry it, and PR 1 is now merged (`c40de8d`).
+
+After PR 1 the slug is a property of the *hardware model*, not of a purpose profile — two profiles of
+one model must carry the same slug, and nothing enforces that today.
+
+### PR 2 settled decisions
+
+**A. The importer keeps a seed catalog; the verifier drops its copy.** *(Resolved with Mike, 2026-08-24.)*
+
+Revision 2 was internally contradictory and unimplementable: it retired the 22 device entries from
+`HOSTNAME_SLUGS` in **both** live copies, while also naming `HOSTNAME_SLUGS` as the importer's
+fallback when the CSV is absent. The fallback was the thing being deleted. Verified against the tree:
+`import_prod_data.py:1067` is the only device slug source, and `_stage6b`'s `NetworkDeviceModel`
+creation (`:1044-1056`) has none at all — so a CSV-less import would give every model a blank slug and
+silently stop computing hostnames for the whole estate, the exact outcome the sentence claimed to
+prevent.
+
+Resolution:
+
+- `import_prod_data.py` keeps the 22 device entries, **renamed** `DEVICE_MODEL_SLUGS` and keyed
+  `(manufacturer, model)`, applied when `_stage6b` creates each `NetworkDeviceModel`. Its
+  `HOSTNAME_SLUGS` keeps only the 4 switch entries. Precedence: **CSV value wins where the row
+  supplies one; the seed catalog fills in otherwise.**
+- `verify_prod_import.py` **drops its device entries entirely** and gains an independent
+  CSV to `NetworkDeviceModel.hostname_slug` check (review note 6). It must keep reading the CSV
+  directly and never the importer's constants — that independence is the command's whole point.
+
+Rationale: the importer is a seeding script whose job is reproducing a known estate from literal
+catalogs, so it legitimately needs seed data. ADR 0026's objection was to the dictionary *simulating
+the entity in the live schema*; after PR 2 the entity is real in the database and a seeding constant
+is no longer pretending to be one. The duplication genuinely retires — two copies become one.
+
+**B. CSV cell semantics are defined, not left to the implementer.** Review note 5. The parser already
+turns an absent or blank fourth cell into `""` (`_prod_import_csv.py:181-202`), and blank is a
+*meaningful* value — it means "compute no hostname for this model". Settle all three cases:
+
+| case | behaviour |
+|---|---|
+| CSV absent entirely | seed catalog supplies every slug; warn once |
+| CSV present, row missing for a model | seed catalog fills that model in |
+| CSV present, row present, **cell blank** | **blank wins** — an explicit blank is an operator saying "no hostname", and must not be silently overwritten by the seed catalog |
+
+The third row is the one that needs a test; it is the only case where CSV and catalog disagree and the
+CSV's answer is the empty string.
+
+**C. Orphan models stay blank.** Review note 12. PR 1 permits a `NetworkDeviceModel` with no profiles.
+"Copy each model's value from its profiles" is undefined for those — they get `""`, and are **not**
+treated as disagreement. Needs a fixture.
+
+### The move itself
 
 - Move the field from `NetworkDeviceType` to `NetworkDeviceModel`, unchanged — same `max_length=63`,
   same `validate_dns_label`, same `blank=True`. Its `help_text` loses the "deliberately not unique:
   two profiles of one model both carry the same abbreviation" clause, because after this it *is*
   unique per model, structurally. That sentence was the comment standing in for this constraint.
-- The normalization (`strip().lower()`) in `save()` and `clean_fields()` moves with it. Once it
-  does, `NetworkDeviceType.clean_fields()` has no body left — delete the override rather than
-  leaving it empty, and check what remains of `save()` beyond the lock check.
-- Migration `0022`: add the column to `NetworkDeviceModel`, copy each model's value from its
-  profiles, drop the column from `NetworkDeviceType`. **Assert rather than assume** that a model's
-  profiles agree — they do today by construction, but nothing has ever enforced it, and that is
-  precisely the drift the ADR says is unprevented. Fail loudly on disagreement.
-- Readers to update: `hostnames.py`, `admin.py`, `models.py` (~18 sites), `views.py`, templates.
-- `HOSTNAME_SLUGS` loses its 22 device entries, keeping 4 switch entries, in **both** live copies
-  (`import_prod_data.py:173`, `verify_prod_import.py:113`). Migration 0018's frozen copy (`:45`) is
-  left alone — it is history and must keep running against old databases.
-- **`test_prod_import.py:1137–1198` (`HostnameSlugsConstantTests`) cross-checks all three copies**
-  against each other, including the Amphenol case at `:1197–1199`. It will fail the moment the
-  constants diverge and must be rewritten to expect the switch-only shape. This is the single test
-  most likely to be missed.
-- The importer starts reading the `Hostname Slug` column, with `HOSTNAME_SLUGS` as the fallback when
-  the CSV is absent — otherwise a slugless import would silently stop computing hostnames.
-- **ADR 0023 amendment**: its decision 1 table places `hostname_slug` "on both Type models". PR 2
-  amends that text in place with a dated note pointing at ADR 0026 decision 2, rather than leaving a
-  committed ADR describing a schema that no longer exists.
+- **The normalization lives in three places, not two** (review note 7 — revision 2 named only the
+  first two, and getting this wrong is an `AttributeError` or a lost lock):
+  - `save()` (`models.py:3599-3615`) — slug lines move.
+  - `clean_fields()` (`:3636-3641`) — does nothing else; **delete the whole override.**
+  - `clean()` (`:3643-3650`) — **normalizes the slug *and* holds the instance lock check.** Remove
+    only its slug lines. Deleting this override would silently remove the lock.
+- **Readers, counted properly** (review note 13 corrects revision 2's "~18 sites"): `models.py` has 18
+  matching lines but 9 are the untouched switch path; the device-side functional sites are **five** —
+  the field, `save()`, `clean_fields()`, `clean()`, and `hostname_diverges` (`models.py:4241`).
+  `hostnames.py`'s 3 hits are documentation mentions with no field reader. **Templates have zero.**
+  Live readers needing the extra hop: the add-form reader (`admin.py:650`), the recompute action
+  (`admin.py:2372`), and the divergence reader (`models.py:4241`).
+- **Two nested-relation query regressions** (review note 11), the same class PR 1's review caught
+  twice: rack elevation selects a bare `"device_type"` (`views.py:650`) and the admin divergence
+  filter selects a bare `self._type_field` (`admin.py:1986-1989`). Once `hostname_diverges` traverses
+  another FK, both N+1. Widen to `device_type__device_model` and keep query-count coverage.
+
+### Migration `0022`
+
+Order matters, and differs from revision 2:
+
+1. **`RunPython` preflight — assert profiles agree, BEFORE any DDL.** Review note 2: production is
+   MariaDB (`config/settings.py:118-121`), whose DDL is **not transactional**, so an assertion that
+   raises *after* `AddField` leaves the new column behind on a migration Django never records. The
+   retry then hits a partially applied, unrecorded migration. Assert first, against the 0021 schema.
+2. `AddField` `hostname_slug` on `NetworkDeviceModel`.
+3. `RunPython(copy_slugs, reverse_code=copy_back)` — copy each model's agreed slug up from its
+   profiles.
+4. `RemoveField` `hostname_slug` from `NetworkDeviceType`.
+
+**The `.order_by()` defect can recur here** (review note 4). `NetworkDeviceType.Meta.ordering` is
+`["device_model__manufacturer", "device_model__model", "name"]` (`models.py:3589-3594`), so a
+`profiles.values_list("hostname_slug", flat=True).distinct()` without `.order_by()` sees the ordering
+columns leak in and reports IK-42's two identical `"ik42"` profiles as two distinct values — a false
+disagreement that aborts a perfectly good migration. Use `.order_by()`, or collect a Python `set`.
+
+**The reverse is simpler than `0021`'s** (review note 3) and needs no placeholder operation: reversing
+`RemoveField` restores the Type column as `NOT NULL` filled with valid blank strings, and there is no
+slug constraint, index, ordering or database validator to trip. But step 3 **must** carry
+`reverse_code` copying the model's slug back to every profile, or rollback silently loses every slug.
+
+### Constants, docs, and roadmap
+
+- `HOSTNAME_SLUGS`: see settled decision A. Migration `0018`'s frozen copy
+  (`0018_seed_hostname_slugs.py:45`) is left alone — it is history and must keep running against old
+  databases.
+- **`HostnameSlugsConstantTests`** is now `test_prod_import.py:1202-1265` (not `:1137-1198`), and the
+  Amphenol case is `:1258-1265` (not `:1197-1199`) — revision 2's line numbers predate PR 1. After the
+  switch-only conversion it should assert Amphenol is **absent** from both live constants but still
+  corrected in frozen migration 0018.
+- Other drifted citations (review note 14): importer constant now `import_prod_data.py:179`, verifier
+  constant now `verify_prod_import.py:118`.
+- **ADR 0023 amendment**: its decision 1 table places `hostname_slug` "on both Type models". Amend in
+  place with a dated note pointing at ADR 0026, rather than leaving a committed ADR describing a
+  schema that no longer exists.
+- **Canonical docs** (review note 9): `DESIGN.md:127` still lists Hostname Slug under Network Device
+  Type — it moves to the Model bullet. `CONTEXT.md:43-45` enumerates the Model's fields without it —
+  add it. Tick ROADMAP phase 23's PR 2 checkboxes (`ROADMAP.md:624-629`).
 
 ### PR 2 tests
 
-Revision 1 specified none, which is how the assertion below would have gone unbuilt. Required:
+Revision 1 specified none. Revision 3 adds the harness detail review note 8 asked for — "end to end
+before and after" is not a test until someone says through *which* reader.
 
-- **Migration `0022` aborts when two profiles of one model disagree on `hostname_slug`.** This is the
-  one that matters. Production data agrees by construction, so a fixture built from production would
-  pass against a broken `.first()`-style implementation that silently picks a winner. The test must
-  **construct disagreement deliberately** and assert the migration raises with a message naming the
-  offending model.
-- The agreeing case migrates cleanly and every profile's slug lands on its model.
-- Hostname computation is unchanged end to end for a device whose slug moved — same computed
-  hostname before and after, which is the whole point of PR 2 being separate.
-- `HostnameSlugsConstantTests` (`test_prod_import.py:1137–1198`) rewritten for the switch-only shape,
-  including the Amphenol case at `:1197–1199`.
-- Migration 0018's frozen `HOSTNAME_SLUGS` copy still runs against an old database — the existing
-  `0018` migration tests must stay green untouched.
-- Importer: with the CSV's `Hostname Slug` column, slugs land from the sheet; without the CSV, the
-  `HOSTNAME_SLUGS` fallback still produces hostnames.
-- `NetworkDeviceType.clean_fields()` is deleted rather than left empty, and `save()` still enforces
-  the lock — assert both, since deleting an override is easy to over-apply.
+- **Migration `0022` aborts when two profiles of one model disagree.** The centrepiece. Production
+  data agrees by construction, so a production-shaped fixture passes against a broken `.first()`
+  implementation that silently picks a winner. **Construct disagreement deliberately** and assert the
+  migration raises naming the offending model. Assert too that it raises **before** the column is
+  added (settled decision A's non-transactional-DDL reasoning).
+- **The agreeing case uses two profiles, not one** (review note 4). A single-profile fixture cannot
+  exercise the `.distinct()`/`.order_by()` path at all. Use the IK-42 shape, and assert the migration
+  does **not** falsely report disagreement.
+- **Orphan model** — a `NetworkDeviceModel` with no profiles migrates to `""` and is not an error.
+- **Hostname computation, through the real readers** (review note 8). Historical migration models
+  carry neither live model methods nor admin forms, so a pure-function comparison can pass while every
+  live path is broken. Drive `MigrationExecutor`, compute from the old Type value and then the new
+  Model value, and **bind the device to the second IK-42 profile** so the multi-profile path is
+  covered. Then exercise each live reader separately: the add-form reader (`admin.py:650`), the
+  recompute action (`admin.py:2372`), and the divergence reader (`models.py:4241`).
+- **CSV precedence, all three cases from settled decision B** — absent file, missing row, and the
+  blank cell that must *win* over the seed catalog rather than be overwritten by it.
+- **The unlocked behaviour, restated** (review note 10). `tests.py:5328-5343` currently proves a Type
+  slug stays editable after instances exist (ADR 0023 settled decision 3). After the move that edit
+  happens on a wholly unlocked Model and affects **every** profile. Replace it with a test that edits
+  a model's slug after instances exist, proves both IK-42 profiles observe the change, and proves the
+  model admin does not make it read-only.
+- **`clean()` keeps its lock** after the slug lines are removed, and `clean_fields()` is gone — assert
+  both, since deleting an override is easy to over-apply (review note 7).
+- **Query counts** for rack elevation and the admin divergence filter (review note 11), using
+  `assertNumQueries` with several rows so an added row does not add a query.
+- `HostnameSlugsConstantTests` rewritten for the switch-only shape, asserting Amphenol is absent from
+  both live constants and still present in frozen migration 0018.
+- Migration `0018`'s existing tests stay green untouched.
 
 ## Review response
 
@@ -633,6 +739,92 @@ missed a *second* kwargs-forwarding helper — `_make_spanning_type`, used by tw
 and did not consider that another passthrough helper might sit between them. Worth remembering the
 next time a plan here counts call sites.
 
+### Review response — PR 2 (revision 3)
+
+`REVIEW-1-PLAN-adr-0026-pr2.md`, codex, high reasoning, read-only over the **post-PR-1** tree. Fourteen
+findings; every one verified against the code before acceptance. **All fourteen folded in, none
+rejected.** One required Mike's decision and stopped the chain; the rest were folded without asking.
+
+| Note | Resolution |
+|---|---|
+| 1 · **P0** — the importer fallback is internally impossible: PR 2 retires the 22 device entries *and* names them as the CSV-absent fallback | **Escalated to Mike, resolved 2026-08-24.** Confirmed real: `import_prod_data.py:1067` is the only device slug source and `_stage6b` has none. Chose the seed-catalog option — importer keeps the entries as `DEVICE_MODEL_SLUGS`, verifier drops its copy and checks the CSV instead. See PR 2 settled decision A. |
+| 2 · P1 — assert before any DDL; MariaDB DDL is not transactional | **Folded in.** Migration `0022` now opens with a preflight `RunPython` against the 0021 schema, so a raised assertion cannot leave an unrecorded half-applied column behind. |
+| 3 · P1 — reverse population unspecified | **Folded in.** Step 3 carries `reverse_code`. Correctly noted that unlike `0021` this needs no placeholder operation — reverse `RemoveField` restores the column before the data step reverses, and there is no constraint to trip. |
+| 4 · P1 — the `0021` `Meta.ordering` defect can recur | **Folded in.** `Meta.ordering` is now `device_model__…`, so an unqualified `.distinct()` would report IK-42's two identical `"ik42"` profiles as a *false disagreement* and abort a good migration. `.order_by()` or a Python set, and the agreeing-case fixture must have two profiles. |
+| 5 · P1 — present-but-blank and partial CSV undefined | **Folded in** as settled decision B, with all three cases tabled. The decisive one: an explicit blank cell **wins** over the seed catalog, because blank means "no hostname" rather than "no answer". |
+| 6 · P1 — the verifier would stop verifying device slugs | **Folded in**, and it is what makes decision A coherent: the verifier drops its constant *and* gains an independent CSV → `NetworkDeviceModel.hostname_slug` check, preserving its rule of never reading the importer's constants. |
+| 7 · P1 — the normalization move misses `clean()` | **Folded in.** Verified: `clean()` normalizes the slug **and** holds the lock check. Revision 2 named only `save()` and `clean_fields()`; deleting `clean()` wholesale would have silently removed the instance lock. Now spelled out per method. |
+| 8 · P1 — the hostname test is too vague to prove the live paths | **Folded in.** "Before and after" is not a test until it names a reader. Now: `MigrationExecutor`, device bound to the **second** IK-42 profile, plus each live reader exercised separately (`admin.py:650`, `admin.py:2372`, `models.py:4241`). |
+| 9 · P1 — canonical docs beyond ADR 0023 go stale | **Folded in.** `DESIGN.md:127` and `CONTEXT.md:43-45` both named, plus ticking ROADMAP phase 23's PR 2 boxes. Same class as PR 1's note 6. |
+| 10 · P2 — pin the intended unlocked behaviour | **Folded in.** `tests.py:5328-5343` proves a *Type* slug stays editable; after the move that edit happens on an unlocked Model and hits every profile. Replaced with a test asserting both IK-42 profiles observe it. |
+| 11 · P2 — two more nested-relation regressions | **Folded in.** `views.py:650` and `admin.py:1986-1989` both select a bare `device_type`. Third and fourth instances of the class PR 1's review caught twice — worth noting the pattern rather than just the sites. |
+| 12 · P2 — orphan-model behaviour undefined | **Folded in** as settled decision C: blank, not a disagreement, with a fixture. |
+| 13 · P3 — the post-PR-1 census is misleading | **Folded in.** Revision 2's "~18 sites in `models.py`" counted 9 untouched switch-path lines; the real device-side surface is **five** functional sites. `hostnames.py`'s hits are documentation only and templates have zero. |
+| 14 · P3 — cited locations have drifted | **Folded in.** PR 1 moved three of four: importer `:173→:179`, verifier `:113→:118`, `HostnameSlugsConstantTests` `:1137→:1202`. Migration 0018's `:45` correctly unmoved, being frozen history. |
+
+The reviewer also confirmed the core add → copy → drop direction sound, that both IK-42 profiles
+genuinely share one `"ik42"` mapping today, and that no serializer, fixture, constraint, index or
+`Meta.ordering` names the Type's slug field.
+
+### Code review of PR 2, after implementation
+
+**The stage-4 review was not codex.** Its account ran out of API credits mid-run and a minimal probe
+confirmed exhaustion, so PR 2 got a five-specialist Claude council instead — security, performance,
+logic, regression, and robustness run **blind** (diff only, no intent briefing). Recorded plainly
+because it matters: this is **five of seven streams with both vendor-independent reviewers missing**
+(codex out of credits, gemini not installed here). Five Claude agents reviewing Claude's output share
+blindspots a different model family would not. PR 2 has had a real review, but not the cross-family
+check PR 1 got.
+
+**No P0.** Logic verified all seven of the plan's claims — by *mutating* the code, not just reading
+it: rewriting `_slug_sets_by_model` into the naive `.distinct()` form produced 5/5 test failures with
+exactly the predicted `Martin Audio IK-42: ['ik42', 'ik42']`, proving the centrepiece test guards
+rather than merely passes. Regression confirmed the PR 1 bug class did **not** recur — no surviving
+reader of `NetworkDeviceType.hostname_slug` anywhere.
+
+Nine findings, all verified against the code, all fixed in `553b7a6`, none rebutted:
+
+| Finding | Flagged by | Resolution |
+|---|---|---|
+| The `owner` ModelSpec (`views.py:1290-1315`) both prefetched one hop short **and** omitted `view_networkdevicemodel` | **security + performance, independently** | Fixed both. Measured 9 queries at 2 device types, 17 at 10 — ~23 extra on the real estate. Now `devices__device_type__device_model`, with a 2-vs-10 equal-counts probe. |
+| `rack_detail` dereferences the model via `hostname_diverges` but never declared it | security | Codename added; partial-grant test extended. |
+| **The migration-test pinning recurred, twice.** `tests.py:7461-7462`, `:7527`, `:7597-7603` pin the DB to `0022` *by name* then query live classes — they pass only because `0022` is head, and `0023` would break them | regression | Executor test uses `project_state(...).apps`; the live-reader test migrates to **head** instead of naming a migration. |
+| `recompute_hostnames` (`admin.py:2393`) N+1 **inside held row locks** — 61 devices, 61 extra round trips | performance + regression | Slug map built before the loop. `_lock_devices_by_pk`'s queryset deliberately **not** widened: adding `select_related` to a `select_for_update` would make MariaDB lock the joined rows too, and that helper is shared with the fit-card and delete paths. |
+| `parse_device_models` silently skips rows and assumes a header | robustness (blind) | Header validated; skipped rows warn with line numbers. See the note below on severity. |
+| Verifier compares a raw CSV cell against a lowercased DB value (`verify_prod_import.py:643`) | logic | Comparison normalized. Latent — the committed sheet is all lowercase. |
+| `_make_device_type(hostname_slug=…)` silently mutated a shared model row, blanking three fixtures' own slugs | regression | Helper now **raises** rather than overwriting, so the class cannot reappear. |
+| `ROADMAP.md:5` said PR 2 outstanding while `:624` ticked it done | logic | Corrected. |
+| `0022`'s docstring overclaimed resumability | regression | Scoped to the preflight-abort path. A failure in `copy_slugs`/`RemoveField` still leaves `AddField` committed and the migration unrecorded. |
+
+**On the parser finding's severity.** The blind reviewer reported that 15 of 22 rows would vanish, and
+that figure is *not* true of the committed sheet — every row repeats its manufacturer, so nothing is
+dropped today. It measured a sheet it had reshaped itself. Recorded as a latent trap with a plausible
+trigger (a human tidying the CSV into manufacturer groups), not a live bug.
+
+What survives that correction is architectural, and is the finding worth keeping: `verify_prod_import.py`
+imports the *same* parser (`:52`, called `:414`), justified in its own docstring as "pure I/O, no
+domain judgement". `if not manufacturer or not model: continue` **is** domain judgement — it decides
+which rows count. So a dropped row is invisible to the importer *and* to the independent check that
+exists to catch exactly that, which then reports "All verification checks passed". The verifier's
+independence boundary is drawn in the wrong place.
+
+**A council split worth recording.** Logic marked verifier independence *verified* (it imports nothing
+from `import_prod_data` — the stated rule holds). Robustness called the shared parser a shared
+blindspot. Both are right on their own terms; robustness questioned whether the rule is drawn
+correctly rather than whether it is followed. Only a blind reviewer could raise it, because the intent
+briefing declared the CSV shape settled.
+
+**Two findings deliberately not fixed** — see Consequences below. Both would have reversed a decision
+rather than corrected a defect.
+
+**The structural finding, which outlives this PR.** The nested-FK N+1 has now been found at **five**
+sites across the two PRs. The reason is measurable: before this round the suite had exactly *one*
+query-count assertion (`test_ui.py:2836`). Site-by-site fixing has not converged and will not; the
+defect class needs standing query-count coverage on every surface that renders a device type. Related:
+`test_ui.py:724-738` restates each view's permission list verbatim, so every partial-grant test proves
+*enforcement* and none prove *completeness* — which is why two missing codenames survived to this
+review.
+
 ## Consequences accepted, not solved
 
 - **Duplicate models are creatable.** ADR decision 4. The picker makes selection the default path;
@@ -645,6 +837,16 @@ next time a plan here counts call sites.
   database. ADR decision 3 makes normalizing them a one-row edit whenever that is wanted; doing it
   here would mean changing the importer catalog and the verifier in the same breath.
 - **`/models/networkdevicemodel/`** reads oddly. Settled decision 2.
+- **The CSV-absent import path has no independent device-slug verification.** Flagged by three of the
+  five council reviewers, and they are right that coverage regressed: the verifier previously checked
+  all 22 device slugs unconditionally, and now checks none when the Device Models CSV is missing —
+  which is precisely the path where `DEVICE_MODEL_SLUGS` is load-bearing. Closing it would mean giving
+  the verifier its own copy of the 22 device entries, which is exactly what PR 2 settled decision A
+  removed. Accepted rather than reversed; worth an issue if CSV-less rebuilds become routine.
+- **The example CSV is untested and outranks the tested constant.** No test parses
+  `docs/examples/MPS Audio Network Standards - Device Models.csv`, yet at import time its values win
+  over `DEVICE_MODEL_SLUGS`, which has three tests. They agree exactly today (verified). Noted by the
+  blind reviewer.
 - **A post-import model rename breaks `verify_prod_import.py`.** Settled decision 7 — correct, but a
   behaviour change worth stating rather than discovering.
 

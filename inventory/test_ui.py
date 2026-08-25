@@ -100,7 +100,10 @@ def _device_model(manufacturer: str, model: str) -> NetworkDeviceModel:
 
 
 def _make_device_type(port_count: int = 0, vlan: VLAN | None = None, **kwargs) -> NetworkDeviceType:
-    """See ``tests.py``'s helper of the same name — identical shape."""
+    """See ``tests.py``'s helper of the same name — identical shape,
+    including review council finding 7's guard against silently
+    overwriting a shared default device_model's hostname_slug.
+    """
     device_model = kwargs.pop("device_model", None)
     if device_model is None:
         manufacturer = kwargs.pop("manufacturer", "Martin Audio")
@@ -109,6 +112,19 @@ def _make_device_type(port_count: int = 0, vlan: VLAN | None = None, **kwargs) -
     else:
         kwargs.pop("manufacturer", None)
         kwargs.pop("model", None)
+    hostname_slug = kwargs.pop("hostname_slug", None)
+    if hostname_slug is not None:
+        normalized_slug = hostname_slug.strip().lower() if hostname_slug else hostname_slug
+        if device_model.hostname_slug and device_model.hostname_slug != normalized_slug:
+            raise AssertionError(
+                f"_make_device_type(hostname_slug={hostname_slug!r}) would silently overwrite "
+                f"{device_model}'s existing hostname_slug {device_model.hostname_slug!r} — pass an "
+                "explicit manufacturer=/model=/device_model= if this call means a different "
+                "hardware model, not the one an earlier call in this test already built."
+            )
+        if device_model.hostname_slug != normalized_slug:
+            device_model.hostname_slug = hostname_slug
+            device_model.save(update_fields=["hostname_slug"])
     kwargs.setdefault("name", "Default")
     device_type = NetworkDeviceType.objects.create(port_count=port_count, device_model=device_model, **kwargs)
     for n in range(1, port_count + 1):
@@ -423,11 +439,15 @@ class ParityFixtureMixin:
         self.switch_port = self.switch.ports.get()
         self.switch_address = self.switch.addresses.get()
 
+        # hostname_slug lives on the model, not the profile, since ADR
+        # 0026 PR 2 — set it there before creating the profile.
+        sb_device_model = _device_model("StageB Device Mfr", "SBDeviceModel")
+        sb_device_model.hostname_slug = "sbdevtype"
+        sb_device_model.save()
         self.device_type = NetworkDeviceType.objects.create(
-            device_model=_device_model("StageB Device Mfr", "SBDeviceModel"),
+            device_model=sb_device_model,
             name="StageB Device Type",
             port_count=1,
-            hostname_slug="sbdevtype",
         )
         NetworkDeviceTypePort.objects.create(
             device_type=self.device_type,
@@ -726,6 +746,9 @@ class PartialGrantAccessTests(TestCase):
                 "view_networkdeviceport",
                 "view_networkdevicetypeport",
                 "view_owner",
+                # ADR 0026 PR 2 — hostname_diverges reads
+                # device_type.device_model.hostname_slug.
+                "view_networkdevicemodel",
             ],
         )
 
@@ -2057,6 +2080,42 @@ class QueryBudgetTests(TestCase):
         self.assertEqual(big_response.status_code, 200)
         self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
 
+    def test_owner_detail_query_count_independent_of_distinct_device_type_count(self) -> None:
+        """Review council finding 1 — the "owner" registry spec's Network
+        Devices inline renders ``str(device_type)``, which dereferences
+        ``device_model`` since ADR 0026; ``detail_prefetch_related`` must
+        widen to ``devices__device_type__device_model`` or each distinct
+        device type on the owner costs one more query. Several *distinct*
+        types, not several devices of one type — a shared type's
+        ``device_model`` is fetched once regardless.
+        """
+        owner = Owner.objects.create(slug="qb-owner", name="QB Owner")
+        vlan = VLAN.objects.create(name="QB Owner VLAN", vlan_id=294, subnet="10.204.0.0/21")
+        small_type = _make_device_type(
+            port_count=1, vlan=vlan, manufacturer="QB Owner Mfr Small", model="Small", name="Default"
+        )
+        NetworkDevice.objects.create(device_type=small_type, owner=owner, hostname="qb-owner-small")
+
+        with CaptureQueriesContext(connection) as small_ctx:
+            small_response = self.client.get(f"/models/owner/{owner.pk}/")
+
+        for i in range(10):
+            device_type = _make_device_type(
+                port_count=1,
+                vlan=vlan,
+                manufacturer=f"QB Owner Mfr {i}",
+                model=f"Big {i}",
+                name="Default",
+            )
+            NetworkDevice.objects.create(device_type=device_type, owner=owner, hostname=f"qb-owner-big-{i}")
+
+        with CaptureQueriesContext(connection) as big_ctx:
+            big_response = self.client.get(f"/models/owner/{owner.pk}/")
+
+        self.assertEqual(small_response.status_code, 200)
+        self.assertEqual(big_response.status_code, 200)
+        self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
+
 
 class DeepLinkTests(TestCase):
     """A deep link's target form is actually prefilled, not merely
@@ -2485,7 +2544,9 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         list_response = self.client.get(self._list_url("networkdevicemodel"))
         self.assertEqual(
             _list_row_cells(list_response.content.decode(), "SBDeviceModel"),
-            ["StageB Device Mfr", "SBDeviceModel", "StageB Model Description", "Details"],
+            # "sbdevtype" — set on this fixture's device_model in setUp
+            # (ADR 0026 PR 2: hostname_slug lives here, not on the profile).
+            ["StageB Device Mfr", "SBDeviceModel", "StageB Model Description", "sbdevtype", "Details"],
         )
 
         detail_response = self.client.get(self._detail_url("networkdevicemodel"))
@@ -2493,6 +2554,7 @@ class ParityContentTests(ParityFixtureMixin, TestCase):
         self.assertEqual(_detail_field_text(content, "Manufacturer"), "StageB Device Mfr")
         self.assertEqual(_detail_field_text(content, "Model"), "SBDeviceModel")
         self.assertEqual(_detail_field_text(content, "Description"), "StageB Model Description")
+        self.assertEqual(_detail_field_text(content, "Hostname slug"), "sbdevtype")
         self.assertEqual(
             _inline_row_cells(content, "Profiles", "StageB Device Type"),
             ["StageB Device Type", "1", "No"],
@@ -2804,6 +2866,27 @@ class HostnameDivergesMarkerTests(TestCase):
         self.assertEqual(small_response.status_code, 200)
         self.assertEqual(big_response.status_code, 200)
         self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
+
+    def test_elevation_query_count_is_fixed_with_several_devices(self) -> None:
+        """ADR 0026 PR 2 review note 11 — ``rack_detail``'s ``device_qs``
+        widened to ``device_type__device_model`` once ``hostname_diverges``
+        started traversing that extra FK. A fixed ``assertNumQueries``, not
+        just the equal-counts shape above, per the PR 2 tests section.
+        """
+        for slot in range(1, 6):
+            NetworkDevice.objects.create(
+                device_type=self.device_type,
+                rack=self.rack,
+                rack_slot=slot,
+                owner=self.owner,
+                hostname="hand-typed" if slot % 2 else "mps-wpcsrl-ik42",
+            )
+        # 12 measured against this tree with device_type__device_model in
+        # place — without it, each of the 5 devices costs one extra query
+        # fetching its device_model.
+        with self.assertNumQueries(12):
+            response = self.client.get(f"/racks/{self.rack.pk}/")
+        self.assertEqual(response.status_code, 200)
 
 
 class RangeOffsetsDivergeUITests(TestCase):
