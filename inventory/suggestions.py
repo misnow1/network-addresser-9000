@@ -231,6 +231,42 @@ def lowest_free_run(occupied: Iterable[tuple[int, int]], span: int, slot_count: 
     return cursor if cursor + span - 1 <= slot_count else None
 
 
+def lowest_free_placement(occupied: Iterable[int], offsets: Iterable[int], slot_count: int) -> int | None:
+    """Lowest 1-based ordinal ``N`` at which a device declaring ``offsets``
+    fits: every ``N + offset`` is free and lands within ``1..slot_count``.
+
+    ADR 0027 — a device claims the **set** of ordinals its declared offsets
+    reach, not a contiguous run. A Shure receiver declaring offsets
+    ``{0, 64}`` needs ordinals ``N`` and ``N + 64`` and is indifferent to
+    the 63 between them, which is what ``lowest_free_run()`` could not
+    express (issue #83).
+
+    ``lowest_free_run()`` is deliberately left alone rather than
+    generalized: it answers a genuinely different question ("``span``
+    *consecutive* free ordinals") and stays correct for the switch path,
+    which always spans exactly 1.
+
+    ``None`` if ``offsets`` is empty or nothing fits. Tolerates unsorted
+    and duplicated input in both arguments, matching ``lowest_free_run()``'s
+    tolerance for callers that union several sources without normalising.
+
+    Negative offsets are handled even though ADR 0027 decision 4 keeps
+    ``slot_offset`` non-negative — the arithmetic costs nothing here, and a
+    silently wrong placement would be worse than a guard that never fires.
+    """
+    wanted = sorted(set(offsets))
+    if not wanted:
+        return None
+    taken = set(occupied)
+    # start must keep every claimed ordinal inside 1..slot_count
+    first_start = max(1, 1 - wanted[0])
+    last_start = slot_count - wanted[-1]
+    for start in range(first_start, last_start + 1):
+        if all(start + offset not in taken for offset in wanted):
+            return start
+    return None
+
+
 def ranges_overlap(a: str, b: str) -> bool:
     """Whether two IPv4 CIDR ranges overlap at all."""
     return ipaddress.IPv4Network(a, strict=True).overlaps(ipaddress.IPv4Network(b, strict=True))
