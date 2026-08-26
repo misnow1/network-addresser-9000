@@ -4775,11 +4775,16 @@ class NetworkDevicePort(AuditedModel):
     purpose), ``vlan``, ``port_type``, and ``slot_offset`` are locked
     hardware/purpose facts copied from the type port (ADR 0010, ADR 0017).
     ``address`` is likewise locked once persisted — derived and
-    system-written only (ADR 0027 decision 1; see ``_locked_fields()``):
-    the rack slot is the only way to change an address now, superseding
-    ADR 0003. ``switch_port`` stays freely editable. Identity is
-    ``(device, description)`` — ``port_number``, when present at all, is
-    neither required nor unique.
+    system-written only (ADR 0027 decision 1; see ``_locked_fields()``),
+    superseding ADR 0003. Moving the device is the only way to change an
+    *existing static* port's address; the one other legal edge is the ADR
+    0013 DHCP-to-static flip (``is_dhcp`` ``True`` -> ``False`` on a
+    persisted row), which derives the address itself from the same
+    formula rather than accepting one typed in
+    (``_derive_address_on_flip_to_static()``) — the operator still never
+    types an address directly. ``switch_port`` stays freely editable.
+    Identity is ``(device, description)`` — ``port_number``, when present
+    at all, is neither required nor unique.
 
     ``switch`` is not stored directly — it's redundant with (and could
     contradict) ``switch_port``, so it's derived from it via a property.
@@ -4872,9 +4877,38 @@ class NetworkDevicePort(AuditedModel):
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
         with transaction.atomic():
+            flipping_to_static = False
             if self.pk is not None:
+                flipping_to_static = self._persisted_is_dhcp() is True and not self.is_dhcp
+                if flipping_to_static:
+                    # ADR 0013's DHCP-to-static conversion, restored under
+                    # ADR 0027 decision 1 (see the method's own docstring):
+                    # derives self.address before the locked-field check
+                    # below runs, and validates it here directly — a bare
+                    # save() with no full_clean() is exactly the case
+                    # _check_locked_fields_unchanged() itself exists for,
+                    # so this can't lean on clean() having already done
+                    # either half.
+                    derived_address = self._derive_address_on_flip_to_static()
+                    vlan = _get_related(self, "vlan")
+                    device = _get_related(self, "device")
+                    if vlan is not None and device is not None:
+                        _validate_static_address(
+                            derived_address,
+                            vlan,
+                            device.rack,
+                            device.rack_slot,
+                            exclude_switch_address_pk=None,
+                            exclude_device_port_pk=self.pk,
+                        )
+                locked_fields = self._locked_fields()
+                if flipping_to_static:
+                    # The one field this transition is allowed to change —
+                    # already derived and validated above, not compared
+                    # against the persisted (necessarily NULL) value.
+                    del locked_fields["address"]
                 _check_locked_fields_unchanged(
-                    NetworkDevicePort, self.pk, self._locked_fields(), update_fields=update_fields
+                    NetworkDevicePort, self.pk, locked_fields, update_fields=update_fields
                 )
             # Lock both the old and new NetworkSwitchPort (connecting,
             # disconnecting, or reassigning switch_port) — the other half of
@@ -4922,10 +4956,17 @@ class NetworkDevicePort(AuditedModel):
 
     def clean(self) -> None:
         super().clean()
+        flipping_to_static = self.pk is not None and self._persisted_is_dhcp() is True and not self.is_dhcp
         if self.pk is not None:
-            _check_locked_fields_unchanged(
-                NetworkDevicePort, self.pk, self._locked_fields(), update_fields=None
-            )
+            locked_fields = self._locked_fields()
+            if flipping_to_static:
+                # See save()'s identical carve-out — the ADR 0013
+                # DHCP-to-static conversion, restored under ADR 0027
+                # decision 1, is the one case allowed to change ``address``
+                # on a persisted row, and it's derived (not compared)
+                # below.
+                del locked_fields["address"]
+            _check_locked_fields_unchanged(NetworkDevicePort, self.pk, locked_fields, update_fields=None)
         if self.is_dhcp:
             if self.address:
                 raise ValidationError("DHCP ports must not have a static address.")
@@ -4937,7 +4978,9 @@ class NetworkDevicePort(AuditedModel):
                     "Unracked devices are spare pool (DHCP-configured per CONTEXT.md); rack "
                     "the device first, or use is_dhcp for this port instead."
                 )
-            if self.pk is None and not self.address and device is not None and vlan is not None:
+            if flipping_to_static:
+                self._derive_address_on_flip_to_static()
+            elif self.pk is None and not self.address and device is not None and vlan is not None:
                 suggestion = _suggest_rack_slot_address(
                     device.rack, device.rack_slot, vlan.pk, self.slot_offset
                 )
@@ -4990,22 +5033,33 @@ class NetworkDevicePort(AuditedModel):
         # save() must not be able to silently move, renumber, or reorder a
         # materialized port, or change its offset.
         #
-        # ``address`` is locked unconditionally now (ADR 0027 decision 1,
+        # ``address`` is locked here unconditionally (ADR 0027 decision 1,
         # superseding ADR 0003 and generalizing ADR 0017's offset-only
         # lock to every port): a static address is derived from the
-        # device's own rack slot and system-written only, so no save() may
-        # change it, regardless of ``slot_offset``. There is no longer a
-        # privileged writer to exempt — ``_derive_offset_siblings()`` and
-        # its ``_deriving_address`` flag are gone along with the cascade
-        # they existed for, and with them the whole reason this method
-        # used to have to read the *persisted* ``slot_offset``
-        # (``_persisted_slot_offset()``) rather than trust ``self.
-        # slot_offset``: that defended against an in-memory ``slot_offset``
-        # forged to 0 being used to drop ``"address"`` from this dict
-        # before the comparison ever ran. With the lock unconditional,
-        # there is no conditional branch left for that forgery to exploit
-        # — ``address`` is always compared, no matter what ``slot_offset``
-        # claims to be.
+        # device's own rack slot and system-written only, so this dict
+        # always compares it, regardless of ``slot_offset``. There is no
+        # longer a privileged *writer* to exempt — ``_derive_offset_
+        # siblings()`` and its ``_deriving_address`` flag are gone along
+        # with the cascade they existed for, and with them the whole
+        # reason this method used to have to read the *persisted*
+        # ``slot_offset`` (``_persisted_slot_offset()``) rather than trust
+        # ``self.slot_offset``: that defended against an in-memory
+        # ``slot_offset`` forged to 0 being used to drop ``"address"``
+        # from this dict before the comparison ever ran. With the lock
+        # unconditional here, there is no conditional branch left in this
+        # method for that forgery to exploit — this dict itself never
+        # drops ``"address"``.
+        #
+        # There is exactly one privileged *transition* that still needs
+        # to change it: the ADR 0013 DHCP-to-static flip, restored under
+        # decision 1 (``_derive_address_on_flip_to_static()``). That
+        # exemption doesn't live here — ``save()``/``clean()`` delete
+        # ``"address"`` from the dict *this method returns*, after
+        # deciding for themselves (by reading the persisted ``is_dhcp``
+        # fresh from the database, not trusting ``self``) that the
+        # transition is genuinely happening. A forged ``self.is_dhcp``
+        # can't manufacture that exemption on its own, since the decision
+        # never reads it as final without the fresh comparison.
         return {
             "device": self.device_id,
             "port_number": self.port_number,
@@ -5026,6 +5080,59 @@ class NetworkDevicePort(AuditedModel):
             .values_list("switch_port_id", flat=True)
             .first()
         )
+
+    def _persisted_is_dhcp(self) -> bool | None:
+        """The persisted ``is_dhcp`` for this row, or ``None`` for an
+        unsaved instance — what ``save()``/``clean()`` compare ``self.
+        is_dhcp`` against to detect the ADR 0013 DHCP-to-static flip
+        (restored under ADR 0027 decision 1's derive-on-flip): the one
+        edge that's still allowed to change ``address`` on a persisted
+        row, despite ``_locked_fields()`` locking it unconditionally
+        everywhere else.
+        """
+        if self.pk is None:
+            return None
+        return NetworkDevicePort._default_manager.filter(pk=self.pk).values_list("is_dhcp", flat=True).first()
+
+    def _derive_address_on_flip_to_static(self) -> str:
+        """Sets ``self.address`` (and returns the same value, so a caller
+        that needs a definitely-non-``None`` ``str`` — ``save()``'s own
+        immediate ``_validate_static_address()`` call, since it runs with
+        no narrowing guard on ``self.address`` beforehand — doesn't have
+        to re-read it off ``self``) for the ADR 0013 DHCP-to-static
+        conversion, restored under ADR 0027 decision 1's system-written
+        address (``_locked_fields()``): an existing row whose ``is_dhcp``
+        is flipping ``True`` -> ``False``. Same ``range_base + rack_slot +
+        slot_offset`` formula ``NetworkDevice._derive_addresses()``
+        computes for a freshly materialized port — the operator flips the
+        toggle and never types an address (the admin's own ``address``
+        field is ``disabled`` for exactly this reason), so this
+        unconditionally overwrites whatever ``self.address`` currently
+        holds rather than trusting it.
+
+        Raises ``ValidationError`` if the device is unracked — nothing to
+        derive from, matching ``_suggest_rack_slot_address()``'s own
+        null-rack contract — or if no usable Rack VLAN Range exists yet
+        for this port's VLAN. Does *not* itself check for a collision or
+        an out-of-range result; callers validate the derived address via
+        ``_validate_static_address()`` (``save()``, and the unconditional
+        check at the end of ``clean()``), so that a bad derivation fails
+        the whole save rather than being persisted half-written.
+        """
+        device = _get_related(self, "device")
+        if device is None or device.rack is None:
+            raise ValidationError(
+                "Unracked devices are spare pool (DHCP-configured per CONTEXT.md); rack "
+                "the device first, or use is_dhcp for this port instead."
+            )
+        address = _suggest_rack_slot_address(device.rack, device.rack_slot, self.vlan_id, self.slot_offset)
+        if address is None:
+            raise ValidationError(
+                f"No usable address range for this port's VLAN in {device.rack} — assign a Rack "
+                "VLAN Range before converting this port to static."
+            )
+        self.address = address
+        return address
 
     def _persisted_delete_guard_fields(self):
         """The persisted ``slot_offset``/``device_id``/``vlan_id`` for this

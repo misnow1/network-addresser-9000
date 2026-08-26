@@ -59,11 +59,28 @@ that the code starts keeping it too, and one console gets moved.
 
 `range_base + rack_slot + slot_offset`, for the `RackVlanRange` covering that port's VLAN. The
 address field stops being operator-editable. Setting the rack slot is the only way to set an
-address.
+address on a port materialized static from the start.
 
 This is not a new mechanism. It is **ADR 0017's derived-offset addressing, applied universally**
 instead of carved out for DiGiCo consoles. ADR 0017 already made non-zero-offset addresses read-only
 and recomputed; this extends the same treatment to offset 0.
+
+There is one other edge, and it is deliberate rather than an oversight: ADR 0013 lets an operator
+flip an existing DHCP port to static by typing its first address. Read literally, "the address field
+stops being operator-editable" would refuse that transition outright — the strictest reading of this
+decision, and the one PR 1 shipped with first. But that reading throws away a capability this ADR
+never argued for and never measured the cost of; it is a side effect of applying decision 1 to every
+port regardless of its current addressing mode, not a conclusion this ADR reached on purpose. Losing
+ADR 0013's conversion was never on the table here, so it does not get to disappear as a side effect
+of a decision about something else. The fix keeps both decisions intact rather than picking one:
+when `is_dhcp` moves from `True` to `False` on a persisted port, `save()` derives the address itself
+from the same `range_base + rack_slot + slot_offset` formula, exactly as if the port had been
+materialized static to begin with. The operator still never *types* an address — flipping the toggle
+is the trigger, the same way setting the rack slot is the trigger for a new port; nothing about "the
+system writes this field" changes. An unracked device has no rack slot to derive from, so the flip
+is refused for exactly the reason materialization already refuses static addressing for an unracked
+device — there is nothing new to argue there, only the existing rule reapplied at a different edge.
+The reverse direction (static to DHCP) already clears the address and is untouched by any of this.
 
 Expressiveness is not lost. `_address_containment_error()` already requires every racked static
 address to sit inside the rack's assigned range, so every address in the system is *already*

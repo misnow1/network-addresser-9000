@@ -3596,18 +3596,24 @@ class PortProfileLockedFieldTests(TestCase):
         with self.assertRaises(ValidationError):
             self.device_port.save()
 
-    def test_device_port_dhcp_to_static_via_manual_address_is_refused(self) -> None:
-        """ADR 0027 decision 1 supersedes ADR 0003: address is derived and
-        system-written only, so a DHCP port can no longer be hand-converted
-        to static by typing an address — even the very first one.
+    def test_device_port_dhcp_to_static_flip_derives_the_address(self) -> None:
+        """ADR 0027 decision 1 supersedes ADR 0003 but restores, rather
+        than loses, the ADR 0013 DHCP-to-static conversion: flipping an
+        existing DHCP port's ``is_dhcp`` to ``False`` derives the address
+        itself — ``range_base + rack_slot + slot_offset``, the same
+        formula ``_derive_addresses()`` computes for a freshly
+        materialized port — rather than accepting one typed in. This
+        types a *wrong* address on purpose to prove the derivation
+        overwrites it: the operator flips the toggle and never types an
+        address for real (the admin's own ``address`` field is
+        ``disabled``).
         """
         self.device_port.is_dhcp = False
-        self.device_port.address = "10.200.1.1"
-        with self.assertRaises(ValidationError):
-            self.device_port.save()
+        self.device_port.address = "10.200.1.5"  # wrong on purpose -- must be overwritten
+        self.device_port.save()  # must not raise
         self.device_port.refresh_from_db()
-        self.assertTrue(self.device_port.is_dhcp)
-        self.assertIsNone(self.device_port.address)
+        self.assertFalse(self.device_port.is_dhcp)
+        self.assertEqual(self.device_port.address, "10.200.1.1")
 
 
 class PortProfileTemplateLockTests(TestCase):
@@ -3903,9 +3909,27 @@ class MaterializedPortLockTests(TestCase):
     def test_device_port_number_readonly_in_admin(self) -> None:
         self.assertIn("port_number", NetworkDevicePortInline.readonly_fields)
 
-    def test_device_port_dhcp_to_static_via_manual_address_still_refused_once_racked(self) -> None:
-        """ADR 0027 decision 1 — racking the device afterward doesn't open
-        a back door: the address is still derived and system-written only.
+    def test_device_port_dhcp_to_static_flip_refused_while_unracked(self) -> None:
+        """ADR 0027 decision 1's derive-on-flip (restoring ADR 0013's
+        DHCP-to-static conversion) needs a rack slot to derive from — an
+        unracked device has none, so the flip is still refused, with the
+        same clear error ``_suggest_rack_slot_address()``'s own null-rack
+        contract already gives every other static-addressing path.
+        """
+        port = self.device.ports.get()
+        port.is_dhcp = False
+        port.address = "10.200.1.1"
+        with self.assertRaises(ValidationError):
+            port.save()
+        port.refresh_from_db()
+        self.assertTrue(port.is_dhcp)
+        self.assertIsNone(port.address)
+
+    def test_device_port_dhcp_to_static_flip_derives_address_once_racked(self) -> None:
+        """ADR 0027 decision 1's derive-on-flip: racking the device first
+        (so there's a rack slot to derive from) makes the flip succeed —
+        this types the *wrong* address on purpose to prove the derivation
+        overwrites it rather than trusting it.
         """
         rack = Rack.objects.create(name="Rack 1", slot_count=4)
         RackVlanRange.objects.create(rack=rack, vlan=self.vlan, address_range="10.200.1.0/27")
@@ -3914,9 +3938,11 @@ class MaterializedPortLockTests(TestCase):
         self.device.save()
         port = self.device.ports.get()
         port.is_dhcp = False
-        port.address = "10.200.1.1"
-        with self.assertRaises(ValidationError):
-            port.save()
+        port.address = "10.200.1.99"  # wrong on purpose -- must be overwritten
+        port.save()  # must not raise
+        port.refresh_from_db()
+        self.assertFalse(port.is_dhcp)
+        self.assertEqual(port.address, "10.200.1.1")
 
 
 class DerivedDefaultGatewayTests(TestCase):
