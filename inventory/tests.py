@@ -8,13 +8,16 @@ that skip ``full_clean()``, since ``Model.clean()`` is not invoked by
 inside ``save()`` itself, can guard those paths.
 """
 
+import csv
 import importlib
 import io
 import ipaddress
 import itertools
 import re
+import tempfile
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
@@ -12506,3 +12509,135 @@ class DanteRecomputeActionTests(TestCase):
         self.assertEqual(device.owner, self.owner)  # the rack's owner, persisted despite the skip
         self.assertEqual(device.hostname, "")  # still blocked — nothing computed to write
         self.assertTrue(any("Skipped" in str(m) for m in get_messages(request)))
+
+
+class SyncDeviceModelsCommandTests(TestCase):
+    """``sync_device_models`` — the route for correcting
+    ``NetworkDeviceModel`` descriptions (and, opt-in, ``hostname_slug``) on
+    a database ``import_prod_data`` can no longer touch because a Rack
+    already exists there.
+    """
+
+    CSV_HEADER = ["Manufacturer", "Model", "Description", "Hostname Slug"]
+
+    def _write_csv(self, rows: list[list[str]]) -> Path:
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        path = Path(tmp_dir.name) / "device-models.csv"
+        with path.open("w", newline="") as handle:
+            csv.writer(handle).writerows(rows)
+        return path
+
+    def test_description_is_updated(self) -> None:
+        device_model = _device_model("Martin Audio", "IK-42")
+        csv_path = self._write_csv([self.CSV_HEADER, ["Martin Audio", "IK-42", "Dante Amp Processor", ""]])
+        out = io.StringIO()
+        call_command("sync_device_models", str(csv_path), stdout=out)
+        device_model.refresh_from_db()
+        self.assertEqual(device_model.description, "Dante Amp Processor")
+        self.assertIn("Updated:", out.getvalue())
+        self.assertIn("Martin Audio IK-42", out.getvalue())
+        self.assertIn("Wrote 1 change", out.getvalue())
+
+    def test_second_run_is_idempotent(self) -> None:
+        _device_model("Martin Audio", "IK-42")
+        csv_path = self._write_csv([self.CSV_HEADER, ["Martin Audio", "IK-42", "Dante Amp Processor", ""]])
+        call_command("sync_device_models", str(csv_path), stdout=io.StringIO())
+        out = io.StringIO()
+        call_command("sync_device_models", str(csv_path), stdout=out)
+        self.assertIn("Unchanged: 1", out.getvalue())
+        self.assertIn("Summary: 0 updated", out.getvalue())
+        self.assertIn("Nothing to write.", out.getvalue())
+
+    def test_dry_run_writes_nothing(self) -> None:
+        device_model = _device_model("Martin Audio", "IK-42")
+        csv_path = self._write_csv([self.CSV_HEADER, ["Martin Audio", "IK-42", "Dante Amp Processor", ""]])
+        out = io.StringIO()
+        call_command("sync_device_models", str(csv_path), "--dry-run", stdout=out)
+        device_model.refresh_from_db()
+        self.assertEqual(device_model.description, "")
+        self.assertIn("Dante Amp Processor", out.getvalue())  # still reported
+        self.assertIn("Dry run: nothing was written.", out.getvalue())
+
+    def test_slugs_untouched_without_the_flag(self) -> None:
+        device_model = _device_model("Martin Audio", "IK-42")
+        device_model.hostname_slug = "ik42"
+        device_model.save(update_fields=["hostname_slug"])
+        csv_path = self._write_csv([self.CSV_HEADER, ["Martin Audio", "IK-42", "", "somethingelse"]])
+        call_command("sync_device_models", str(csv_path), stdout=io.StringIO())
+        device_model.refresh_from_db()
+        self.assertEqual(device_model.hostname_slug, "ik42")
+
+    def test_slugs_updated_with_the_flag(self) -> None:
+        device_model = _device_model("Martin Audio", "IK-42")
+        device_model.hostname_slug = "old"
+        device_model.save(update_fields=["hostname_slug"])
+        csv_path = self._write_csv([self.CSV_HEADER, ["Martin Audio", "IK-42", "", "newslug"]])
+        out = io.StringIO()
+        call_command("sync_device_models", str(csv_path), "--slugs", stdout=out)
+        device_model.refresh_from_db()
+        self.assertEqual(device_model.hostname_slug, "newslug")
+        self.assertIn("does NOT recompute", out.getvalue())
+
+    def test_slugs_flag_reports_affected_device_count(self) -> None:
+        device_type = _make_device_type(manufacturer="Martin Audio", model="IK-42", hostname_slug="old")
+        NetworkDevice.objects.create(device_type=device_type)
+        NetworkDevice.objects.create(device_type=device_type)
+        csv_path = self._write_csv([self.CSV_HEADER, ["Martin Audio", "IK-42", "", "newslug"]])
+        out = io.StringIO()
+        call_command("sync_device_models", str(csv_path), "--slugs", stdout=out)
+        self.assertIn("2 existing device(s)", out.getvalue())
+        self.assertIn("Recompute hostname", out.getvalue())
+
+    def test_csv_row_with_no_matching_model_is_reported_and_creates_nothing(self) -> None:
+        csv_path = self._write_csv(
+            [self.CSV_HEADER, ["Ghost Manufacturer", "Ghost Model", "A description", ""]]
+        )
+        out = io.StringIO()
+        call_command("sync_device_models", str(csv_path), stdout=out)
+        self.assertFalse(NetworkDeviceModel.objects.filter(manufacturer="Ghost Manufacturer").exists())
+        self.assertIn("In the CSV, no such model (1)", out.getvalue())
+        self.assertIn("Ghost Manufacturer Ghost Model", out.getvalue())
+
+    def test_db_model_with_no_csv_row_is_reported_and_left_alone(self) -> None:
+        device_model = _device_model("Orphan Manufacturer", "Orphan Model")
+        device_model.description = "Keep me exactly as I am"
+        device_model.save(update_fields=["description"])
+        csv_path = self._write_csv([self.CSV_HEADER])  # header only, no data rows
+        out = io.StringIO()
+        call_command("sync_device_models", str(csv_path), stdout=out)
+        device_model.refresh_from_db()
+        self.assertEqual(device_model.description, "Keep me exactly as I am")
+        self.assertIn("In the database, no CSV row (1)", out.getvalue())
+        self.assertIn("Orphan Manufacturer Orphan Model", out.getvalue())
+
+    def test_invalid_slug_text_raises_command_error_naming_the_row(self) -> None:
+        _device_model("Martin Audio", "IK-42")
+        csv_path = self._write_csv([self.CSV_HEADER, ["Martin Audio", "IK-42", "", "not a legal slug!"]])
+        with self.assertRaises(CommandError) as ctx:
+            call_command("sync_device_models", str(csv_path), "--slugs", stdout=io.StringIO())
+        message = str(ctx.exception)
+        self.assertIn("Martin Audio", message)
+        self.assertIn("IK-42", message)
+        self.assertIn("hostname_slug", message)
+
+    def test_duplicate_slugs_across_different_models_warns_but_does_not_refuse(self) -> None:
+        _device_model("Shure", "ULXD4Q")
+        _device_model("Shure", "ULXD4D")
+        _device_model("Shure", "ULXD4")
+        csv_path = self._write_csv(
+            [
+                self.CSV_HEADER,
+                ["Shure", "ULXD4Q", "", "ulxd4"],
+                ["Shure", "ULXD4D", "", "ulxd4"],
+                ["Shure", "ULXD4", "", "ulxd4"],
+            ]
+        )
+        out = io.StringIO()
+        call_command("sync_device_models", str(csv_path), "--slugs", stdout=out)
+        self.assertIn("Duplicate hostname_slug", out.getvalue())
+        self.assertIn("'ulxd4'", out.getvalue())
+        # Not refused — all three still wrote successfully.
+        for model in ("ULXD4Q", "ULXD4D", "ULXD4"):
+            device_model = NetworkDeviceModel.objects.get(manufacturer="Shure", model=model)
+            self.assertEqual(device_model.hostname_slug, "ulxd4")
