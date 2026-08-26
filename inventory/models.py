@@ -27,6 +27,7 @@ otherwise seed-once/never-re-synced rule.
 """
 
 import ipaddress
+from collections.abc import Iterable
 from typing import Any, cast
 
 from django.conf import settings
@@ -136,9 +137,9 @@ def _normalize_update_fields(
     callers must treat that as "everything," not "nothing."
 
     Shared by ``_check_locked_fields_unchanged`` (below) and
-    ``NetworkDevicePort.save()``'s offset-sibling cascade gate (ADR 0017),
-    which needs the identical normalization to decide whether a given
-    ``save(update_fields=...)`` actually touched ``address``/``is_dhcp``.
+    ``NetworkDeviceTypePort._hostname_suffix_only_edit()``, which needs the
+    identical normalization to decide whether a given
+    ``save(update_fields=...)`` actually touched a given field.
     """
     if update_fields is None:
         return None
@@ -4424,6 +4425,42 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                 # as a plain, non-field error here.
                 raise ValidationError(exc.messages) from exc
 
+    def _derive_addresses(self, ports: "Iterable[NetworkDevicePort]") -> None:
+        """Sets ``port.address`` from ``range_base + self.rack_slot +
+        port.slot_offset`` for every static port in ``ports`` (ADR 0027) —
+        the single formula every static address in this system now goes
+        through, replacing both ADR 0017's offset-0-derives-then-cascades
+        shape (``NetworkDevicePort._derive_offset_siblings()``, deleted)
+        and the per-port fill-if-blank suggestion that used to live in
+        ``NetworkDevicePort.clean()``. Each port derives independently
+        from this device's own slot, so — unlike the cascade it replaces —
+        no offset-0-first ordering is required among ``ports``.
+
+        A DHCP port in ``ports`` is left untouched (its ``address`` stays
+        whatever it already was — ``None``, materialized elsewhere).
+        Callers are responsible for persisting each mutated port
+        afterward — this only computes and assigns the value, matching
+        every other suggestion helper in this module (``_suggest_rack_
+        slot_address`` itself included) staying a pure setter of state,
+        not a writer.
+
+        Raises ``ValidationError``, naming the VLAN, if no usable rack
+        VLAN range exists for a static port's VLAN — reachable only via a
+        path that skipped ``_check_static_materialization_possible()``'s
+        own identical check (a bypassed ``objects.create()``), matching
+        that method's own error text.
+        """
+        for port in ports:
+            if port.is_dhcp:
+                continue
+            address = _suggest_rack_slot_address(self.rack, self.rack_slot, port.vlan_id, port.slot_offset)
+            if address is None:
+                raise ValidationError(
+                    f"No usable address range for {port.vlan} in {self.rack} — assign a Rack "
+                    f"VLAN Range for this VLAN before deriving {self}'s addresses."
+                )
+            port.address = address
+
     def _materialize_ports(self) -> None:
         """One-time copy of ``device_type``'s Network Device Type Ports into
         real ``NetworkDevicePort`` rows — static by default when racked, or
@@ -4433,34 +4470,35 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         the device and every port materialized before it.
 
         Each port's ``slot_offset`` is copied from its type port (ADR
-        0017), and each port's own address is computed from its own
-        offset independently (``_suggest_rack_slot_address`` inside
-        ``NetworkDevicePort.clean()``) — so, unlike the derive-on-edit
-        cascade (``NetworkDevicePort._derive_offset_siblings``), no
-        offset-0-first ordering is required here; the loop stays ordered
-        by ``ordinal`` as it always has.
+        0017); every static port's ``address`` is computed by
+        ``_derive_addresses()`` (ADR 0027) before any of them are written
+        — one whole-device pass rather than the derive-on-edit cascade
+        (``NetworkDevicePort._derive_offset_siblings``, deleted) this
+        replaces, so no offset-0-first ordering is required and the loop
+        below stays ordered by ``ordinal`` as it always has.
         """
         _validate_device_type_port_profile(self.device_type)
         static = self._materializes_static()
         if static:
             self._check_static_materialization_possible()
+        pending: list[NetworkDevicePort] = []
         for type_port in self.device_type.type_ports.select_related("vlan").order_by("ordinal"):
             if static and type_port.vlan.subnet:
-                port = NetworkDevicePort(
-                    device=self,
-                    port_number=type_port.port_number,
-                    description=type_port.description,
-                    vlan=type_port.vlan,
-                    port_type=type_port.port_type,
-                    ordinal=type_port.ordinal,
-                    slot_offset=type_port.slot_offset,
-                    source_type_port=type_port,
-                    is_dhcp=False,
-                    address=None,
-                    created_by=self.created_by,
+                pending.append(
+                    NetworkDevicePort(
+                        device=self,
+                        port_number=type_port.port_number,
+                        description=type_port.description,
+                        vlan=type_port.vlan,
+                        port_type=type_port.port_type,
+                        ordinal=type_port.ordinal,
+                        slot_offset=type_port.slot_offset,
+                        source_type_port=type_port,
+                        is_dhcp=False,
+                        address=None,
+                        created_by=self.created_by,
+                    )
                 )
-                port.full_clean()
-                port.save()
             else:
                 # DHCP path — either the overall choice, or an L2-only VLAN
                 # under a static choice (decision 4), which always
@@ -4478,6 +4516,10 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                     address=None,
                     created_by=self.created_by,
                 )
+        self._derive_addresses(pending)
+        for port in pending:
+            port.full_clean()
+            port.save()
 
     def _check_rack_slot_not_occupied(self) -> None:
         """ADR 0027: overlap is checked against the exact **set** of
@@ -4725,21 +4767,19 @@ class NetworkDevicePort(AuditedModel):
 
     Materialized exactly once from the device's ``device_type`` when the
     device is first created (``NetworkDevice._materialize_ports``) —
-    static by default when racked, computed rack-range-base + rack-slot
-    (or, at a non-zero ``slot_offset``, rack-range-base + rack-slot +
-    offset — ADR 0017) like every other static address here, or DHCP-
-    configured (``is_dhcp=True``, ``address=None``) when unracked or
-    explicitly chosen (ADR 0013, revising ADR 0010's always-DHCP rule).
-    ``description`` (this port's purpose), ``vlan``, ``port_type``, and
-    ``slot_offset`` are locked hardware/purpose facts copied from the type
-    port (ADR 0010, ADR 0017); ``is_dhcp``/``address``/``switch_port`` are
-    editable — **except** ``address`` on a ``slot_offset > 0`` port, which
-    is derived from the offset-0 port on the same ``(device, vlan)`` and
-    locked (see ``_locked_fields()``/``_derive_offset_siblings()``): an
-    operator can flip *that* port's addressing either way, and every
-    offset sibling follows it automatically. Identity is ``(device,
-    description)`` — ``port_number``, when present at all, is neither
-    required nor unique.
+    static by default when racked, computed rack-range-base + rack-slot +
+    ``slot_offset`` (ADR 0027, generalizing ADR 0017's offset-0-vs-offset
+    split to every port alike) or DHCP-configured (``is_dhcp=True``,
+    ``address=None``) when unracked or explicitly chosen (ADR 0013,
+    revising ADR 0010's always-DHCP rule). ``description`` (this port's
+    purpose), ``vlan``, ``port_type``, and ``slot_offset`` are locked
+    hardware/purpose facts copied from the type port (ADR 0010, ADR 0017).
+    ``address`` is likewise locked once persisted — derived and
+    system-written only (ADR 0027 decision 1; see ``_locked_fields()``):
+    the rack slot is the only way to change an address now, superseding
+    ADR 0003. ``switch_port`` stays freely editable. Identity is
+    ``(device, description)`` — ``port_number``, when present at all, is
+    neither required nor unique.
 
     ``switch`` is not stored directly — it's redundant with (and could
     contradict) ``switch_port``, so it's derived from it via a property.
@@ -4753,20 +4793,10 @@ class NetworkDevicePort(AuditedModel):
     stop them from being given two different addresses, which wouldn't
     reflect the real, single-IP hardware — ``slot_offset`` (ADR 0017) does
     not cover this case, and is deliberately narrower: it's for a port
-    whose address the *hardware itself* computes from another port's and
-    refuses to let anyone change, not general multi-jack/multi-part
-    hardware. See ADR 0017's scope-boundary section.
+    whose address is computed from the device's own rack slot at a fixed
+    offset, not general multi-jack/multi-part hardware. See ADR 0017's
+    scope-boundary section.
     """
-
-    #: Set only by ``_derive_offset_siblings()`` while it writes a derived
-    #: address onto an offset sibling, and consulted by ``_locked_fields()``
-    #: — the single legitimate writer of an offset port's otherwise-locked
-    #: ``address``. Never a field, never persisted; a plain class-level
-    #: default like ``created_by``'s pattern elsewhere in this module isn't
-    #: used here because this genuinely never needs to be constructor-
-    #: settable the way ``port_addressing``/``address_materialization`` are
-    #: — nothing outside this class should ever set it.
-    _deriving_address: bool = False
 
     device = models.ForeignKey(NetworkDevice, on_delete=models.CASCADE, related_name="ports")
     port_number = models.PositiveIntegerField(null=True, blank=True, validators=[MinValueValidator(1)])
@@ -4783,9 +4813,9 @@ class NetworkDevicePort(AuditedModel):
     slot_offset = models.PositiveIntegerField(
         default=0,
         help_text=(
-            "Address offset from the device's slot, copied from the device's type — locked "
-            "after creation. Above 0, this port's address is derived from the offset-0 port "
-            "on the same VLAN and can't be edited directly."
+            "Address offset from the device's own rack slot, copied from the device's type — "
+            "locked after creation. This port's address is range_base + rack_slot + slot_offset "
+            "(ADR 0027) and can't be edited directly."
         ),
     )
     ordinal = models.PositiveIntegerField(editable=False, default=0)
@@ -4853,72 +4883,9 @@ class NetworkDevicePort(AuditedModel):
             persisted_switch_port_id = self._persisted_switch_port_id()
             _lock_switch_port_rows(self.switch_port_id, persisted_switch_port_id)
 
-            # Snapshot the *persisted* address/is_dhcp before super().save()
-            # overwrites them (ADR 0017 plan review, note 2) — needed only
-            # to decide, after the write, whether to cascade a derived
-            # recompute to this port's offset siblings. Restricted to an
-            # existing (self.pk is not None) offset-0 port: a brand new row
-            # has no persisted state to compare against and no siblings yet
-            # to cascade to (materialization derives each offset port's own
-            # address directly, not via this cascade — see
-            # NetworkDevice._materialize_ports()); an offset>0 port is
-            # itself a cascade *target*, never a trigger, so it never needs
-            # this snapshot either.
-            #
-            # Gated on the *persisted* slot_offset, not self.slot_offset —
-            # same reasoning as ``_locked_fields()`` (finding 2): by the
-            # time we reach this line the lock check above has already
-            # raised for any tampered slot_offset that would otherwise
-            # matter, but keying this gate off self.slot_offset too would
-            # (harmlessly, since the write above never happens without
-            # the lock check's own guard passing) still needlessly ask
-            # "should a value that was never truly this row's offset-0
-            # state trigger a cascade" — using the persisted value keeps
-            # this gate meaningful/correct on its own, independent of the
-            # lock check above.
-            #
-            # ADR 0027 retires the ``OPERATOR`` mechanism (ADR 0022) that
-            # used to carve an exception out of this gate — every offset-0
-            # port is now unconditionally a cascade trigger, with no
-            # provenance check needed to tell an independently-addressed
-            # port apart from a derivation source.
-            pre_save_pk = self.pk
-            persisted: dict[str, Any] | None = None
-            if pre_save_pk is not None and self._persisted_slot_offset() == 0:
-                candidate = (
-                    NetworkDevicePort._default_manager.filter(pk=pre_save_pk)
-                    .values("address", "is_dhcp")
-                    .first()
-                )
-                if candidate is not None:
-                    persisted = {"address": candidate["address"], "is_dhcp": candidate["is_dhcp"]}
-
             super().save(
                 force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
             )
-
-            if persisted is not None:
-                # *Effective* post-save values, not necessarily self.address/
-                # self.is_dhcp directly. When update_fields restricts the
-                # write, a field it excludes keeps its persisted value in
-                # the database regardless of whatever's dirty in memory —
-                # e.g. save(update_fields=["address"]) with a stale,
-                # never-actually-saved self.is_dhcp left over from some
-                # earlier unrelated edit. Deriving straight from
-                # self.is_dhcp/self.address would let that stale value
-                # dictate every sibling's address even though the
-                # database's own is_dhcp never changed; falling back to the
-                # pre-save snapshot for an excluded field guarantees we
-                # only ever derive from what this save actually persisted.
-                normalized = _normalize_update_fields(NetworkDevicePort, update_fields)
-                effective_address = (
-                    self.address if (normalized is None or "address" in normalized) else persisted["address"]
-                )
-                effective_is_dhcp = (
-                    self.is_dhcp if (normalized is None or "is_dhcp" in normalized) else persisted["is_dhcp"]
-                )
-                if effective_address != persisted["address"] or effective_is_dhcp != persisted["is_dhcp"]:
-                    self._derive_offset_siblings(effective_address, effective_is_dhcp)
 
     def delete(self, using=None, keep_parents=False) -> tuple[int, dict[str, int]]:
         # ADR 0017: block deleting an offset-0 port that still has offset
@@ -5019,10 +4986,27 @@ class NetworkDevicePort(AuditedModel):
         # ``device``/``port_number``/``ordinal``/``source_type_port``/
         # ``slot_offset`` identify which physical port this row represents
         # (materialized once from the device's type, ADR 0010/0017) — only
-        # ``is_dhcp``/``address``/``switch_port`` are meant to be editable,
-        # so a plain save() must not be able to silently move, renumber, or
-        # reorder a materialized port, or change its offset.
-        fields: dict[str, Any] = {
+        # ``is_dhcp``/``switch_port`` are meant to be editable, so a plain
+        # save() must not be able to silently move, renumber, or reorder a
+        # materialized port, or change its offset.
+        #
+        # ``address`` is locked unconditionally now (ADR 0027 decision 1,
+        # superseding ADR 0003 and generalizing ADR 0017's offset-only
+        # lock to every port): a static address is derived from the
+        # device's own rack slot and system-written only, so no save() may
+        # change it, regardless of ``slot_offset``. There is no longer a
+        # privileged writer to exempt — ``_derive_offset_siblings()`` and
+        # its ``_deriving_address`` flag are gone along with the cascade
+        # they existed for, and with them the whole reason this method
+        # used to have to read the *persisted* ``slot_offset``
+        # (``_persisted_slot_offset()``) rather than trust ``self.
+        # slot_offset``: that defended against an in-memory ``slot_offset``
+        # forged to 0 being used to drop ``"address"`` from this dict
+        # before the comparison ever ran. With the lock unconditional,
+        # there is no conditional branch left for that forgery to exploit
+        # — ``address`` is always compared, no matter what ``slot_offset``
+        # claims to be.
+        return {
             "device": self.device_id,
             "port_number": self.port_number,
             "description": self.description,
@@ -5031,86 +5015,8 @@ class NetworkDevicePort(AuditedModel):
             "ordinal": self.ordinal,
             "source_type_port": self.source_type_port_id,
             "slot_offset": self.slot_offset,
+            "address": self.address,
         }
-        # ADR 0017: a slot_offset > 0 port's address is derived from the
-        # offset-0 port on its VLAN, not independently settable — lock it
-        # the same way as the identity fields above, *unless* this write is
-        # the one privileged writer of a derived address
-        # (_derive_offset_siblings(), which sets _deriving_address before
-        # writing). An offset-0 port's address is never added here — it
-        # stays editable exactly as ADR 0003 requires.
-        #
-        # Whether to lock ``address`` is decided from the *persisted*
-        # slot_offset (``_persisted_slot_offset()``), not
-        # ``self.slot_offset`` — slot_offset is itself one of the fields
-        # above this method exists to protect. Trusting the in-memory
-        # value here would let a caller set ``slot_offset = 0`` on an already-
-        # materialized offset port and pair it with an address edit: the
-        # bogus in-memory offset would drop ``"address"`` from this dict
-        # *before* the caller ever compares ``slot_offset`` against what's
-        # actually persisted, so with ``update_fields=["address"]`` the
-        # intersection check in ``_check_locked_fields_unchanged()`` would
-        # see neither key and return early — skipping the comparison
-        # (including of ``slot_offset`` itself) entirely, letting a locked
-        # address change slip through unchecked in the same save().
-        persisted_offset = self._persisted_slot_offset()
-        locked_offset = self.slot_offset if persisted_offset is None else persisted_offset
-        if locked_offset > 0 and not self._deriving_address:
-            fields["address"] = self.address
-        return fields
-
-    def _derive_offset_siblings(self, control_address: str | None, control_is_dhcp: bool) -> None:
-        """Recompute every offset sibling's ``address``/``is_dhcp`` from
-        the offset-0 control port's own *effective* post-save values (ADR
-        0017) — called only from ``save()``, only for an offset-0 port
-        whose persisted address/DHCP state this save actually changed (see
-        ``save()`` for the snapshot-before-write reasoning that decides
-        that, and for why ``control_address``/``control_is_dhcp`` are
-        passed in rather than read from ``self.address``/``self.is_dhcp``
-        directly — those attributes can hold a dirty, never-actually-
-        persisted value when ``update_fields`` excluded them from this
-        save).
-
-        This is the single legitimate writer of a locked offset port's
-        ``address`` — each sibling's ``_deriving_address`` is set before
-        ``full_clean()``/``save()`` so ``_locked_fields()`` lifts the lock
-        for exactly this write. Runs inside the caller's
-        ``transaction.atomic()`` block (``save()``'s), so a derived address
-        that collides with an existing one, falls outside the rack's
-        range, or overflows past the top of IPv4 address space
-        (``ipaddress.AddressValueError`` is caught and re-raised as a
-        ``ValidationError`` below, since the former isn't one and would
-        otherwise reach the admin as a bare 500) raises and rolls back the
-        control edit that triggered this cascade too — nothing is left
-        half-updated.
-
-        Going DHCP (``control_is_dhcp`` or ``control_address is None``)
-        takes every sibling to DHCP with it (``address=None``); coming
-        back to static re-derives ``control_address + sibling.slot_offset``
-        for each. Same reasoning ADR 0017 gives for deriving the engine
-        address at all: an engine address stored against a control address
-        that no longer exists is worse than one that's simply gone.
-        """
-        siblings = NetworkDevicePort.objects.filter(
-            device_id=self.device_id, vlan_id=self.vlan_id, slot_offset__gt=0
-        )
-        for sibling in siblings:
-            sibling._deriving_address = True
-            if control_is_dhcp or control_address is None:
-                sibling.is_dhcp = True
-                sibling.address = None
-            else:
-                sibling.is_dhcp = False
-                try:
-                    sibling.address = str(ipaddress.IPv4Address(control_address) + sibling.slot_offset)
-                except ipaddress.AddressValueError as exc:
-                    raise ValidationError(
-                        f"{sibling}'s derived address ({control_address} + {sibling.slot_offset}) "
-                        "is not a valid IPv4 address — the control address is too close to "
-                        "255.255.255.255 for this offset to fit."
-                    ) from exc
-            sibling.full_clean()
-            sibling.save()
 
     def _persisted_switch_port_id(self) -> int | None:
         if self.pk is None:
@@ -5118,15 +5024,6 @@ class NetworkDevicePort(AuditedModel):
         return (
             NetworkDevicePort._default_manager.filter(pk=self.pk)
             .values_list("switch_port_id", flat=True)
-            .first()
-        )
-
-    def _persisted_slot_offset(self) -> int | None:
-        if self.pk is None:
-            return None
-        return (
-            NetworkDevicePort._default_manager.filter(pk=self.pk)
-            .values_list("slot_offset", flat=True)
             .first()
         )
 
@@ -5157,41 +5054,6 @@ class NetworkDevicePort(AuditedModel):
             .values("slot_offset", "device_id", "vlan_id")
             .first()
         )
-
-    def refresh_locked_offset_address(self) -> None:
-        """Re-sync ``address``/``is_dhcp`` from what's currently persisted
-        — offset ports only (ADR 0017). A no-op for an offset-0 port
-        (never called on unsaved rows either) — see
-        ``AuditedModelAdminMixin.save_formset()``, the only caller.
-
-        Exists for exactly one race: ``NetworkDevicePortForm`` disables
-        ``address`` on an offset row, so Django keeps that field's
-        *initial* value (whatever was persisted at form-bind/GET time) on
-        the instance the formset constructs — never anything the user
-        actually submitted, since a disabled field accepts no input. In
-        one admin submission that edits both the offset-0 control row's
-        address *and* some other editable field on an offset row (e.g.
-        ``switch_port``), saving the control row cascades a fresh derived
-        address onto every offset sibling in the database
-        (``_derive_offset_siblings()``) — but the offset row's own
-        formset-built instance was already constructed before any of this
-        ran, so its ``address`` is now stale against what's actually
-        persisted. Without this, that stale instance's own save would look
-        like a locked-field violation to ``_check_locked_fields_unchanged()``
-        even though nothing the user did asked to change the address —
-        rejecting an otherwise entirely valid submission. Safe to simply
-        overwrite: the disabled field guarantees the in-memory value was
-        never user intent to begin with, so there is nothing to lose here.
-        """
-        if self.pk is None:
-            return
-        persisted_offset = self._persisted_slot_offset()
-        if not persisted_offset:
-            return
-        current = NetworkDevicePort._default_manager.filter(pk=self.pk).values("address", "is_dhcp").first()
-        if current is not None:
-            self.address = current["address"]
-            self.is_dhcp = current["is_dhcp"]
 
     @property
     def switch(self) -> "NetworkSwitch | None":

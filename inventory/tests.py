@@ -2412,7 +2412,9 @@ class SlotOffsetAddressingTests(TestCase):
         self.assertEqual(ports["Engine"].address, "10.200.1.8")
         self.assertEqual(ports["Engine"].slot_offset, 1)
 
-    # Case 2: offset port's address rejected as read-only after creation.
+    # Case 2: every static port's address is rejected as read-only after
+    # creation (ADR 0027 decision 1) — offset>0 and offset-0 alike, unlike
+    # ADR 0017's offset-only lock this generalizes.
     def test_offset_port_address_rejected_as_readonly_after_creation(self) -> None:
         device_type = self._make_sd12_type(name="SD12 Locked")
         device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
@@ -2421,73 +2423,15 @@ class SlotOffsetAddressingTests(TestCase):
         with self.assertRaises(ValidationError):
             engine.save()
 
-    # Case 3: offset port recomputed when the offset-0 address is edited.
-    def test_offset_port_recomputed_when_control_address_edited(self) -> None:
-        device_type = self._make_sd12_type(name="SD12 Recompute")
+    def test_control_port_address_also_rejected_as_readonly_after_creation(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Control Locked")
         device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
         control = device.ports.get(description="Control")
-        control.address = "10.200.1.5"
-        control.save()
-        engine = device.ports.get(description="Engine")
-        self.assertEqual(engine.address, "10.200.1.6")
-
-    # Case 4: DHCP cascade both ways.
-    def test_dhcp_cascade_both_ways(self) -> None:
-        device_type = self._make_sd12_type(name="SD12 DHCP Cascade")
-        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=2)
-        control = device.ports.get(description="Control")
-
-        control.is_dhcp = True
-        control.address = None
-        control.save()
-        engine = device.ports.get(description="Engine")
-        self.assertTrue(engine.is_dhcp)
-        self.assertIsNone(engine.address)
-
-        control.is_dhcp = False
-        control.address = "10.200.1.9"
-        control.save()
-        engine.refresh_from_db()
-        self.assertFalse(engine.is_dhcp)
-        self.assertEqual(engine.address, "10.200.1.10")
-
-    # Case 5: rollback — a derived collision rolls back the control edit too.
-    def test_rollback_on_derived_collision(self) -> None:
-        device_type = self._make_sd12_type(name="SD12 Rollback")
-        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
-        # Occupy 10.200.1.6 — the address the Engine would derive to once
-        # Control moves to .5 — with an unrelated device's port, so the
-        # collision below is deliberate, not incidental.
-        blocker_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="SD12 Rollback Blocker")
-        NetworkDevice.objects.create(device_type=blocker_type, rack=self.rack, rack_slot=6)
-
-        control = device.ports.get(description="Control")
-        control.address = "10.200.1.5"
+        control.address = "10.200.1.99"
         with self.assertRaises(ValidationError):
             control.save()
-
         control.refresh_from_db()
         self.assertEqual(control.address, "10.200.1.1")
-        self.assertEqual(device.ports.get(description="Engine").address, "10.200.1.2")
-
-    # Case 6: update_fields discipline — a dirty in-memory address must not
-    # cascade when update_fields excludes it.
-    def test_update_fields_switch_port_only_does_not_cascade(self) -> None:
-        device_type = self._make_sd12_type(name="SD12 Update Fields")
-        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
-        switch_type = _make_switch_type(port_count=1)
-        switch = NetworkSwitch.objects.create(switch_type=switch_type)
-        switch_port = switch.ports.get()
-
-        control = device.ports.get(description="Control")
-        control.switch_port = switch_port
-        control.address = "10.200.1.9"  # dirty in-memory only — must not persist or cascade
-        control.save(update_fields=["switch_port"])
-
-        control.refresh_from_db()
-        self.assertEqual(control.address, "10.200.1.1")
-        self.assertEqual(control.switch_port, switch_port)
-        self.assertEqual(device.ports.get(description="Engine").address, "10.200.1.2")
 
     # Case 7 (both directions): a second occupant refused inside an
     # existing occupant's span.
@@ -2630,135 +2574,56 @@ class SlotOffsetAddressingTests(TestCase):
         self.assertEqual(device.ports.get(description="Control").address, control_before)
         self.assertEqual(device.ports.get(description="Engine").address, engine_before)
 
-    # Case 14: admin — the offset row's address widget is disabled, and a
-    # POST that tries to smuggle a value past it is ignored.
-    def test_admin_offset_row_address_widget_disabled(self) -> None:
+    # Case 14: admin — every row's address widget is disabled (ADR 0027
+    # decision 6, generalizing what used to be offset-only), and a POST
+    # that tries to smuggle a value past it is ignored.
+    def test_admin_address_widget_disabled_on_every_row(self) -> None:
         device_type = self._make_sd12_type(name="SD12 Admin Disabled")
         device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
         engine = device.ports.get(description="Engine")
         control = device.ports.get(description="Control")
         self.assertTrue(NetworkDevicePortForm(instance=engine).fields["address"].disabled)
-        self.assertFalse(NetworkDevicePortForm(instance=control).fields["address"].disabled)
+        self.assertTrue(NetworkDevicePortForm(instance=control).fields["address"].disabled)
 
-    def test_admin_offset_row_address_post_smuggle_ignored(self) -> None:
+    def test_admin_address_post_smuggle_ignored_on_every_row(self) -> None:
         device_type = self._make_sd12_type(name="SD12 Admin Smuggle")
         device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
-        engine = device.ports.get(description="Engine")
-        original_address = engine.address
+        for description in ("Control", "Engine"):
+            port = device.ports.get(description=description)
+            original_address = port.address
+            form = NetworkDevicePortForm(
+                data={
+                    "description": port.description,
+                    "port_number": port.port_number or "",
+                    "port_type": port.port_type,
+                    "vlan": str(port.vlan_id),
+                    "slot_offset": str(port.slot_offset),
+                    "address": "10.200.1.250",  # smuggled — the field is disabled, ignored either way
+                },
+                instance=port,
+            )
+            self.assertTrue(form.is_valid(), form.errors)
+            saved = form.save()
+            self.assertEqual(saved.address, original_address)
 
-        form = NetworkDevicePortForm(
-            data={
-                "description": engine.description,
-                "port_number": engine.port_number or "",
-                "port_type": engine.port_type,
-                "vlan": str(engine.vlan_id),
-                "slot_offset": str(engine.slot_offset),
-                "address": "10.200.1.250",  # smuggled — the field is disabled, so this must be ignored
-            },
-            instance=engine,
-        )
-        self.assertTrue(form.is_valid(), form.errors)
-        saved = form.save()
-        self.assertEqual(saved.address, original_address)
-
-    # The cascade must derive from what update_fields actually persisted,
-    # not from whatever's dirty in memory on an excluded field.
-    def test_update_fields_address_only_ignores_dirty_in_memory_is_dhcp(self) -> None:
-        device_type = self._make_sd12_type(name="SD12 Effective Values")
-        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
-        control = device.ports.get(description="Control")
-
-        # is_dhcp is dirty in memory only — save(update_fields=["address"])
-        # must not let it influence the cascade, since the database's own
-        # is_dhcp column is never touched by this save.
-        control.address = "10.200.1.5"
-        control.is_dhcp = True
-        control.save(update_fields=["address"])
-
-        control.refresh_from_db()
-        self.assertFalse(control.is_dhcp)
-        self.assertEqual(control.address, "10.200.1.5")
-        engine = device.ports.get(description="Engine")
-        self.assertFalse(engine.is_dhcp)
-        self.assertEqual(engine.address, "10.200.1.6")
-
-    # The address lock must key off the *persisted* slot_offset, not a
-    # caller-tampered in-memory one.
-    def test_locked_field_check_uses_persisted_offset_not_in_memory(self) -> None:
-        device_type = self._make_sd12_type(name="SD12 Persisted Offset Lock")
+    # The lock is unconditional now (ADR 0027 decision 1) — a forged
+    # in-memory slot_offset can no longer matter to it either way, unlike
+    # the offset-conditional lock this replaces (see _locked_fields()'s
+    # docstring for the attack that conditional lock had to defend
+    # against, and why an unconditional one has no such branch to exploit).
+    def test_address_lock_unaffected_by_forged_slot_offset(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 Forged Offset")
         device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
         engine = device.ports.get(description="Engine")
 
-        engine.slot_offset = 0  # tampered in memory — must not evade the address lock
-        engine.address = "10.200.1.9"  # otherwise-valid — isolates the lock check specifically
+        engine.slot_offset = 0  # tampered in memory — irrelevant to the address lock now
+        engine.address = "10.200.1.9"
         with self.assertRaises(ValidationError):
             engine.save(update_fields=["address"])
 
         engine.refresh_from_db()
         self.assertEqual(engine.slot_offset, 1)
         self.assertEqual(engine.address, "10.200.1.2")
-
-    # A single admin submission editing both the control row's address and
-    # an offset row's other editable field (switch_port) must not be
-    # rejected over a stale formset snapshot.
-    def test_formset_save_refreshes_stale_offset_address_before_saving(self) -> None:
-        device_type = self._make_sd12_type(name="SD12 Formset Staleness")
-        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
-        control = device.ports.get(description="Control")
-        engine = device.ports.get(description="Engine")
-        switch_type = _make_switch_type(port_count=1)
-        switch = NetworkSwitch.objects.create(switch_type=switch_type)
-        switch_port = switch.ports.get()
-        user = User.objects.create_user(username="formset-editor", password="x")
-
-        FormSet = inlineformset_factory(
-            NetworkDevice,
-            NetworkDevicePort,
-            form=NetworkDevicePortForm,
-            fields=["is_dhcp", "address", "switch_port"],
-            extra=0,
-            can_delete=False,
-        )
-        data = {
-            "ports-TOTAL_FORMS": "2",
-            "ports-INITIAL_FORMS": "2",
-            "ports-MIN_NUM_FORMS": "0",
-            "ports-MAX_NUM_FORMS": "1000",
-            "ports-0-id": str(control.pk),
-            "ports-0-address": "10.200.1.5",  # control edit — must cascade to Engine
-            "ports-1-id": str(engine.pk),
-            "ports-1-address": engine.address,  # disabled — submitted value is ignored either way
-            "ports-1-switch_port": str(switch_port.pk),  # engine's own, unrelated, legitimate edit
-        }
-        formset = FormSet(data, instance=device, prefix="ports")
-        self.assertTrue(formset.is_valid(), formset.errors)
-
-        admin = NetworkDeviceAdmin(NetworkDevice, AdminSite())
-        request = RequestFactory().post(f"/admin/inventory/networkdevice/{device.pk}/change/")
-        request.user = user
-        admin.save_formset(request, form=None, formset=formset, change=True)
-
-        control.refresh_from_db()
-        engine.refresh_from_db()
-        self.assertEqual(control.address, "10.200.1.5")
-        self.assertEqual(engine.address, "10.200.1.6")  # derived, not rejected
-        self.assertEqual(engine.switch_port, switch_port)
-
-    # An IPv4 overflow while deriving a sibling's address must raise
-    # ValidationError, not a bare ipaddress.AddressValueError (which
-    # would 500 the admin).
-    def test_derived_overflow_raises_validation_error(self) -> None:
-        device_type = self._make_sd12_type(name="SD12 Overflow")
-        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
-        control = device.ports.get(description="Control")
-
-        control.address = "255.255.255.255"
-        with self.assertRaises(ValidationError):
-            control.save()
-
-        control.refresh_from_db()
-        self.assertEqual(control.address, "10.200.1.1")
-        self.assertEqual(device.ports.get(description="Engine").address, "10.200.1.2")
 
     # Deleting an offset-0 port must not orphan its offset siblings —
     # single delete, queryset delete, and the whole-device cascade (which
@@ -3692,8 +3557,9 @@ class PortProfileLockedFieldTests(TestCase):
         self.switch_port = self.switch.ports.get()
         self.device_type = _make_device_type(port_count=1, vlan=self.vlan_a)
         # Explicit DHCP: this class is about locked fields, not addressing
-        # defaults — test_device_port_can_be_made_static below needs a DHCP
-        # starting point to actually exercise the DHCP -> static transition.
+        # defaults — test_device_port_dhcp_to_static_via_manual_address_is_
+        # refused below needs a DHCP starting point to prove that
+        # transition is refused, not to exercise it succeeding.
         self.device = NetworkDevice.objects.create(  # type: ignore[misc]
             device_type=self.device_type,
             rack=self.rack,
@@ -3730,12 +3596,18 @@ class PortProfileLockedFieldTests(TestCase):
         with self.assertRaises(ValidationError):
             self.device_port.save()
 
-    def test_device_port_can_be_made_static(self) -> None:
+    def test_device_port_dhcp_to_static_via_manual_address_is_refused(self) -> None:
+        """ADR 0027 decision 1 supersedes ADR 0003: address is derived and
+        system-written only, so a DHCP port can no longer be hand-converted
+        to static by typing an address — even the very first one.
+        """
         self.device_port.is_dhcp = False
         self.device_port.address = "10.200.1.1"
-        self.device_port.save()  # must not raise
+        with self.assertRaises(ValidationError):
+            self.device_port.save()
         self.device_port.refresh_from_db()
-        self.assertEqual(self.device_port.address, "10.200.1.1")
+        self.assertTrue(self.device_port.is_dhcp)
+        self.assertIsNone(self.device_port.address)
 
 
 class PortProfileTemplateLockTests(TestCase):
@@ -4031,7 +3903,10 @@ class MaterializedPortLockTests(TestCase):
     def test_device_port_number_readonly_in_admin(self) -> None:
         self.assertIn("port_number", NetworkDevicePortInline.readonly_fields)
 
-    def test_device_port_dhcp_and_address_still_editable(self) -> None:
+    def test_device_port_dhcp_to_static_via_manual_address_still_refused_once_racked(self) -> None:
+        """ADR 0027 decision 1 — racking the device afterward doesn't open
+        a back door: the address is still derived and system-written only.
+        """
         rack = Rack.objects.create(name="Rack 1", slot_count=4)
         RackVlanRange.objects.create(rack=rack, vlan=self.vlan, address_range="10.200.1.0/27")
         self.device.rack = rack
@@ -4040,7 +3915,8 @@ class MaterializedPortLockTests(TestCase):
         port = self.device.ports.get()
         port.is_dhcp = False
         port.address = "10.200.1.1"
-        port.save()  # must not raise
+        with self.assertRaises(ValidationError):
+            port.save()
 
 
 class DerivedDefaultGatewayTests(TestCase):
@@ -4063,26 +3939,17 @@ class DerivedDefaultGatewayTests(TestCase):
         self.assertIsNone(port.default_gateway)
 
     def test_gateway_derived_from_vlan_once_static(self) -> None:
-        # Explicit DHCP so this test actually exercises the DHCP -> static
-        # transition it's named for, rather than starting out static already
-        # (ADR 0013's new default) and never actually flipping.
-        device = NetworkDevice.objects.create(  # type: ignore[misc]
-            device_type=self.device_type, rack=self.rack, rack_slot=1, port_addressing=PortAddressing.DHCP
-        )
+        # ADR 0027: a static port's address is derived at materialization,
+        # not hand-converted from DHCP afterward — so this device is
+        # racked and static from creation, rather than DHCP-then-flipped.
+        device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=1)
         port = device.ports.get()
-        port.is_dhcp = False
-        port.address = "10.200.1.1"
-        port.save()
+        self.assertFalse(port.is_dhcp)
         self.assertEqual(port.default_gateway, "10.200.0.1")
 
     def test_gateway_follows_later_vlan_gateway_change(self) -> None:
-        device = NetworkDevice.objects.create(  # type: ignore[misc]
-            device_type=self.device_type, rack=self.rack, rack_slot=1, port_addressing=PortAddressing.DHCP
-        )
+        device = NetworkDevice.objects.create(device_type=self.device_type, rack=self.rack, rack_slot=1)
         port = device.ports.get()
-        port.is_dhcp = False
-        port.address = "10.200.1.1"
-        port.save()
         self.vlan.default_gateway = "10.200.0.254"
         self.vlan.save()
         port.refresh_from_db()
@@ -9628,11 +9495,12 @@ class RackSlotSuggestionTests(TestCase):
             device_type=self.device_type, rack=self.rack, rack_slot=1, hostname="deviceA"
         )
         port_a = device_a.ports.get()
-        # Edit ordinal 1's own stored address to what ordinal 2's
-        # arithmetic would produce (ADR 0003 makes addresses editable).
-        port_a.address = "10.200.1.2"
-        port_a.full_clean()
-        port_a.save()
+        # Move ordinal 1's own stored address to what ordinal 2's
+        # arithmetic would produce — reachable only through a bypassed
+        # write now (ADR 0027 decision 2: every claimed ordinal's address
+        # matches its own occupant by construction, so this state is no
+        # longer reachable through save()/clean() at all).
+        NetworkDevicePort.objects.filter(pk=port_a.pk).update(address="10.200.1.2")
 
         form = NetworkDeviceAddForm(data=self._device_data(hostname="deviceB", port_addressing="static"))
         self.assertFalse(form.is_valid())
