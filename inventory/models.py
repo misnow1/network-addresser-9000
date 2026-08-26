@@ -4726,12 +4726,24 @@ models.signals.pre_delete.connect(_clear_installed_cards_before_delete, sender=N
 
 
 class NetworkDevicePortQuerySet(models.QuerySet):
-    """Blocks bulk ``QuerySet.delete()`` from orphaning an offset port
-    (ADR 0017) — the model's own ``delete()`` override below only guards a
-    single ``instance.delete()``; a queryset delete bypasses
-    ``Model.delete()`` for every row, the same reason
-    ``NetworkDeviceTypePortQuerySet``/``NetworkSwitchTypePortQuerySet``
+    """Blocks bulk ``QuerySet.delete()`` from leaving a device's ports out
+    of step with its type's declared port profile — the model's own
+    ``delete()`` override below only guards a single ``instance.delete()``;
+    a queryset delete bypasses ``Model.delete()`` for every row, the same
+    reason ``NetworkDeviceTypePortQuerySet``/``NetworkSwitchTypePortQuerySet``
     already carry their own ``delete()`` override alongside the model's.
+
+    Originally (ADR 0017) this protected an offset sibling's derivation —
+    it read its address from the offset-0 row on its VLAN, so deleting
+    that row would strand it. Under ADR 0027 every port derives
+    independently from the *device's own* rack slot, not from a sibling
+    port, so that reasoning no longer holds. What the guard still protects
+    (see the model's own ``delete()`` for the full account): ``_validate_
+    device_type_port_profile()`` requires every offset-carrying VLAN on
+    the device's *type* to also carry an offset-0 port, and nothing
+    revalidates that shape on an *instance* after a delete — dropping the
+    offset-0 row while its offset sibling(s) survive would leave a live
+    device silently violating its own type's declared profile.
 
     Unlike the model's ``delete()``, this has no in-memory-identity hole to
     guard against: ``self`` here is the queryset being deleted, so
@@ -4755,9 +4767,10 @@ class NetworkDevicePortQuerySet(models.QuerySet):
                     device_id=row["device_id"], vlan_id=row["vlan_id"], slot_offset__gt=0
                 ).exists():
                     raise ValidationError(
-                        "Cannot delete an offset-0 Network Device Port that still has offset "
-                        "ports (ADR 0017) deriving their address from it — delete those first, "
-                        "or delete the whole device."
+                        "Cannot delete an offset-0 Network Device Port while its offset "
+                        "sibling(s) on this VLAN still exist — that would leave this device "
+                        "violating its own type's declared port profile (ADR 0010/0017); "
+                        "delete the offset ports first, or delete the whole device."
                     )
             return super().delete()
 
@@ -4922,16 +4935,31 @@ class NetworkDevicePort(AuditedModel):
             )
 
     def delete(self, using=None, keep_parents=False) -> tuple[int, dict[str, int]]:
-        # ADR 0017: block deleting an offset-0 port that still has offset
-        # siblings on its VLAN — they derive their address from this row,
-        # and losing it would leave them locked, persisted, and
-        # permanently pointed at nothing. Deliberately does *not* run for
-        # a whole-device delete (device.delete() cascades to every port,
-        # including these, via on_delete=CASCADE) — Django's deletion
-        # Collector issues that DELETE directly, bypassing both this
-        # override and NetworkDevicePortQuerySet.delete() (see that
-        # queryset's docstring), so removing a device still works in one
-        # step.
+        # Blocks deleting an offset-0 port that still has offset siblings
+        # on its VLAN. Originally (ADR 0017) this protected the sibling's
+        # own derivation — it read its address from this row, and losing
+        # it would leave it locked, persisted, and permanently pointed at
+        # nothing. Under ADR 0027 that reasoning is stale: every port now
+        # derives independently from the *device's own* rack slot, not
+        # from a sibling port, so no sibling is left "pointed at nothing"
+        # by this delete any more.
+        #
+        # What the guard still protects: _validate_device_type_port_
+        # profile() requires every offset-carrying VLAN on the device's
+        # *type* to also carry an offset-0 port, and nothing revalidates
+        # that shape on an *instance* after a delete — dropping this row
+        # while its offset sibling(s) survive would leave a live device
+        # silently violating its own type's declared port profile. That's
+        # a real invariant regardless of whether anything still derives
+        # from this row, so the guard stays even though its original
+        # justification doesn't.
+        #
+        # Deliberately does *not* run for a whole-device delete
+        # (device.delete() cascades to every port, including these, via
+        # on_delete=CASCADE) — Django's deletion Collector issues that
+        # DELETE directly, bypassing both this override and
+        # NetworkDevicePortQuerySet.delete() (see that queryset's
+        # docstring), so removing a device still works in one step.
         #
         # Reads the *persisted* slot_offset/device_id/vlan_id
         # (_persisted_delete_guard_fields()), not self's in-memory ones —
@@ -4948,9 +4976,10 @@ class NetworkDevicePort(AuditedModel):
                 ).exists()
             ):
                 raise ValidationError(
-                    "Cannot delete an offset-0 Network Device Port that still has offset ports "
-                    "(ADR 0017) deriving their address from it — delete those first, or delete "
-                    "the whole device."
+                    "Cannot delete an offset-0 Network Device Port while its offset "
+                    "sibling(s) on this VLAN still exist — that would leave this device "
+                    "violating its own type's declared port profile (ADR 0010/0017); delete "
+                    "the offset ports first, or delete the whole device."
                 )
             return super().delete(using=using, keep_parents=keep_parents)
 

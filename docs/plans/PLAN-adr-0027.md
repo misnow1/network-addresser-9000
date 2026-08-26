@@ -225,3 +225,98 @@ review and hard to roll back.
 - **`mps-sd9-1` / `mps-sd11-1`.** If the SD9's engine is confirmed while this is in flight, it needs
   CONSOLES ordinal 12, which `mps-sd11-1` holds, and PR 1 will refuse it — correctly, but
   disruptively. `PROD-DATA-ANALYSIS.md:292-295`.
+
+## Review response
+
+PR 1 is implemented and staged as four green, individually committed steps (occupancy becomes a
+set; retire `address_source`/`OPERATOR`; universal derivation and a read-only address; docs). Every
+build decision (1-7) is implemented as written. Two places where I judged something the ADR/plan
+left implicit, and one place I disagree with a consequence of decision 1 as written:
+
+- **DHCP → static conversion after creation is now impossible, and this plan never says so.**
+  Decision 1's "the address field stops being operator-editable... setting the rack slot is the
+  only way to set an address" is unconditional in the ADR's own text, and I implemented it that way:
+  `NetworkDevicePort._locked_fields()` locks `address` for every persisted row, full stop. That
+  necessarily also locks the case ADR 0013 explicitly designed for — flipping an existing DHCP port
+  to static by typing its first address (`test_device_port_dhcp_to_static_via_manual_address_is_
+  refused`, `inventory/tests.py`). Materialization-time DHCP/static is untouched (that choice still
+  works exactly as before); what's gone is *changing your mind afterward* without recreating the
+  device. Neither the ADR nor the plan discusses this transition at all — decision 1 is framed
+  entirely around a *static* port's address, and this is a side effect of applying it literally to
+  every port regardless of its current addressing mode. I implemented the strict reading rather than
+  inventing an auto-derive-on-DHCP-flip mechanism the ADR never asked for, but this is a real,
+  user-visible regression from ADR 0013 that deserves a decision, not a silent side effect: either
+  the ADR should say this is intended, or a follow-up needs to teach `save()` to derive the address
+  itself when `is_dhcp` flips to `False` on an existing row (the same formula `_derive_addresses()`
+  already computes, just triggered by a different edge than "device just created").
+
+  **Resolved 2026-08-26, Mike's ruling: build the derive-on-flip mechanism.** Losing ADR 0013's
+  conversion is a capability loss this ADR never argued for or measured, and it should not ride
+  along with decision 1 as an unexamined side effect. Implemented: `NetworkDevicePort.
+  _persisted_is_dhcp()` / `_derive_address_on_flip_to_static()` derive the address from the same
+  formula when `is_dhcp` flips `True` → `False` on a persisted row, called from both `save()` (the
+  backstop — the same reason `_check_locked_fields_unchanged()` itself runs there and not only in
+  `clean()`) and `clean()`. `_locked_fields()`'s `"address"` entry is exempted from the comparison
+  only for that specific, freshly-detected transition (read fresh from the database each time, not
+  from a self-reported flag on `self`) — every other transition still locks it unconditionally. An
+  unracked device is refused with the same message `clean()` already gives static addressing on an
+  unracked device generally; nothing new to argue there. A derived address that collides or falls
+  outside the rack's range fails via `_validate_static_address()`, inside the same
+  `transaction.atomic()` block `save()` already wraps everything in, so a bad derivation aborts the
+  whole save rather than persisting half-written. `test_device_port_dhcp_to_static_via_manual_
+  address_is_refused` is renamed to `test_device_port_dhcp_to_static_flip_derives_the_address` and
+  rewritten to assert the derivation — typing a *wrong* address on purpose, to prove it's
+  overwritten rather than trusted, since the operator flips a toggle and never types one for real
+  (the admin's own `address` field stays `disabled`). Its sibling in `MaterializedPortLockTests`
+  (`..._still_refused_once_racked`) is likewise split into an unracked-refusal test and a
+  racked-derivation test, since racking the device is now exactly what makes the flip succeed.
+  ADR 0027 decision 1 now argues this explicitly rather than leaving it to this plan's aside.
+- **The offset-0 delete guard (`NetworkDevicePortQuerySet.delete()` / `NetworkDevicePort.delete()`)
+  is left untouched, deliberately, and neither the ADR nor the plan says whether it should be.** Its
+  original reasoning — "an offset sibling derives its address from this row, so deleting it would
+  strand that derivation" — is no longer literally true: every port now derives from the *device's*
+  rack slot independently, not from a sibling port. But the guard still protects a real invariant
+  once you set that stale reasoning aside: `_validate_device_type_port_profile()` requires every
+  offset-carrying VLAN to also carry an offset-0 port at the *type* level, and nothing revalidates
+  that shape on an *instance* after one port is deleted. Deleting an instance's offset-0 port while
+  its offset sibling survives would leave a live device silently violating its own type's declared
+  shape. I kept the guard rather than deleting it with the cascade, since removing it would open that
+  gap; the delete-guard tests are untouched because their assertions still hold for this reason, not
+  the original one. Worth an explicit ADR 0027 sentence either confirming this reasoning or
+  overriding it.
+
+  **The comment is now corrected to state this actual reasoning** —
+  `NetworkDevicePortQuerySet.delete()`'s class docstring, `NetworkDevicePort.delete()`'s inline
+  comment, and the two raised `ValidationError` messages (wording only; the guard's behaviour is
+  unchanged). Whether ADR 0027 should formally confirm or override this reasoning is still open —
+  not decided here, left for the reviewers to weigh in on as noted above.
+- **Migration `0023`'s conformance assertion has no dedicated automated test.** The project's own
+  convention (`RetireCompanionsMigrationTests`, `HostnameNormaliseMigrationTests`, and others in
+  `inventory/tests.py`) is a `MigrationExecutor`-driven `TransactionTestCase` reconstructing the
+  pre-migration schema and exercising the `RunPython` functions directly, including the failure
+  path. I did not add one for `0023` — the plan's own Risks section calls the type-port lock bypass
+  "the highest-risk item" in this PR, and its assertion is exactly what stands between a drifted
+  estate and silent data loss on an irreversible column drop. This is a real gap against the
+  project's own testing standard for exactly this class of migration, flagged here rather than left
+  quietly uncovered.
+
+  **Resolved: added.** `DerivedAddressesMigrationTests` (direct-function tests against the
+  reconstructed `0022` schema, the `RetireCompanionsMigrationTests`/`HostnameNormaliseMigrationTests`
+  shape) covers the happy path — a conforming console estate's operator-sourced type port and
+  instance rewritten to `slot_offset=1` with the address re-derived from scratch (typed wrong on
+  purpose, to prove it's recomputed rather than trusted), a DHCP-configured operator-sourced
+  instance getting the offset without an address touch, and the two guard clauses inside the rewrite
+  itself (unracked device, missing Rack VLAN Range) — and the failure path: an *ordinary*
+  (non-operator) port's pre-existing drift, untouched by the rewrite step, reaches
+  `_assert_full_conformance` unchanged and raises `RuntimeError` naming the divergent port.
+  `DerivedAddressesMigrationExecutorTests` adds one real `MigrationExecutor` run (the
+  `HostnameSlugMoveMigrationExecutorTests` shape) proving the failure path holds at the schema level
+  too: a non-conforming estate raises before `RemoveField` runs, `0023` is never recorded as applied,
+  and `address_source` survives on the table — then fixes the drift and confirms a normal forward
+  migrate proceeds cleanly from that same database.
+- **Minor, out of PR 1's explicit scope but worth a mention:** `templates/inventory/device_detail.
+  html`'s "derived" tag (`{% if port.slot_offset > 0 %}`) now under-reports — every static port is
+  derived under ADR 0027, not just offset>0 ones — but the read-only UI wasn't named in this PR's
+  brief and I left it alone rather than guess at scope. `#93` (the bracket) and this are the same
+  shape of leftover: display code that was correct under the old model and is now quietly wrong
+  under the new one, without being what either ADR 0027 or this plan actually asked PR 1 to fix.
