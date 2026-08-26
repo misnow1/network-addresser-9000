@@ -7675,6 +7675,348 @@ class HostnameSlugMoveLiveReaderTests(TransactionTestCase):
         self.assertEqual(form.instance.hostname, "mps-wpcsrl-ik42-1")
 
 
+class DerivedAddressesMigrationTests(TransactionTestCase):
+    """``0023_derived_addresses`` (ADR 0027 PR 1, decision 5) — the plan's
+    own Risks section calls the type-port lock bypass here "the
+    highest-risk item" in PR 1, and its pre-drop conformance assertion is
+    the only thing standing between a drifted estate and silently losing
+    ``address_source`` (irreversible: ``RemoveField``). Reconstructs the
+    schema as of ``0022_hostname_slug_to_device_model`` (immediately
+    before this migration) via ``MigrationExecutor``, the same shape
+    ``RetireCompanionsMigrationTests``/``HostnameNormaliseMigrationTests``
+    use — ``address_source`` genuinely doesn't exist on this branch's live
+    schema by the time any other test in this suite runs. Every fixture is
+    built through the *historical* models this reconstructed state
+    provides, and both ``RunPython`` functions are called directly, the
+    same shape those two classes use.
+
+    ``DerivedAddressesMigrationExecutorTests`` below covers the same
+    failure with a real ``MigrationExecutor`` run, proving the column
+    itself survives — what this ``_FakeSchemaEditor`` harness cannot.
+    """
+
+    apps: Any
+    _migration_module: Any
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        executor = MigrationExecutor(connection)
+        executor.migrate([("inventory", "0022_hostname_slug_to_device_model")])
+        executor.loader.build_graph()
+        cls.apps = executor.loader.project_state(("inventory", "0022_hostname_slug_to_device_model")).apps
+        cls._migration_module = importlib.import_module("inventory.migrations.0023_derived_addresses")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        call_command("migrate", "inventory", verbosity=0)
+        super().tearDownClass()
+
+    def setUp(self) -> None:
+        self.schema_editor = _FakeSchemaEditor(connection.alias)
+        self._counter = 0
+
+    def _unique(self, label: str) -> str:
+        self._counter += 1
+        return f"{label}-{self._counter}"
+
+    def _next_vlan_id(self) -> int:
+        self._counter += 1
+        return 900 + self._counter
+
+    def _rewrite(self) -> None:
+        self._migration_module._rewrite_operator_ports_and_readdress(self.apps, self.schema_editor)
+
+    def _assert_conformance(self) -> None:
+        self._migration_module._assert_full_conformance(self.apps, self.schema_editor)
+
+    def _make_console(
+        self,
+        *,
+        rack_slot: int = 4,
+        control_address: str | None = None,
+        control_is_dhcp: bool = False,
+        range_cidr: str = "10.201.6.0/27",
+    ) -> dict[str, Any]:
+        """A DM7C-shaped console: one type with a Dante Primary port
+        (``slot_offset=0``) and an ``address_source="operator"`` Device
+        Control port on the same VLAN — the production shape the plan's
+        own measurement names ("Yamaha DM3 and DM7C 'Device Control',
+        VLAN 201") — and one racked, statically-addressed instance of it.
+        ``control_address`` defaults to the *correct* post-migration value
+        (``rack_slot + 1``) so a bare ``_make_console()`` is already
+        conforming; individual tests override it to prove the rewrite
+        recomputes from scratch rather than trusting whatever was there.
+        """
+        apps = self.apps
+        VLAN = apps.get_model("inventory", "VLAN")
+        Rack = apps.get_model("inventory", "Rack")
+        RackVlanRange = apps.get_model("inventory", "RackVlanRange")
+        NetworkDeviceModel = apps.get_model("inventory", "NetworkDeviceModel")
+        NetworkDeviceType = apps.get_model("inventory", "NetworkDeviceType")
+        NetworkDeviceTypePort = apps.get_model("inventory", "NetworkDeviceTypePort")
+        NetworkDevice = apps.get_model("inventory", "NetworkDevice")
+        NetworkDevicePort = apps.get_model("inventory", "NetworkDevicePort")
+
+        vlan = VLAN.objects.create(name=self._unique("Dante Primary"), vlan_id=self._next_vlan_id())
+        rack = Rack.objects.create(name=self._unique("Rack"), slot_count=32)
+        RackVlanRange.objects.create(rack=rack, vlan=vlan, address_range=range_cidr)
+
+        device_model = NetworkDeviceModel.objects.create(manufacturer="Yamaha", model=self._unique("DM7C"))
+        device_type = NetworkDeviceType.objects.create(
+            device_model=device_model, name="Default", port_count=2
+        )
+        primary_type_port = NetworkDeviceTypePort.objects.create(
+            device_type=device_type,
+            description="Dante Primary",
+            port_type="1gbe_rj45",
+            vlan=vlan,
+            ordinal=1,
+            slot_offset=0,
+        )
+        control_type_port = NetworkDeviceTypePort.objects.create(
+            device_type=device_type,
+            description="Device Control",
+            port_type="1gbe_rj45",
+            vlan=vlan,
+            ordinal=2,
+            slot_offset=0,
+            address_source="operator",
+        )
+        device = NetworkDevice.objects.create(
+            device_type=device_type, rack=rack, rack_slot=rack_slot, hostname=self._unique("dm7c")
+        )
+        primary_port = NetworkDevicePort.objects.create(
+            device=device,
+            description="Dante Primary",
+            vlan=vlan,
+            port_type="1gbe_rj45",
+            ordinal=1,
+            slot_offset=0,
+            source_type_port=primary_type_port,
+            is_dhcp=False,
+            address=suggest_slot_address(range_cidr, rack_slot),
+        )
+        if control_address is None and not control_is_dhcp:
+            control_address = suggest_slot_address(range_cidr, rack_slot + 1)
+        control_port = NetworkDevicePort.objects.create(
+            device=device,
+            description="Device Control",
+            vlan=vlan,
+            port_type="1gbe_rj45",
+            ordinal=2,
+            slot_offset=0,
+            source_type_port=control_type_port,
+            is_dhcp=control_is_dhcp,
+            address=None if control_is_dhcp else control_address,
+        )
+        return {
+            "vlan": vlan,
+            "rack": rack,
+            "device": device,
+            "control_type_port": control_type_port,
+            "primary_port": primary_port,
+            "control_port": control_port,
+            "range_cidr": range_cidr,
+            "rack_slot": rack_slot,
+        }
+
+    def test_operator_type_port_rewritten_to_slot_offset_one(self) -> None:
+        NetworkDeviceTypePort = self.apps.get_model("inventory", "NetworkDeviceTypePort")
+        estate = self._make_console()
+        self._rewrite()
+        control_type_port = NetworkDeviceTypePort.objects.get(pk=estate["control_type_port"].pk)
+        self.assertEqual(control_type_port.slot_offset, 1)
+
+    def test_operator_sourced_instance_offset_and_address_rederived(self) -> None:
+        """The rewrite recomputes the address from scratch — it doesn't
+        trust whatever was already there, which is why this fixture
+        deliberately starts the control port on a wrong address.
+        """
+        NetworkDevicePort = self.apps.get_model("inventory", "NetworkDevicePort")
+        estate = self._make_console(control_address="10.201.6.99")
+        self._rewrite()
+        control_port = NetworkDevicePort.objects.get(pk=estate["control_port"].pk)
+        self.assertEqual(control_port.slot_offset, 1)
+        self.assertEqual(
+            control_port.address, suggest_slot_address(estate["range_cidr"], estate["rack_slot"] + 1)
+        )
+
+    def test_operator_sourced_dhcp_instance_gets_offset_but_address_untouched(self) -> None:
+        NetworkDevicePort = self.apps.get_model("inventory", "NetworkDevicePort")
+        estate = self._make_console(control_is_dhcp=True)
+        self._rewrite()
+        control_port = NetworkDevicePort.objects.get(pk=estate["control_port"].pk)
+        self.assertEqual(control_port.slot_offset, 1)
+        self.assertIsNone(control_port.address)
+
+    def test_rewrite_is_a_noop_on_a_fresh_database(self) -> None:
+        self._rewrite()  # no operator-sourced type ports at all -- must not raise
+
+    def test_rewrite_raises_when_operator_ports_device_is_unracked(self) -> None:
+        NetworkDevice = self.apps.get_model("inventory", "NetworkDevice")
+        estate = self._make_console()
+        NetworkDevice.objects.filter(pk=estate["device"].pk).update(rack=None, rack_slot=None)
+        with self.assertRaises(RuntimeError):
+            self._rewrite()
+
+    def test_rewrite_raises_when_no_rack_vlan_range_for_operator_port(self) -> None:
+        estate = self._make_console()
+        self.apps.get_model("inventory", "RackVlanRange").objects.filter(
+            rack=estate["rack"], vlan=estate["vlan"]
+        ).delete()
+        with self.assertRaises(RuntimeError):
+            self._rewrite()
+
+    def test_conformance_assertion_passes_after_a_clean_rewrite(self) -> None:
+        self._make_console()
+        self._rewrite()
+        self._assert_conformance()  # must not raise
+
+    def test_conformance_assertion_ignores_dhcp_ports(self) -> None:
+        self._make_console(control_is_dhcp=True)
+        self._rewrite()
+        self._assert_conformance()  # must not raise
+
+    def test_conformance_assertion_ignores_unracked_devices(self) -> None:
+        VLAN = self.apps.get_model("inventory", "VLAN")
+        NetworkDeviceModel = self.apps.get_model("inventory", "NetworkDeviceModel")
+        NetworkDeviceType = self.apps.get_model("inventory", "NetworkDeviceType")
+        NetworkDeviceTypePort = self.apps.get_model("inventory", "NetworkDeviceTypePort")
+        NetworkDevice = self.apps.get_model("inventory", "NetworkDevice")
+        NetworkDevicePort = self.apps.get_model("inventory", "NetworkDevicePort")
+
+        vlan = VLAN.objects.create(name=self._unique("Control"), vlan_id=self._next_vlan_id())
+        device_model = NetworkDeviceModel.objects.create(manufacturer="Test", model=self._unique("Spare"))
+        device_type = NetworkDeviceType.objects.create(
+            device_model=device_model, name="Default", port_count=1
+        )
+        type_port = NetworkDeviceTypePort.objects.create(
+            device_type=device_type, description="Control", port_type="1gbe_rj45", vlan=vlan, ordinal=1
+        )
+        device = NetworkDevice.objects.create(device_type=device_type, hostname=self._unique("spare"))
+        NetworkDevicePort.objects.create(
+            device=device,
+            description="Control",
+            vlan=vlan,
+            port_type="1gbe_rj45",
+            ordinal=1,
+            source_type_port=type_port,
+            is_dhcp=True,
+            address=None,
+        )
+        self._assert_conformance()  # unracked and DHCP -- out of scope, must not raise
+
+    def test_conformance_assertion_raises_and_names_the_divergent_port(self) -> None:
+        """The case that actually matters: a non-conforming estate must
+        refuse the (irreversible) drop rather than silently dropping over
+        bad data. Corrupts the *ordinary* (non-operator) Dante Primary
+        port on purpose — the rewrite step never touches a non-operator
+        port, so pre-existing drift on one survives to reach the
+        assertion unchanged, exactly the "estate drifted between
+        measurement and migration" risk the plan's Risks section names.
+        """
+        NetworkDevicePort = self.apps.get_model("inventory", "NetworkDevicePort")
+        estate = self._make_console()
+        primary_port = estate["primary_port"]
+        NetworkDevicePort.objects.filter(pk=primary_port.pk).update(address="10.201.6.250")
+        self._rewrite()
+        with self.assertRaises(RuntimeError) as ctx:
+            self._assert_conformance()
+        message = str(ctx.exception)
+        self.assertIn(str(primary_port.pk), message)
+        self.assertIn("Dante Primary", message)
+
+
+class DerivedAddressesMigrationExecutorTests(TransactionTestCase):
+    """A ``MigrationExecutor`` test that migrates ``0022 -> 0023`` for
+    real — covers what ``DerivedAddressesMigrationTests``' ``_FakeSchema
+    Editor`` harness cannot: that a non-conforming estate fails *before*
+    ``address_source`` is actually dropped (decision 5's "highest-risk
+    item"; the plan's Risks section: the drop is irreversible, so a
+    drifted estate must never reach it), the same reasoning
+    ``HostnameSlugMoveMigrationExecutorTests``' own disagreement test
+    already establishes for ``0022``.
+    """
+
+    def test_forward_migration_raises_before_dropping_address_source_on_nonconforming_estate(self) -> None:
+        self.addCleanup(lambda: call_command("migrate", "inventory", verbosity=0))
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([("inventory", "0022_hostname_slug_to_device_model")])
+        executor.loader.build_graph()
+        apps_0022 = executor.loader.project_state(("inventory", "0022_hostname_slug_to_device_model")).apps
+        VLAN = apps_0022.get_model("inventory", "VLAN")
+        Rack = apps_0022.get_model("inventory", "Rack")
+        RackVlanRange = apps_0022.get_model("inventory", "RackVlanRange")
+        NetworkDeviceModel = apps_0022.get_model("inventory", "NetworkDeviceModel")
+        NetworkDeviceType = apps_0022.get_model("inventory", "NetworkDeviceType")
+        NetworkDeviceTypePort = apps_0022.get_model("inventory", "NetworkDeviceTypePort")
+        NetworkDevice = apps_0022.get_model("inventory", "NetworkDevice")
+        NetworkDevicePort = apps_0022.get_model("inventory", "NetworkDevicePort")
+
+        vlan = VLAN.objects.create(name="Dante Primary", vlan_id=901)
+        rack = Rack.objects.create(name="Rack 1", slot_count=32)
+        RackVlanRange.objects.create(rack=rack, vlan=vlan, address_range="10.201.6.0/27")
+        device_model = NetworkDeviceModel.objects.create(manufacturer="Yamaha", model="DM7C")
+        device_type = NetworkDeviceType.objects.create(
+            device_model=device_model, name="Default", port_count=1
+        )
+        type_port = NetworkDeviceTypePort.objects.create(
+            device_type=device_type, description="Dante Primary", port_type="1gbe_rj45", vlan=vlan, ordinal=1
+        )
+        device = NetworkDevice.objects.create(
+            device_type=device_type, rack=rack, rack_slot=4, hostname="dm7c-1"
+        )
+        # Drifted on purpose -- no operator-sourced type port involved at
+        # all, so this reaches the conformance assertion untouched by the
+        # rewrite step (the "estate drifted between measurement and
+        # migration" risk, not anything this migration's rewrite causes).
+        port = NetworkDevicePort.objects.create(
+            device=device,
+            description="Dante Primary",
+            vlan=vlan,
+            port_type="1gbe_rj45",
+            ordinal=1,
+            source_type_port=type_port,
+            is_dhcp=False,
+            address="10.201.6.250",
+        )
+
+        executor = MigrationExecutor(connection)
+        with self.assertRaises(RuntimeError):
+            executor.migrate([("inventory", "0023_derived_addresses")])
+
+        self.assertFalse(
+            MigrationRecorder(connection)
+            .migration_qs.filter(app="inventory", name="0023_derived_addresses")
+            .exists()
+        )
+        # MariaDB is this project's target (config/settings.py) -- a raw
+        # SHOW COLUMNS is the direct way to prove RemoveField never ran,
+        # rather than trusting the ORM's view of a schema that may not
+        # match the database if this assertion is wrong.
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW COLUMNS FROM inventory_networkdevicetypeport LIKE 'address_source'")
+            self.assertNotEqual(cursor.fetchall(), ())
+
+        # Recovery is real, not just "migrate() doesn't crash": fix the
+        # drift and prove a normal forward migrate can now proceed from
+        # this exact database -- it must not be stuck on a half-applied
+        # state left over from the failed attempt above.
+        NetworkDevicePort.objects.filter(pk=port.pk).update(address=suggest_slot_address("10.201.6.0/27", 4))
+        executor = MigrationExecutor(connection)
+        executor.migrate([("inventory", "0023_derived_addresses")])
+        self.assertTrue(
+            MigrationRecorder(connection)
+            .migration_qs.filter(app="inventory", name="0023_derived_addresses")
+            .exists()
+        )
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW COLUMNS FROM inventory_networkdevicetypeport LIKE 'address_source'")
+            self.assertEqual(cursor.fetchall(), ())
+
+
 class AssembleHostnameTests(TestCase):
     """PLAN-hostname-computation.md PR 2 — ``assemble_hostname()`` is a
     pure join, no queries, no object: ``HostnameComponents`` carries
