@@ -680,6 +680,55 @@ work.
 
 ### Design deferred
 
+- **Surface the device model description where a device is identified only by hostname.** Phase 23
+  gave every model a `description` ("Dante Interface with AES3 I/O"), but a bare hostname like
+  `rjd32a3-drv-1` still tells an operator nothing unless they already know the catalog. Raised
+  2026-08-24; design deliberately deferred, but the survey is recorded here so the next pass starts
+  from facts rather than re-deriving them.
+
+  Read-only throughout — **not** blocked on ADR 0020 decision 2, unlike everything in the section
+  above it.
+
+  Where it is missing, cheapest first:
+
+  - **`vlan_map.html:113` — "Addresses in use" prints `str(device)`, i.e. the bare hostname.** The
+    worst case, and the only surface not already paid for: `_vlan_addresses_in_use`
+    (`views.py:729-770`) selects `select_related("device")` only (`:753`), and `vlan_map`'s
+    permission list (`:776-792`) declares neither `view_networkdevicetype` nor
+    `view_networkdevicemodel`. Cost: widen the join to `device__device_type__device_model`, add both
+    codenames, add a field to the `AddressEntry` dataclass (`:701`). The table is 2 columns — there
+    is room.
+  - **`spare_pool.html:50-56` — the emptiest device surface**, a 3-column table (Hostname / Type /
+    Serial). Join and codename already exist (`views.py:1022`, `:1044`). Template-only.
+  - **`device_detail.html:75-77` "Cards fitted"** — 4 columns, sparse, join and codename already
+    there (`views.py:984`).
+  - **`rack_detail.html:78-80` — occupant is hostname-only**, and this is the one to think hardest
+    about. Join and codename exist (`views.py:613`, `:659`) so it costs no queries, but the text
+    comes from a frozen `Occupant` dataclass (`views.py:250-269`) and would need a new field set in
+    `_device_row` (`:515-524`) and left blank in `_switch_row` (`:467-476`), since `NetworkSwitch`
+    has no model FK. The `ordinal-cell` is also the tightest space in the app — `9rem` min-width
+    already carrying an ordinal, a link and up to three badges.
+
+  Already shown, do not duplicate: `device_detail.html:18-20`, the `networkdevicemodel` list and
+  detail (`views.py:1574`, `:1581`), and `networkdevicetype` **detail only** — `views.py:1624-1626`
+  deliberately keeps it off that changelist because "the changelist already carries six columns and
+  the description is long." That comment sets the crowding threshold for this field; the
+  `networkdevice` list already carries eight columns and should stay out of scope.
+
+  Two house conventions to extend rather than reinvent:
+
+  - **Parenthesized suffix, suppressed when blank** is already the established way to say "this
+    thing, plus what it is" — `admin.py:980-983` renders `f"{label} ({description})"` in the
+    device-type picker.
+  - **Do not append `— description` after a type string.** `NetworkDeviceType.__str__` is
+    `f"{device_model} — {name}"` (`models.py:3629-3630`) and already contains an em-dash; a second
+    one collides. The em-dash is load-bearing elsewhere too (`|default:"—"`, the `::before` "no port
+    on this VLAN" marker at `na9k.css:353-355`).
+  - `.tile__meta` (`na9k.css:234-237`) is the house muted-text class; `.taken-by-label`
+    (`:396-400`) is the existing precedent for a muted second line *inside a dense cell*; and every
+    advisory marker carries a full-sentence `title=` tooltip, which may be the right answer for the
+    rack elevation instead of visible text.
+
 - Device-replacement workflow (swapping a spare into an already-addressed slot) — flagged in ADR 0003, design deferred
 - ~~Two *independent* static addresses on one VLAN (a Yamaha console's "For Device Control" interface) — see #42.~~ **Closed by ADR 0022, built in phase 17** as `NetworkDeviceTypePort.address_source`. This entry predicted the outcome exactly — *"if it ever lands, those consoles collapse to one device and their companion links fall away"* — which is what phase 17's PR 2 does, ADR 0018 and all. Still the nearest neighbour of phase 20, which needs the opposite shape: two ports *sharing* one address (#27), not two addresses on one VLAN
 - **A port is a physical jack *and* a logical interface, and the model has only one row for both**
