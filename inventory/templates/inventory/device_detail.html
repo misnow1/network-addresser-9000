@@ -105,11 +105,6 @@
               {{ port.description }}
               {% if port.hostname %}<span class="tile__meta">({{ port.hostname }})</span>{% endif %}
               {% if port.slot_offset > 0 %}<span class="tag-derived" title="The hardware works this address out from another of its own ports, and won't let it be changed.">derived</span>{% endif %}
-              {# ADR 0022's OPERATOR address_source, issue #60: this port's address was typed by an   #}
-              {# operator rather than computed from the device's rack slot, so it stays free to sit on #}
-              {# an address that another ordinal's arithmetic would also offer — see rack_detail.html  #}
-              {# for where that shows up as a taken-address marker on the elevation.                   #}
-              {% if port.is_operator_addressed %}<span class="tag-operator-set" title="Entered by hand rather than calculated from the slot.">operator-set</span>{% endif %}
             </td>
             <td>{{ port.port_number|default:"—" }}</td>
             <td>

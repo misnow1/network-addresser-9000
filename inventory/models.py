@@ -106,28 +106,6 @@ class PortMode(models.TextChoices):
     ACCESS = "access", "Access"
 
 
-class PortAddressSource(models.TextChoices):
-    """Where a ``NetworkDeviceTypePort``'s address comes from (ADR 0022).
-
-    ``SLOT`` (the default) is every port that exists today: computed from
-    the device's rack slot (plus ``slot_offset``, ADR 0017) and freely
-    editable afterwards. ``OPERATOR`` is a second, independent static
-    address on a VLAN the device already uses — a Yamaha console's Device
-    Control interface (issue #42) — which the system has no way to
-    compute and the operator supplies at creation.
-
-    Orthogonal to ``slot_offset``: that field answers *"is this address
-    derived from another port's?"*, this one answers *"does the system
-    compute this address at all?"*. ``OPERATOR`` combined with
-    ``slot_offset > 0`` is rejected (``_validate_device_type_port_profile``)
-    since an address the operator sets cannot also be one the hardware
-    derives.
-    """
-
-    SLOT = "slot", "From the device's rack slot"
-    OPERATOR = "operator", "Set by the operator"
-
-
 def _get_related(instance: Any, field_name: str) -> Any | None:
     """Safely read FK ``field_name`` off ``instance``, ``None`` if unset.
 
@@ -277,20 +255,23 @@ def _validate_switch_type_port_profile(switch_type: "NetworkSwitchType") -> None
 
 def _validate_device_type_port_profile(device_type: "NetworkDeviceType") -> None:
     """Raise ``ValidationError`` if ``device_type``'s port profile is
-    incomplete, a non-zero ``slot_offset`` port has no offset-0 port on
-    the same VLAN to derive its address from, or an ``OPERATOR``-sourced
-    port declares a non-zero ``slot_offset`` (ADR 0022 decision 3) — an
-    address the operator sets cannot also be one the hardware derives.
-    Device type ports have no numbering requirement (unlike switch type
-    ports) since ``port_number`` is optional for these.
+    incomplete, or a non-zero ``slot_offset`` port has no offset-0 port on
+    the same VLAN. Device type ports have no numbering requirement (unlike
+    switch type ports) since ``port_number`` is optional for these.
+
+    The offset-0-per-VLAN requirement predates ADR 0027 (it comes from ADR
+    0017) and stays even though every port now derives independently from
+    the device's own ``rack_slot`` rather than from a same-VLAN sibling —
+    ADR 0027 itself notes this is "already satisfied" by every live
+    console's built-in Dante Primary port, not that it's being relaxed.
 
     Called unconditionally from both ``NetworkDevice.clean()`` and
     ``_materialize_ports()`` — every addressing path, not only the static
-    one. The offset checks in particular must live here rather than in
+    one. The offset check in particular must live here rather than in
     ``_check_static_materialization_possible()`` (ADR 0017 plan review,
     note 4): that method only runs for a racked+static device, so a DHCP
     or unracked device would otherwise sail past it and materialize an
-    offset port with nothing to derive an address from — a row that could
+    offset port with no offset-0 sibling on its VLAN — a row that could
     never correctly be made static later either.
     """
     count = device_type.type_ports.count()
@@ -303,12 +284,6 @@ def _validate_device_type_port_profile(device_type: "NetworkDeviceType") -> None
     offsets_by_vlan: dict[int, set[int]] = {}
     vlan_by_id: dict[int, VLAN] = {}
     for type_port in device_type.type_ports.select_related("vlan"):
-        if type_port.address_source == PortAddressSource.OPERATOR and type_port.slot_offset > 0:
-            raise ValidationError(
-                f"{device_type}'s {type_port.description!r} port is operator-addressed and "
-                "cannot also have a non-zero slot_offset — an address the operator sets "
-                "cannot be one the hardware derives (ADR 0022)."
-            )
         offsets_by_vlan.setdefault(type_port.vlan_id, set()).add(type_port.slot_offset)
         vlan_by_id[type_port.vlan_id] = type_port.vlan
     for vlan_id, offsets in offsets_by_vlan.items():
@@ -3769,18 +3744,21 @@ class NetworkDeviceTypePort(AuditedModel):
     fixed purpose per port but no meaningful port number (e.g. "Dante
     Primary").
 
-    ``slot_offset`` (ADR 0017) is the mechanism for hardware that computes
-    a second port's address from a first one and refuses to let anyone
-    change it (a DiGiCo console's audio engine, always control address +
-    1) — every type port defaults to offset 0 (its own slot), and a VLAN
-    with any non-zero-offset port must also carry an offset-0 port on that
-    VLAN (``_validate_device_type_port_profile``). This is a narrow,
-    mechanism-only carve-out, not a general multi-part-hardware feature —
-    see ADR 0017's scope-boundary section for the test ("does the hardware
-    compute the second address from the first and refuse to let anyone
-    change it?") that keeps ordinary multi-device hardware (a console plus
-    a separately-addressed extender, an add-in card) as separate,
-    independently-addressed ``NetworkDevice`` rows instead.
+    ``slot_offset`` (ADR 0017, generalized by ADR 0027) is every static
+    address's whole addressing mechanism: ``range_base + rack_slot +
+    slot_offset``. Every type port defaults to offset 0 (its own slot),
+    and a VLAN with any non-zero-offset port must also carry an offset-0
+    port on that VLAN (``_validate_device_type_port_profile``). A non-zero
+    offset covers two distinct hardware shapes — a second port whose
+    address the hardware itself computes from the first and refuses to
+    let anyone change (a DiGiCo console's audio engine, always control
+    address + 1), and a second, independently-addressed interface on a
+    VLAN the device already uses (a Yamaha console's Device Control
+    interface, ADR 0027 decision 3, closing #42 — retiring ADR 0022's
+    ``OPERATOR`` mechanism for exactly this case). Ordinary multi-device
+    hardware (a console plus a separately-addressed extender, an add-in
+    card) stays as separate, independently-addressed ``NetworkDevice``
+    rows instead — see ADR 0017's scope-boundary section.
     """
 
     device_type = models.ForeignKey(NetworkDeviceType, on_delete=models.CASCADE, related_name="type_ports")
@@ -3793,19 +3771,10 @@ class NetworkDeviceTypePort(AuditedModel):
     slot_offset = models.PositiveIntegerField(
         default=0,
         help_text=(
-            "Address offset from the device's slot. Leave at 0 unless the hardware itself "
-            "derives this port's address from another port's (e.g. a console engine at "
-            "control + 1)."
-        ),
-    )
-    address_source = models.CharField(
-        max_length=10,
-        choices=PortAddressSource.choices,
-        default=PortAddressSource.SLOT,
-        help_text=(
-            "Where this port's address comes from. Leave at the default unless this port is a "
-            "second address on a VLAN this device already uses — a Yamaha console's Device "
-            "Control interface — which the system cannot compute and the operator must supply."
+            "Address offset from the device's own rack slot (ADR 0027) — every static address "
+            "is range_base + rack_slot + slot_offset. Leave at 0 unless this port needs a "
+            "second, distinct address on its VLAN (e.g. a console engine at control + 1, or a "
+            "second interface like a Yamaha console's Device Control)."
         ),
     )
     hostname_suffix = models.CharField(
@@ -4089,14 +4058,6 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
     #: when the name is a field or a property (ADR 0013).
     _port_addressing: str = PortAddressing.STATIC
 
-    #: Class-level default for the ``operator_addresses`` property below —
-    #: exactly the ``_port_addressing`` pattern above, for the same reason
-    #: (ADR 0022 settled decision 2). Creation-time-only input keyed by
-    #: type port ``description``, e.g. ``{"Device Control": "10.201.6.4"}``
-    #: — never stored; the materialized ``NetworkDevicePort.address`` is
-    #: the record of what was chosen.
-    _operator_addresses: dict[str, str] = {}
-
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=["rack", "rack_slot"], name="unique_device_rack_slot"),
@@ -4149,25 +4110,6 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
             ),
         ]
         ordering = ["hostname"]
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        # A fresh per-instance mapping, never left bound to the class-level
-        # ``_operator_addresses`` default (Codex review of PR 1, P2).
-        # ``_operator_addresses`` is a ``dict`` — unlike ``_port_addressing``
-        # (a ``str``, immutable) just above, an instance that never sets its
-        # own would otherwise share the *same* dict object as every other
-        # such instance, and an in-place mutation on one
-        # (``device.operator_addresses["Device Control"] = addr`` — the
-        # natural way to write to a dict-typed property) would silently
-        # leak into every other device that never supplied its own mapping.
-        # ``super().__init__()`` first: if ``operator_addresses`` was passed
-        # as a constructor kwarg, ``Model.__init__`` has already routed it
-        # through the property setter below by the time this line runs, so
-        # ``self.__dict__`` already holds a distinct (caller-supplied) dict
-        # and this is a no-op for that case.
-        super().__init__(*args, **kwargs)
-        if "_operator_addresses" not in self.__dict__:
-            self._operator_addresses = {}
 
     def __str__(self) -> str:
         return self.hostname or f"Device #{self.pk}"
@@ -4343,22 +4285,6 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         self._port_addressing = value
 
     @property
-    def operator_addresses(self) -> dict[str, str]:
-        """Creation-time-only input for ``OPERATOR``-sourced ports (ADR
-        0022 settled decision 2), keyed by the type port's ``description``
-        — e.g. ``{"Device Control": "10.201.6.4"}``. Never stored; exactly
-        the ``port_addressing`` pattern above, so
-        ``objects.create(operator_addresses={...})`` works. Setting this
-        after creation has no effect since ``_materialize_ports()`` only
-        runs once.
-        """
-        return self._operator_addresses
-
-    @operator_addresses.setter
-    def operator_addresses(self, value: dict[str, str]) -> None:
-        self._operator_addresses = value
-
-    @property
     def slot_span(self) -> int:
         """Delegates to ``device_type.slot_span`` (ADR 0017) — overrides
         ``RackSlotAssignmentMixin``'s default of 1. Reads ``device_type``
@@ -4392,24 +4318,6 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         """
         return self.rack is not None and self.port_addressing == PortAddressing.STATIC
 
-    def _operator_address_for(self, type_port: "NetworkDeviceTypePort") -> str:
-        """The operator-supplied address for an ``OPERATOR``-sourced type
-        port (ADR 0022), keyed by ``description`` in
-        ``self.operator_addresses``. Raises, naming the port, if the
-        operator didn't supply one — called from both
-        ``_check_static_materialization_possible()`` (the pre-flight that
-        also covers the ``objects.create()`` path) and
-        ``_materialize_ports()`` itself.
-        """
-        try:
-            return self.operator_addresses[type_port.description]
-        except KeyError:
-            raise ValidationError(
-                f"{self.device_type}'s {type_port.description!r} port is operator-addressed "
-                "(ADR 0022) and needs an address — set "
-                f"operator_addresses[{type_port.description!r}]."
-            ) from None
-
     def _check_static_materialization_possible(self) -> None:
         """Pre-flight over ``self.device_type``'s Network Device Type Ports
         for whether static materialization can succeed — pure, needs no
@@ -4418,38 +4326,28 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         never calls ``clean()``).
 
         Skips L2-only-VLAN ports entirely (decision 4: those always
-        materialize DHCP and that's not a failure). Of what's left,
-        ``SLOT``-sourced ports are grouped by ``(vlan, slot_offset)``: any
-        VLAN shared by more than one port **at the same slot_offset**
-        can't be addressed by ``suggest_slot_address()``'s
-        one-address-per-(slot, VLAN) model (decision 5, Switched Mode
-        devices — ADR 0017 narrows this from "same VLAN" to "same VLAN and
-        same offset", so it still catches Switched Mode but no longer
-        catches a console's derived engine port), and each remaining
-        port's suggested address must actually be usable
-        (``_validate_static_address``).
+        materialize DHCP and that's not a failure). Of what's left, ports
+        are grouped by ``(vlan, slot_offset)``: any VLAN shared by more
+        than one port **at the same slot_offset** can't be addressed by
+        ``suggest_slot_address()``'s one-address-per-(slot, VLAN) model
+        (decision 5, Switched Mode devices — ADR 0017 narrows this from
+        "same VLAN" to "same VLAN and same offset", so it still catches
+        Switched Mode but not two ports sharing a VLAN at different
+        offsets — a Yamaha console's Dante Primary and Device Control, ADR
+        0027 decision 3, retiring ADR 0022's ``OPERATOR`` exemption for
+        exactly this case), and each remaining port's suggested address
+        must actually be usable (``_validate_static_address``).
 
-        ``OPERATOR``-sourced ports (ADR 0022) are exempt from that
-        grouping refusal entirely — that exemption is the fix for issue
-        #42, letting a second, independently-addressed port share a VLAN
-        with a ``SLOT`` port. Each still needs its own pre-flight: the
-        operator must have supplied an address for it
-        (``_operator_address_for``, a ``ValidationError`` naming the port
-        if not — this is what makes the ``objects.create()`` path fail
-        before writing anything, matching ``_materialize_ports()`` below),
-        and that address must validate the same as any other static one.
-
-        Every candidate address (``SLOT``-suggested or operator-supplied)
-        is also checked against every other candidate on **this same
-        device** as it's produced (Codex review of PR 1, P1) — an operator
-        address that happens to equal the pending ``SLOT`` suggestion on
-        its VLAN, or two operator ports given the same address, would
-        otherwise sail past ``_validate_static_address()``'s uniqueness
-        check, since neither row exists in the database yet for that
-        check to find. Without this, the pre-flight passes, the admin form
-        validates, and materialization fails partway through on the
-        second port — an inconsistent, confusing failure this catches in
-        one pass instead, before either address is chosen as final.
+        Every candidate address is also checked against every other
+        candidate on **this same device** as it's produced (Codex review
+        of PR 1, P1) — two ports whose independently-derived addresses
+        happen to coincide would otherwise sail past ``_validate_static_
+        address()``'s uniqueness check, since neither row exists in the
+        database yet for that check to find. Without this, the pre-flight
+        passes, the admin form validates, and materialization fails
+        partway through on the second port — an inconsistent, confusing
+        failure this catches in one pass instead, before either address is
+        chosen as final.
 
         Also enforces the ``.255`` bound here (ADR 0017 plan review, note
         3), not only in ``RackSlotAssignmentMixin.clean()`` — this method
@@ -4460,10 +4358,8 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         broadcast address (see ``required_block_size()``/ADR 0015).
         """
         addressable = [tp for tp in self.device_type.type_ports.select_related("vlan") if tp.vlan.subnet]
-        slot_ports = [tp for tp in addressable if tp.address_source == PortAddressSource.SLOT]
-        operator_ports = [tp for tp in addressable if tp.address_source == PortAddressSource.OPERATOR]
         by_vlan_offset: dict[tuple[int, int], list[NetworkDeviceTypePort]] = {}
-        for type_port in slot_ports:
+        for type_port in addressable:
             by_vlan_offset.setdefault((type_port.vlan_id, type_port.slot_offset), []).append(type_port)
         for type_port_group in by_vlan_offset.values():
             if len(type_port_group) > 1:
@@ -4498,7 +4394,7 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                 )
             proposed[key] = type_port
 
-        for type_port in slot_ports:
+        for type_port in addressable:
             address = _suggest_rack_slot_address(
                 self.rack, self.rack_slot, type_port.vlan_id, type_port.slot_offset
             )
@@ -4527,20 +4423,6 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                 # ValueError instead of rendering a form error, so re-raise
                 # as a plain, non-field error here.
                 raise ValidationError(exc.messages) from exc
-        for type_port in operator_ports:
-            address = self._operator_address_for(type_port)
-            _check_no_self_collision(type_port, address)
-            try:
-                _validate_static_address(
-                    address,
-                    type_port.vlan,
-                    self.rack,
-                    self.rack_slot,
-                    exclude_switch_address_pk=None,
-                    exclude_device_port_pk=None,
-                )
-            except ValidationError as exc:
-                raise ValidationError(exc.messages) from exc
 
     def _materialize_ports(self) -> None:
         """One-time copy of ``device_type``'s Network Device Type Ports into
@@ -4557,15 +4439,6 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         cascade (``NetworkDevicePort._derive_offset_siblings``), no
         offset-0-first ordering is required here; the loop stays ordered
         by ``ordinal`` as it always has.
-
-        An ``OPERATOR``-sourced port (ADR 0022) on a device that
-        materializes statically takes its address from
-        ``self.operator_addresses`` instead of being derived — set
-        explicitly here so ``NetworkDevicePort.clean()``'s own
-        auto-suggest branch (which would otherwise fill in the *slot*
-        address, since ``slot_offset`` is always 0 for an operator port)
-        never runs for it. On an unracked/DHCP device it materializes DHCP
-        like any other port and the mapping is ignored.
         """
         _validate_device_type_port_profile(self.device_type)
         static = self._materializes_static()
@@ -4573,9 +4446,6 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
             self._check_static_materialization_possible()
         for type_port in self.device_type.type_ports.select_related("vlan").order_by("ordinal"):
             if static and type_port.vlan.subnet:
-                address = None
-                if type_port.address_source == PortAddressSource.OPERATOR:
-                    address = self._operator_address_for(type_port)
                 port = NetworkDevicePort(
                     device=self,
                     port_number=type_port.port_number,
@@ -4586,7 +4456,7 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                     slot_offset=type_port.slot_offset,
                     source_type_port=type_port,
                     is_dhcp=False,
-                    address=address,
+                    address=None,
                     created_by=self.created_by,
                 )
                 port.full_clean()
@@ -5007,37 +4877,20 @@ class NetworkDevicePort(AuditedModel):
             # this gate meaningful/correct on its own, independent of the
             # lock check above.
             #
-            # Also excludes an ``OPERATOR``-sourced offset-0 port (ADR
-            # 0022; Codex review of PR 1, P1) — a profile may legally hold
-            # a ``SLOT`` offset-0 port, an ``OPERATOR`` offset-0 port and a
-            # ``SLOT`` offset-1 port all on one VLAN (the DM7C shape plus a
-            # derived engine on the same VLAN), and editing the
-            # independent operator address must never be mistaken for
-            # editing the *control* address the offset-1 sibling derives
-            # from. Read off the persisted row's ``source_type_port``, not
-            # ``self.source_type_port`` — that FK is itself one of the
-            # identity fields ``_locked_fields()`` already refuses to let a
-            # plain ``save()`` change, so trusting it is safe, but reading
-            # the persisted copy keeps this gate independent of that lock
-            # check the same way the offset value above already is. A
-            # ``None`` ``source_type_port`` (a directly-constructed port
-            # with no type-port provenance — every test fixture built
-            # before this ADR, and any future one that skips
-            # materialization) is treated as ``SLOT`` — cascading is this
-            # module's behaviour for every offset-0 port that predates
-            # ``address_source`` existing at all, and staying silent about
-            # provenance is not the same claim as being operator-addressed.
+            # ADR 0027 retires the ``OPERATOR`` mechanism (ADR 0022) that
+            # used to carve an exception out of this gate — every offset-0
+            # port is now unconditionally a cascade trigger, with no
+            # provenance check needed to tell an independently-addressed
+            # port apart from a derivation source.
             pre_save_pk = self.pk
             persisted: dict[str, Any] | None = None
             if pre_save_pk is not None and self._persisted_slot_offset() == 0:
                 candidate = (
                     NetworkDevicePort._default_manager.filter(pk=pre_save_pk)
-                    .values("address", "is_dhcp", "source_type_port__address_source")
+                    .values("address", "is_dhcp")
                     .first()
                 )
-                if candidate is not None and candidate["source_type_port__address_source"] != (
-                    PortAddressSource.OPERATOR
-                ):
+                if candidate is not None:
                     persisted = {"address": candidate["address"], "is_dhcp": candidate["is_dhcp"]}
 
             super().save(
@@ -5161,20 +5014,6 @@ class NetworkDevicePort(AuditedModel):
         if device is None or not device.hostname:
             return None
         return f"{device.hostname}-{source_type_port.hostname_suffix}"
-
-    @property
-    def is_operator_addressed(self) -> bool:
-        """Whether this port is *currently holding* an address an operator
-        typed rather than one computed from its device's ordinal (ADR 0022).
-
-        False for a DHCP port even when its type port is ``OPERATOR``-sourced:
-        such a port materialized DHCP (unracked device) and consumed no
-        address, so nothing about it is operator-set yet. See issue #60.
-        """
-        if self.is_dhcp or self.address is None:
-            return False
-        type_port = self.source_type_port
-        return type_port is not None and type_port.address_source == PortAddressSource.OPERATOR
 
     def _locked_fields(self) -> dict[str, Any]:
         # ``device``/``port_number``/``ordinal``/``source_type_port``/

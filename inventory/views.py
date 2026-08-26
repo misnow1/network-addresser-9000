@@ -1648,7 +1648,6 @@ REGISTRY: dict[str, ModelSpec] = {
                     FieldSpec("Port type", "port_type", render="choice"),
                     FieldSpec("VLAN", "vlan", render="relation"),
                     FieldSpec("Slot offset", "slot_offset"),
-                    FieldSpec("Address source", "address_source", render="choice"),
                     FieldSpec("Hostname suffix", "hostname_suffix"),
                 ),
                 ordering=("ordinal",),

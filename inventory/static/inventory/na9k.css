@@ -375,10 +375,9 @@ a {
  * (nothing occupies the slot); what's taken is the *address* it would
  * offer, already held by another occupant's static port/address
  * elsewhere in this rack (ADR 0003's stored-not-immutable addresses let
- * that happen). Deliberately muted like .tag-derived/.tag-operator-set —
- * this is information, not the data problem .row-conflict/.cell-conflict
- * report, so it must not borrow their --danger/--derived-bg language. */
-.tag-operator-set,
+ * that happen). Deliberately muted like .tag-derived — this is
+ * information, not the data problem .row-conflict/.cell-conflict report,
+ * so it must not borrow their --danger/--derived-bg language. */
 .tag-address-taken {
   font-size: 0.65rem;
   text-transform: uppercase;

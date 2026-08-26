@@ -35,7 +35,6 @@ from .models import (
     NetworkSwitchTypePort,
     Owner,
     PortAddressing,
-    PortAddressSource,
     PortMode,
     Rack,
     RackTemplate,
@@ -998,47 +997,12 @@ class NetworkDeviceAddForm(forms.ModelForm):
     the choice has no effect after creation, so the change form omits it
     entirely rather than showing a field that does nothing.
 
-    Also carries one ``GenericIPAddressField`` per ``OPERATOR``-sourced
-    Network Device Type Port on the chosen type (ADR 0022) — a Yamaha
-    console's Device Control interface, e.g. — labelled from the port's
-    ``description``. These aren't model fields either; ``clean()``
-    assembles them into ``self.instance.operator_addresses``, the
-    transient property ``_materialize_ports()`` reads from.
-
-    Which fields exist depends on ``device_type``, which isn't known until
-    a device type is actually chosen — this class alone only ever adds
-    them from ``__init__`` (self.data on a submission, self.initial on a
-    prefilled GET, e.g. the spare-pool deep link), onto the *instance*.
-    That's enough for direct construction (as every test in this codebase
-    that builds this form does), but **not** enough for the real admin
-    view (Codex review of PR 1, P1): Django's ``ModelAdmin`` computes the
-    fieldset it renders from the form *class*'s ``base_fields`` — set once
-    when ``modelform_factory()`` builds the class, before any instance's
-    ``__init__`` ever runs — so a field added only in ``__init__`` is
-    genuinely present in ``self.fields`` (form validation sees it fine)
-    but never appears in the rendered page at all. ``NetworkDeviceAdmin.
-    get_form()`` is what actually fixes this: it builds a fresh subclass
-    with these fields *declared* (so they land in ``base_fields``) for
-    each request, via :meth:`with_operator_fields`, and passes that
-    subclass in as the form to use instead of this bare class. This class
-    keeps its own ``__init__``-based fallback too, since it costs nothing
-    and keeps every direct-construction test (and any future non-admin
-    caller) working unchanged.
-
-    Required is deliberately ``False`` (Codex review of PR 1, P2) — an
-    unracked device, an explicit DHCP choice, or an operator port on an
-    L2-only VLAN all materialize DHCP and ignore ``operator_addresses``
-    entirely (``NetworkDevice._materialize_ports()``), so a blank field in
-    those cases means nothing and must not block submission.
-    ``clean()``'s ``_validate_operator_addresses()`` adds the field error
-    back in exactly the cases where the device *will* actually
-    materialize the port statically.
+    ``clean()`` fills a blank ``rack_slot`` with the lowest ordinal at
+    which every one of the chosen type's ``claimed_offsets`` is free (ADR
+    0027's ``lowest_free_placement()`` — the placement suggester for a
+    device claiming a *set* of ordinals rather than a contiguous span, the
+    fix for issue #62/#83's suggestion half).
     """
-
-    #: Prefix for the per-type-port dynamic fields above — never collides
-    #: with a real model field name, so ``cleaned_data`` keys built from it
-    #: can be told apart from everything else Meta.fields draws in.
-    _OPERATOR_ADDRESS_FIELD_PREFIX = "operator_address__"
 
     port_addressing = forms.ChoiceField(
         choices=PortAddressing.choices,
@@ -1081,110 +1045,6 @@ class NetworkDeviceAddForm(forms.ModelForm):
         self.fields["device_type"].queryset = NetworkDeviceType.objects.select_related(  # type: ignore[attr-defined]
             "device_model"
         )
-        # One field per OPERATOR-sourced type port on the chosen type (ADR
-        # 0022) — self.data (bound: a submission) takes priority over
-        # self.initial (unbound: a prefilled GET), matching how every
-        # other ModelChoiceField on this form resolves its value. Adds to
-        # ``self.fields`` (the instance), which is enough for direct
-        # construction; see the class docstring for why the real admin
-        # view needs ``with_operator_fields()`` as well.
-        device_type_id = (self.data or {}).get("device_type") or self.initial.get("device_type")
-        self._operator_type_ports = self._operator_type_ports_for(device_type_id)
-        for type_port in self._operator_type_ports:
-            field_name = self._operator_address_field_name(type_port)
-            if field_name not in self.fields:
-                self.fields[field_name] = self._operator_address_field(type_port)
-
-    @staticmethod
-    def _operator_type_ports_for(device_type_id: Any) -> list[NetworkDeviceTypePort]:
-        """Every ``OPERATOR``-sourced Network Device Type Port on
-        ``device_type_id``, or ``[]`` if none is given — shared by
-        ``__init__`` (instance fields, for direct construction) and
-        ``with_operator_fields()`` (class-level fields, for the real admin
-        view).
-
-        Coerces to ``int`` here, defensively, rather than trusting a caller
-        to have already validated it (Codex review of ADR 0022 PR 3, P2) —
-        ``__init__`` reads this straight from ``self.data``/``self.initial``
-        (an unvalidated request value) on *every* construction, not only
-        through ``with_operator_fields()``, so a fix only at that one call
-        site (ADR 0022 PR 3's fit view) would still have left this the raw,
-        crashing path for a crafted ``device_type`` reaching ``__init__``
-        directly — a bare ``QuerySet.filter(device_type_id=<garbage>)``
-        raises ``ValueError`` before ``ModelChoiceField`` ever gets a
-        chance to turn it into an ordinary form error. A non-coercible value
-        degrades to "no type chosen yet" (``[]``), the same shape a blank
-        value already produces.
-        """
-        if not device_type_id:
-            return []
-        try:
-            device_type_id = int(device_type_id)
-        except (TypeError, ValueError):
-            return []
-        return list(
-            NetworkDeviceTypePort.objects.filter(
-                device_type_id=device_type_id, address_source=PortAddressSource.OPERATOR
-            )
-            .select_related("vlan")
-            .order_by("ordinal")
-        )
-
-    @classmethod
-    def _operator_address_field_name(cls, type_port: NetworkDeviceTypePort) -> str:
-        return f"{cls._OPERATOR_ADDRESS_FIELD_PREFIX}{type_port.pk}"
-
-    @staticmethod
-    def _operator_address_field(type_port: NetworkDeviceTypePort) -> forms.GenericIPAddressField:
-        # required=False — see the class docstring (Codex review of PR 1,
-        # P2). clean()'s _validate_operator_addresses() adds the field
-        # error back in exactly the cases where this device will actually
-        # materialize the port statically.
-        return forms.GenericIPAddressField(
-            protocol="IPv4",
-            required=False,
-            label=type_port.description,
-            help_text=(
-                f"Static address for {type_port.description} on {type_port.vlan} — the system "
-                "has no way to compute this one (ADR 0022). Required only if this device will "
-                "get a static address; ignored (and may be left blank) for an unracked device "
-                "or an explicit DHCP choice."
-            ),
-        )
-
-    @classmethod
-    def with_operator_fields(cls, device_type_id: Any) -> type["NetworkDeviceAddForm"]:
-        """A subclass of this form with one ``GenericIPAddressField`` per
-        ``OPERATOR``-sourced type port on ``device_type_id`` *declared at
-        the class level* — not just added to an instance's ``self.fields``
-        the way ``__init__`` does above.
-
-        This is what makes the fields actually render (Codex review of PR
-        1, P1): ``NetworkDeviceAdmin.get_form()`` calls this to build the
-        form class it hands to Django's admin machinery, which computes
-        the rendered fieldset from ``form.base_fields`` — a class-level
-        attribute the ``ModelFormMetaclass`` populates once, from the
-        class body, when the class is created. A field ``__init__`` adds
-        later is real (validation sees it) but invisible (nothing in the
-        fieldset names it), so a type with an ``OPERATOR`` port could
-        never actually be created through the admin before this existed:
-        the field's own ``required=False`` (see above) would have let the
-        submission past *were* it rendered, but it never was, so the
-        browser never sent a value, and there was nothing on the page
-        allowing an operator to supply one either.
-
-        Returns this class unchanged when ``device_type_id`` has no
-        ``OPERATOR`` ports (or is unset) — the overwhelmingly common case,
-        which shouldn't pay for a needless dynamic subclass.
-        """
-        type_ports = cls._operator_type_ports_for(device_type_id)
-        if not type_ports:
-            return cls
-        extra_fields = {
-            cls._operator_address_field_name(type_port): cls._operator_address_field(type_port)
-            for type_port in type_ports
-        }
-        return type(cls.__name__, (cls,), extra_fields)
 
     def clean(self) -> dict[str, Any]:
         """A blank ``rack_slot`` is filled in with the lowest ordinal at
@@ -1230,33 +1090,7 @@ class NetworkDeviceAddForm(forms.ModelForm):
                 )
                 return cleaned_data
             cleaned_data["rack_slot"] = host_slot
-        self._validate_operator_addresses(cleaned_data)
         return cleaned_data
-
-    def _validate_operator_addresses(self, cleaned_data: dict[str, Any]) -> None:
-        """Requires an address for each ``OPERATOR`` type port only when
-        this device will actually materialize it statically (ADR 0022;
-        Codex review of PR 1, P2) — ``NetworkDevice._materialize_ports()``
-        ignores ``operator_addresses`` entirely for an unracked device, an
-        explicit DHCP choice, or a port on an L2-only VLAN, and the field
-        itself is ``required=False`` for exactly that reason (see the
-        class docstring). Called only from the tail of ``clean()``, where
-        ``rack``/``device_type`` both cleaned and a ``rack_slot`` was
-        found — every earlier bail-out in ``clean()`` is itself a case
-        where this device won't productively materialize statically, so
-        skipping the check there is correct, not merely convenient.
-        """
-        port_addressing = cleaned_data.get("port_addressing") or PortAddressing.STATIC
-        if port_addressing != PortAddressing.STATIC:
-            return
-        for type_port in self._operator_type_ports:
-            if not type_port.vlan.subnet:
-                continue  # L2-only VLAN — always materializes DHCP regardless of port_addressing
-            field_name = self._operator_address_field_name(type_port)
-            if not cleaned_data.get(field_name):
-                self.add_error(
-                    field_name, "This field is required for a device that will get a static address."
-                )
 
     def _post_clean(self) -> None:
         # `or`, not `.get(..., default)` alone — required=False means an
@@ -1266,17 +1100,6 @@ class NetworkDeviceAddForm(forms.ModelForm):
         # does leave the key genuinely absent). Must run before
         # super()._post_clean(), which is what calls self.instance.full_clean().
         self.instance.port_addressing = self.cleaned_data.get("port_addressing") or PortAddressing.STATIC
-        # Assembled from the dynamic per-type-port fields __init__() added
-        # (ADR 0022), keyed by description — exactly what
-        # NetworkDevice._materialize_ports() reads from. A field missing
-        # from cleaned_data (this row's own validation failed) is simply
-        # omitted here; the model's own pre-flight reports the missing
-        # address by name rather than this silently supplying a blank one.
-        self.instance.operator_addresses = {
-            type_port.description: self.cleaned_data[f"{self._OPERATOR_ADDRESS_FIELD_PREFIX}{type_port.pk}"]
-            for type_port in self._operator_type_ports
-            if f"{self._OPERATOR_ADDRESS_FIELD_PREFIX}{type_port.pk}" in self.cleaned_data
-        }
         super()._post_clean()  # type: ignore[misc]
         # ADR 0024 plan settled decision 6, review note 1 — measured here,
         # off the fully-normalized self.instance super()._post_clean() just
@@ -1296,10 +1119,9 @@ class NetworkDeviceAddForm(forms.ModelForm):
 class NetworkDeviceChangeForm(forms.ModelForm):
     """Change form for an existing device — deliberately distinct from
     ``NetworkDeviceAddForm`` (same shape as ``NetworkSwitchAddForm``/the
-    default ``ModelForm`` split elsewhere here): ``port_addressing`` and
-    the ``OPERATOR``-port address fields only make sense at creation, so
-    the change form omits them entirely rather than showing fields that
-    do nothing.
+    default ``ModelForm`` split elsewhere here): ``port_addressing`` only
+    makes sense at creation, so the change form omits it entirely rather
+    than showing a field that does nothing.
 
     ``_post_clean()`` (ADR 0024 plan settled decisions 6 and 8, review
     note 1) is new here — this form had neither ``clean()`` nor
@@ -1541,29 +1363,6 @@ def _profile_locked(type_obj: Any, instances_related_name: str) -> bool:
     )
 
 
-def _clean_device_type_id(raw: str | None) -> int | None:
-    """Best-effort int coercion for a raw, unvalidated ``device_type`` POST
-    value — used only to decide which ``OPERATOR``-port fields ``With_
-    operator_fields()`` should declare on the create-a-card form, never to
-    look a row up directly.
-
-    A malformed value (``"not-an-int"``, from a crafted POST) must fall
-    through to the ordinary, already-robust ``ModelChoiceField`` validation
-    on the resulting form — which converts exactly this shape of bad input
-    into a field error — rather than reach a raw ``QuerySet.filter(device_
-    type_id=raw)`` call, which raises a bare ``ValueError`` past any form
-    (Codex review, P2; ``NetworkDeviceAdmin._fit_new_card``). Returning
-    ``None`` here reproduces the "no type chosen yet" shape ``with_operator_
-    fields()``/``_operator_type_ports_for()`` already handle.
-    """
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return None
-
-
 class NetworkSwitchTypePortInline(admin.TabularInline):
     model = NetworkSwitchTypePort
     formset = NetworkSwitchTypePortFormSet
@@ -1599,7 +1398,6 @@ class NetworkDeviceTypePortInline(admin.TabularInline):
         "port_type",
         "vlan",
         "slot_offset",
-        "address_source",
         "hostname_suffix",
     ]
 
@@ -1629,7 +1427,7 @@ class NetworkDeviceTypePortInline(admin.TabularInline):
         # (ADR 0022 decision 4) — every other field freezes, matching
         # NetworkDeviceTypePort's own model-layer exemption.
         if _profile_locked(obj, "devices"):
-            return ["port_number", "description", "port_type", "vlan", "slot_offset", "address_source"]
+            return ["port_number", "description", "port_type", "vlan", "slot_offset"]
         return []
 
 
@@ -2268,22 +2066,11 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
         _emit_dante_warnings(request, form)
 
     def get_form(self, request: HttpRequest, obj: Any = None, change: bool = False, **kwargs: Any) -> Any:
-        # port_addressing/operator-address inputs (ADR 0013/0022) only
-        # make sense at creation. Two distinct forms, same shape as
-        # NetworkSwitchAddForm/the default ModelForm split elsewhere here.
+        # port_addressing (ADR 0013) only makes sense at creation. Two
+        # distinct forms, same shape as NetworkSwitchAddForm/the default
+        # ModelForm split elsewhere here.
         if obj is None:
-            # NetworkDeviceAddForm.with_operator_fields() (ADR 0022; Codex
-            # review of PR 1, P1) — a form class built per request, with
-            # this request's OPERATOR-port fields *declared* rather than
-            # merely instance-added, so Django's admin machinery (which
-            # computes the rendered fieldset from the form class's
-            # base_fields, before any instance's __init__ ever runs) can
-            # actually see and render them. request.POST (a submission)
-            # takes priority over request.GET (a prefilled deep link),
-            # matching NetworkDeviceAddForm.__init__'s own self.data-over-
-            # self.initial resolution for the same field.
-            device_type_id = request.POST.get("device_type") or request.GET.get("device_type")
-            kwargs["form"] = NetworkDeviceAddForm.with_operator_fields(device_type_id)
+            kwargs["form"] = NetworkDeviceAddForm
         else:
             kwargs["form"] = NetworkDeviceChangeForm
         form_class = super().get_form(request, obj, change=change, **kwargs)
@@ -2577,7 +2364,7 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
         self, request: HttpRequest, host: NetworkDevice, create_form: NetworkDeviceAddForm | None = None
     ) -> TemplateResponse:
         if create_form is None:
-            create_form = NetworkDeviceAddForm.with_operator_fields(None)(instance=NetworkDevice(host=host))
+            create_form = NetworkDeviceAddForm(instance=NetworkDevice(host=host))
         create_form.fields["device_type"].queryset = NetworkDeviceType.objects.filter(  # type: ignore[attr-defined]
             is_add_in_card=True
         ).select_related("device_model")
@@ -2658,8 +2445,6 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
             and request.user.has_perm("inventory.change_networkdevice")
         ):
             raise PermissionDenied
-        device_type_id = _clean_device_type_id(request.POST.get("device_type"))
-        form_cls = NetworkDeviceAddForm.with_operator_fields(device_type_id)
         with transaction.atomic():
             locked = _lock_devices_by_pk(host.pk)
             locked_host = locked.get(host.pk)
@@ -2669,13 +2454,13 @@ class NetworkDeviceAdmin(AuditedModelAdminMixin, AuditlogHistoryAdminMixin, admi
             if locked_host.device_type.is_add_in_card:
                 messages.error(request, f"{locked_host} is itself an add-in card and cannot host another.")
                 return redirect("admin:inventory_networkdevice_change", locked_host.pk)
-            # NetworkDeviceAddForm.with_operator_fields() (review note 5) —
-            # a bespoke form here would silently bypass that form's rack-
-            # slot suggester, operator-address fields and materialization
-            # pre-flight. instance=NetworkDevice(host=locked_host) so
-            # full_clean() sees the relationship and the row is inserted
-            # once with host already set, never patched in afterward.
-            form = form_cls(data=request.POST, instance=NetworkDevice(host=locked_host))
+            # NetworkDeviceAddForm (review note 5) — a bespoke form here
+            # would silently bypass that form's rack-slot suggester and
+            # materialization pre-flight. instance=NetworkDevice(host=
+            # locked_host) so full_clean() sees the relationship and the
+            # row is inserted once with host already set, never patched in
+            # afterward.
+            form = NetworkDeviceAddForm(data=request.POST, instance=NetworkDevice(host=locked_host))
             form.fields["device_type"].queryset = NetworkDeviceType.objects.filter(  # type: ignore[attr-defined]
                 is_add_in_card=True
             ).select_related("device_model")

@@ -38,7 +38,6 @@ from inventory.models import (
     NetworkSwitchAddress,
     NetworkSwitchType,
     Owner,
-    PortAddressSource,
     Rack,
 )
 from inventory.suggestions import suggest_slot_address
@@ -285,22 +284,22 @@ EXPECTED_DEVICE_TYPE_PORTS: dict[tuple[str, str, str], tuple[tuple[str, str, int
         ("Dante Primary", FN_DANTE_PRIMARY, 0),
         ("Dante Secondary", FN_DANTE_SECONDARY, 0),
     ),
-    # The fourth, OPERATOR-sourced Device Control port (ADR 0022, closing
-    # #42) shares its VLAN with the console's own Dante Primary port —
-    # verified by ``_check_device_control_pairs()``, not by the
-    # (vlan, offset)-keyed generic address check.
+    # The fourth Device Control port (ADR 0027, closing #42) is an
+    # ordinary slot_offset=1 port sharing its VLAN with the console's own
+    # Dante Primary port — verified by ``_check_device_control_pairs()``,
+    # not by the (vlan, offset)-keyed generic address check.
     ("Yamaha", "DM7C", "Default"): (
         ("Control", FN_CONTROL, 0),
         ("Dante Primary", FN_DANTE_PRIMARY, 0),
         ("Dante Secondary", FN_DANTE_SECONDARY, 0),
-        ("Device Control", FN_DANTE_PRIMARY, 0),
+        ("Device Control", FN_DANTE_PRIMARY, 1),
     ),
     ("Yamaha", "DM7-EX", "Default"): (("Control", FN_CONTROL, 0),),
     ("Yamaha", "DM3", "Default"): (
         ("Control", FN_CONTROL, 0),
         ("Dante Primary", FN_DANTE_PRIMARY, 0),
         ("Dante Secondary", FN_DANTE_SECONDARY, 0),
-        ("Device Control", FN_DANTE_PRIMARY, 0),
+        ("Device Control", FN_DANTE_PRIMARY, 1),
     ),
     ("Yamaha", "Tio1608-D2", "Default"): (
         ("Control", FN_CONTROL, 0),
@@ -691,13 +690,15 @@ def _check_device_control_pairs(
     vlan_id_by_function: dict[str, int],
     expected_device_keys: set[tuple[str, int]],
 ) -> int:
-    """Independent Device Control check (ADR 0022) — mirrors the SD12
-    Control/Engine lookahead inside the main per-row loop below, but keyed
-    on the ``-device-control`` hostname suffix rather than slot adjacency
-    (the row can sit either below or above its host — DM7C/DM3
-    respectively — which slot-adjacency can't express in both directions
-    at once), and re-declared independently of ``import_prod_data.py``'s
-    own pre-pass.
+    """Independent Device Control check (ADR 0027, retiring ADR 0022's
+    ``OPERATOR`` mechanism) — mirrors the SD12 Control/Engine lookahead
+    inside the main per-row loop below, but keyed on the ``-device-
+    control`` hostname suffix and a rack-wide stem scan rather than that
+    lookahead's own slot-adjacency (``row.slot + 1``): both consoles'
+    Device Control interfaces sit exactly one slot above their host now,
+    so a positional check would find the same row, but this stays
+    independent of assuming that direction, and re-declared independently
+    of ``import_prod_data.py``'s own pre-pass either way.
 
     Runs as a genuine pre-pass over *every* row, not a lookahead triggered
     while iterating — CSV order isn't reliable (the DM7C's Device Control
@@ -1155,12 +1156,13 @@ def _check_hostnames_and_types_and_addresses(
 
 def _device_address(device: NetworkDevice, *, description: str) -> str | None:
     """The address of one of ``device``'s already-materialized ports,
-    selected by ``description`` — not ``(vlan, slot_offset)`` (ADR 0022):
-    a console's Dante Primary and its Device Control interface now share
-    both, which made that selector ambiguous. Every port description in
-    this dataset's independently-declared catalog
-    (``EXPECTED_DEVICE_TYPE_PORTS``) is unique per device type, so
-    ``description`` alone disambiguates.
+    selected by ``description`` rather than ``(vlan, slot_offset)`` — a
+    single, simpler selector rather than two different ones depending on
+    the port. Every port description in this dataset's independently-
+    declared catalog (``EXPECTED_DEVICE_TYPE_PORTS``) is unique per device
+    type, so ``description`` alone disambiguates, including a console's
+    Dante Primary and its Device Control interface (ADR 0027 gives them
+    distinct offsets on the same VLAN).
     """
     port = device.ports.filter(description=description).first()
     return port.address if port is not None else None
@@ -1397,28 +1399,23 @@ def _check_dhcp_server_enabled(findings: _Findings) -> None:
 
 def _check_cross_vlan_alignment(findings: _Findings) -> None:
     """Every device's static ports should share the same offset from their
-    respective VLAN's network address (PROD-DATA-ANALYSIS.md §6.1) — a
-    coincidence of per-VLAN first-fit here, not an enforced invariant, so
-    this is exactly the kind of drift the import is the one cheap moment to
-    catch.
+    respective VLAN's network address, once each port's own ``slot_offset``
+    is subtracted back out (PROD-DATA-ANALYSIS.md §6.1) — a coincidence of
+    per-VLAN first-fit here, not an enforced invariant, so this is exactly
+    the kind of drift the import is the one cheap moment to catch.
 
-    Excludes ``OPERATOR``-sourced ports (ADR 0022), resolved through
-    ``source_type_port`` — a console's Device Control interface has no
-    derivable relationship to the other ports' offset at all (production
-    points *both ways*: a DM7C's Device Control sits below its own Dante
-    Primary, a DM3's above), so including it here would make a correct
-    import fail this check. A port with ``source_type_port=None`` stays
-    included — the exemption is for ``OPERATOR`` specifically, not for
-    "no type port on record," so a corrupted ordinary ``SLOT`` port on the
-    same console still trips this.
+    Unconditional over every static port now (ADR 0027 retires the
+    ``OPERATOR`` exemption this used to need) — a Yamaha console's Device
+    Control interface is an ordinary ``slot_offset=1`` port like any
+    other, so ``base + rack_slot + slot_offset`` already accounts for it
+    the same way it does a DiGiCo SD12's engine, and subtracting
+    ``port.slot_offset`` before comparing is what keeps both correctly
+    aligned with the console's own offset-0 ports.
     """
-    for device in NetworkDevice.objects.prefetch_related("ports__vlan", "ports__source_type_port"):
+    for device in NetworkDevice.objects.prefetch_related("ports__vlan"):
         offsets: dict[int, str] = {}
         for port in device.ports.all():
             if port.address is None:
-                continue
-            source_type_port = port.source_type_port
-            if source_type_port is not None and source_type_port.address_source == PortAddressSource.OPERATOR:
                 continue
             network = ipaddress.IPv4Network(port.vlan.subnet, strict=True)
             offset = (

@@ -28,8 +28,7 @@ must be quiesced for the import."
 
 import ipaddress
 import re
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +47,6 @@ from inventory.models import (
     NetworkSwitchType,
     NetworkSwitchTypePort,
     Owner,
-    PortAddressSource,
     PortMode,
     PortType,
     Rack,
@@ -90,14 +88,6 @@ FN_CONTROL = "Audio Control"
 FN_DANTE_PRIMARY = "Dante Primary"
 FN_DANTE_SECONDARY = "Dante Secondary"
 
-#: VLAN function name -> the ``AddressingRow`` attribute holding that
-#: function's address, for reading an ``OPERATOR``-sourced type port's
-#: address off whichever CSV column corresponds to its VLAN (ADR 0022).
-_ADDRESS_BY_FUNCTION: dict[str, Callable[[AddressingRow], str]] = {
-    FN_CONTROL: lambda row: row.control,
-    FN_DANTE_PRIMARY: lambda row: row.dante_primary,
-    FN_DANTE_SECONDARY: lambda row: row.dante_secondary,
-}
 
 #: Racks whose bases sit behind deliberate gaps that first-fit will never
 #: leave — entered with explicit ranges, not the "Audio Rack" template
@@ -287,8 +277,8 @@ def _slugify_rack_name(name: str) -> str:
 class DeviceTypeSpec:
     """One ``NetworkDeviceType`` to create: identity plus its ports.
 
-    Each port is ``(description, vlan_function, slot_offset, address_source,
-    hostname_suffix)`` (ADR 0022) — the VLAN is resolved by function name
+    Each port is ``(description, vlan_function, slot_offset,
+    hostname_suffix)`` (ADR 0027) — the VLAN is resolved by function name
     (``FN_CONTROL`` etc.), not a hardcoded VLAN id, so this catalog is
     independent of which numeric VLAN ids a given Calc Lookups export
     happens to use. Every device port in this dataset is a plain 1GbE
@@ -307,19 +297,15 @@ class DeviceTypeSpec:
     manufacturer: str
     model: str
     name: str
-    ports: tuple[tuple[str, str, int, str, str], ...]
+    ports: tuple[tuple[str, str, int, str], ...]
     is_add_in_card: bool = False
 
 
-#: Default ``(address_source, hostname_suffix)`` for an ordinary
-#: SLOT-addressed port with no derived hostname of its own — most ports in
-#: this catalog. Spread with ``*_SLOT`` into a port tuple.
-_SLOT = (PortAddressSource.SLOT, "")
-
 #: Tier 1 (six unambiguous types) and tier 3 (AVIO), per PLAN-prod-import.md
-#: §7. The Yamaha consoles' Device Control interface (ADR 0022, closing
-#: #42) is a fourth, ``OPERATOR``-sourced port on the console's own type
-#: rather than a separate device type.
+#: §7. The Yamaha consoles' Device Control interface is an ordinary
+#: ``slot_offset=1`` port on the console's own type (ADR 0027, retiring
+#: ADR 0022's ``OPERATOR`` mechanism — closing #42 the same way SD12's
+#: engine already does: offset + 1 from the device's own rack slot).
 DEVICE_TYPES: tuple[DeviceTypeSpec, ...] = (
     DeviceTypeSpec(
         "ik42_with_card",
@@ -327,9 +313,9 @@ DEVICE_TYPES: tuple[DeviceTypeSpec, ...] = (
         "IK-42",
         "with Dante Card",
         (
-            ("Control", FN_CONTROL, 0, *_SLOT),
-            ("Dante Primary", FN_DANTE_PRIMARY, 0, *_SLOT),
-            ("Dante Secondary", FN_DANTE_SECONDARY, 0, *_SLOT),
+            ("Control", FN_CONTROL, 0, ""),
+            ("Dante Primary", FN_DANTE_PRIMARY, 0, ""),
+            ("Dante Secondary", FN_DANTE_SECONDARY, 0, ""),
         ),
     ),
     DeviceTypeSpec(
@@ -337,7 +323,7 @@ DEVICE_TYPES: tuple[DeviceTypeSpec, ...] = (
         "Martin Audio",
         "IK-42",
         "without Dante Card",
-        (("Control", FN_CONTROL, 0, *_SLOT),),
+        (("Control", FN_CONTROL, 0, ""),),
     ),
     DeviceTypeSpec(
         "ik81_with_card",
@@ -345,9 +331,9 @@ DEVICE_TYPES: tuple[DeviceTypeSpec, ...] = (
         "IK-81",
         "with Dante Card",
         (
-            ("Control", FN_CONTROL, 0, *_SLOT),
-            ("Dante Primary", FN_DANTE_PRIMARY, 0, *_SLOT),
-            ("Dante Secondary", FN_DANTE_SECONDARY, 0, *_SLOT),
+            ("Control", FN_CONTROL, 0, ""),
+            ("Dante Primary", FN_DANTE_PRIMARY, 0, ""),
+            ("Dante Secondary", FN_DANTE_SECONDARY, 0, ""),
         ),
     ),
     DeviceTypeSpec(
@@ -355,21 +341,21 @@ DEVICE_TYPES: tuple[DeviceTypeSpec, ...] = (
         "Lab.Gruppen",
         "LM26",
         "Redundant Mode",
-        (("Dante Primary", FN_DANTE_PRIMARY, 0, *_SLOT), ("Dante Secondary", FN_DANTE_SECONDARY, 0, *_SLOT)),
+        (("Dante Primary", FN_DANTE_PRIMARY, 0, ""), ("Dante Secondary", FN_DANTE_SECONDARY, 0, "")),
     ),
     DeviceTypeSpec(
         "lm44",
         "Lab.Gruppen",
         "LM44",
         "Redundant Mode",
-        (("Dante Primary", FN_DANTE_PRIMARY, 0, *_SLOT), ("Dante Secondary", FN_DANTE_SECONDARY, 0, *_SLOT)),
+        (("Dante Primary", FN_DANTE_PRIMARY, 0, ""), ("Dante Secondary", FN_DANTE_SECONDARY, 0, "")),
     ),
     DeviceTypeSpec(
         "plm20000q",
         "Lab.Gruppen",
         "PLM20000Q",
         "Redundant Mode",
-        (("Dante Primary", FN_DANTE_PRIMARY, 0, *_SLOT), ("Dante Secondary", FN_DANTE_SECONDARY, 0, *_SLOT)),
+        (("Dante Primary", FN_DANTE_PRIMARY, 0, ""), ("Dante Secondary", FN_DANTE_SECONDARY, 0, "")),
     ),
     DeviceTypeSpec(
         "sd12",
@@ -377,18 +363,18 @@ DEVICE_TYPES: tuple[DeviceTypeSpec, ...] = (
         "SD12",
         "Default",
         (
-            ("Control", FN_CONTROL, 0, *_SLOT),
-            ("Engine", FN_CONTROL, 1, PortAddressSource.SLOT, "engine"),
+            ("Control", FN_CONTROL, 0, ""),
+            ("Engine", FN_CONTROL, 1, "engine"),
         ),
     ),
-    DeviceTypeSpec("sd9", "DiGiCo", "SD9", "Default", (("Control", FN_CONTROL, 0, *_SLOT),)),
-    DeviceTypeSpec("sd11", "DiGiCo", "SD11", "Default", (("Control", FN_CONTROL, 0, *_SLOT),)),
+    DeviceTypeSpec("sd9", "DiGiCo", "SD9", "Default", (("Control", FN_CONTROL, 0, ""),)),
+    DeviceTypeSpec("sd11", "DiGiCo", "SD11", "Default", (("Control", FN_CONTROL, 0, ""),)),
     DeviceTypeSpec(
         "dmi_dante",
         "DiGiCo",
         "DMI-DANTE",
         "Default",
-        (("Dante Primary", FN_DANTE_PRIMARY, 0, *_SLOT), ("Dante Secondary", FN_DANTE_SECONDARY, 0, *_SLOT)),
+        (("Dante Primary", FN_DANTE_PRIMARY, 0, ""), ("Dante Secondary", FN_DANTE_SECONDARY, 0, "")),
         is_add_in_card=True,
     ),
     DeviceTypeSpec(
@@ -397,23 +383,23 @@ DEVICE_TYPES: tuple[DeviceTypeSpec, ...] = (
         "DM7C",
         "Default",
         (
-            ("Control", FN_CONTROL, 0, *_SLOT),
-            ("Dante Primary", FN_DANTE_PRIMARY, 0, *_SLOT),
-            ("Dante Secondary", FN_DANTE_SECONDARY, 0, *_SLOT),
-            ("Device Control", FN_DANTE_PRIMARY, 0, PortAddressSource.OPERATOR, "device-control"),
+            ("Control", FN_CONTROL, 0, ""),
+            ("Dante Primary", FN_DANTE_PRIMARY, 0, ""),
+            ("Dante Secondary", FN_DANTE_SECONDARY, 0, ""),
+            ("Device Control", FN_DANTE_PRIMARY, 1, "device-control"),
         ),
     ),
-    DeviceTypeSpec("dm7ex", "Yamaha", "DM7-EX", "Default", (("Control", FN_CONTROL, 0, *_SLOT),)),
+    DeviceTypeSpec("dm7ex", "Yamaha", "DM7-EX", "Default", (("Control", FN_CONTROL, 0, ""),)),
     DeviceTypeSpec(
         "dm3",
         "Yamaha",
         "DM3",
         "Default",
         (
-            ("Control", FN_CONTROL, 0, *_SLOT),
-            ("Dante Primary", FN_DANTE_PRIMARY, 0, *_SLOT),
-            ("Dante Secondary", FN_DANTE_SECONDARY, 0, *_SLOT),
-            ("Device Control", FN_DANTE_PRIMARY, 0, PortAddressSource.OPERATOR, "device-control"),
+            ("Control", FN_CONTROL, 0, ""),
+            ("Dante Primary", FN_DANTE_PRIMARY, 0, ""),
+            ("Dante Secondary", FN_DANTE_SECONDARY, 0, ""),
+            ("Device Control", FN_DANTE_PRIMARY, 1, "device-control"),
         ),
     ),
     DeviceTypeSpec(
@@ -422,9 +408,9 @@ DEVICE_TYPES: tuple[DeviceTypeSpec, ...] = (
         "Tio1608-D2",
         "Default",
         (
-            ("Control", FN_CONTROL, 0, *_SLOT),
-            ("Dante Primary", FN_DANTE_PRIMARY, 0, *_SLOT),
-            ("Dante Secondary", FN_DANTE_SECONDARY, 0, *_SLOT),
+            ("Control", FN_CONTROL, 0, ""),
+            ("Dante Primary", FN_DANTE_PRIMARY, 0, ""),
+            ("Dante Secondary", FN_DANTE_SECONDARY, 0, ""),
         ),
     ),
     DeviceTypeSpec(
@@ -433,9 +419,9 @@ DEVICE_TYPES: tuple[DeviceTypeSpec, ...] = (
         "SQ-5",
         "Default",
         (
-            ("Control", FN_CONTROL, 0, *_SLOT),
-            ("Dante Primary", FN_DANTE_PRIMARY, 0, *_SLOT),
-            ("Dante Secondary", FN_DANTE_SECONDARY, 0, *_SLOT),
+            ("Control", FN_CONTROL, 0, ""),
+            ("Dante Primary", FN_DANTE_PRIMARY, 0, ""),
+            ("Dante Secondary", FN_DANTE_SECONDARY, 0, ""),
         ),
     ),
     DeviceTypeSpec(
@@ -443,56 +429,56 @@ DEVICE_TYPES: tuple[DeviceTypeSpec, ...] = (
         "Amphenol",
         "RJD1212-0050",
         "Default",
-        (("Dante Primary", FN_DANTE_PRIMARY, 0, *_SLOT),),
+        (("Dante Primary", FN_DANTE_PRIMARY, 0, ""),),
     ),
     DeviceTypeSpec(
         "avio_amph_rjd2203",
         "Amphenol",
         "RJD2203-0050",
         "Default",
-        (("Dante Primary", FN_DANTE_PRIMARY, 0, *_SLOT),),
+        (("Dante Primary", FN_DANTE_PRIMARY, 0, ""),),
     ),
     DeviceTypeSpec(
         "avio_amph_rjd32a3",
         "Amphenol",
         "RJD32A3-0050",
         "Default",
-        (("Dante Primary", FN_DANTE_PRIMARY, 0, *_SLOT),),
+        (("Dante Primary", FN_DANTE_PRIMARY, 0, ""),),
     ),
     DeviceTypeSpec(
         "avio_amph_rjd32u1",
         "Amphenol",
         "RJD32U1-0050",
         "Default",
-        (("Dante Primary", FN_DANTE_PRIMARY, 0, *_SLOT),),
+        (("Dante Primary", FN_DANTE_PRIMARY, 0, ""),),
     ),
     DeviceTypeSpec(
         "avio_audinate_ao2",
         "Audinate",
         "AVIO-AO2",
         "Default",
-        (("Dante Primary", FN_DANTE_PRIMARY, 0, *_SLOT),),
+        (("Dante Primary", FN_DANTE_PRIMARY, 0, ""),),
     ),
     DeviceTypeSpec(
         "avio_neutrik_na2dline",
         "Neutrik",
         "NA2-DLINE",
         "Default",
-        (("Dante Primary", FN_DANTE_PRIMARY, 0, *_SLOT),),
+        (("Dante Primary", FN_DANTE_PRIMARY, 0, ""),),
     ),
     DeviceTypeSpec(
         "avio_radial_tx",
         "Radial",
         "DiNET DAN-TX",
         "Default",
-        (("Dante Primary", FN_DANTE_PRIMARY, 0, *_SLOT),),
+        (("Dante Primary", FN_DANTE_PRIMARY, 0, ""),),
     ),
     DeviceTypeSpec(
         "avio_radial_rx",
         "Radial",
         "DiNET DAN-RX",
         "Default",
-        (("Dante Primary", FN_DANTE_PRIMARY, 0, *_SLOT),),
+        (("Dante Primary", FN_DANTE_PRIMARY, 0, ""),),
     ),
 )
 
@@ -650,13 +636,6 @@ class _DeviceEntry:
     slot: int
     hostname: str
     type_key: str
-    #: ADR 0022 — a Yamaha console's Device Control address, keyed by the
-    #: type port ``description`` ("Device Control") that will materialize
-    #: it, found by ``_classify_device_control_pairs()`` below and carried
-    #: alongside the host entry so ``_stage9_devices()`` can pass it
-    #: straight to ``NetworkDevice.operator_addresses``. Empty for every
-    #: type with no ``OPERATOR``-sourced port.
-    operator_addresses: dict[str, str] = field(default_factory=dict)
     #: ADR 0022 PR 3 — the hostname of the device this entry's card should
     #: be linked to via ``NetworkDevice.host``, set only for the DMI-DANTE
     #: entry (settled decision 7: linked to the console whose row carried
@@ -1104,14 +1083,13 @@ class _Importer:
             )
             device_type.full_clean()
             device_type.save()
-            for description, function, slot_offset, address_source, hostname_suffix in spec.ports:
+            for description, function, slot_offset, hostname_suffix in spec.ports:
                 type_port = NetworkDeviceTypePort(
                     device_type=device_type,
                     description=description,
                     port_type=PortType.GBE_RJ45,
                     vlan=self.vlans_by_function[function],
                     slot_offset=slot_offset,
-                    address_source=address_source,
                     hostname_suffix=hostname_suffix,
                     created_by=self.user,
                 )
@@ -1139,14 +1117,10 @@ class _Importer:
         for row in deduped:
             max_slot_by_rack[row.rack] = max(max_slot_by_rack.get(row.rack, 0), row.slot)
 
-        # Device Control pre-pass (ADR 0022) — runs to completion before
+        # Device Control pre-pass (ADR 0027) — runs to completion before
         # the main per-row loop below, so a Device Control row is always
-        # consumed before that loop reaches it regardless of CSV order
-        # (the DM7C's Device Control row precedes its host; the DM3's
-        # follows it). See _classify_device_control_pairs()'s own docstring for
-        # why this can't be expressed as the SD12 pass's slot-adjacency
-        # instead.
-        self._classify_device_control_pairs(deduped, consumed, device_entries)
+        # consumed before that loop reaches it regardless of CSV order.
+        self._classify_device_control_pairs(deduped, by_key, consumed, device_entries)
 
         for row in deduped:
             key = (row.rack, row.slot)
@@ -1234,77 +1208,63 @@ class _Importer:
     def _classify_device_control_pairs(
         self,
         deduped: list[AddressingRow],
+        by_key: dict[tuple[str, int], AddressingRow],
         consumed: set[tuple[str, int]],
         device_entries: list[_DeviceEntry],
     ) -> None:
-        """Pairs a ``<host>-device-control`` row with its host (ADR 0022),
-        emitting one merged ``_DeviceEntry`` at the *host's* slot — the
-        Device Control row's own address folded into the host's
-        ``operator_addresses`` rather than a separate device — and marking
-        both rows consumed before ``_classify_addressing_rows()``'s main
-        per-row loop ever reaches either of them.
+        """Pairs a ``<host>-device-control`` row with its host, one slot
+        below it (ADR 0027) — the same "collapse a same-device second row
+        into the host's own ``_DeviceEntry``" shape the SD12 Control/Engine
+        pass below uses, now that a Yamaha console's Device Control
+        interface is an ordinary ``slot_offset=1`` type port rather than an
+        ``OPERATOR``-sourced one (ADR 0022's mechanism, retired). Nothing
+        here reads this row's own address — ``NetworkDevice._materialize_
+        ports()`` derives it from the host's own ``rack_slot + 1``, same as
+        SD12's Engine.
 
-        Keyed on hostname, not the SD12 pass's slot-adjacency
-        (``row.slot + 1``) — that can't express a Device Control row sitting
-        *below* its host (the DM7C's interface, one address below its
-        console) and *above* it (the DM3's, one address above) in the
-        same catalog. Matches case-insensitively, within one rack — the
-        same convention the pre-ADR-0022 importer used, stated once here
-        since this importer is the forward-going path.
+        Positional (``row.slot - 1``), not the pre-ADR-0027 importer's
+        hostname scan across the whole rack: both consoles' Device Control
+        interfaces sit one slot *above* their host now (the DM7C's used to
+        sit below — a hand re-address, ADR 0027's plan "Step 0", moved it
+        to match before this catalog could stop declaring an ``OPERATOR``-
+        sourced port at all).
 
-        Zero or several stem matches, or a host type with no
-        ``OPERATOR``-sourced type port to receive the address (a rename,
-        or a row misclassified as a Device Control row) is a loud
-        ``CommandError`` — never a guess.
+        Marks both rows consumed before ``_classify_addressing_rows()``'s
+        main per-row loop ever reaches either of them, matching the SD12
+        pass's own consumed-before-main-loop ordering.
+
+        A stem that doesn't match the row actually sitting at ``slot - 1``,
+        or a host type with no "Device Control" type port at all (a
+        rename, or a row misclassified as a Device Control row), is a
+        loud ``CommandError`` — never a guess.
         """
         for row in deduped:
             key = (row.rack, row.slot)
             if key in consumed or not row.description.lower().endswith(DEVICE_CONTROL_SUFFIX):
                 continue
             stem = row.description[: -len(DEVICE_CONTROL_SUFFIX)]
-            matches = [
-                other
-                for other in deduped
-                if other.rack == row.rack and other is not row and other.description.lower() == stem.lower()
-            ]
-            if len(matches) != 1:
+            host_key = (row.rack, row.slot - 1)
+            host_row = by_key.get(host_key)
+            if host_row is None or host_row.description.lower() != stem.lower():
                 raise CommandError(
                     f"Device Control row {row.description!r} at {row.rack} slot {row.slot} (ADR "
-                    f"0022): expected exactly one host row matching {stem!r} (case-insensitive) "
-                    f"in the same rack, found {len(matches)}."
+                    f"0027): expected a host row matching {stem!r} (case-insensitive) at slot "
+                    f"{row.slot - 1}, found none."
                 )
-            host_row = matches[0]
-            host_key = self._device_type_key_for(host_row)
-            host_spec = SPEC_BY_KEY[host_key]
-            operator_ports = [
-                (description, function)
-                for description, function, _slot_offset, address_source, _hostname_suffix in host_spec.ports
-                if address_source == PortAddressSource.OPERATOR
-            ]
-            if len(operator_ports) != 1:
+            type_key = self._device_type_key_for(host_row)
+            type_spec = SPEC_BY_KEY[type_key]
+            has_device_control = any(
+                description == "Device Control"
+                for description, _function, _offset, _suffix in type_spec.ports
+            )
+            if not has_device_control:
                 raise CommandError(
                     f"Device Control row {row.description!r} matches host {host_row.description!r} "
-                    f"(type {host_key!r}), but that type declares {len(operator_ports)} "
-                    "OPERATOR-sourced ports, not exactly one — ADR 0022 catalog mismatch."
+                    f"(type {type_key!r}), but that type declares no 'Device Control' port — "
+                    "ADR 0027 catalog mismatch."
                 )
-            port_description, function = operator_ports[0]
-            address = _ADDRESS_BY_FUNCTION[function](row)
-            if not address:
-                raise CommandError(
-                    f"Device Control row {row.description!r} at {row.rack} slot {row.slot} has no "
-                    f"address for {function!r} — nothing to give {host_row.description!r}'s "
-                    f"{port_description!r} port."
-                )
-            device_entries.append(
-                _DeviceEntry(
-                    host_row.rack,
-                    host_row.slot,
-                    host_row.description,
-                    host_key,
-                    operator_addresses={port_description: address},
-                )
-            )
-            consumed.add((host_row.rack, host_row.slot))
+            device_entries.append(_DeviceEntry(host_row.rack, host_row.slot, host_row.description, type_key))
+            consumed.add(host_key)
             consumed.add(key)
 
     @staticmethod
@@ -1374,20 +1334,15 @@ class _Importer:
                         f"{entry.hostname or entry.type_key!r} at {entry.rack}/{entry.slot} names "
                         f"host {entry.host_hostname!r}, but no such device has been created yet."
                     ) from None
-            device = NetworkDevice(  # type: ignore[misc]
+            device = NetworkDevice(
                 device_type=device_type,
                 rack=rack,
                 rack_slot=entry.slot,
                 hostname=entry.hostname,
-                # ADR 0022 — {} for every ordinary entry; populated only by
-                # _classify_device_control_pairs() for a Device Control host
-                # entry, and _materialize_ports() ignores it entirely
-                # unless device_type actually has an OPERATOR-sourced port.
-                operator_addresses=entry.operator_addresses,
                 host=host,
                 created_by=self.user,
             )
             device.full_clean()
-            device.save()  # materializes static addresses (ADR 0013, 0017, 0022)
+            device.save()  # materializes static addresses (ADR 0013, 0017, 0027)
             if entry.hostname:
                 devices_by_hostname[entry.hostname] = device
