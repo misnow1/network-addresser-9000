@@ -134,8 +134,20 @@ state that should not have existed is effort in the wrong place.
 3. Set Device Control to `10.201.6.5`.
 4. Re-address both interfaces on the hardware.
 
-`mps-dm7ex-1` stays at ordinal 6 throughout. After this, both surviving `OPERATOR` ports are `+1`
-and the estate is 132/132 conforming.
+`mps-dm7ex-1` stays at ordinal 6 throughout.
+
+**Done 2026-08-26 and verified.** `mps-dm7c-1` sits at slot 4 with Dante Primary `10.201.6.4` and
+Device Control `10.201.6.5`; `mps-dm7ex-1` is undisturbed at 6; no ordinal is doubly claimed.
+
+The conformance report still reads **130/132**, and that is the correct reading of a *completed*
+step 0 — not a failure. `measure-adr-0027.py` compares each address's *implied* offset against its
+port's **declared** `slot_offset`, and the two Device Control ports stay `declared=0` until
+migration `0023` rewrites their type ports to `slot_offset=1`. What step 0 actually achieves is
+narrower and is what the migration needs: **both implied offsets are now `+1`**, so there is a
+single positive value for `0023` to write, and no ordinal collides once it does.
+
+132/132 is reachable only *after* `0023`. An earlier revision of this plan claimed step 0 would
+reach it, which was wrong.
 
 ## PR 1 — derived addresses, and the retirement of `OPERATOR`
 
@@ -178,8 +190,10 @@ review and hard to roll back.
 ## Verification
 
 - `set -a; source .env; set +a` then `python manage.py test inventory` — green.
-- `docs/plans/measure-adr-0027.py` against the app container reports **132/132** conforming, both
-  before `0023` drops the column and after PR 1 merges.
+- `docs/plans/measure-adr-0027.py` against the app container reports **PRE-MIGRATION GATE: GREEN**
+  before `0023` runs — every `OPERATOR` port's implied offset a single non-negative value, and no
+  doubly-claimed ordinal — and **132/132 conforming** after PR 1 merges. It reads 130/132 in
+  between, by construction: declared offsets are what `0023` writes.
 - `python manage.py verify_prod_import` still passes.
 - A Shure receiver with offsets `{0, 64}` claims exactly 2 ordinals; ordinals `N+1..N+63` remain
   free and placeable (**#83**).

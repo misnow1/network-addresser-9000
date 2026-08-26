@@ -93,3 +93,29 @@ for rack in {d.rack for d in NetworkDevice.objects.filter(rack__isnull=False).se
             print(f"  {rack} ordinal {ordinal}: {'; '.join(holders)}")
 if not clashes:
     print("  none")
+
+print()
+print("=== pre-migration gate (for migration 0023) ===")
+# Before 0023 runs, a non-conforming port is EXPECTED: the two Device Control
+# ports still declare slot_offset=0, and rewriting them to the offset their
+# address already implies is exactly what 0023 does. So the gate is not
+# "132/132" -- that is only reachable afterwards. What 0023 needs is that every
+# divergent port implies a single non-negative offset it can write, and that
+# nothing collides once written.
+blockers = []
+for device, port, _ordinal, implied in divergent:
+    if implied < 0:
+        blockers.append(f"{device} [{port.description}] implies a negative offset ({implied})")
+if clashes:
+    blockers.append(f"{clashes} doubly-claimed ordinal(s)")
+
+if blockers:
+    print("  BLOCKED:")
+    for blocker in blockers:
+        print(f"    - {blocker}")
+elif divergent:
+    print(f"  GREEN -- {len(divergent)} port(s) awaiting 0023, all implying a positive offset:")
+    for device, port, _ordinal, implied in divergent:
+        print(f"    - {device} [{port.description}] -> slot_offset={implied}")
+else:
+    print("  GREEN -- nothing left for 0023 to rewrite (already 132/132)")
