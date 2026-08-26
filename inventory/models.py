@@ -356,40 +356,60 @@ def _suggest_rack_slot_address(
         return None
 
 
-def occupied_rack_slot_ranges(rack: "Rack") -> list[tuple[int, int]]:
-    """Every occupied ``(start, end)`` ordinal range in ``rack``, unioning
-    both equipment tables (ADR 0019). Public — unlike its ``_``-prefixed
-    neighbour above — because ``admin.py`` calls this to feed
-    ``suggestions.lowest_free_run()``.
+def occupied_rack_slot_ordinals(rack: "Rack") -> dict[int, str]:
+    """Every ordinal claimed in ``rack`` (ADR 0027), mapped to a label for
+    whatever claims it — a switch's own ``rack_slot``, or ``{rack_slot +
+    offset}`` for each distinct ``slot_offset`` a device's type declares,
+    always including 0 (a device occupies its own slot regardless of
+    whether any type port sits there — ``NetworkDeviceType.
+    claimed_offsets``).
 
-    Switches always span 1 (``RackSlotAssignmentMixin.slot_span``), so
-    they need no aggregate. Devices reuse the existing span annotation
-    verbatim rather than inventing a second one — the same
-    ``Coalesce(Max("device_type__type_ports__slot_offset"), 0) + 1`` used
-    by ``NetworkSwitch._check_rack_slot_not_occupied()`` and
-    ``NetworkDevice._check_rack_slot_not_occupied()`` — so an already-
-    stored spanning device contributes its whole range here too, not just
-    its starting ordinal.
+    Two bounded queries — the same "two, not per-row" budget
+    ``occupied_rack_slot_ranges()`` (below, now built on this) always had.
+    Switches need no join (a switch always claims exactly one ordinal, its
+    own). Devices join straight through to ``device_type__type_ports`` in
+    **one** query — SQL aggregates can express "the highest offset"
+    (``slot_span``) but not "the distinct set of offsets", so this walks
+    the join's rows (one per (device, type port) pair — a ``LEFT OUTER
+    JOIN``, so a type with zero type ports still contributes one row, with
+    a ``None`` offset) in Python instead of annotating them.
 
-    ``rack_slot__isnull=False`` is filtered defensively even though
-    ``rack``/``rack_slot`` are all-or-neither (``RackSlotAssignmentMixin.
-    clean()``); two bounded queries, no aggregate per row.
+    Last write wins on a genuinely double-claimed ordinal (reachable only
+    through a ``clean()``-bypassing bare ``.save()`` — see
+    ``RackSlotAssignmentMixin``'s "Known gap" docstring); this is a
+    convenience lookup, not the authority on conflicts, which the rack
+    elevation surfaces separately (``ElevationRow.conflicts``).
     """
-    switch_slots = NetworkSwitch.objects.filter(rack=rack, rack_slot__isnull=False).values_list(
-        "rack_slot", flat=True
-    )
-    # cast(int, ...): rack_slot/_end are guaranteed non-null by the
-    # isnull=False filter above, but the queryset's own typing can't
-    # express that.
-    switch_ranges = [(cast(int, slot), cast(int, slot)) for slot in switch_slots]
-    device_ranges = [
-        (cast(int, start), cast(int, end))
-        for start, end in NetworkDevice.objects.filter(rack=rack, rack_slot__isnull=False)
-        .annotate(_span=Coalesce(models.Max("device_type__type_ports__slot_offset"), 0) + 1)
-        .annotate(_end=models.F("rack_slot") + models.F("_span") - 1)
-        .values_list("rack_slot", "_end")
-    ]
-    return switch_ranges + device_ranges
+    ordinals: dict[int, str] = {}
+    for rack_slot, hostname, pk in NetworkSwitch.objects.filter(
+        rack=rack, rack_slot__isnull=False
+    ).values_list("rack_slot", "hostname", "pk"):
+        ordinals[cast(int, rack_slot)] = hostname or f"Switch #{pk}"
+    for device_id, hostname, rack_slot, offset in NetworkDevice.objects.filter(
+        rack=rack, rack_slot__isnull=False
+    ).values_list("id", "hostname", "rack_slot", "device_type__type_ports__slot_offset"):
+        label = hostname or f"Device #{device_id}"
+        ordinals[cast(int, rack_slot)] = label  # offset 0 always claimed, regardless of ports
+        ordinals[cast(int, rack_slot) + (offset or 0)] = label
+    return ordinals
+
+
+def occupied_rack_slot_ranges(rack: "Rack") -> list[tuple[int, int]]:
+    """Every occupied ordinal in ``rack``, unioning both equipment tables
+    (ADR 0019), as a list of ``(o, o)`` singleton ranges. Public — unlike
+    its ``_``-prefixed neighbour above — because ``admin.py`` calls this to
+    feed ``suggestions.lowest_free_run()`` for the switch path (a switch
+    always spans 1, so a set of ordinals and a set of length-1 ranges are
+    the same thing).
+
+    Built on ``occupied_rack_slot_ordinals()`` (ADR 0027) rather than a
+    second, span-based query — a device's own placement search moved to
+    ``suggestions.lowest_free_placement()``, which wants the raw ordinal
+    set directly and no longer calls this at all (ADR 0027 decision 2: the
+    device path stops being a ``lowest_free_run()`` caller, since a
+    claimed set isn't generally a contiguous run).
+    """
+    return [(ordinal, ordinal) for ordinal in sorted(occupied_rack_slot_ordinals(rack))]
 
 
 def _address_containment_error(
@@ -2048,10 +2068,12 @@ class RackSlotAssignmentMixin:
     can't be expressed as a DB constraint.
 
     Also cross-checks the *other* equipment table so a switch and a device
-    can't both claim an occupied ordinal — since ADR 0017 lets a device
-    span several ordinals (``slot_span`` > 1), this is a range-overlap
-    check, not just an exact-match one; see ``_check_rack_slot_not_
-    occupied()`` on each subclass. This is an interim, form/full_clean-time
+    can't both claim an occupied ordinal — since a device claims the
+    **set** of ordinals ``{rack_slot + offset}`` for each offset its type
+    declares (ADR 0027 decision 2), not necessarily a contiguous run, this
+    is a set-membership check, not merely a range-overlap or exact-match
+    one; see ``_check_rack_slot_not_occupied()`` on each subclass. This is
+    an interim, form/full_clean-time
     guard, not a concurrency-safe one — a shared rack-occupancy table would
     be needed to close the direct-ORM/race-condition gap. That's re-filed
     under ``ROADMAP.md``'s "Later / not yet designed" section (the "Rack
@@ -3217,24 +3239,35 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
             )
 
     def _check_rack_slot_not_occupied(self) -> None:
-        # A plain rack_slot=self.rack_slot equality test (pre-ADR-0017)
-        # can't see a device that starts at an earlier ordinal and spans
-        # through this switch's slot (e.g. a device at 7 with slot_span 2
-        # occupying 7-8, and a switch trying to claim 8) — so this is a
-        # range-overlap query against the annotated device end, not an
-        # equality test, even though a switch itself always spans exactly
-        # one ordinal (plan review note 6).
-        conflict = (
+        """ADR 0027: a switch always claims exactly its own ordinal, but a
+        device's claim is a **set**, not a contiguous span
+        (``NetworkDeviceType.claimed_offsets``), so an equality test
+        against a device's ``rack_slot`` alone would miss a device whose
+        offset ports reach this switch's slot without starting there (a
+        device at 7 with offsets ``{0, 1}`` occupying 7 and 8, and a
+        switch trying to claim 8).
+
+        The query below still narrows candidates to those whose own
+        contiguous *envelope* (``rack_slot .. rack_slot + slot_span - 1``)
+        could possibly reach this switch's slot — cheap, and sufficient as
+        a prefilter, since any *actual* claimed ordinal is necessarily
+        inside that envelope — and the exact, set-based check happens in
+        Python afterward, the same "SQL can bound, only Python can express
+        a set" split ``occupied_rack_slot_ordinals()`` documents.
+        """
+        candidates = (
             NetworkDevice.objects.filter(rack=self.rack, rack_slot__lte=self.rack_slot)
             .annotate(_span=Coalesce(models.Max("device_type__type_ports__slot_offset"), 0) + 1)
             .annotate(_end=models.F("rack_slot") + models.F("_span") - 1)
             .filter(_end__gte=self.rack_slot)
-            .first()
+            .select_related("device_type")
         )
-        if conflict is not None:
-            raise ValidationError(
-                f"Rack slot {self.rack_slot} in {self.rack} is already occupied by a device."
-            )
+        for candidate in candidates:
+            assert candidate.rack_slot is not None  # DB constraint: rack and rack_slot are all-or-neither
+            if self.rack_slot in {candidate.rack_slot + offset for offset in candidate.claimed_offsets}:
+                raise ValidationError(
+                    f"Rack slot {self.rack_slot} in {self.rack} is already occupied by a device."
+                )
 
     def _validate_existing_addresses_still_fit(self) -> None:
         for address in self.addresses.all():
@@ -3642,9 +3675,16 @@ class NetworkDeviceType(AuditedModel):
 
     @property
     def slot_span(self) -> int:
-        """Ordinal range an instance of this type occupies:
-        ``max(slot_offset) + 1`` across its type ports (ADR 0017), or ``1``
-        for a type with no offset ports (or no ports at all yet).
+        """``max(slot_offset) + 1`` across this type's ports (ADR 0017), or
+        ``1`` for a type with no offset ports (or no ports at all yet) —
+        the highest ordinal an instance's claim *reaches*. Kept **only**
+        for the rack ``slot_count`` bound (``rack_slot + slot_span - 1 <=
+        slot_count``), which genuinely is about the highest ordinal
+        reached, not the full set of ordinals claimed. See
+        ``claimed_offsets`` below for occupancy proper (ADR 0027 decision
+        2) — two honest concepts rather than forcing both through one
+        number: a type with offsets ``{0, 64}`` has a ``slot_span`` of 65
+        but a ``claimed_offsets`` of only ``{0, 64}``.
 
         Computed, not stored — a type's port list is immutable once any
         instance exists (ADR 0010), so this can never drift from what a
@@ -3658,6 +3698,26 @@ class NetworkDeviceType(AuditedModel):
         """
         max_offset = self.type_ports.aggregate(models.Max("slot_offset"))["slot_offset__max"]
         return (max_offset or 0) + 1
+
+    @property
+    def claimed_offsets(self) -> frozenset[int]:
+        """Every distinct ordinal, relative to an instance's own
+        ``rack_slot``, this type's instances claim (ADR 0027 decision 2) —
+        ``{rack_slot + offset for offset in claimed_offsets}`` is the
+        occupied ordinal **set**, not a range: a type with offsets ``{0,
+        64}`` claims exactly two ordinals and is indifferent to the 63
+        between them (the fix for issue #83).
+
+        Always includes ``0`` — a device occupies its own slot regardless
+        of whether any type port is actually declared there. Computed, not
+        stored, same reasoning as ``slot_span`` above; the two are
+        deliberately separate properties (``slot_span`` for the
+        ``slot_count`` bound, this for occupancy) rather than one value
+        pressed into both jobs.
+        """
+        offsets = set(self.type_ports.values_list("slot_offset", flat=True))
+        offsets.add(0)
+        return frozenset(offsets)
 
     def clean(self) -> None:
         super().clean()
@@ -4305,12 +4365,24 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         via ``_get_related()`` so an unsaved device with no type assigned
         yet still cleans (mirrors the same defensive pattern used
         throughout this module for a possibly-unset FK on an in-progress
-        instance).
+        instance). See ``NetworkDeviceType.slot_span`` — kept only for the
+        ``slot_count`` bound; see ``claimed_offsets`` below for occupancy.
         """
         device_type = _get_related(self, "device_type")
         if device_type is None or device_type.pk is None:
             return 1
         return device_type.slot_span
+
+    @property
+    def claimed_offsets(self) -> frozenset[int]:
+        """Delegates to ``device_type.claimed_offsets`` (ADR 0027) —
+        ``{0}`` for an unsaved device with no type assigned yet, mirroring
+        ``slot_span``'s identical defensive fallback above.
+        """
+        device_type = _get_related(self, "device_type")
+        if device_type is None or device_type.pk is None:
+            return frozenset({0})
+        return device_type.claimed_offsets
 
     def _materializes_static(self) -> bool:
         """Whether this (not-yet-materialized) device will get static
@@ -4538,41 +4610,57 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
                 )
 
     def _check_rack_slot_not_occupied(self) -> None:
+        """ADR 0027: overlap is checked against the exact **set** of
+        ordinals each occupant claims (``claimed_offsets``), not a
+        contiguous span — the write-path half of the fix for #83, whose
+        whole point is that a device with offsets ``{0, 64}`` must not
+        block the 63 ordinals between them for some other occupant.
+
+        The queries below still narrow candidates to those whose own
+        contiguous *envelope* (``rack_slot .. rack_slot + slot_span - 1``)
+        could possibly overlap mine — cheap, and sufficient as a
+        prefilter, since any *actual* claimed ordinal is necessarily
+        inside that envelope — and the exact, set-based check happens in
+        Python afterward, the same "SQL can bound, only Python can express
+        a set" split ``occupied_rack_slot_ordinals()`` documents.
+        """
         if self.rack_slot is None:
             return  # only ever called from clean() once rack/rack_slot are both set
-        my_start = self.rack_slot
-        my_end = self.rack_slot + self.slot_span - 1
-        if NetworkSwitch.objects.filter(
-            rack=self.rack, rack_slot__gte=my_start, rack_slot__lte=my_end
-        ).exists():
+        my_ordinals = {self.rack_slot + offset for offset in self.claimed_offsets}
+        my_start = min(my_ordinals)
+        my_end = max(my_ordinals)
+        switch_conflict = NetworkSwitch.objects.filter(rack=self.rack, rack_slot__in=my_ordinals).first()
+        if switch_conflict is not None:
             raise ValidationError(
-                f"Rack slot(s) {my_start}-{my_end} in {self.rack} are already occupied by a switch."
-                if my_end != my_start
-                else f"Rack slot {self.rack_slot} in {self.rack} is already occupied by a switch."
+                f"Rack slot {switch_conflict.rack_slot} in {self.rack} is already occupied by a switch."
             )
         # Devices only — unique(rack, rack_slot) already catches an equal
         # starting ordinal at the DB level; this catches the case that
-        # constraint can't: another device's span overlapping ours without
-        # sharing a starting ordinal (a device at 7 spanning 7-8, a new one
-        # at 8). Annotates every other device's own end ordinal from its
-        # type's slot_span (a switch always spans 1, so only this side
-        # needs the aggregate — plan review note 6) and tests range overlap
-        # against it, not equality.
-        conflict = (
+        # constraint can't: another device's claim overlapping ours
+        # without sharing a starting ordinal (a device at 7 with offsets
+        # {0, 1} occupying 7-8, a new one at 8). Annotates every other
+        # device's own end ordinal from its type's slot_span (a switch
+        # always spans 1, so only this side needs the aggregate — plan
+        # review note 6) to narrow candidates cheaply in SQL; the exact,
+        # ordinal-exact test happens in Python via set intersection.
+        candidates = (
             NetworkDevice.objects.filter(rack=self.rack, rack_slot__lte=my_end)
             .exclude(pk=self.pk)
             .annotate(_span=Coalesce(models.Max("device_type__type_ports__slot_offset"), 0) + 1)
             .annotate(_end=models.F("rack_slot") + models.F("_span") - 1)
             .filter(_end__gte=my_start)
-            .first()
+            .select_related("device_type")
         )
-        if conflict is not None:
-            assert conflict.rack_slot is not None  # DB constraint: rack and rack_slot are all-or-neither
-            conflict_end = conflict.rack_slot + conflict.slot_span - 1
-            raise ValidationError(
-                f"Rack slot(s) {my_start}-{my_end} in {self.rack} overlap {conflict}'s existing "
-                f"occupied range ({conflict.rack_slot}-{conflict_end})."
-            )
+        for candidate in candidates:
+            assert candidate.rack_slot is not None  # DB constraint: rack and rack_slot are all-or-neither
+            other_ordinals = {candidate.rack_slot + offset for offset in candidate.claimed_offsets}
+            overlap = sorted(my_ordinals & other_ordinals)
+            if overlap:
+                raise ValidationError(
+                    f"Rack slot(s) {overlap} in {self.rack} "
+                    f"{'is' if len(overlap) == 1 else 'are'} already occupied by {candidate} "
+                    f"(claiming {sorted(other_ordinals)})."
+                )
 
     def _validate_existing_addresses_still_fit(self) -> None:
         for port in self.ports.filter(address__isnull=False):

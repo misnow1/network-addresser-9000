@@ -266,6 +266,18 @@ class Occupant:
 
     @property
     def bracketed(self) -> bool:
+        """True whenever this occupant's span is more than one ordinal.
+
+        Knowingly wrong for a *sparse* claim under ADR 0027 decision 2 —
+        a device's occupancy is now the **set** ``{rack_slot + offset}``
+        for each declared offset, not the contiguous range ``span`` still
+        describes here, so a device with offsets ``{0, 64}`` renders a
+        bracket asserting 65 ordinals of contiguity when only 2 are
+        actually claimed. Deliberately deferred to issue #93, to be taken
+        with the other rack-cell work (#82 and the device-model-
+        description pass) rather than designing that cell three times —
+        see ADR 0027's "Known gaps".
+        """
         return self.span > 1
 
 

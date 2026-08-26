@@ -46,10 +46,17 @@ from .models import (
     _format_allocation,
     _lock_devices_by_pk,
     _vlan_alignment_input,
+    occupied_rack_slot_ordinals,
     occupied_rack_slot_ranges,
     switch_port_profile_summary,
 )
-from .suggestions import lowest_free_run, range_at_offset, range_offset, suggest_aligned_offset
+from .suggestions import (
+    lowest_free_placement,
+    lowest_free_run,
+    range_at_offset,
+    range_offset,
+    suggest_aligned_offset,
+)
 
 
 class AuditedModelAdminMixin:
@@ -1180,13 +1187,16 @@ class NetworkDeviceAddForm(forms.ModelForm):
         return type(cls.__name__, (cls,), extra_fields)
 
     def clean(self) -> dict[str, Any]:
-        """A blank ``rack_slot`` is filled in with the lowest free ordinal
-        (ADR 0019) — never overwriting a typed value.
+        """A blank ``rack_slot`` is filled in with the lowest ordinal at
+        which the chosen type's ``claimed_offsets`` are all free (ADR
+        0027's ``lowest_free_placement()`` — the placement suggester for a
+        device claiming a *set* of ordinals rather than a contiguous span,
+        the fix for issue #62/#83's suggestion half) — never overwriting a
+        typed value.
 
         Bails outright unless both ``rack`` and ``device_type`` cleaned: a
-        field error on either means the span needed for the search is
-        unknowable, so the ordinary field error is left to surface on its
-        own.
+        field error on either means the placement search is unknowable, so
+        the ordinary field error is left to surface on its own.
         """
         cleaned_data = super().clean() or {}
         rack = cleaned_data.get("rack")
@@ -1209,12 +1219,13 @@ class NetworkDeviceAddForm(forms.ModelForm):
             return cleaned_data
         host_slot = cleaned_data.get("rack_slot")
         if host_slot is None:
-            occupied = occupied_rack_slot_ranges(rack)
-            host_slot = lowest_free_run(occupied, device_type.slot_span, rack.slot_count)
+            occupied = occupied_rack_slot_ordinals(rack)
+            host_slot = lowest_free_placement(occupied, device_type.claimed_offsets, rack.slot_count)
             if host_slot is None:
                 self.add_error(
                     "rack_slot",
-                    f"No free rack slot for a span of {device_type.slot_span} in {rack} "
+                    f"No free rack slot for {device_type}'s claimed ordinals "
+                    f"({sorted(device_type.claimed_offsets)} from the slot) in {rack} "
                     f"(slot_count {rack.slot_count}).",
                 )
                 return cleaned_data
