@@ -4891,8 +4891,11 @@ class NetworkDevicePort(AuditedModel):
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None) -> None:
         with transaction.atomic():
             flipping_to_static = False
+            flipping_to_dhcp = False
             if self.pk is not None:
-                flipping_to_static = self._persisted_is_dhcp() is True and not self.is_dhcp
+                persisted_is_dhcp = self._persisted_is_dhcp()
+                flipping_to_static = persisted_is_dhcp is True and not self.is_dhcp
+                flipping_to_dhcp = persisted_is_dhcp is False and self.is_dhcp
                 if flipping_to_static:
                     # ADR 0013's DHCP-to-static conversion, restored under
                     # ADR 0027 decision 1 (see the method's own docstring):
@@ -4914,11 +4917,27 @@ class NetworkDevicePort(AuditedModel):
                             exclude_switch_address_pk=None,
                             exclude_device_port_pk=self.pk,
                         )
+                elif flipping_to_dhcp:
+                    # The symmetric edge: ADR 0013's static-to-DHCP
+                    # direction was always meant to "already clear the
+                    # address" (ADR 0027 decision 1's own words), but
+                    # nothing ever did — ``_locked_fields()`` locks
+                    # ``address`` unconditionally and the only exemption
+                    # was the opposite flip above, so this transition was
+                    # dead both ways (clear it yourself and the lock
+                    # rejects the change; leave it and clean() refuses a
+                    # DHCP port with a static address). Clearing it here,
+                    # server-side, doesn't depend on the admin form
+                    # actually submitting ``None`` — the form's own
+                    # ``address`` field stays ``disabled`` on every
+                    # persisted row, so it always resubmits the old
+                    # value regardless of which way ``is_dhcp`` flips.
+                    self.address = None
                 locked_fields = self._locked_fields()
-                if flipping_to_static:
+                if flipping_to_static or flipping_to_dhcp:
                     # The one field this transition is allowed to change —
-                    # already derived and validated above, not compared
-                    # against the persisted (necessarily NULL) value.
+                    # already derived/cleared and validated above, not
+                    # compared against the persisted value.
                     del locked_fields["address"]
                 _check_locked_fields_unchanged(
                     NetworkDevicePort, self.pk, locked_fields, update_fields=update_fields
@@ -4985,17 +5004,25 @@ class NetworkDevicePort(AuditedModel):
 
     def clean(self) -> None:
         super().clean()
-        flipping_to_static = self.pk is not None and self._persisted_is_dhcp() is True and not self.is_dhcp
+        persisted_is_dhcp = self._persisted_is_dhcp() if self.pk is not None else None
+        flipping_to_static = self.pk is not None and persisted_is_dhcp is True and not self.is_dhcp
+        flipping_to_dhcp = self.pk is not None and persisted_is_dhcp is False and self.is_dhcp
         if self.pk is not None:
             locked_fields = self._locked_fields()
-            if flipping_to_static:
+            if flipping_to_static or flipping_to_dhcp:
                 # See save()'s identical carve-out — the ADR 0013
                 # DHCP-to-static conversion, restored under ADR 0027
-                # decision 1, is the one case allowed to change ``address``
-                # on a persisted row, and it's derived (not compared)
+                # decision 1, and its symmetric static-to-DHCP sibling,
+                # are the only cases allowed to change ``address`` on a
+                # persisted row, and it's derived/cleared (not compared)
                 # below.
                 del locked_fields["address"]
             _check_locked_fields_unchanged(NetworkDevicePort, self.pk, locked_fields, update_fields=None)
+        if flipping_to_dhcp:
+            # The reverse of the flip below: static to DHCP was always
+            # supposed to "already clear the address" (ADR 0027 decision
+            # 1), but nothing did — see save()'s identical carve-out.
+            self.address = None
         if self.is_dhcp:
             if self.address:
                 raise ValidationError("DHCP ports must not have a static address.")
@@ -5079,14 +5106,16 @@ class NetworkDevicePort(AuditedModel):
         # method for that forgery to exploit — this dict itself never
         # drops ``"address"``.
         #
-        # There is exactly one privileged *transition* that still needs
-        # to change it: the ADR 0013 DHCP-to-static flip, restored under
-        # decision 1 (``_derive_address_on_flip_to_static()``). That
-        # exemption doesn't live here — ``save()``/``clean()`` delete
+        # There are exactly two privileged *transitions* that still need
+        # to change it, on either side of the DHCP/static boundary: the
+        # ADR 0013 DHCP-to-static flip, restored under decision 1
+        # (``_derive_address_on_flip_to_static()``), and its symmetric
+        # static-to-DHCP sibling, which simply clears it. Neither
+        # exemption lives here — ``save()``/``clean()`` delete
         # ``"address"`` from the dict *this method returns*, after
         # deciding for themselves (by reading the persisted ``is_dhcp``
-        # fresh from the database, not trusting ``self``) that the
-        # transition is genuinely happening. A forged ``self.is_dhcp``
+        # fresh from the database, not trusting ``self``) that one of the
+        # transitions is genuinely happening. A forged ``self.is_dhcp``
         # can't manufacture that exemption on its own, since the decision
         # never reads it as final without the fresh comparison.
         return {
@@ -5113,11 +5142,12 @@ class NetworkDevicePort(AuditedModel):
     def _persisted_is_dhcp(self) -> bool | None:
         """The persisted ``is_dhcp`` for this row, or ``None`` for an
         unsaved instance — what ``save()``/``clean()`` compare ``self.
-        is_dhcp`` against to detect the ADR 0013 DHCP-to-static flip
-        (restored under ADR 0027 decision 1's derive-on-flip): the one
-        edge that's still allowed to change ``address`` on a persisted
-        row, despite ``_locked_fields()`` locking it unconditionally
-        everywhere else.
+        is_dhcp`` against to detect either flip across the DHCP/static
+        boundary: the ADR 0013 DHCP-to-static conversion (restored under
+        ADR 0027 decision 1's derive-on-flip) and its symmetric
+        static-to-DHCP sibling. These are the only two edges still
+        allowed to change ``address`` on a persisted row, despite
+        ``_locked_fields()`` locking it unconditionally everywhere else.
         """
         if self.pk is None:
             return None

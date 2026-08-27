@@ -80,7 +80,14 @@ is the trigger, the same way setting the rack slot is the trigger for a new port
 system writes this field" changes. An unracked device has no rack slot to derive from, so the flip
 is refused for exactly the reason materialization already refuses static addressing for an unracked
 device — there is nothing new to argue there, only the existing rule reapplied at a different edge.
-The reverse direction (static to DHCP) already clears the address and is untouched by any of this.
+The reverse direction (static to DHCP) needs the exact same treatment, not none: applying decision 1
+literally locks `address` unconditionally on every persisted row, which makes this transition dead
+both ways on its own — clear the address yourself and the lock rejects the edit; leave it and the
+DHCP/static check on `clean()` rejects a DHCP port carrying a static address. `save()`/`clean()`
+detect the flip the same way as the forward direction (the persisted `is_dhcp` read fresh, `True` ->
+`False` there, `False` -> `True` here) and clear `address` themselves, exempting it from the lock for
+that transition only. Nothing is derived on this side — there's no formula to run, only the address
+to let go of.
 
 Expressiveness is not lost. `_address_containment_error()` already requires every racked static
 address to sit inside the rack's assigned range, so every address in the system is *already*

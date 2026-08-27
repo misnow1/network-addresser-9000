@@ -2433,6 +2433,59 @@ class SlotOffsetAddressingTests(TestCase):
         control.refresh_from_db()
         self.assertEqual(control.address, "10.200.1.1")
 
+    # Case 3/4 (replaces main's deleted test_dhcp_cascade_both_ways):
+    # under ADR 0027 nothing derives from a sibling port any more — every
+    # port derives independently from the device's own rack slot — so the
+    # old *cascade* assertion (flipping Control's is_dhcp also flips
+    # Engine's) no longer applies. What survives is that both directions
+    # of the flip still work, and now independently per port.
+    def test_dhcp_static_flip_both_directions_derive_independently(self) -> None:
+        device_type = self._make_sd12_type(name="SD12 DHCP Both Ways")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=2)
+        control = device.ports.get(description="Control")
+        engine = device.ports.get(description="Engine")
+        self.assertEqual(control.address, "10.200.1.2")
+        self.assertEqual(engine.address, "10.200.1.3")
+
+        # static -> DHCP: address cleared; the untouched sibling is unaffected.
+        control.is_dhcp = True
+        control.save()  # must not raise
+        control.refresh_from_db()
+        self.assertTrue(control.is_dhcp)
+        self.assertIsNone(control.address)
+        engine.refresh_from_db()
+        self.assertFalse(engine.is_dhcp)
+        self.assertEqual(engine.address, "10.200.1.3")
+
+        # DHCP -> static: address re-derived from the device's own slot —
+        # not from the (untouched) sibling — this types a wrong address on
+        # purpose to prove it's overwritten rather than trusted.
+        control.is_dhcp = False
+        control.address = "10.200.1.55"
+        control.save()  # must not raise
+        control.refresh_from_db()
+        self.assertFalse(control.is_dhcp)
+        self.assertEqual(control.address, "10.200.1.2")
+        engine.refresh_from_db()
+        self.assertEqual(engine.address, "10.200.1.3")
+
+    def test_static_to_dhcp_flip_dead_end_reproduction_now_fixed(self) -> None:
+        """The exact council reproduction: ``is_dhcp=True`` with
+        ``address=None`` on a persisted static port used to raise
+        ``ValidationError: address cannot be changed after creation`` from
+        ``full_clean()`` — the lock had no exemption for this direction.
+        """
+        device_type = self._make_sd12_type(name="SD12 Repro")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=1)
+        control = device.ports.get(description="Control")
+        control.is_dhcp = True
+        control.address = None
+        control.full_clean()  # must not raise
+        control.save()
+        control.refresh_from_db()
+        self.assertTrue(control.is_dhcp)
+        self.assertIsNone(control.address)
+
     # Case 7 (both directions): a second occupant refused inside an
     # existing occupant's span.
     def test_device_span_refused_over_existing_switch(self) -> None:
