@@ -184,6 +184,47 @@ def resolve_slot_spans(devices: Iterable[NetworkDevice]) -> dict[int, int]:
     return spans
 
 
+def resolve_claimed_offsets(devices: Iterable[NetworkDevice]) -> dict[int, frozenset[int]]:
+    """Bulk-resolve ``NetworkDeviceType.claimed_offsets`` (ADR 0027
+    decision 2) for every device type represented in ``devices``, as
+    ``{device_type_id: frozenset[int]}`` — the same N+1 ``resolve_slot_
+    spans`` above already fixes for ``slot_span``, but for the full
+    claimed-offset *set* rather than just its maximum.
+
+    ``_build_occupancy`` needs the set, not the span: a type with offsets
+    ``{0, 64}`` occupies exactly ordinals ``rack_slot`` and ``rack_slot +
+    64``, not every ordinal in between — using ``resolve_slot_spans``'s
+    ``span`` there (council finding, ADR 0027 PR 1 review) claims all 65
+    as this device's, silently turning a legal placement at a genuinely
+    free in-between ordinal into a manufactured ``len(entries) > 1``
+    "conflict" — the state ADR 0027 decision 5 reserves for a real,
+    bypassed-write violation, not an artifact of this map's own arithmetic.
+
+    Can't be expressed as one aggregate the way ``slot_span``'s ``Max()``
+    is — SQL aggregates a single value per group, not "the distinct set of
+    values" — so this walks the ``(device_type_id, slot_offset)`` rows
+    from one query in Python instead, the same shape
+    ``occupied_rack_slot_ordinals()`` (``models.py``) already uses for the
+    identical reason. Still one query, not one per device.
+    """
+    device_type_ids = {device.device_type_id for device in devices}
+    if not device_type_ids:
+        return {}
+    offsets_by_type: dict[int, set[int]] = defaultdict(set)
+    for device_type_id, offset in NetworkDeviceTypePort.objects.filter(
+        device_type_id__in=device_type_ids
+    ).values_list("device_type_id", "slot_offset"):
+        offsets_by_type[device_type_id].add(offset)
+    # Always includes 0 -- a device occupies its own slot regardless of
+    # whether any type port is actually declared there (matches
+    # NetworkDeviceType.claimed_offsets, and covers a type with zero type
+    # ports, which contributes no row to the query above at all).
+    return {
+        device_type_id: frozenset(offsets_by_type.get(device_type_id, set()) | {0})
+        for device_type_id in device_type_ids
+    }
+
+
 # ---------------------------------------------------------------------------
 # Rack elevation
 # ---------------------------------------------------------------------------
@@ -325,14 +366,24 @@ class _OccupancyEntry:
 
 
 def _build_occupancy(
-    switches: Iterable[NetworkSwitch], devices: Iterable[NetworkDevice], spans: dict[int, int]
+    switches: Iterable[NetworkSwitch],
+    devices: Iterable[NetworkDevice],
+    claimed_offsets: dict[int, frozenset[int]],
 ) -> dict[int, list[_OccupancyEntry]]:
     """``{ordinal: [_OccupancyEntry, ...]}`` covering every ordinal a
     switch or device claims — not just each occupant's own ``rack_slot``
     (review note 1). A switch always claims exactly its own slot; a
-    device claims ``rack_slot .. rack_slot + span - 1`` where ``span``
-    comes from ``spans`` (``resolve_slot_spans``'s output), never from a
-    per-device ``slot_span`` property access.
+    device claims ``{rack_slot + offset for offset in offsets}`` where
+    ``offsets`` comes from ``claimed_offsets`` (``resolve_claimed_
+    offsets``'s output — the bulk form of ``NetworkDeviceType.claimed_
+    offsets``, ADR 0027 decision 2), never a contiguous ``range(span)``:
+    a type with offsets ``{0, 64}`` claims exactly ordinals 0 and 64, not
+    every ordinal between them — the same sparse set the write-path guard
+    (``NetworkDevice._check_rack_slot_not_occupied``) already checks
+    against. Using ``span`` here instead (a council finding, ADR 0027 PR
+    1 review) would claim every in-between ordinal too, turning a legal
+    placement at a genuinely free one into a manufactured multi-claimant
+    "conflict".
 
     A **list** per ordinal, not a single entry (Codex review round 2,
     finding 4) — the DB's ``unique(rack, rack_slot)`` constraint only
@@ -358,8 +409,8 @@ def _build_occupancy(
     for device in devices:
         if device.rack_slot is None:
             continue
-        span = spans.get(device.device_type_id, 1)
-        for offset in range(span):
+        offsets = claimed_offsets.get(device.device_type_id, frozenset({0}))
+        for offset in sorted(offsets):
             occupancy[device.rack_slot + offset].append(
                 _OccupancyEntry(
                     kind="device",
@@ -543,12 +594,17 @@ def _build_elevation_rows(
     switches: list[NetworkSwitch],
     devices: list[NetworkDevice],
     spans: dict[int, int],
+    claimed_offsets: dict[int, frozenset[int]],
 ) -> list[ElevationRow]:
     """One ``ElevationRow`` per ordinal ``1..rack.slot_count``, built from
-    an occupancy map that already accounts for multi-ordinal spans (ADR
-    0017) — see ``_build_occupancy``.
+    an occupancy map that already accounts for a device's full sparse
+    claimed-ordinal set (ADR 0027 decision 2) — see ``_build_occupancy``.
+    ``spans`` is unrelated to occupancy here; it only feeds ``_device_
+    row``'s ``Occupant.span``/``bracketed`` (the contiguous-bracket
+    rendering issue #93 leaves as a known, deliberate approximation for a
+    sparse claim).
     """
-    occupancy = _build_occupancy(switches, devices, spans)
+    occupancy = _build_occupancy(switches, devices, claimed_offsets)
     taken = _build_taken_address_map(switches, devices)
     rows = []
     for ordinal in range(1, rack.slot_count + 1):
@@ -641,12 +697,13 @@ def rack_detail(request: HttpRequest, pk: int) -> HttpResponse:
     on a genuinely empty ordinal.
 
     Query budget: every relation this view needs is prefetched once,
-    up front, and ``resolve_slot_spans`` resolves every device's span in
-    one grouped query rather than touching ``NetworkDeviceType.slot_span``
-    per device — see that function's docstring. The result is a query
-    count independent of how many switches/devices the rack holds, which
-    ``test_ui.py`` locks in by asserting equal counts for a 2-device and a
-    50-device rack.
+    up front, and ``resolve_slot_spans``/``resolve_claimed_offsets`` each
+    resolve every device's span/claimed-offset set in one grouped query
+    rather than touching ``NetworkDeviceType.slot_span``/``claimed_
+    offsets`` per device — see each function's docstring. The result is a
+    query count independent of how many switches/devices the rack holds,
+    which ``test_ui.py`` locks in by asserting equal counts for a 2-device
+    and a 50-device rack.
 
     This is already the canonical ``Rack`` page (Stage B decision 13): the
     generic parity route for ``Rack`` redirects here rather than rendering
@@ -684,7 +741,8 @@ def rack_detail(request: HttpRequest, pk: int) -> HttpResponse:
     switches = list(rack.switches.all())
     devices = list(rack.devices.all())
     spans = resolve_slot_spans(devices)
-    rows = _build_elevation_rows(rack, columns, switches, devices, spans)
+    claimed_offsets = resolve_claimed_offsets(devices)
+    rows = _build_elevation_rows(rack, columns, switches, devices, spans, claimed_offsets)
     audit_entries, audit_content_type_pk = _object_audit_panel_context(rack, request.user)
     context = {
         "rack": rack,

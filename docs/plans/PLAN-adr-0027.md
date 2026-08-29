@@ -363,3 +363,24 @@ project's convention of folding findings in rather than defending the original.
   flipping_to_dhcp` branch. Proven by `test_flip_to_static_with_narrow_update_fields_still_persists_
   address` and `test_flip_to_dhcp_with_narrow_update_fields_still_clears_address`
   (`SlotOffsetAddressingTests`).
+- **The rack elevation's occupancy map claimed a contiguous `range(span)` for every device, not the
+  sparse ordinal set ADR 0027 decision 2 actually defines.** `_build_occupancy` derived each device's
+  occupied ordinals from `resolve_slot_spans`'s `span` (`max(offset) + 1`), the same number
+  `NetworkDeviceType.slot_span`'s own docstring warns is "the highest ordinal reached," not the full
+  set — a type declaring offsets `{0, 64}` has `span=65` but `claimed_offsets={0, 64}`. The write
+  path (`NetworkDevice._check_rack_slot_not_occupied`, `suggestions.lowest_free_placement`) already
+  used the sparse set and correctly allows a second device on any of the 63 in-between ordinals; the
+  read side then saw two occupants claiming that same ordinal and rendered `state="conflict"` — the
+  encoding ADR 0027 decision 5 reserves for a real, bypassed-write violation, not this map's own
+  arithmetic. A legal placement read as data corruption, and every one of those in-between ordinals
+  lost its `add_url` though genuinely free. Fixed: a new `resolve_claimed_offsets()` (the
+  `resolve_slot_spans` bulk-query shape, for the full offset set rather than its maximum) feeds
+  `_build_occupancy` the sparse set directly; `spans` still flows to `_device_row` unchanged, since
+  `Occupant.span`/`bracketed` stay a deliberate, documented approximation for a sparse claim (issue
+  #93 — left alone, per the finding's own instruction not to touch it). Adds one flat query to the
+  view's budget, so the two `QueryBudgetTests`/`HostnameDivergesMarkerTests` absolute-count
+  assertions move from 12 to 13 (still independent of device/rack size — the property those tests
+  actually guard). Proven by `SparseClaimedOffsetsOccupancyTests` (`test_ui.py`): a `{0, 64}` device
+  plus an in-between device at ordinal 2 — every ordinal both devices actually claim has
+  `conflicts == []` and the correct occupant, and every genuinely free ordinal in between has
+  `conflicts == []`, `occupant is None`, and an `add_url`.

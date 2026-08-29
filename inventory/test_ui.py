@@ -71,8 +71,11 @@ from .models import (
 from .suggestions import suggest_rack_vlan_range, suggest_slot_address
 from .views import (
     REGISTRY,
+    ElevationRow,
+    _build_elevation_rows,
     _content_type_for_model_no_create,
     _object_audit_panel_context,
+    resolve_claimed_offsets,
     resolve_slot_spans,
     safe_slot_address,
 )
@@ -1057,6 +1060,96 @@ class ElevationEncodingTests(TestCase):
                 device.device_type,
             )
 
+    def test_resolve_claimed_offsets_agrees_with_claimed_offsets_property(self) -> None:
+        for device in [self.bracket_device, self.decoy, self.device_on_vlan_a, self.device_on_vlan_b]:
+            claimed_offsets = resolve_claimed_offsets([device])
+            self.assertEqual(
+                claimed_offsets[device.device_type_id],
+                device.device_type.claimed_offsets,
+                device.device_type,
+            )
+
+
+class SparseClaimedOffsetsOccupancyTests(TestCase):
+    """A council finding against ADR 0027 PR 1: ``_build_occupancy`` used
+    to claim every ordinal in ``range(span)`` for a device, rather than
+    the sparse ``claimed_offsets`` set the write path already checks
+    against. A type declaring offsets ``{0, 64}`` has a ``slot_span`` of
+    65 (the highest ordinal *reached*) but claims exactly 2 ordinals — the
+    63 in between are genuinely free, and the write path's own
+    ``lowest_free_placement()``/``_check_rack_slot_not_occupied()`` will
+    happily place another device on one of them. Reading them back as
+    occupied was a bug in the read side alone: a legal placement rendered
+    as ``state="conflict"``, the encoding ADR 0027 decision 5 reserves for
+    a real, bypassed-write violation.
+    """
+
+    def setUp(self) -> None:
+        call_command("sync_roles", stdout=io.StringIO())
+        self.vlan = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
+        self.rack = Rack.objects.create(name="Sparse Rack", slot_count=70)
+        RackVlanRange.objects.create(rack=self.rack, vlan=self.vlan, address_range="10.200.1.0/24")
+
+        # A type with offsets {0, 64} -- slot_span 65, claimed_offsets {0, 64}.
+        self.sparse_type = NetworkDeviceType.objects.create(
+            device_model=_device_model("Test", "Sparse64"), name="Default", port_count=2
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=self.sparse_type,
+            description="Near",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan,
+            slot_offset=0,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=self.sparse_type,
+            description="Far",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan,
+            slot_offset=64,
+        )
+        self.sparse_device = NetworkDevice.objects.create(
+            device_type=self.sparse_type, rack=self.rack, rack_slot=1, hostname="sparse64-1"
+        )
+
+        # A genuinely free, in-between ordinal used by another device --
+        # the exact placement lowest_free_placement()/_check_rack_slot_
+        # not_occupied() already allow.
+        self.between_type = _make_device_type(port_count=1, vlan=self.vlan, name="Between")
+        self.between_device = NetworkDevice.objects.create(
+            device_type=self.between_type, rack=self.rack, rack_slot=2, hostname="between-1"
+        )
+
+    def _rows(self) -> dict[int, ElevationRow]:
+        columns = list(self.rack.vlan_ranges.all())
+        switches: list[NetworkSwitch] = []
+        devices = [self.sparse_device, self.between_device]
+        spans = resolve_slot_spans(devices)
+        claimed_offsets = resolve_claimed_offsets(devices)
+        rows = _build_elevation_rows(self.rack, columns, switches, devices, spans, claimed_offsets)
+        return {row.ordinal: row for row in rows}
+
+    def test_claimed_ordinals_have_no_conflict_and_correct_occupant(self) -> None:
+        rows = self._rows()
+        self.assertEqual(rows[1].conflicts, [])
+        self.assertIsNotNone(rows[1].occupant)
+        assert rows[1].occupant is not None
+        self.assertEqual(rows[1].occupant.row_kind, "start")
+        self.assertEqual(rows[65].conflicts, [])
+        self.assertIsNotNone(rows[65].occupant)
+        assert rows[65].occupant is not None
+        self.assertEqual(rows[65].occupant.row_kind, "continuation")
+        self.assertEqual(rows[2].conflicts, [])
+        self.assertIsNotNone(rows[2].occupant)
+
+    def test_in_between_ordinals_are_free_not_conflicted(self) -> None:
+        rows = self._rows()
+        for ordinal in list(range(3, 65)) + list(range(66, 71)):
+            row = rows[ordinal]
+            self.assertEqual(row.conflicts, [], ordinal)
+            self.assertIsNone(row.occupant, ordinal)
+            self.assertIsNotNone(row.add_url, ordinal)
+
 
 class TakenAddressMarkerTests(TestCase):
     """The elevation's ``taken_by`` marker (issue #60,
@@ -1800,16 +1893,17 @@ class QueryBudgetTests(TestCase):
         self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
         # Issue #60's taken-address map is built entirely from data this
         # view already prefetches (PLAN-consumed-slot-addresses.md decision
-        # 4) — it must add exactly zero queries. 12 is the absolute count
-        # recorded on the pre-#60 revision of this test (both rack sizes);
-        # an implementation that reaches for a fresh
-        # NetworkDevicePort.objects.filter(...), or that touches
-        # port.source_type_port while building the map (prefetched in
-        # device_detail(), not here — see _build_taken_address_map's
-        # docstring), would pass the equality assertion above while
-        # quietly moving this number.
-        self.assertEqual(len(small_ctx.captured_queries), 12)
-        self.assertEqual(len(big_ctx.captured_queries), 12)
+        # 4) — it must add exactly zero queries. 13 is the absolute count
+        # recorded on this tree (both rack sizes; bumped from 12 by ADR
+        # 0027 PR 1 review's resolve_claimed_offsets, one flat query
+        # alongside resolve_slot_spans's own); an implementation that
+        # reaches for a fresh NetworkDevicePort.objects.filter(...), or
+        # that touches port.source_type_port while building the map
+        # (prefetched in device_detail(), not here — see
+        # _build_taken_address_map's docstring), would pass the equality
+        # assertion above while quietly moving this number.
+        self.assertEqual(len(small_ctx.captured_queries), 13)
+        self.assertEqual(len(big_ctx.captured_queries), 13)
 
     def test_vlan_map_query_count_independent_of_address_count(self) -> None:
         vlan_small = VLAN.objects.create(name="Small", vlan_id=200, subnet="10.200.0.0/21")
@@ -2888,10 +2982,12 @@ class HostnameDivergesMarkerTests(TestCase):
                 owner=self.owner,
                 hostname="hand-typed" if slot % 2 else "mps-wpcsrl-ik42",
             )
-        # 12 measured against this tree with device_type__device_model in
+        # 13 measured against this tree with device_type__device_model in
         # place — without it, each of the 5 devices costs one extra query
-        # fetching its device_model.
-        with self.assertNumQueries(12):
+        # fetching its device_model. ADR 0027 PR 1 review's occupancy fix
+        # (resolve_claimed_offsets) adds one flat query alongside resolve_
+        # slot_spans's own — bumped from 12 for that, not a regression.
+        with self.assertNumQueries(13):
             response = self.client.get(f"/racks/{self.rack.pk}/")
         self.assertEqual(response.status_code, 200)
 
