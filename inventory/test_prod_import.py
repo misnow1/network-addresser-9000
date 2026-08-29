@@ -50,9 +50,7 @@ from .management.commands.import_prod_data import (
 )
 from .management.commands.import_prod_data import HOSTNAME_SLUGS as IMPORTER_HOSTNAME_SLUGS
 from .management.commands.verify_prod_import import HOSTNAME_SLUGS as VERIFIER_HOSTNAME_SLUGS
-from .management.commands.verify_prod_import import _check_cross_vlan_alignment, _Findings
 from .models import (
-    VLAN,
     NetworkDevice,
     NetworkDeviceModel,
     NetworkDevicePort,
@@ -62,7 +60,6 @@ from .models import (
     NetworkSwitchAddress,
     NetworkSwitchType,
     Owner,
-    PortAddressSource,
     Rack,
     RackVlanRange,
 )
@@ -290,18 +287,12 @@ ADDRESSING_ROWS = [
         "",
         "",
     ),
-    # CONSOLES: a DM7C console + its Device Control row, sitting BELOW its
-    # host (ADR 0022 — production has the DM7C's interface one address
-    # below its console, e.g. 10.201.6.4 vs .5).
-    (
-        "dm7c-1-device-control",
-        "CONSOLES",
-        5,
-        "",
-        addr(FN_DANTE_PRIMARY, "CONSOLES", 5),
-        "",
-        "Only on Dante Primary for controlling snakes",
-    ),
+    # CONSOLES: a DM7C console + its Device Control row, sitting one
+    # address above its host (ADR 0027 retires ADR 0022's per-instance
+    # OPERATOR mechanism — a Yamaha console's Device Control interface is
+    # now an ordinary slot_offset=1 type port, so every instance's
+    # interface sits at the same fixed offset from its own console,
+    # matching production after ADR 0027 plan Step 0's hand move).
     (
         "DM7C-1",
         "CONSOLES",
@@ -311,11 +302,19 @@ ADDRESSING_ROWS = [
         addr(FN_DANTE_SECONDARY, "CONSOLES", 6),
         "",
     ),
-    # CONSOLES: a DM3 console + its Device Control row, sitting ABOVE its
-    # host (production has the DM3's interface one address above its
-    # console) — the opposite direction from the DM7C pair above, proving
-    # the importer's Device Control pre-pass isn't
-    # slot-adjacency/direction-specific (ADR 0022).
+    (
+        "dm7c-1-device-control",
+        "CONSOLES",
+        7,
+        "",
+        addr(FN_DANTE_PRIMARY, "CONSOLES", 7),
+        "",
+        "Only on Dante Primary for controlling snakes",
+    ),
+    # CONSOLES: a DM3 console + its Device Control row, sitting one
+    # address above its host too — the same fixed offset as DM7C now that
+    # ADR 0027 makes it a type-level slot_offset rather than a
+    # per-instance OPERATOR address.
     (
         "bej-dm3-1",
         "CONSOLES",
@@ -599,11 +598,11 @@ class ImportProdDataTests(TestCase):
         self.assertEqual(without_card.device_model.hostname_slug, "ik42")
 
     def test_dm7c_and_dm3_device_control_ports(self) -> None:
-        # ADR 0022: the importer's Device Control pre-pass folds each
-        # "-device-control" row's address into its own console's fourth,
-        # OPERATOR-sourced port rather than materializing it as a second
-        # device — in both directions, DM7C's sits below its host, DM3's
-        # sits above.
+        # ADR 0027 retires ADR 0022's OPERATOR mechanism: the importer's
+        # Device Control pre-pass folds each "-device-control" row into
+        # its own console's fourth port, now an ordinary slot_offset=1
+        # type port sitting one address above the host, for both consoles
+        # alike.
         dm7c_host = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=6)
         # Lowercase — ADR 0023 decision 8 (amended).
         self.assertEqual(dm7c_host.hostname, "dm7c-1")
@@ -611,21 +610,21 @@ class ImportProdDataTests(TestCase):
         self.assertEqual(dm7c_host.ports.count(), 4)
         dm7c_device_control = dm7c_host.ports.get(description="Device Control")
         assert dm7c_device_control.source_type_port is not None  # materialized ports always set this
-        self.assertEqual(dm7c_device_control.source_type_port.address_source, PortAddressSource.OPERATOR)
-        self.assertEqual(dm7c_device_control.address, addr(FN_DANTE_PRIMARY, "CONSOLES", 5))
+        self.assertEqual(dm7c_device_control.slot_offset, 1)
+        self.assertEqual(dm7c_device_control.address, addr(FN_DANTE_PRIMARY, "CONSOLES", 7))
         # Lowercase — the very property ADR 0022 believed it had protected
         # from case-sensitive assertions; ADR 0023 decision 8 (amended)
         # settles the casing this depends on.
         self.assertEqual(dm7c_device_control.hostname, "dm7c-1-device-control")
-        # Slot 5 — the interface's own row in the sheet — releases entirely;
+        # Slot 7 — the interface's own row in the sheet — releases entirely;
         # no device sits there at all (#42).
-        self.assertFalse(NetworkDevice.objects.filter(rack__name="CONSOLES", rack_slot=5).exists())
+        self.assertFalse(NetworkDevice.objects.filter(rack__name="CONSOLES", rack_slot=7).exists())
 
         dm3_host = NetworkDevice.objects.get(rack__name="CONSOLES", rack_slot=8)
         self.assertEqual(dm3_host.hostname, "bej-dm3-1")
         dm3_device_control = dm3_host.ports.get(description="Device Control")
         assert dm3_device_control.source_type_port is not None  # materialized ports always set this
-        self.assertEqual(dm3_device_control.source_type_port.address_source, PortAddressSource.OPERATOR)
+        self.assertEqual(dm3_device_control.slot_offset, 1)
         self.assertEqual(dm3_device_control.address, addr(FN_DANTE_PRIMARY, "CONSOLES", 9))
         self.assertFalse(NetworkDevice.objects.filter(rack__name="CONSOLES", rack_slot=9).exists())
 
@@ -653,18 +652,19 @@ class ImportProdDataTests(TestCase):
             call_command("verify_prod_import", data_dir=str(self.data_dir))
 
     def test_verify_catches_a_stale_device_at_a_released_device_control_slot(self) -> None:
-        # ADR 0022 — the Device Control row's own slot (5, for the DM7C
-        # pair in this fixture) is released; nothing should occupy it. A
-        # stale device left there (e.g. a leftover row from before a
-        # re-import) must be caught as an unexplained extra against the
-        # complete expected device-slot set, not silently ignored because
-        # no CSV row names that key to check "expected device" against.
+        # ADR 0027 (retiring ADR 0022's OPERATOR mechanism) — the Device
+        # Control row's own slot (7, for the DM7C pair in this fixture) is
+        # released; nothing should occupy it. A stale device left there
+        # (e.g. a leftover row from before a re-import) must be caught as
+        # an unexplained extra against the complete expected device-slot
+        # set, not silently ignored because no CSV row names that key to
+        # check "expected device" against.
         rack = Rack.objects.get(name="CONSOLES")
         device_type = NetworkDeviceType.objects.get(
             device_model__manufacturer="DiGiCo", device_model__model="SD9"
         )
         NetworkDevice.objects.create(  # type: ignore[misc]
-            device_type=device_type, rack=rack, rack_slot=5, hostname="stale", port_addressing="dhcp"
+            device_type=device_type, rack=rack, rack_slot=7, hostname="stale", port_addressing="dhcp"
         )
         with self.assertRaises(CommandError):
             call_command("verify_prod_import", data_dir=str(self.data_dir))
@@ -1019,97 +1019,6 @@ class VerifyCatchesADeviceControlRowsExtraColumnsTests(TestCase):
             call_command("import_prod_data", data_dir=str(data_dir))  # succeeds — the column is ignored
             with self.assertRaises(CommandError):
                 call_command("verify_prod_import", data_dir=str(data_dir))
-
-
-class CrossVlanAlignmentExemptionTests(TestCase):
-    """ADR 0022, review note 14 — ``_check_cross_vlan_alignment()``'s
-    ``OPERATOR`` exemption is bounded to the ``OPERATOR`` port itself, not
-    to the whole device it sits on, and keys off ``address_source``, not
-    off a missing ``source_type_port``. Exercised directly against
-    ``_check_cross_vlan_alignment()`` rather than through a full CSV
-    import — the scenario this guards against (an over-broad exemption)
-    needs a ``source_type_port=None`` port, which no CSV row can express;
-    ``_materialize_ports()`` always sets it.
-    """
-
-    def setUp(self) -> None:
-        self.user = get_user_model().objects.create_user(username="alignment-test")
-        # No dhcp_range — the /27 rack ranges below (.32-.63) need to be
-        # clear of it, and the DHCP range is optional (unlike
-        # import_prod_data.py's real VLANs, this fixture has no reason to
-        # carry one).
-        self.vlan_a = VLAN(name="Alignment A", vlan_id=901, subnet="10.90.0.0/24", created_by=self.user)
-        self.vlan_a.full_clean()
-        self.vlan_a.save()
-        self.vlan_b = VLAN(name="Alignment B", vlan_id=902, subnet="10.91.0.0/24", created_by=self.user)
-        self.vlan_b.full_clean()
-        self.vlan_b.save()
-        self.rack = Rack(name="Alignment Rack", slot_count=10, created_by=self.user)
-        self.rack.full_clean()
-        self.rack.save()
-        for vlan, base in ((self.vlan_a, "10.90.0.32/27"), (self.vlan_b, "10.91.0.32/27")):
-            rng = RackVlanRange(rack=self.rack, vlan=vlan, address_range=base, created_by=self.user)
-            rng.full_clean()
-            rng.save()
-        device_model = NetworkDeviceModel.objects.create(manufacturer="Test", model="Alignment")
-        self.device_type = NetworkDeviceType(
-            device_model=device_model, name="Default", port_count=3, created_by=self.user
-        )
-        self.device_type.full_clean()
-        self.device_type.save()
-        for description, vlan, address_source in (
-            ("Primary A", self.vlan_a, PortAddressSource.SLOT),
-            ("Primary B", self.vlan_b, PortAddressSource.SLOT),
-            ("Aux", self.vlan_a, PortAddressSource.OPERATOR),
-        ):
-            type_port = NetworkDeviceTypePort(
-                device_type=self.device_type,
-                description=description,
-                port_type="1gbe_rj45",
-                vlan=vlan,
-                slot_offset=0,
-                address_source=address_source,
-                created_by=self.user,
-            )
-            type_port.full_clean()
-            type_port.save()
-        self.device = NetworkDevice(  # type: ignore[misc]
-            device_type=self.device_type,
-            rack=self.rack,
-            rack_slot=1,
-            hostname="alignment-1",
-            created_by=self.user,
-            operator_addresses={"Aux": "10.90.0.40"},
-        )
-        self.device.full_clean()
-        self.device.save()
-
-    def test_operator_port_exempt_aligned_slot_ports_pass(self) -> None:
-        # The OPERATOR "Aux" port's address (10.90.0.99) shares Primary A's
-        # VLAN but bears no derivable relationship to it — if it weren't
-        # exempt, this would already fail on the happy path.
-        findings = _Findings()
-        _check_cross_vlan_alignment(findings)
-        self.assertEqual(findings.mismatches, [])
-
-    def test_corrupted_slot_port_still_fails_alignment(self) -> None:
-        port = self.device.ports.get(description="Primary A")
-        NetworkDevicePort.objects.filter(pk=port.pk).update(address="10.90.0.250")
-        findings = _Findings()
-        _check_cross_vlan_alignment(findings)
-        self.assertTrue(any(m.check == "cross_vlan_alignment" for m in findings.mismatches))
-
-    def test_corrupted_slot_port_with_no_source_type_port_still_fails_alignment(self) -> None:
-        # The exemption keys off address_source == OPERATOR read through
-        # source_type_port, not off source_type_port being unset — an
-        # implementation that exempted every source_type_port=None port
-        # (mistaking "no type port on record" for "operator-addressed")
-        # would pass this the same as the happy path.
-        port = self.device.ports.get(description="Primary A")
-        NetworkDevicePort.objects.filter(pk=port.pk).update(address="10.90.0.250", source_type_port=None)
-        findings = _Findings()
-        _check_cross_vlan_alignment(findings)
-        self.assertTrue(any(m.check == "cross_vlan_alignment" for m in findings.mismatches))
 
 
 class ImportUserIdentityTests(TestCase):
