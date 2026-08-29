@@ -27,6 +27,7 @@ otherwise seed-once/never-re-synced rule.
 """
 
 import ipaddress
+from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any, cast
 
@@ -368,6 +369,42 @@ def occupied_rack_slot_ordinals(rack: "Rack") -> dict[int, str]:
         ordinals[cast(int, rack_slot)] = label  # offset 0 always claimed, regardless of ports
         ordinals[cast(int, rack_slot) + (offset or 0)] = label
     return ordinals
+
+
+def _bulk_claimed_offsets(device_type_ids: Iterable[int]) -> dict[int, frozenset[int]]:
+    """Bulk form of ``NetworkDeviceType.claimed_offsets`` (ADR 0027
+    decision 2) for every id in ``device_type_ids``, as ``{device_type_id:
+    frozenset[int]}`` — one query, not one per candidate.
+
+    ``NetworkSwitch``/``NetworkDevice._check_rack_slot_not_occupied()``
+    each walk a SQL-prefiltered candidate list and ask every candidate's
+    own ``claimed_offsets`` — calling that property directly there costs
+    one extra, uncached query per candidate (it recomputes on every
+    access by design; see its own docstring), an N+1 that scales with
+    rack occupancy exactly where ADR 0027's own ``{0, 64}``-shaped
+    hardware widens the candidate set the most: the SQL prefilter still
+    narrows by the contiguous *envelope* (``rack_slot .. rack_slot +
+    slot_span - 1``), which is at its widest for exactly this kind of
+    type. Resolving every candidate's offsets here first, in one query,
+    closes it. Mirrors ``views.resolve_claimed_offsets()``'s identical
+    shape — duplicated rather than imported, since ``views.py`` imports
+    from ``models.py`` and not the other way around.
+    """
+    device_type_ids = set(device_type_ids)
+    if not device_type_ids:
+        return {}
+    offsets_by_type: dict[int, set[int]] = defaultdict(set)
+    for device_type_id, offset in NetworkDeviceTypePort.objects.filter(
+        device_type_id__in=device_type_ids
+    ).values_list("device_type_id", "slot_offset"):
+        offsets_by_type[device_type_id].add(offset)
+    # Always includes 0 (a device occupies its own slot regardless of
+    # whether any type port is declared there), and covers a type with
+    # zero type ports, which contributes no row to the query above.
+    return {
+        device_type_id: frozenset(offsets_by_type.get(device_type_id, set()) | {0})
+        for device_type_id in device_type_ids
+    }
 
 
 def occupied_rack_slot_ranges(rack: "Rack") -> list[tuple[int, int]]:
@@ -3230,17 +3267,25 @@ class NetworkSwitch(RackSlotAssignmentMixin, AuditedModel):
         inside that envelope — and the exact, set-based check happens in
         Python afterward, the same "SQL can bound, only Python can express
         a set" split ``occupied_rack_slot_ordinals()`` documents.
+
+        ``claimed_offsets`` for every candidate is resolved once, in bulk,
+        before the loop (``_bulk_claimed_offsets()``) rather than read
+        off each candidate's own property — that property recomputes on
+        every access, so reading it per candidate here is an N+1 (ADR 0027
+        PR 1 review).
         """
-        candidates = (
+        candidates = list(
             NetworkDevice.objects.filter(rack=self.rack, rack_slot__lte=self.rack_slot)
             .annotate(_span=Coalesce(models.Max("device_type__type_ports__slot_offset"), 0) + 1)
             .annotate(_end=models.F("rack_slot") + models.F("_span") - 1)
             .filter(_end__gte=self.rack_slot)
             .select_related("device_type")
         )
+        claimed_offsets = _bulk_claimed_offsets(candidate.device_type_id for candidate in candidates)
         for candidate in candidates:
             assert candidate.rack_slot is not None  # DB constraint: rack and rack_slot are all-or-neither
-            if self.rack_slot in {candidate.rack_slot + offset for offset in candidate.claimed_offsets}:
+            offsets = claimed_offsets.get(candidate.device_type_id, frozenset({0}))
+            if self.rack_slot in {candidate.rack_slot + offset for offset in offsets}:
                 raise ValidationError(
                     f"Rack slot {self.rack_slot} in {self.rack} is already occupied by a device."
                 )
@@ -4535,6 +4580,13 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         inside that envelope — and the exact, set-based check happens in
         Python afterward, the same "SQL can bound, only Python can express
         a set" split ``occupied_rack_slot_ordinals()`` documents.
+
+        ``claimed_offsets`` for every candidate is resolved once, in bulk,
+        before the loop (``_bulk_claimed_offsets()``) rather than read
+        off each candidate's own property — that property recomputes on
+        every access, so reading it per candidate here is an N+1 (ADR 0027
+        PR 1 review; measured at 5 queries flat on ``main`` vs. 39 on this
+        branch for a 39-device rack before this fix).
         """
         if self.rack_slot is None:
             return  # only ever called from clean() once rack/rack_slot are both set
@@ -4555,7 +4607,7 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
         # always spans 1, so only this side needs the aggregate — plan
         # review note 6) to narrow candidates cheaply in SQL; the exact,
         # ordinal-exact test happens in Python via set intersection.
-        candidates = (
+        candidates = list(
             NetworkDevice.objects.filter(rack=self.rack, rack_slot__lte=my_end)
             .exclude(pk=self.pk)
             .annotate(_span=Coalesce(models.Max("device_type__type_ports__slot_offset"), 0) + 1)
@@ -4563,9 +4615,11 @@ class NetworkDevice(RackSlotAssignmentMixin, AuditedModel):
             .filter(_end__gte=my_start)
             .select_related("device_type")
         )
+        claimed_offsets = _bulk_claimed_offsets(candidate.device_type_id for candidate in candidates)
         for candidate in candidates:
             assert candidate.rack_slot is not None  # DB constraint: rack and rack_slot are all-or-neither
-            other_ordinals = {candidate.rack_slot + offset for offset in candidate.claimed_offsets}
+            offsets = claimed_offsets.get(candidate.device_type_id, frozenset({0}))
+            other_ordinals = {candidate.rack_slot + offset for offset in offsets}
             overlap = sorted(my_ordinals & other_ordinals)
             if overlap:
                 raise ValidationError(

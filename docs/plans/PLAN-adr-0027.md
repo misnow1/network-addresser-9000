@@ -384,3 +384,19 @@ project's convention of folding findings in rather than defending the original.
   plus an in-between device at ordinal 2 — every ordinal both devices actually claim has
   `conflicts == []` and the correct occupant, and every genuinely free ordinal in between has
   `conflicts == []`, `occupant is None`, and an `add_url`.
+- **The same `claimed_offsets` recomputation is an N+1 on the write path too.**
+  `NetworkDeviceType.claimed_offsets` runs its own query on every access, by design (it can never
+  drift from a type's locked-once port list, so there's no correctness reason to cache it) — but
+  `NetworkDevice`/`NetworkSwitch._check_rack_slot_not_occupied()` each read it directly off every
+  SQL-prefiltered candidate inside their overlap-check loop, one query per candidate. Measured: 5
+  queries flat on `main` vs. 39 on this branch for a 39-device rack — and the SQL prefilter (the
+  contiguous envelope `rack_slot .. rack_slot + slot_span - 1`) is at its widest exactly for the
+  `{0, 64}`-shaped hardware this ADR targets, so the candidate set this loop walks grows fastest
+  right where the bug bites hardest. Fixed: a new `_bulk_claimed_offsets()` (the `views.resolve_
+  claimed_offsets()` shape, duplicated rather than imported since `views.py` depends on `models.py`
+  and not the reverse) resolves every candidate's offsets in one query before either loop runs.
+  Proven by `RackSlotOccupancyQueryBudgetTests` (`tests.py`): a `CaptureQueriesContext` around each
+  of the two `_check_rack_slot_not_occupied()` methods asserts an equal query count between a
+  5-device and a 39-device rack — the write path's own version of `test_ui.py`'s `QueryBudgetTests`
+  shape, which is why this regression landed unnoticed in the first place — plus a correctness test
+  that the bulk resolution still finds a real overlap in the larger rack.

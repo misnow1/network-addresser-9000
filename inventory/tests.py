@@ -2821,6 +2821,79 @@ class SlotOffsetAddressingTests(TestCase):
         self.assertFalse(NetworkDevicePort.objects.filter(device_id=device.pk).exists())
 
 
+class RackSlotOccupancyQueryBudgetTests(TestCase):
+    """ADR 0027 PR 1 review: ``NetworkDeviceType.claimed_offsets``
+    recomputes from scratch on every access (its own docstring, by
+    design), and ``NetworkDevice``/``NetworkSwitch._check_rack_slot_not_
+    occupied()`` used to read it directly off every SQL-prefiltered
+    candidate in their overlap-check loop — an N+1 that scales with rack
+    occupancy, measured at 5 queries flat on ``main`` vs. 39 on this
+    branch for a 39-device rack. ``_bulk_claimed_offsets()`` now resolves
+    every candidate's offsets in one query before the loop instead.
+
+    The write path had no equivalent of ``test_ui.py``'s
+    ``QueryBudgetTests`` before this, which is why the regression landed
+    unnoticed — these assert *equal* counts across occupancy sizes, not a
+    single recorded number, the same shape as that class.
+    """
+
+    def setUp(self) -> None:
+        self._vlan_id = 200
+        self.switch_type = _make_switch_type(port_count=1)
+
+    def _rack_with_devices(self, name: str, count: int) -> tuple[Rack, NetworkDevice]:
+        # A fresh VLAN per rack -- these racks otherwise share addresses
+        # from the same range, which would trip unique_device_port_vlan_
+        # address_value across the two independent rack fixtures below.
+        self._vlan_id += 1
+        vlan = VLAN.objects.create(name=f"Control {self._vlan_id}", vlan_id=self._vlan_id)
+        device_type = _make_device_type(port_count=1, vlan=vlan, name=f"Type {self._vlan_id}")
+        rack = Rack.objects.create(name=name, slot_count=count + 5)
+        RackVlanRange.objects.create(rack=rack, vlan=vlan, address_range="10.200.1.0/24")
+        for slot in range(1, count + 1):
+            NetworkDevice.objects.create(device_type=device_type, rack=rack, rack_slot=slot)
+        candidate = NetworkDevice(device_type=device_type, rack=rack, rack_slot=count + 2)
+        return rack, candidate
+
+    def test_device_check_rack_slot_not_occupied_query_count_is_flat(self) -> None:
+        _, small_candidate = self._rack_with_devices("Small Device Occupancy", 5)
+        _, big_candidate = self._rack_with_devices("Big Device Occupancy", 39)
+
+        with CaptureQueriesContext(connection) as small_ctx:
+            small_candidate._check_rack_slot_not_occupied()
+        with CaptureQueriesContext(connection) as big_ctx:
+            big_candidate._check_rack_slot_not_occupied()
+
+        self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
+
+    def test_switch_check_rack_slot_not_occupied_query_count_is_flat(self) -> None:
+        small_rack, _ = self._rack_with_devices("Small Switch Occupancy", 5)
+        big_rack, _ = self._rack_with_devices("Big Switch Occupancy", 39)
+        small_switch = NetworkSwitch(switch_type=self.switch_type, rack=small_rack, rack_slot=7)
+        big_switch = NetworkSwitch(switch_type=self.switch_type, rack=big_rack, rack_slot=41)
+
+        with CaptureQueriesContext(connection) as small_ctx:
+            small_switch._check_rack_slot_not_occupied()
+        with CaptureQueriesContext(connection) as big_ctx:
+            big_switch._check_rack_slot_not_occupied()
+
+        self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
+
+    def test_bulk_claimed_offsets_finds_overlap_across_a_larger_rack(self) -> None:
+        """Not just a query-count check — the bulk resolution must still
+        find the same overlap the per-candidate property lookup did. A
+        device claiming offsets {0, 1} at slot 39 in a 39-device rack (one
+        device per slot, 1..39) collides with the device already at slot
+        40... except this rack only has 39 devices, so slot 40 is free;
+        placing the candidate at slot 39 itself instead, atop an existing
+        occupant, must still raise.
+        """
+        _, candidate = self._rack_with_devices("Overlap Still Detected", 39)
+        candidate.rack_slot = 39  # already occupied by the 39th device created above
+        with self.assertRaises(ValidationError):
+            candidate._check_rack_slot_not_occupied()
+
+
 class RetireCompanionsMigrationTests(TransactionTestCase):
     """``0014_retire_companions`` (ADR 0022 PR 2, PLAN-adr-0022.md's
     settled decisions 8-10) — the one genuinely dangerous step in this
