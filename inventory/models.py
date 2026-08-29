@@ -4939,6 +4939,14 @@ class NetworkDevicePort(AuditedModel):
                     # already derived/cleared and validated above, not
                     # compared against the persisted value.
                     del locked_fields["address"]
+                    if update_fields is not None and "address" not in update_fields:
+                        # Either flip changes self.address in memory (derived
+                        # above, or cleared) — a caller-supplied update_fields
+                        # that omits it would otherwise silently drop that
+                        # write, leaving is_dhcp and address disagreeing on
+                        # what's persisted and tripping the DB's
+                        # device_port_dhcp_xor_static_address CHECK.
+                        update_fields = [*update_fields, "address"]
                 _check_locked_fields_unchanged(
                     NetworkDevicePort, self.pk, locked_fields, update_fields=update_fields
                 )
@@ -5169,6 +5177,19 @@ class NetworkDevicePort(AuditedModel):
         unconditionally overwrites whatever ``self.address`` currently
         holds rather than trusting it.
 
+        Derives from the *persisted* ``slot_offset``/``vlan_id``
+        (fetched fresh, one query), never ``self.slot_offset``/
+        ``self.vlan_id`` directly — the same untrusted-``self`` reasoning
+        ``_persisted_delete_guard_fields()`` documents for the delete
+        path. Both fields are normally locked (``_locked_fields()``), but
+        this flip's own ``save()``/``clean()`` carve-out deletes
+        ``"address"`` from that dict and nothing else — a
+        ``save(update_fields=["is_dhcp", "address"])`` intersects none of
+        the *remaining* locked keys, so ``_check_locked_fields_
+        unchanged()`` early-returns without ever comparing ``slot_offset``
+        against what's persisted. Deriving from a fresh read closes that
+        hole regardless of what ``update_fields`` excludes.
+
         Raises ``ValidationError`` if the device is unracked — nothing to
         derive from, matching ``_suggest_rack_slot_address()``'s own
         null-rack contract — or if no usable Rack VLAN Range exists yet
@@ -5184,7 +5205,14 @@ class NetworkDevicePort(AuditedModel):
                 "Unracked devices are spare pool (DHCP-configured per CONTEXT.md); rack "
                 "the device first, or use is_dhcp for this port instead."
             )
-        address = _suggest_rack_slot_address(device.rack, device.rack_slot, self.vlan_id, self.slot_offset)
+        persisted = (
+            NetworkDevicePort._default_manager.filter(pk=self.pk).values("slot_offset", "vlan_id").first()
+            if self.pk is not None
+            else None
+        )
+        slot_offset = persisted["slot_offset"] if persisted is not None else self.slot_offset
+        vlan_id = persisted["vlan_id"] if persisted is not None else self.vlan_id
+        address = _suggest_rack_slot_address(device.rack, device.rack_slot, vlan_id, slot_offset)
         if address is None:
             raise ValidationError(
                 f"No usable address range for this port's VLAN in {device.rack} — assign a Rack "

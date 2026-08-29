@@ -340,3 +340,26 @@ project's convention of folding findings in rather than defending the original.
   implied offset, an unracked operator-sourced device, a missing Rack VLAN Range, and — the one
   invariant 2 exists for — a post-rewrite ordinal collision with an unrelated device already racked
   at the ordinal the rewrite is about to claim).
+- **A forged `NetworkDevicePort.slot_offset` survives the DHCP-to-static flip's own locked-field
+  check.** `save()`'s flip carve-out deletes only `"address"` from `_locked_fields()` before running
+  `_check_locked_fields_unchanged()`; a `save(update_fields=["is_dhcp", "address"])` then intersects
+  none of the *remaining* locked keys (`slot_offset` included), so the check short-circuits without
+  ever comparing it. `_derive_address_on_flip_to_static()` then derived from `self.slot_offset` — the
+  same untrusted-`self` shape `_persisted_delete_guard_fields()` already exists to defend against on
+  the delete path — so a caller that forges `slot_offset` in memory before the flip gets a silently
+  wrong, permanently-locked address written under a `slot_offset` that itself stays correctly
+  unchanged. Fixed: the derivation now reads persisted `slot_offset`/`vlan_id` fresh (one query),
+  mirroring `_persisted_delete_guard_fields()`'s own reasoning, so a forged in-memory value can no
+  longer reach the formula at all. Proven by
+  `test_flip_to_static_derives_from_persisted_slot_offset_not_forged_self`
+  (`SlotOffsetAddressingTests`).
+- **The same flip, given a narrow `update_fields`, could derive/clear `self.address` in memory and
+  then never write it** — `save(update_fields=["is_dhcp"])` alone leaves the actually-persisted
+  `address` unchanged on both sides of the boundary, tripping the bare
+  `device_port_dhcp_xor_static_address` CHECK regardless of which direction the flip runs. Fixed:
+  `save()` now widens `update_fields` to include `"address"` whenever a flip is happening and it
+  isn't already present. Checked stage 8's static→DHCP carve-out for the identical hole and found it
+  shares the same fix, since both directions go through the same `if flipping_to_static or
+  flipping_to_dhcp` branch. Proven by `test_flip_to_static_with_narrow_update_fields_still_persists_
+  address` and `test_flip_to_dhcp_with_narrow_update_fields_still_clears_address`
+  (`SlotOffsetAddressingTests`).

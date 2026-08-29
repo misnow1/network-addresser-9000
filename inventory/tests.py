@@ -2486,6 +2486,77 @@ class SlotOffsetAddressingTests(TestCase):
         self.assertTrue(control.is_dhcp)
         self.assertIsNone(control.address)
 
+    def test_flip_to_static_derives_from_persisted_slot_offset_not_forged_self(self) -> None:
+        """The council's finding: ``save()``'s flip carve-out deletes only
+        ``"address"`` from ``_locked_fields()`` before comparing against
+        ``update_fields`` -- ``save(update_fields=["is_dhcp", "address"])``
+        then intersects none of the *remaining* locked keys (``slot_
+        offset`` included), so ``_check_locked_fields_unchanged`` never
+        runs at all. The derivation itself must not trust ``self.slot_
+        offset`` either, or a forged in-memory value silently corrupts the
+        very address that lock exists to protect.
+        """
+        device_type = self._make_sd12_type(name="SD12 Forged Offset")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=5)
+        engine = device.ports.get(description="Engine")
+        self.assertEqual(engine.slot_offset, 1)
+        engine.is_dhcp = True
+        engine.address = None
+        engine.save()  # plain, unrestricted flip to DHCP -- sets up the fixture
+        engine.refresh_from_db()
+
+        engine.slot_offset = 0  # forged -- persisted value is still 1
+        engine.is_dhcp = False
+        engine.save(update_fields=["is_dhcp", "address"])
+
+        engine.refresh_from_db()
+        self.assertEqual(engine.slot_offset, 1)  # untouched -- not in update_fields
+        # base (.0) + rack_slot (5) + the *persisted* offset (1) -- not the
+        # forged 0's .5, which would also collide with Control's own address.
+        self.assertEqual(engine.address, "10.200.1.6")
+
+    def test_flip_to_static_with_narrow_update_fields_still_persists_address(self) -> None:
+        """``save(update_fields=["is_dhcp"])`` alone derives a new
+        ``self.address`` in memory but, without this fix, never writes it
+        -- persisting ``is_dhcp=False`` next to the old (``NULL``)
+        address and tripping the bare ``device_port_dhcp_xor_static_
+        address`` CHECK. The flip must widen ``update_fields`` to include
+        ``"address"`` itself.
+        """
+        device_type = self._make_sd12_type(name="SD12 Narrow Update Fields")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=5)
+        engine = device.ports.get(description="Engine")
+        engine.is_dhcp = True
+        engine.address = None
+        engine.save()
+        engine.refresh_from_db()
+
+        engine.is_dhcp = False
+        engine.save(update_fields=["is_dhcp"])  # must not raise IntegrityError
+
+        engine.refresh_from_db()
+        self.assertFalse(engine.is_dhcp)
+        self.assertEqual(engine.address, "10.200.1.6")
+
+    def test_flip_to_dhcp_with_narrow_update_fields_still_clears_address(self) -> None:
+        """The symmetric direction of the same hole (stage A's carve-out):
+        clearing ``address`` in memory on a static -> DHCP flip is
+        likewise dropped by a narrow ``update_fields``, persisting
+        ``is_dhcp=True`` next to the old static address -- the same CHECK
+        violated from the other side.
+        """
+        device_type = self._make_sd12_type(name="SD12 Narrow Update Fields DHCP")
+        device = NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=5)
+        engine = device.ports.get(description="Engine")
+        self.assertEqual(engine.address, "10.200.1.6")
+
+        engine.is_dhcp = True
+        engine.save(update_fields=["is_dhcp"])  # must not raise IntegrityError
+
+        engine.refresh_from_db()
+        self.assertTrue(engine.is_dhcp)
+        self.assertIsNone(engine.address)
+
     # Case 7 (both directions): a second occupant refused inside an
     # existing occupant's span.
     def test_device_span_refused_over_existing_switch(self) -> None:
