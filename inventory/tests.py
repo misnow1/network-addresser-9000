@@ -7783,6 +7783,9 @@ class DerivedAddressesMigrationTests(TransactionTestCase):
     def _assert_conformance(self) -> None:
         self._migration_module._assert_full_conformance(self.apps, self.schema_editor)
 
+    def _check_preconditions(self) -> None:
+        self._migration_module._assert_preconditions(self.apps, self.schema_editor)
+
     def _make_console(
         self,
         *,
@@ -7980,6 +7983,137 @@ class DerivedAddressesMigrationTests(TransactionTestCase):
         self.assertIn(str(primary_port.pk), message)
         self.assertIn("Dante Primary", message)
 
+    def test_preconditions_pass_on_a_fresh_database(self) -> None:
+        self._check_preconditions()  # no operator-sourced type ports at all -- must not raise
+
+    def test_preconditions_pass_on_a_consistent_conforming_estate(self) -> None:
+        NetworkDeviceTypePort = self.apps.get_model("inventory", "NetworkDeviceTypePort")
+        estate = self._make_console()
+        self._check_preconditions()  # must not raise
+        # Genuinely a pre-check: nothing written yet.
+        self.assertEqual(NetworkDeviceTypePort.objects.get(pk=estate["control_type_port"].pk).slot_offset, 0)
+
+    def test_preconditions_raise_on_inconsistent_offsets_across_two_consoles(self) -> None:
+        self._make_console(rack_slot=15)  # implied offset 1 (default control_address)
+        self._make_console(
+            rack_slot=4, control_address=suggest_slot_address("10.201.6.0/27", 4 + 2)
+        )  # implied offset 2
+        with self.assertRaises(RuntimeError) as ctx:
+            self._check_preconditions()
+        self.assertIn("inconsistent", str(ctx.exception))
+
+    def test_preconditions_raise_on_negative_implied_offset(self) -> None:
+        estate_rack_slot = 4
+        self._make_console(
+            rack_slot=estate_rack_slot,
+            control_address=suggest_slot_address("10.201.6.0/27", estate_rack_slot - 1),
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            self._check_preconditions()
+        self.assertIn("inconsistent or negative", str(ctx.exception))
+
+    def test_preconditions_raise_when_operator_ports_device_is_unracked(self) -> None:
+        NetworkDevice = self.apps.get_model("inventory", "NetworkDevice")
+        estate = self._make_console()
+        NetworkDevice.objects.filter(pk=estate["device"].pk).update(rack=None, rack_slot=None)
+        with self.assertRaises(RuntimeError):
+            self._check_preconditions()
+
+    def test_preconditions_raise_when_no_rack_vlan_range_for_operator_port(self) -> None:
+        estate = self._make_console()
+        self.apps.get_model("inventory", "RackVlanRange").objects.filter(
+            rack=estate["rack"], vlan=estate["vlan"]
+        ).delete()
+        with self.assertRaises(RuntimeError) as ctx:
+            self._check_preconditions()
+        self.assertIn("no Rack VLAN Range", str(ctx.exception))
+
+    def test_preconditions_raise_on_post_rewrite_ordinal_collision(self) -> None:
+        """The rewrite is about to declare ``slot_offset=1`` for the
+        console's Device Control type port, which would newly claim
+        ordinal ``rack_slot + 1`` for every instance. Here that ordinal is
+        already claimed by an unrelated device racked in the same rack —
+        a collision the rewrite itself would create, which decision 5
+        refuses outright rather than reporting.
+        """
+        VLAN = self.apps.get_model("inventory", "VLAN")
+        Rack = self.apps.get_model("inventory", "Rack")
+        RackVlanRange = self.apps.get_model("inventory", "RackVlanRange")
+        NetworkDeviceModel = self.apps.get_model("inventory", "NetworkDeviceModel")
+        NetworkDeviceType = self.apps.get_model("inventory", "NetworkDeviceType")
+        NetworkDeviceTypePort = self.apps.get_model("inventory", "NetworkDeviceTypePort")
+        NetworkDevice = self.apps.get_model("inventory", "NetworkDevice")
+        NetworkDevicePort = self.apps.get_model("inventory", "NetworkDevicePort")
+
+        rack = Rack.objects.create(name=self._unique("Rack"), slot_count=32)
+        console_vlan = VLAN.objects.create(name=self._unique("Dante Primary"), vlan_id=self._next_vlan_id())
+        console_cidr = "10.201.6.0/27"
+        RackVlanRange.objects.create(rack=rack, vlan=console_vlan, address_range=console_cidr)
+
+        console_model = NetworkDeviceModel.objects.create(manufacturer="Yamaha", model=self._unique("DM7C"))
+        console_type = NetworkDeviceType.objects.create(
+            device_model=console_model, name="Default", port_count=2
+        )
+        primary_type_port = NetworkDeviceTypePort.objects.create(
+            device_type=console_type,
+            description="Dante Primary",
+            port_type="1gbe_rj45",
+            vlan=console_vlan,
+            ordinal=1,
+            slot_offset=0,
+        )
+        control_type_port = NetworkDeviceTypePort.objects.create(
+            device_type=console_type,
+            description="Device Control",
+            port_type="1gbe_rj45",
+            vlan=console_vlan,
+            ordinal=2,
+            slot_offset=0,
+            address_source="operator",
+        )
+        console_rack_slot = 4
+        console = NetworkDevice.objects.create(
+            device_type=console_type, rack=rack, rack_slot=console_rack_slot, hostname=self._unique("dm7c")
+        )
+        NetworkDevicePort.objects.create(
+            device=console,
+            description="Dante Primary",
+            vlan=console_vlan,
+            port_type="1gbe_rj45",
+            ordinal=1,
+            slot_offset=0,
+            source_type_port=primary_type_port,
+            is_dhcp=False,
+            address=suggest_slot_address(console_cidr, console_rack_slot),
+        )
+        NetworkDevicePort.objects.create(
+            device=console,
+            description="Device Control",
+            vlan=console_vlan,
+            port_type="1gbe_rj45",
+            ordinal=2,
+            slot_offset=0,
+            source_type_port=control_type_port,
+            is_dhcp=False,
+            address=suggest_slot_address(console_cidr, console_rack_slot + 1),
+        )
+
+        # An unrelated device, already racked in the console's rack at
+        # exactly the ordinal the rewrite is about to claim for the
+        # console's Device Control port (console_rack_slot + 1).
+        other_model = NetworkDeviceModel.objects.create(manufacturer="Test", model=self._unique("Spare"))
+        other_type = NetworkDeviceType.objects.create(device_model=other_model, name="Default", port_count=0)
+        NetworkDevice.objects.create(
+            device_type=other_type,
+            rack=rack,
+            rack_slot=console_rack_slot + 1,
+            hostname=self._unique("spare"),
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            self._check_preconditions()
+        self.assertIn("already claimed", str(ctx.exception))
+
 
 class DerivedAddressesMigrationExecutorTests(TransactionTestCase):
     """A ``MigrationExecutor`` test that migrates ``0022 -> 0023`` for
@@ -8068,6 +8202,116 @@ class DerivedAddressesMigrationExecutorTests(TransactionTestCase):
         with connection.cursor() as cursor:
             cursor.execute("SHOW COLUMNS FROM inventory_networkdevicetypeport LIKE 'address_source'")
             self.assertEqual(cursor.fetchall(), ())
+
+    def test_forward_migration_raises_on_inconsistent_operator_offsets_before_any_rewrite(self) -> None:
+        """The council's finding, at the real ``MigrationExecutor`` level:
+        two operator-sourced consoles whose instances imply *different*
+        offsets. Unlike this class's other test above, this row **is**
+        one the rewrite step would touch — the exact case
+        ``_assert_full_conformance`` alone cannot catch, since by the time
+        it runs the rewrite has already declared a single ``slot_offset``
+        and written every address from that same formula, so ``implied ==
+        declared`` trivially for both consoles regardless of which one
+        was really right. ``_assert_preconditions`` has to be the gate
+        that actually stops this, and it has to run *before* the rewrite
+        so refusing here leaves both type ports' ``slot_offset`` at their
+        original ``0``.
+        """
+        executor = MigrationExecutor(connection)
+        executor.migrate([("inventory", "0022_hostname_slug_to_device_model")])
+        executor.loader.build_graph()
+        apps_0022 = executor.loader.project_state(("inventory", "0022_hostname_slug_to_device_model")).apps
+        VLAN = apps_0022.get_model("inventory", "VLAN")
+        Rack = apps_0022.get_model("inventory", "Rack")
+        RackVlanRange = apps_0022.get_model("inventory", "RackVlanRange")
+        NetworkDeviceModel = apps_0022.get_model("inventory", "NetworkDeviceModel")
+        NetworkDeviceType = apps_0022.get_model("inventory", "NetworkDeviceType")
+        NetworkDeviceTypePort = apps_0022.get_model("inventory", "NetworkDeviceTypePort")
+        NetworkDevice = apps_0022.get_model("inventory", "NetworkDevice")
+        NetworkDevicePort = apps_0022.get_model("inventory", "NetworkDevicePort")
+
+        # This test deliberately leaves the estate in exactly the drifted
+        # state the new gate refuses, so a plain re-migrate in cleanup
+        # would be refused too. Reconcile the drift first -- pull DM7C's
+        # Device Control address from slot+2 back to slot+1, so both
+        # consoles imply offset 1 -- then migrate. The UPDATE is a no-op
+        # if that row was never created, so an early failure still cleans
+        # up.
+        def _cleanup() -> None:
+            NetworkDevicePort.objects.filter(address="10.201.7.6", is_dhcp=False).update(address="10.201.7.5")
+            call_command("migrate", "inventory", verbosity=0)
+
+        self.addCleanup(_cleanup)
+
+        def _make_console(name: str, vlan_id: int, cidr: str, rack_slot: int, implied_offset: int):
+            vlan = VLAN.objects.create(name=f"{name} Dante Primary", vlan_id=vlan_id)
+            rack = Rack.objects.create(name=f"{name} Rack", slot_count=32)
+            RackVlanRange.objects.create(rack=rack, vlan=vlan, address_range=cidr)
+            device_model = NetworkDeviceModel.objects.create(manufacturer="Yamaha", model=name)
+            device_type = NetworkDeviceType.objects.create(
+                device_model=device_model, name="Default", port_count=2
+            )
+            primary_type_port = NetworkDeviceTypePort.objects.create(
+                device_type=device_type,
+                description="Dante Primary",
+                port_type="1gbe_rj45",
+                vlan=vlan,
+                ordinal=1,
+                slot_offset=0,
+            )
+            control_type_port = NetworkDeviceTypePort.objects.create(
+                device_type=device_type,
+                description="Device Control",
+                port_type="1gbe_rj45",
+                vlan=vlan,
+                ordinal=2,
+                slot_offset=0,
+                address_source="operator",
+            )
+            device = NetworkDevice.objects.create(
+                device_type=device_type, rack=rack, rack_slot=rack_slot, hostname=f"{name.lower()}-1"
+            )
+            NetworkDevicePort.objects.create(
+                device=device,
+                description="Dante Primary",
+                vlan=vlan,
+                port_type="1gbe_rj45",
+                ordinal=1,
+                slot_offset=0,
+                source_type_port=primary_type_port,
+                is_dhcp=False,
+                address=suggest_slot_address(cidr, rack_slot),
+            )
+            NetworkDevicePort.objects.create(
+                device=device,
+                description="Device Control",
+                vlan=vlan,
+                port_type="1gbe_rj45",
+                ordinal=2,
+                slot_offset=0,
+                source_type_port=control_type_port,
+                is_dhcp=False,
+                address=suggest_slot_address(cidr, rack_slot + implied_offset),
+            )
+            return control_type_port
+
+        _make_console("DM3", 902, "10.201.6.0/27", rack_slot=15, implied_offset=1)
+        drifted_control_type_port = _make_console("DM7C", 903, "10.201.7.0/27", rack_slot=4, implied_offset=2)
+
+        executor = MigrationExecutor(connection)
+        with self.assertRaises(RuntimeError):
+            executor.migrate([("inventory", "0023_derived_addresses")])
+
+        self.assertFalse(
+            MigrationRecorder(connection)
+            .migration_qs.filter(app="inventory", name="0023_derived_addresses")
+            .exists()
+        )
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW COLUMNS FROM inventory_networkdevicetypeport LIKE 'address_source'")
+            self.assertNotEqual(cursor.fetchall(), ())
+        # Nothing was rewritten -- the gate ran before step 2, not after it.
+        self.assertEqual(NetworkDeviceTypePort.objects.get(pk=drifted_control_type_port.pk).slot_offset, 0)
 
 
 class AssembleHostnameTests(TestCase):

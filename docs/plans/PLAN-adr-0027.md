@@ -320,3 +320,23 @@ left implicit, and one place I disagree with a consequence of decision 1 as writ
   brief and I left it alone rather than guess at scope. `#93` (the bracket) and this are the same
   shape of leftover: display code that was correct under the old model and is now quietly wrong
   under the new one, without being what either ADR 0027 or this plan actually asked PR 1 to fix.
+
+### Council fixes
+
+An independent review council pass verified a further batch of findings against the code after the
+above. Each verified finding is applied directly (no re-litigating); recorded here per this
+project's convention of folding findings in rather than defending the original.
+
+- **Migration `0023`'s `_assert_preconditions` gate had no test coverage at all**, despite being the
+  load-bearing check (module docstring step 1): the one place that can catch two operator-sourced
+  consoles whose instances imply *different* offsets, before the rewrite has already declared one
+  `slot_offset` for the type and made `implied == declared` trivially true for both regardless of
+  which was right. Added: a `DerivedAddressesMigrationExecutorTests` real-`MigrationExecutor` test
+  reproducing exactly that (`test_forward_migration_raises_on_inconsistent_operator_offsets_before_
+  any_rewrite`) — its cleanup reconciles the estate's drift before re-migrating rather than trying to
+  re-migrate a database the new gate would refuse a second time. Plus six direct-function tests
+  against `_assert_preconditions` itself in `DerivedAddressesMigrationTests` (the fresh-database
+  no-op, a consistent conforming estate passing, inconsistent offsets across two consoles, a negative
+  implied offset, an unracked operator-sourced device, a missing Rack VLAN Range, and — the one
+  invariant 2 exists for — a post-rewrite ordinal collision with an unrelated device already racked
+  at the ordinal the rewrite is about to claim).
