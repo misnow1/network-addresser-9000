@@ -26,6 +26,31 @@ repos:
         args: [--fix]
       - id: ruff-format
 
+  - repo: local
+    hooks:
+      # A model change with no accompanying migration is invisible to
+      # `manage.py test`: the suite runs against whatever the models say, so
+      # it stays green while `makemigrations --check` fails. ci.yml's test
+      # job runs the same command, but only after a push -- this runs it at
+      # commit time instead. It cost a red CI round trip on ADR 0027 PR 1 to
+      # learn that a locally-green suite proves nothing about this.
+      #
+      # Sources .env when present so a developer gets their real settings,
+      # and falls back to DJANGO_DEBUG=true otherwise, because the lint job
+      # runs `pre-commit run --all-files` with no .env and no DB service
+      # (settings.py's fail-closed SECRET_KEY has a dev fallback under
+      # DEBUG). The check needs no database of its own -- an unreachable one
+      # is a warning here, not an error.
+      - id: django-makemigrations-check
+        name: no missing migrations
+        entry: >-
+          bash -c 'if [ -f .env ]; then set -a; . ./.env; set +a; fi;
+          if [ -z "$DJANGO_DEBUG" ]; then export DJANGO_DEBUG=true; fi;
+          exec python manage.py makemigrations --check --dry-run'
+        language: system
+        pass_filenames: false
+        always_run: true
+
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v2.3.0
     hooks:
