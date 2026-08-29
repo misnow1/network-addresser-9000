@@ -400,3 +400,16 @@ project's convention of folding findings in rather than defending the original.
   5-device and a 39-device rack — the write path's own version of `test_ui.py`'s `QueryBudgetTests`
   shape, which is why this regression landed unnoticed in the first place — plus a correctness test
   that the bulk resolution still finds a real overlap in the larger rack.
+- **The three new primitives ADR 0027 introduced had zero tests of their own** —
+  `suggestions.lowest_free_placement()`, `NetworkDeviceType.claimed_offsets`, and `models.
+  occupied_rack_slot_ordinals()` appeared nowhere in `tests.py`/`test_ui.py`/`test_prod_import.py`,
+  though the `lowest_free_run`/`slot_span` code they largely replace kept 6 tests of its own. Added,
+  in `SuggestionFunctionTests` (the `lowest_free_run` house style): empty `offsets` is `None`; no
+  room for the max offset (`slot_count - max(offset) < 1`) is `None`; the exact top-of-range start;
+  unsorted/duplicated `occupied` and `offsets` match the normalised answer; and the docstring's own
+  claim that a negative offset is handled, locked in. In `SlotOffsetAddressingTests`: a zero-port
+  type's `claimed_offsets` is `frozenset({0})`; an SD12-shaped type's is `{0, 1}`; a `{0, 64}`-shaped
+  type's `claimed_offsets` is exactly `{0, 64}` while its `slot_span` stays 65 (the distinction issue
+  #83/decision 2 exist for); and `occupied_rack_slot_ordinals()` claims an all-DHCP device's own bare
+  `rack_slot` with no static ports at all, and correctly reports both a switch's ordinal and an
+  offset device's two claimed ordinals in the same rack.

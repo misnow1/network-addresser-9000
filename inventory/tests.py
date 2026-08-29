@@ -107,10 +107,12 @@ from .models import (
     _format_allocation,
     _lock_devices_by_pk,
     default_switch_port_vlan_profile,
+    occupied_rack_slot_ordinals,
 )
 from .suggestions import (
     dhcp_range_overlaps_cidr,
     iter_free_offsets,
+    lowest_free_placement,
     lowest_free_run,
     prefix_length_for_capacity,
     range_at_offset,
@@ -764,6 +766,37 @@ class SuggestionFunctionTests(TestCase):
         # 3-4, ending exactly at slot_count — the case that distinguishes
         # `<` from `<=` at the boundary.
         self.assertEqual(lowest_free_run([(1, 2)], 2, 4), 3)
+
+    # -- lowest_free_placement (ADR 0027) --------------------------------------------
+
+    def test_lowest_free_placement_empty_offsets_is_none(self) -> None:
+        # A type with no declared offsets at all -- nothing to place.
+        self.assertIsNone(lowest_free_placement(occupied=set(), offsets=[], slot_count=10))
+
+    def test_lowest_free_placement_no_room_for_the_max_offset_is_none(self) -> None:
+        # offsets={0, 64} needs slot_count - 64 >= 1; slot_count=64 leaves
+        # exactly zero room (last_start = 64 - 64 = 0 < first_start = 1).
+        self.assertIsNone(lowest_free_placement(occupied=set(), offsets=[0, 64], slot_count=64))
+
+    def test_lowest_free_placement_exact_top_of_range(self) -> None:
+        # slot_count=10, offsets={0, 2}: last_start = 10 - 2 = 8, the top of
+        # the valid range. Starts 1-7 are all blocked (each collides on the
+        # offset-0 ordinal), so 8 -- the only remaining candidate -- is both
+        # the answer and exactly slot_count - max(offset).
+        occupied = {1, 2, 3, 4, 5, 6, 7}
+        self.assertEqual(lowest_free_placement(occupied=occupied, offsets=[0, 2], slot_count=10), 8)
+
+    def test_lowest_free_placement_unsorted_and_duplicated_input_matches_normalised(self) -> None:
+        normalised = lowest_free_placement(occupied={2, 5}, offsets=[0, 3], slot_count=10)
+        unsorted_duplicated = lowest_free_placement(occupied=[5, 2, 5, 2], offsets=[3, 0, 3], slot_count=10)
+        self.assertEqual(unsorted_duplicated, normalised)
+
+    def test_lowest_free_placement_negative_offset_handled(self) -> None:
+        # ADR 0027 decision 4 keeps slot_offset non-negative in practice,
+        # but the function's own docstring promises the arithmetic still
+        # works for a negative offset -- lock that promise in. offsets=
+        # {-1, 0}: start must be >= 2 so that start + (-1) >= 1.
+        self.assertEqual(lowest_free_placement(occupied=set(), offsets=[-1, 0], slot_count=10), 2)
 
 
 class VLANSuggestionTests(TestCase):
@@ -2598,6 +2631,75 @@ class SlotOffsetAddressingTests(TestCase):
             device_model=_device_model("Generic", "Empty"), name="Zero Ports", port_count=0
         )
         self.assertEqual(device_type.slot_span, 1)
+
+    def test_type_with_zero_ports_claimed_offsets_is_just_zero(self) -> None:
+        # ADR 0027 decision 2: a device occupies its own slot regardless of
+        # whether any type port is actually declared there.
+        device_type = NetworkDeviceType.objects.create(
+            device_model=_device_model("Generic", "Empty Claimed"), name="Zero Ports", port_count=0
+        )
+        self.assertEqual(device_type.claimed_offsets, frozenset({0}))
+
+    def test_claimed_offsets_always_includes_zero_alongside_declared_offsets(self) -> None:
+        # bracket_type-shaped: an offset-0 port plus an offset-1 port --
+        # claimed_offsets is the distinct set, not the max ({0, 1}, not a
+        # span of 2).
+        device_type = self._make_sd12_type(name="SD12 Claimed Offsets")
+        self.assertEqual(device_type.claimed_offsets, frozenset({0, 1}))
+
+    def test_claimed_offsets_is_the_sparse_set_not_the_contiguous_span(self) -> None:
+        # A type declaring offsets {0, 64}: slot_span is 65 (the highest
+        # ordinal reached), but claimed_offsets is exactly the two ordinals
+        # actually claimed -- the distinction issue #83/ADR 0027 exist for.
+        device_type = NetworkDeviceType.objects.create(
+            device_model=_device_model("Generic", "Sparse64"), name="Default", port_count=2
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type,
+            description="Near",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_a,
+            slot_offset=0,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=device_type,
+            description="Far",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_a,
+            slot_offset=64,
+        )
+        self.assertEqual(device_type.slot_span, 65)
+        self.assertEqual(device_type.claimed_offsets, frozenset({0, 64}))
+
+    def test_occupied_rack_slot_ordinals_claims_own_slot_with_no_static_ports(self) -> None:
+        # A device occupies its own rack_slot regardless of whether it has
+        # any statically-addressed port at all -- an all-DHCP device must
+        # still block its own ordinal for another occupant.
+        device_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="All DHCP")
+        device = NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=device_type, rack=self.rack, rack_slot=3, port_addressing=PortAddressing.DHCP
+        )
+        self.assertTrue(device.ports.filter(is_dhcp=True).exists())
+        ordinals = occupied_rack_slot_ordinals(self.rack)
+        self.assertIn(3, ordinals)
+        self.assertEqual(ordinals[3], device.hostname or f"Device #{device.pk}")
+
+    def test_occupied_rack_slot_ordinals_covers_switches_and_offset_devices(self) -> None:
+        switch_type = _make_switch_type(port_count=1)
+        switch = NetworkSwitch.objects.create(  # type: ignore[misc]
+            switch_type=switch_type,
+            rack=self.rack,
+            rack_slot=20,
+            address_materialization=SwitchAddressing.MANUAL,
+        )
+        bracket_type = self._make_sd12_type(name="SD12 Ordinals")
+        device = NetworkDevice.objects.create(device_type=bracket_type, rack=self.rack, rack_slot=1)
+        ordinals = occupied_rack_slot_ordinals(self.rack)
+        self.assertEqual(ordinals[20], switch.hostname or f"Switch #{switch.pk}")
+        self.assertIn(1, ordinals)  # own slot (offset 0)
+        self.assertIn(2, ordinals)  # Engine's offset-1 ordinal
+        self.assertEqual(ordinals[1], device.hostname or f"Device #{device.pk}")
+        self.assertEqual(ordinals[2], device.hostname or f"Device #{device.pk}")
 
     def test_unracked_devices_ignored_by_span_occupancy_check(self) -> None:
         unracked_type = self._make_sd12_type(name="SD12 Unracked")
