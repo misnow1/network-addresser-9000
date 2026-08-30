@@ -15,9 +15,10 @@ Four groups of tests, matching the plan's own structure:
   (``login_required`` outermost, ``require_GET``, ``permission_required``)
   and ADR 0020's central "writes nothing" claim, proved rather than
   asserted in prose.
-* ``ElevationEncodingTests`` — the four encodings, asserted by coordinate
-  and with negative controls (review note 7): a wrong-cell pass is exactly
-  what a presence-only assertion would miss.
+* ``ElevationEncodingTests`` — the five ``ElevationCell`` states plus a
+  switch row and a switch/device conflict, most asserted by coordinate
+  and with negative controls (review note 7): a wrong-cell pass is
+  exactly what a presence-only assertion would miss.
 * ``RobustnessTests`` — legal-but-awkward stored data (a malformed range,
   an L2-only VLAN, an ordinal past a block's own address-space capacity)
   must render 200, not 500 (review note 3).
@@ -933,9 +934,14 @@ class WritesNothingTests(TestCase):
 
 
 class ElevationEncodingTests(TestCase):
-    """The rack-elevation encodings, each asserted at a specific coordinate
-    with a negative control (review note 7) — a wrong-cell pass is exactly
-    what a presence-only assertion would miss.
+    """The rack-elevation encodings — the five ``ElevationCell`` states
+    plus a switch row and a switch/device conflict — most asserted at a
+    specific coordinate with a negative control (review note 7): a
+    wrong-cell pass is exactly what a presence-only assertion would miss.
+    The three tests rescued from ``TakenAddressMarkerTests`` (ADR 0027
+    PR 2) assert a single row each and carry no negative control of
+    their own — nothing worth inventing one for, but a departure from
+    this class's original shape.
     """
 
     def setUp(self) -> None:
@@ -1065,11 +1071,11 @@ class ElevationEncodingTests(TestCase):
         only coverage of this state, bundled there with the issue #60
         marker this PR removes.
 
-        Built with a span-2 device whose offset-0 port is on ``vlan_a``
-        and whose offset-1 port is on ``vlan_b``: the continuation
-        ordinal's ``vlan_a`` cell is "blank" — the device does use
-        ``vlan_a``, just not at this offset — not "absent" and not
-        "empty".
+        Built with a span-2 device with a Control port on ``vlan_a`` at
+        offset 0 and, on ``vlan_b``, both a Primary port at offset 0 and
+        an Engine port at offset 1: the continuation ordinal's ``vlan_a``
+        cell is "blank" — the device does use ``vlan_a``, just not at
+        this offset — not "absent" and not "empty".
         """
         span_type = NetworkDeviceType.objects.create(
             device_model=_device_model("Test", "Split VLAN Span"), name="Blank Cell Span", port_count=3
@@ -1081,6 +1087,10 @@ class ElevationEncodingTests(TestCase):
             vlan=self.vlan_a,
             slot_offset=0,
         )
+        # ADR 0017 requires an offset>0 port's VLAN to also carry an
+        # offset-0 port to derive its address from, so vlan_b needs both
+        # this Primary (offset 0) and the Engine (offset 1) below — it
+        # is not redundant with Control, which is on vlan_a.
         NetworkDeviceTypePort.objects.create(
             device_type=span_type,
             description="Primary",
@@ -1148,10 +1158,13 @@ class ElevationEncodingTests(TestCase):
     def test_switch_holding_another_ordinals_address_leaves_that_ordinal_empty(self) -> None:
         """The positive test ADR 0027 PR 2 needs once the issue #60 marker
         is gone: a racked switch's address is admin-editable and never
-        re-derived (ADR 0027's amended consequence, issue #103), so it can
-        still be set to the value another ordinal would offer. That
-        ordinal must still render exactly as any other empty ordinal — no
-        crash, no phantom conflict, no marker.
+        re-derived (ADR 0027's Known gaps, issue #103), so it can still be
+        set to the value another ordinal would offer — through
+        ``full_clean()`` with every validator running, not a bypassed
+        write, proving the ADR's claim that this happens "with full
+        validation running". That ordinal must still render exactly as
+        any other empty ordinal — no crash, no phantom conflict, no
+        marker.
         """
         switch_type = _make_switch_type(port_count=0)
         switch = NetworkSwitch.objects.create(
@@ -1160,11 +1173,27 @@ class ElevationEncodingTests(TestCase):
         held_address = suggest_slot_address("10.200.1.0/27", 18)
         switch_address = switch.addresses.get(vlan=self.vlan_a)
         switch_address.address = held_address
+        switch_address.full_clean()
         switch_address.save()
+
+        # Self-verifying: confirm the fixture actually holds ordinal 18's
+        # address rather than trusting the write above. Every assertion
+        # below is otherwise also true of a bare empty ordinal 18 (see
+        # test_empty_ordinal_shows_the_address_suggest_slot_address_returns
+        # and test_continuation_has_no_add_link_negative_control_empty_does
+        # above) — a fixture that silently stopped working (e.g. a future
+        # #103 fix that re-derives switch addresses on save) would leave
+        # this test green without proving anything.
+        switch_address.refresh_from_db()
+        self.assertEqual(switch_address.address, held_address)
 
         response = self.client.get(f"/racks/{self.rack.pk}/")
         self.assertEqual(response.status_code, 200)
-        row18 = _row_html(response.content.decode(), 18)
+        content = response.content.decode()
+        row3 = _row_html(content, 3)
+        self.assertIn(held_address, row3)  # the switch's own row really carries it
+
+        row18 = _row_html(content, 18)
         self.assertEqual(_cell_states(row18), ["empty", "empty"])
         self.assertIn(held_address, row18)
         self.assertIn("add-slot-link", row18)

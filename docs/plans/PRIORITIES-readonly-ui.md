@@ -8,8 +8,9 @@ section and no single topic. Each tier-1 and tier-2 item below still needs its o
 Written 2026-08-25 against `main` at d10207e, with no PRs open.
 
 > **Tier 1 was overtaken on the day this was written.** Grilling #84 found that its behaviour
-> was a *recorded decision* (`PLAN-consumed-slot-addresses.md` decision 1, guarded by a test at
-> `test_ui.py:1149`) rather than an oversight. Pulling that thread produced **ADR 0027 — the
+> was a *recorded decision* (`PLAN-consumed-slot-addresses.md` decision 1, guarded at the time by
+> `TakenAddressMarkerTests` — deleted by ADR 0027 PR 2, `docs/plans/PLAN-adr-0027.md`) rather than
+> an oversight. Pulling that thread produced **ADR 0027 — the
 > ordinal is the unit**, which closes #84, #83, #62 and #28 together by deriving every static
 > address from its rack slot. See `docs/adr/0027-the-ordinal-is-the-unit.md` and
 > `PLAN-adr-0027.md`. Tier 1 below is kept as written, because its diagnosis is what produced
@@ -165,9 +166,10 @@ them separately means designing that cell twice.
 
 The pass should decide: what the elevation row shows, what moves to a `title=` tooltip
 (every advisory marker in the app already carries a full-sentence one), and whether the
-muted second line generalizes — `.taken-by-label` (`na9k.css:396-400`) is the existing
-precedent for muted text inside a dense cell, and `.tile__meta` (`:234-237`) is the
-house muted-text class.
+muted second line generalizes. `.taken-by-label`, the only precedent for muted text
+*inside a dense cell*, was deleted by ADR 0027 PR 2 (`docs/plans/PLAN-adr-0027.md`) along
+with the marker it supported — this pass starts from `.tile__meta` (`na9k.css:234-237`),
+the house muted-text class, rather than reusing a rule that no longer exists.
 
 Note #83 also touches this cell's encoding (bracket vs tether), so this pass wants to land
 *after* #83, not before.

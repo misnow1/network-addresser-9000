@@ -272,13 +272,16 @@ class ElevationCell:
       than guessing.
 
     An ordinal's ``would_be_address`` can still be held by something else
-    in the rack — a racked switch's address is admin-editable and never
-    re-derived (ADR 0027, amended consequence, issue #103) — but that is
-    unreachable **for device ports**, which this cell otherwise renders:
-    every static device-port address is derived from the device's own
-    rack slot, so a device can never hold another ordinal's address. This
-    project no longer marks that case in the grid (issue #60); it was the
-    ``taken_by`` axis this dataclass carried until ADR 0027 PR 2.
+    in the rack. A racked switch's address is admin-editable and never
+    re-derived (ADR 0027's Known gaps, issue #103), so an operator can
+    set one to another ordinal's value through the ordinary admin. A
+    device port's address is derived from the device's own rack slot
+    whenever it is set the ordinary way — the admin's address field is
+    read-only, and materialization always derives — but a port created
+    directly, in code, with an explicit address bypasses that and keeps
+    it unchecked against the ordinal (ADR 0027's Known gaps, issue #99,
+    open). This project no longer marks either case in the grid (issue
+    #60); ``taken_by`` was the axis that did, deleted by ADR 0027 PR 2.
     """
 
     state: str
