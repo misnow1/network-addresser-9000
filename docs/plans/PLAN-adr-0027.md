@@ -1,5 +1,13 @@
 # Implement ADR 0027 — the ordinal is the unit
 
+> **Revision 2** (2026-08-29) — rewrites the **PR 2** section against an independent review
+> (`REVIEW-1-PLAN-adr-0027-pr2.md`), which found its file list carried two grep false positives, its
+> deletion list missing the symbol the template actually branches on, and four assertions inside the
+> class it deletes that are the sole coverage of live behaviour. One finding hit the escalation gate
+> and was resolved with Mike: **PR 2 now amends ADR 0027 itself**, because the ADR's claim that the
+> deleted axis renders a state "unreachable by construction" is true of device ports and false of
+> switch addresses. See "Review response — PR 2". PR 1's sections are left as built.
+
 Revision 1. Written 2026-08-25 against `main` at d10207e, on branch `adr-0027`.
 
 ## Context
@@ -167,16 +175,117 @@ Closes **#83**, **#62**, **#84**.
 
 ## PR 2 — delete the `taken_by` axis
 
-Closes the #60 residue.
+Closes the #60 residue. Unblocks `docs/plans/PLAN-issue-99.md`, which is sequenced behind this PR
+because the guard it specifies makes one fixture in the class deleted here unconstructible.
 
-`views.py` (9), `rack_detail.html` (4), `na9k.css` (3), `test_ui.py` (31), `tests.py` (1),
-`test_prod_import.py` (1). Delete `_build_taken_address_map()`, `ElevationCell.taken_by`,
-`taken-by-label`, `cell-taken`, `tag-address-taken` and `ElevationEncodingTests`' assertions for
-them. Update `ElevationCell`'s docstring, which documents each encoding against the failure it
-guards — the removal must be recorded there, not silently dropped.
+Revision 1's file list was a substring line-count of `taken_by|taken-by|cell-taken|tag-address-taken|
+_build_taken_address_map`, which is why it named `tests.py` (1) and `test_prod_import.py` (1): those
+two matches are `test_current_name_matching_but_taken_by_something_else_falls_through`
+(`inventory/tests.py:8788`, ADR 0023 hostname computation) and
+`test_refuses_when_username_taken_by_a_real_account` (`inventory/test_prod_import.py:1053`,
+`seed_users`). Neither has anything to do with issue #60. **Both files are out of scope.**
 
-Amend `PLAN-consumed-slot-addresses.md` with a superseding note. Its decision 1 and review note 6
-were correct when taken; the model changed underneath them.
+### `inventory/views.py`
+
+Delete, as one connected removal — anything left behind here fails loudly except the template
+branch, which fails silently:
+
+- `_build_taken_address_map()`, its docstring, the `taken = _build_taken_address_map(...)` local and
+  its call site (`:608`, `:613`).
+- `ElevationCell.taken_by`, and the `taken_by` paragraph of `ElevationCell`'s docstring (`:274-282`)
+  — this is what revision 1 meant by "update `ElevationCell`'s docstring".
+- **`ElevationRow.has_taken_address`** (`:351`), unnamed in revision 1 and the symbol
+  `rack_detail.html:58` actually branches on. A partial deletion that drops the property but leaves
+  the template `{% if %}` renders nothing forever without erroring, since Django template lookups on
+  a missing attribute are silent.
+- `_empty_cell()`'s `taken` parameter and body (`:501-508`); the signature drops back to
+  `(column, ordinal)`.
+
+**The docstring note must scope its claim to device ports** (see the ADR amendment below). It must
+not repeat "unreachable by construction" unqualified.
+
+### `inventory/templates/inventory/rack_detail.html`, `inventory/static/inventory/na9k.css`
+
+The `has_taken_address` block (`rack_detail.html:58-64`) and the `cell-taken` /
+`tag-address-taken` rules. Verified during review: no other selector references them, and no import
+in `views.py` goes orphaned (`defaultdict` and `Iterable` both stay in use elsewhere).
+
+### `inventory/test_ui.py` — delete the class, but rescue four assertions first
+
+`TakenAddressMarkerTests` (`:1154-1564`, 13 methods) is the #60 suite — **not**
+`ElevationEncodingTests`, which revision 1 named and which contains zero occurrences of the axis.
+`ElevationEncodingTests` is the encoding lock-in and must not be touched except to receive the
+rewrites below.
+
+Four things in the deleted class are the sole coverage of behaviour that survives this PR. Each is
+rewritten into `ElevationEncodingTests` by dropping its holder fixture and keeping its assertion:
+
+| Rescue | Where | Why it survives |
+|---|---|---|
+| `_cell_states(row6) == ["blank", "occupied"]` | `:1423` | the **only** assertion anywhere that the `blank` cell state renders — one of five documented encodings (`views.py:262-267`). Its own docstring records that it exists because a Codex review found the state uncovered |
+| `_cell_states(row10) == ["occupied", "occupied"]` for a **switch** row | `:1450` | `ElevationEncodingTests` contains no switch at all; a switch materializes an address on every rack VLAN range, so it is never `absent` the way a device's unused-VLAN column is |
+| `row-conflict` + `_cell_states(row3) == ["conflict", "conflict"]` for a **switch/device** collision | `:1483-1484` | `OccupancyConflictTests` covers only device/device and never asserts the conflict *cell* state — the documented "a conflict cell carries nothing" guarantee (`views.py:268-272`) |
+| a **new** positive test (finding 8) | — | see "The verification this PR needs" below |
+
+`test_address_outside_the_racks_range_marks_nothing` (`:1522-1534`) is **deleted, not rewritten** —
+it is the fixture `PLAN-issue-99.md` is waiting on, and its scenario is precisely what #99's guard
+forbids. The remaining eight methods are deleted outright: assertion target dead, scenario either
+redundant with `ElevationEncodingTests` or nothing to salvage.
+
+Also in this file:
+
+- `_cell_html()` (`:203-211`) is called only from inside the deleted class (`:1259`, `:1291`,
+  `:1560`). Keep it for the rescues with a rewritten docstring, or delete it — do not leave it
+  unreferenced with a docstring citing "issue #60's taken-by marker text".
+- `_cell_states()`'s docstring (`:197-199`) explains its trailing `[^"]*` as tolerating
+  `cell-taken`. The regex stays harmless; the explanation becomes false.
+- `QueryBudgetTests.test_elevation_query_count_independent_of_device_count` (`:1894-1904`) justifies
+  its absolute count `13` by reference to `_build_taken_address_map`'s docstring — a docstring this
+  PR deletes. Rewrite the comment. The count itself should not move (both prefetches the map
+  consumed are still consumed by `_switch_row` and `_device_port_index`), but
+  `HostnameDivergesMarkerTests` carries the same absolute `13` — check both rather than assuming.
+
+### `docs/adr/0027-the-ordinal-is-the-unit.md` — amend the consequence
+
+**Escalated and resolved with Mike, 2026-08-29.** The ADR's consequence bullet (`:218-219`) says the
+deleted axis renders a state that "becomes unreachable by construction". That is true of
+`NetworkDevicePort` after PR 1 and **false of `NetworkSwitchAddress`**, which PR 1 did not touch:
+its `clean()` suggests an address only on insert-when-blank (`models.py:3347`), validates it by
+containment only — `_address_containment_error()` never compares against `range_base + rack_slot` —
+never re-derives it after `_materialize_addresses()`, and the admin inline declares no
+`readonly_fields` (`admin.py:400-420`). An operator can therefore set a racked switch's address to
+the value ordinal *N* would offer, through the ordinary admin with full validation running; ordinal
+*N* then still renders `empty` with its `+ add device` link, and the next device placed there is
+refused. That is issue #60's original complaint, still live, on a holder class
+`_build_taken_address_map()` deliberately indexed (`views.py:488-492`).
+
+Amend the bullet to scope "unreachable by construction" to device ports and name **#103** as the
+open question for switch addresses. The deletion itself is unchanged — the marker goes, as decided;
+what changes is that the ADR stops claiming something the code contradicts.
+
+### The verification this PR needs
+
+Revision 1 offered only an absence check. That proves the symbols are gone and nothing about what
+the elevation renders afterwards — and after this PR no test anywhere exercises a rack where one
+occupant holds another ordinal's would-be address. Given the switch-address gap above, that scenario
+is live, not hypothetical.
+
+Add a positive test (~20 lines, reusing the switch fixture at `:1353-1359`): a racked switch holding
+ordinal *N*'s address renders 200, ordinal *N* is still `state == "empty"` with its
+`would_be_address` shown, still carries `add-slot-link`, and carries `conflicts == []`. No crash, no
+phantom conflict, no marker. That is the behaviour this PR actually changes.
+
+### Superseding notes
+
+`PLAN-consumed-slot-addresses.md` gets a **whole-document** superseding note, dated, naming both PRs
+— not the two items revision 1 listed. PR 2 kills its decisions 1-4, its `## View`, `## Templates and
+CSS` and `## Tests` sections, and review notes 1, 2, 4, 5, 6 and 8; and **PR 1 already superseded its
+decision 5**, its `is_operator_addressed` property and its `operator-set` tag (verified gone from the
+tree) without leaving a note.
+
+`PRIORITIES-readonly-ui.md:53-70` walks through `_build_elevation_rows`/`_empty_cell`/`taken_by` as
+live code and proposes building #84's fix on top of the axis. Its banner already records that ADR
+0027 overtook tier 1, but not that the code it cites is gone. One line pointing at this PR.
 
 ## PR 3 — recompute on move, with confirmation
 
@@ -206,8 +315,11 @@ review and hard to roll back.
   (**#28**).
 - Migration `0023` refuses to run against a non-conforming estate.
 - `QueryBudgetTests` unchanged: occupancy stays two bounded queries.
-- Zero occurrences of `address_source`, `PortAddressSource`, `taken_by`, `_build_taken_address_map`
-  or `_derive_offset_siblings` remain outside the superseded-plan notes.
+- Zero occurrences of `address_source`, `PortAddressSource`, `_build_taken_address_map`,
+  `ElevationCell.taken_by`, `has_taken_address`, `taken-by-label`, `cell-taken`,
+  `tag-address-taken` or `_derive_offset_siblings` remain outside the superseded-plan notes.
+  **Symbol names, not the substring `taken_by`** — two unrelated test names contain it
+  (`tests.py:8788`, `test_prod_import.py:1053`), so a substring gate can never pass.
 
 ## Risks and what could still be wrong
 
@@ -413,3 +525,25 @@ project's convention of folding findings in rather than defending the original.
   #83/decision 2 exist for); and `occupied_rack_slot_ordinals()` claims an all-DHCP device's own bare
   `rack_slot` with no static ports at all, and correctly reports both a switch's ordinal and an
   offset device's two claimed ordinals in the same rack.
+
+## Review response — PR 2 (revision 2)
+
+Independent review of the PR 2 section, folded in on 2026-08-29. `codex` was unavailable (no API
+credits), so the review was run by a Claude agent with no knowledge of how the plan was written —
+weaker independence than the ritual assumes, recorded here rather than glossed. Every finding was
+re-verified against `main` at `6ee9a34` before folding.
+
+| Note | Resolution | Section |
+|---|---|---|
+| 1 (P1) — the zero-occurrence gate is unsatisfiable; `tests.py`/`test_prod_import.py` are grep false positives | **Folded.** Verified both matches are unrelated test names. Gate restated as symbol names; both files dropped from scope | PR 2 preamble; Verification |
+| 2 (P1) — "unreachable by construction" is false for `NetworkSwitchAddress`, which the deleted map indexes | **Escalated, resolved with Mike.** The deletion stands; PR 2 now amends ADR 0027's consequence bullet to scope the claim to device ports and name #103. Verified: the map iterates `switch.addresses` (`views.py:488-492`), and switch addresses are suggest-on-insert-only, containment-validated, admin-editable | PR 2 → ADR amendment |
+| 3 (P1) — `test_ui.py:1423` is the only assertion that the `blank` cell state renders | **Folded.** Rescued into `ElevationEncodingTests` by dropping the holder fixture and keeping the span fixture | PR 2 → rescue table |
+| 4 (P2) — `ElevationRow.has_taken_address` missing from the deletion list | **Folded**, with the silent-failure reasoning: the template branch fails silently, unlike every other symbol here. `_empty_cell()`'s parameter and the call site named too | PR 2 → `views.py` |
+| 5 (P2) — the plan names `ElevationEncodingTests`; the #60 suite is `TakenAddressMarkerTests` | **Folded.** Corrected, with an explicit "must not be touched except to receive the rescues" | PR 2 → `test_ui.py` |
+| 6 (P2) — three more assertions are sole coverage (switch row states, switch/device conflict cells) | **Folded** into the rescue table. The other eight methods stay deleted, with the reason recorded | PR 2 → rescue table |
+| 7 (P2) — `_cell_html()` orphaned; two docstrings go stale; `QueryBudgetTests`' `13` cites a deleted docstring | **Folded**, including the reviewer's caveat that `HostnameDivergesMarkerTests` carries the same absolute count and both must be checked rather than assumed | PR 2 → `test_ui.py` |
+| 8 (P2) — grep-for-zero proves nothing about what renders afterwards | **Folded.** A positive rendering test is now a deliverable, not a nicety — it is the only thing that will exercise the scenario once the class is gone | PR 2 → verification |
+| 9 (P2) — the superseding note's scope is understated, and PR 1 already superseded more without saying so | **Folded.** Whole-document note, dated, naming both PRs | PR 2 → superseding notes |
+| 10 (P3) — `PLAN-issue-99.md` depends on one test being deleted rather than rewritten | **Folded.** Named explicitly as the one member of the class where "rewrite, don't delete" is wrong, and the unblocking recorded at the top of the section so the sequencing is visible from both ends | PR 2 preamble; `test_ui.py` |
+| 11 (P3) — `PRIORITIES-readonly-ui.md` describes the deleted symbols as live code | **Folded** as a one-line amendment | PR 2 → superseding notes |
+| 12 (P3) — counts and citations are stale | **Folded** by deleting the count table entirely. It was a substring line-count written pre-PR-1 (`test_ui.py` is 34 today, not 31); the section now names symbols and files rather than numbers that rot | PR 2 |

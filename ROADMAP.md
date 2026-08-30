@@ -724,10 +724,12 @@ work.
     `f"{device_model} — {name}"` (`models.py:3629-3630`) and already contains an em-dash; a second
     one collides. The em-dash is load-bearing elsewhere too (`|default:"—"`, the `::before` "no port
     on this VLAN" marker at `na9k.css:353-355`).
-  - `.tile__meta` (`na9k.css:234-237`) is the house muted-text class; `.taken-by-label`
-    (`:396-400`) is the existing precedent for a muted second line *inside a dense cell*; and every
-    advisory marker carries a full-sentence `title=` tooltip, which may be the right answer for the
-    rack elevation instead of visible text.
+  - `.tile__meta` (`na9k.css:234-237`) is the house muted-text class. ADR 0027 PR 2 deleted
+    `.taken-by-label`, this codebase's only precedent for a muted second line *inside a dense
+    cell* — there is no existing rule of that shape to reuse, so this pass either establishes one
+    fresh off `.tile__meta`'s convention or reaches for the alternative below. Every advisory
+    marker carries a full-sentence `title=` tooltip, which may be the right answer for the rack
+    elevation instead of visible text.
 
 - Device-replacement workflow (swapping a spare into an already-addressed slot) — flagged in ADR 0003, design deferred
 - ~~Two *independent* static addresses on one VLAN (a Yamaha console's "For Device Control" interface) — see #42.~~ **Closed by ADR 0022, built in phase 17** as `NetworkDeviceTypePort.address_source`. This entry predicted the outcome exactly — *"if it ever lands, those consoles collapse to one device and their companion links fall away"* — which is what phase 17's PR 2 does, ADR 0018 and all. Still the nearest neighbour of phase 20, which needs the opposite shape: two ports *sharing* one address (#27), not two addresses on one VLAN
