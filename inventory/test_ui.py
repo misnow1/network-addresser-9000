@@ -52,7 +52,6 @@ from .models import (
     Department,
     NetworkDevice,
     NetworkDeviceModel,
-    NetworkDevicePort,
     NetworkDeviceType,
     NetworkDeviceTypePort,
     NetworkSwitch,
@@ -194,20 +193,8 @@ def _cell_states(row_html: str) -> list[str]:
     """The ``cell-<state>`` class of every VLAN column in one row's
     markup, in column order — lets a test assert *which* column carries
     an encoding, not just that the encoding appears somewhere in the row.
-    The trailing ``[^"]*`` tolerates ``cell-taken`` (issue #60) riding
-    alongside the state class in the same attribute.
     """
     return re.findall(r'<td class="cell cell-(\w+)[^"]*"', row_html)
-
-
-def _cell_html(row_html: str, column_index: int) -> str:
-    """The full ``<td class="cell ...">...</td>`` markup for one VLAN
-    column (0-based, in column order) in one elevation row's markup — lets
-    a test assert on a cell's *content* (issue #60's taken-by marker
-    text), not just its state class.
-    """
-    cells = re.findall(r'<td class="cell[^"]*">.*?</td>', row_html, re.DOTALL)
-    return cells[column_index]
 
 
 def _clean_text(raw_html: str) -> str:
@@ -1069,6 +1056,121 @@ class ElevationEncodingTests(TestCase):
                 device.device_type,
             )
 
+    def test_blank_cell_renders_when_device_uses_the_vlan_at_another_offset(self) -> None:
+        """``blank`` (``ElevationCell``'s docstring) is only reachable for a
+        multi-offset device with ports on the same VLAN at *some but not
+        all* of its offsets — narrower than "occupied" or "absent", and
+        easy to miss (Codex review of 84ffa17, P2). Rescued from
+        ``TakenAddressMarkerTests`` (ADR 0027 PR 2) — that class was the
+        only coverage of this state, bundled there with the issue #60
+        marker this PR removes.
+
+        Built with a span-2 device whose offset-0 port is on ``vlan_a``
+        and whose offset-1 port is on ``vlan_b``: the continuation
+        ordinal's ``vlan_a`` cell is "blank" — the device does use
+        ``vlan_a``, just not at this offset — not "absent" and not
+        "empty".
+        """
+        span_type = NetworkDeviceType.objects.create(
+            device_model=_device_model("Test", "Split VLAN Span"), name="Blank Cell Span", port_count=3
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=span_type,
+            description="Control",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_a,
+            slot_offset=0,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=span_type,
+            description="Primary",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_b,
+            slot_offset=0,
+        )
+        NetworkDeviceTypePort.objects.create(
+            device_type=span_type,
+            description="Engine",
+            port_type=PortType.GBE_RJ45,
+            vlan=self.vlan_b,
+            slot_offset=1,
+        )
+        NetworkDevice.objects.create(
+            device_type=span_type, rack=self.rack, rack_slot=1, hostname="blankspan-1"
+        )  # occupies ordinals 1-2; ordinal 2's vlan_a cell is "blank".
+
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        row2 = _row_html(response.content.decode(), 2)
+        self.assertEqual(_cell_states(row2), ["blank", "occupied"])
+
+    def test_switch_row_renders_occupied_on_every_column(self) -> None:
+        """A switch materializes an address on every rack VLAN range
+        (unlike a device, which can leave a VLAN "absent"). Rescued from
+        ``TakenAddressMarkerTests`` (ADR 0027 PR 2) — this class otherwise
+        contains no switch at all.
+        """
+        switch_type = _make_switch_type(port_count=0)
+        NetworkSwitch.objects.create(
+            switch_type=switch_type, rack=self.rack, rack_slot=3, hostname="switch-1"
+        )
+
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        row3 = _row_html(response.content.decode(), 3)
+        self.assertEqual(_cell_states(row3), ["occupied", "occupied"])
+
+    def test_conflicting_switch_and_device_render_conflict_cells(self) -> None:
+        """A conflict cell carries nothing, whatever the two claimants'
+        kinds — ``OccupancyConflictTests`` covers only device/device and
+        never asserts the conflict *cell* state itself. Rescued from
+        ``TakenAddressMarkerTests`` (ADR 0027 PR 2).
+        """
+        plain_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="Conflict Plain")
+        switch_type = _make_switch_type(port_count=0)
+        # Neither call runs full_clean(), so the DB's own per-table
+        # unique(rack, rack_slot) is the only thing checked — both land at
+        # ordinal 4.
+        NetworkDevice.objects.create(  # type: ignore[misc]
+            device_type=plain_type,
+            rack=self.rack,
+            rack_slot=4,
+            hostname="conflictdevice",
+            port_addressing="dhcp",
+        )
+        NetworkSwitch.objects.create(
+            switch_type=switch_type, rack=self.rack, rack_slot=4, hostname="conflictswitch"
+        )
+
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        row4 = _row_html(response.content.decode(), 4)
+        self.assertIn("row-conflict", row4)
+        self.assertEqual(_cell_states(row4), ["conflict", "conflict"])
+
+    def test_switch_holding_another_ordinals_address_leaves_that_ordinal_empty(self) -> None:
+        """The positive test ADR 0027 PR 2 needs once the issue #60 marker
+        is gone: a racked switch's address is admin-editable and never
+        re-derived (ADR 0027's amended consequence, issue #103), so it can
+        still be set to the value another ordinal would offer. That
+        ordinal must still render exactly as any other empty ordinal — no
+        crash, no phantom conflict, no marker.
+        """
+        switch_type = _make_switch_type(port_count=0)
+        switch = NetworkSwitch.objects.create(
+            switch_type=switch_type, rack=self.rack, rack_slot=3, hostname="switch-1"
+        )
+        held_address = suggest_slot_address("10.200.1.0/27", 18)
+        switch_address = switch.addresses.get(vlan=self.vlan_a)
+        switch_address.address = held_address
+        switch_address.save()
+
+        response = self.client.get(f"/racks/{self.rack.pk}/")
+        self.assertEqual(response.status_code, 200)
+        row18 = _row_html(response.content.decode(), 18)
+        self.assertEqual(_cell_states(row18), ["empty", "empty"])
+        self.assertIn(held_address, row18)
+        self.assertIn("add-slot-link", row18)
+        rows = {row.ordinal: row for row in response.context["rows"]}
+        self.assertEqual(rows[18].conflicts, [])
+
 
 class SparseClaimedOffsetsOccupancyTests(TestCase):
     """A council finding against ADR 0027 PR 1: ``_build_occupancy`` used
@@ -1149,418 +1251,6 @@ class SparseClaimedOffsetsOccupancyTests(TestCase):
             self.assertEqual(row.conflicts, [], ordinal)
             self.assertIsNone(row.occupant, ordinal)
             self.assertIsNotNone(row.add_url, ordinal)
-
-
-class TakenAddressMarkerTests(TestCase):
-    """The elevation's ``taken_by`` marker (issue #60,
-    PLAN-consumed-slot-addresses.md) — "this ordinal's would-be address is
-    already held by somebody", detected across every static address in the
-    rack, not just ``OPERATOR``-sourced ones (decision 3). Both VLAN ranges
-    sit on a non-zero network base (``/27`` at ``.32``, review note 5) so an
-    implementation deriving the ordinal from the address's last octet fails
-    rather than passing by luck.
-    """
-
-    def setUp(self) -> None:
-        call_command("sync_roles", stdout=io.StringIO())
-        self.admin_user = User.objects.create_user("takenaddr-admin", password="testpass123", is_staff=True)
-        self.admin_user.groups.add(Group.objects.get(name="Admin"))
-        self.client.login(username="takenaddr-admin", password="testpass123")
-
-        self.vlan_a = VLAN.objects.create(name="Control", vlan_id=200, subnet="10.200.0.0/21")
-        self.vlan_b = VLAN.objects.create(name="Dante Primary", vlan_id=201, subnet="10.201.0.0/21")
-        self.rack = Rack.objects.create(name="Taken", slot_count=20)
-        self.range_a = RackVlanRange.objects.create(
-            rack=self.rack, vlan=self.vlan_a, address_range="10.200.6.32/27"
-        )
-        self.range_b = RackVlanRange.objects.create(
-            rack=self.rack, vlan=self.vlan_b, address_range="10.201.6.32/27"
-        )
-
-    def _make_console_type(self, **kwargs) -> NetworkDeviceType:
-        """A Dante Primary (offset 0) + Device Control (offset 1) console
-        type on ``self.vlan_a`` — the exact shape issue #60 was found on
-        (``DM7C-1``/``10.201.6.4`` in production), rebuilt on ADR 0027's
-        ordinary ``slot_offset`` mechanism now that ADR 0022's ``OPERATOR``
-        sourcing is retired (decision 3).
-        """
-        device_type = NetworkDeviceType.objects.create(
-            device_model=_device_model("Yamaha", "DM7C"), port_count=2, **kwargs
-        )
-        NetworkDeviceTypePort.objects.create(
-            device_type=device_type,
-            description="Dante Primary",
-            port_type=PortType.GBE_RJ45,
-            vlan=self.vlan_a,
-        )
-        NetworkDeviceTypePort.objects.create(
-            device_type=device_type,
-            description="Device Control",
-            port_type=PortType.GBE_RJ45,
-            vlan=self.vlan_a,
-            slot_offset=1,
-            hostname_suffix="device-control",
-        )
-        return device_type
-
-    def test_slot_marked_on_both_axes_neighbours_and_own_row_untouched(self) -> None:
-        """Under ADR 0027 every claimed ordinal's address matches its own
-        occupant by construction (decision 2), so the "empty ordinal, held
-        address" state this marker exists for is reachable only through a
-        bypassed write (a bare ``QuerySet.update()``, skipping ``save()``/
-        ``clean()`` entirely) — never through the admin. That bypass is
-        exactly what this test exercises, overwriting the Device Control
-        port's own legitimately-derived address (ordinal 6) with one that
-        belongs to nobody (ordinal 4).
-        """
-        device_type = self._make_console_type(name="Marker Console")
-        held_address = suggest_slot_address(self.range_a.address_range, 4)
-        device = NetworkDevice.objects.create(
-            device_type=device_type,
-            rack=self.rack,
-            rack_slot=5,
-            hostname="DM7C-1",
-        )
-        NetworkDevicePort.objects.filter(device=device, description="Device Control").update(
-            address=held_address
-        )
-        response = self.client.get(f"/racks/{self.rack.pk}/")
-        content = response.content.decode()
-
-        row4 = _row_html(content, 4)
-        row5 = _row_html(content, 5)
-        row6 = _row_html(content, 6)
-
-        # Slot 4: marked on both axes — the cell and the row's ordinal marker.
-        self.assertIn("taken-by-label", row4)
-        # Lowercase — ADR 0023 decision 8 (amended): hostname is normalised
-        # on write, even though "DM7C-1" was typed above.
-        self.assertIn("dm7c-1", row4)
-        self.assertIn("cell-taken", row4)
-        self.assertIn("tag-address-taken", row4)
-
-        # Slots 5-6 (the holder's own claimed ordinals, offset 0 and 1):
-        # neither axis marked on either.
-        self.assertNotIn("taken-by-label", row5)
-        self.assertNotIn("tag-address-taken", row5)
-        self.assertNotIn("taken-by-label", row6)
-        self.assertNotIn("tag-address-taken", row6)
-
-        # Neighbours 1-3 and 7+: neither axis marked.
-        for ordinal in [1, 2, 3, 7, 8, 9, 10]:
-            row = _row_html(content, ordinal)
-            self.assertNotIn("taken-by-label", row, f"ordinal {ordinal}")
-            self.assertNotIn("tag-address-taken", row, f"ordinal {ordinal}")
-
-        # Review note 6 / settled decision 1 — the marked ordinal keeps its
-        # "+ add device" link, stays state == "empty", and still shows its
-        # would_be_address.
-        self.assertIn("add-slot-link", row4)
-        vlan_a_cell = _cell_html(row4, 0)  # columns ordered by vlan__vlan_id: 200 then 201
-        self.assertIn("cell-empty", vlan_a_cell)
-        self.assertIn(held_address, vlan_a_cell)
-
-    def test_two_holders_of_one_address_render_both_labels_sorted(self) -> None:
-        plain_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="Plain Holder")
-        switch_type = _make_switch_type(port_count=0)
-        held_address = suggest_slot_address(self.range_a.address_range, 4)
-
-        # "Zeta" holds slot 4's address on an ordinary hand-moved port.
-        # Under ADR 0027 every claimed ordinal's address matches its own
-        # occupant by construction, so this state is reachable only
-        # through a bypassed write (a bare QuerySet.update(), skipping
-        # save()/clean() entirely) — never through the admin.
-        zeta = NetworkDevice.objects.create(
-            device_type=plain_type, rack=self.rack, rack_slot=8, hostname="Zeta"
-        )
-        zeta_port = zeta.ports.get()
-        NetworkDevicePort.objects.filter(pk=zeta_port.pk).update(address=held_address)
-
-        # "Alpha" holds the *same* address on a switch — device-port and
-        # switch-address uniqueness are separate constraints (decision 2),
-        # so both can genuinely hold one address at once.
-        alpha_switch = NetworkSwitch.objects.create(
-            switch_type=switch_type, rack=self.rack, rack_slot=9, hostname="Alpha"
-        )
-        alpha_address = alpha_switch.addresses.get(vlan=self.vlan_a)
-        alpha_address.address = held_address
-        alpha_address.save()
-
-        response = self.client.get(f"/racks/{self.rack.pk}/")
-        row4 = _row_html(response.content.decode(), 4)
-        cell = _cell_html(row4, 0)
-        # Sorted regardless of creation order — "Alpha" before "Zeta".
-        # Lowercase — ADR 0023 decision 8 (amended); still Alpha-before-Zeta
-        # sort order.
-        self.assertIn("address used by alpha, zeta", cell)
-
-    def test_hand_moved_ordinary_slot_address_produces_a_marker(self) -> None:
-        """The positive test for decision 3: an ordinary port, no
-        second-address mechanism involved at all, still consumes another
-        ordinal's would-be address identically once hand-moved — reachable
-        only through a bypassed write now (ADR 0027 decision 5), never
-        through the admin.
-        """
-        plain_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="Plain Mover")
-        held_address = suggest_slot_address(self.range_a.address_range, 4)
-        device = NetworkDevice.objects.create(
-            device_type=plain_type, rack=self.rack, rack_slot=8, hostname="Mover-1"
-        )
-        port = device.ports.get()
-        self.assertNotEqual(port.address, held_address)  # sanity: starts on its own ordinal
-        NetworkDevicePort.objects.filter(pk=port.pk).update(address=held_address)
-
-        response = self.client.get(f"/racks/{self.rack.pk}/")
-        row4 = _row_html(response.content.decode(), 4)
-        self.assertIn("taken-by-label", row4)
-        # Lowercase — ADR 0023 decision 8 (amended).
-        self.assertIn("mover-1", row4)
-
-    def test_no_markers_when_every_address_sits_on_its_own_ordinal(self) -> None:
-        plain_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="Aligned")
-        for slot in [1, 2, 3]:
-            NetworkDevice.objects.create(
-                device_type=plain_type, rack=self.rack, rack_slot=slot, hostname=f"aligned-{slot}"
-            )
-        response = self.client.get(f"/racks/{self.rack.pk}/")
-        content = response.content.decode()
-        self.assertNotIn("taken-by-label", content)
-        self.assertNotIn("tag-address-taken", content)
-
-    def test_taken_address_on_a_continuation_ordinal_keeps_its_state_and_no_marker(self) -> None:
-        bracket_type = NetworkDeviceType.objects.create(
-            device_model=_device_model("DiGiCo", "SD12"), name="Continuation Bracket", port_count=2
-        )
-        NetworkDeviceTypePort.objects.create(
-            device_type=bracket_type,
-            description="Control",
-            port_type=PortType.GBE_RJ45,
-            vlan=self.vlan_a,
-            slot_offset=0,
-        )
-        NetworkDeviceTypePort.objects.create(
-            device_type=bracket_type,
-            description="Engine",
-            port_type=PortType.GBE_RJ45,
-            vlan=self.vlan_a,
-            slot_offset=1,
-        )
-        NetworkDevice.objects.create(
-            device_type=bracket_type, rack=self.rack, rack_slot=5, hostname="Bracket-1"
-        )  # occupies ordinals 5-6; ordinal 6's Engine address is base_a + 6.
-
-        continuation_address = suggest_slot_address(self.range_a.address_range, 6)
-        switch_type = _make_switch_type(port_count=0)
-        ghost_switch = NetworkSwitch.objects.create(
-            switch_type=switch_type, rack=self.rack, rack_slot=12, hostname="Ghost"
-        )
-        ghost_address = ghost_switch.addresses.get(vlan=self.vlan_a)
-        ghost_address.address = continuation_address
-        ghost_address.save()
-
-        response = self.client.get(f"/racks/{self.rack.pk}/")
-        row6 = _row_html(response.content.decode(), 6)
-        self.assertEqual(_cell_states(row6), ["occupied", "absent"])
-        self.assertIn("ordinal-cell--span-continuation", row6)
-        self.assertNotIn("taken-by-label", row6)
-        self.assertNotIn("cell-taken", row6)
-        self.assertNotIn("tag-address-taken", row6)
-
-    def test_taken_address_on_a_blank_cell_keeps_its_state_and_no_marker(self) -> None:
-        """``blank`` (``ElevationCell``'s docstring) is only reachable for a
-        multi-offset device with ports on the same VLAN at *some but not
-        all* of its offsets — a narrower shape than the "occupied"
-        continuation ordinal above, and easy to miss (Codex review of
-        84ffa17, P2). Built here with a span-2 device whose offset-0 port
-        is on ``vlan_a`` and whose offset-1 port is on ``vlan_b``: the
-        continuation ordinal's ``vlan_a`` cell is "blank" — the device
-        does use ``vlan_a``, just not at this offset — not "absent" and
-        not "empty".
-        """
-        # ADR 0017 requires an offset>0 port's VLAN to also carry an
-        # offset-0 port to derive its address from, so vlan_b needs both a
-        # Primary (offset 0) and an Engine (offset 1) — vlan_a's Control
-        # port sits at offset 0 only, with nothing on vlan_a at offset 1.
-        span_type = NetworkDeviceType.objects.create(
-            device_model=_device_model("Test", "Split VLAN Span"), name="Blank Cell Span", port_count=3
-        )
-        NetworkDeviceTypePort.objects.create(
-            device_type=span_type,
-            description="Control",
-            port_type=PortType.GBE_RJ45,
-            vlan=self.vlan_a,
-            slot_offset=0,
-        )
-        NetworkDeviceTypePort.objects.create(
-            device_type=span_type,
-            description="Primary",
-            port_type=PortType.GBE_RJ45,
-            vlan=self.vlan_b,
-            slot_offset=0,
-        )
-        NetworkDeviceTypePort.objects.create(
-            device_type=span_type,
-            description="Engine",
-            port_type=PortType.GBE_RJ45,
-            vlan=self.vlan_b,
-            slot_offset=1,
-        )
-        NetworkDevice.objects.create(
-            device_type=span_type, rack=self.rack, rack_slot=5, hostname="BlankSpan-1"
-        )  # occupies ordinals 5-6; ordinal 6's vlan_a cell is "blank".
-
-        blank_ordinal_address = suggest_slot_address(self.range_a.address_range, 6)
-        switch_type = _make_switch_type(port_count=0)
-        holder_switch = NetworkSwitch.objects.create(
-            switch_type=switch_type, rack=self.rack, rack_slot=12, hostname="BlankHolder"
-        )
-        holder_address = holder_switch.addresses.get(vlan=self.vlan_a)
-        holder_address.address = blank_ordinal_address
-        holder_address.save()
-
-        response = self.client.get(f"/racks/{self.rack.pk}/")
-        row6 = _row_html(response.content.decode(), 6)
-        self.assertEqual(_cell_states(row6), ["blank", "occupied"])
-        self.assertNotIn("taken-by-label", row6)
-        self.assertNotIn("cell-taken", row6)
-        self.assertNotIn("tag-address-taken", row6)
-
-    def test_taken_address_on_a_switch_occupied_ordinal_keeps_its_state_and_no_marker(self) -> None:
-        switch_type = _make_switch_type(port_count=0)
-        switch = NetworkSwitch.objects.create(
-            switch_type=switch_type, rack=self.rack, rack_slot=10, hostname="Switch-1"
-        )
-        switch_address = switch.addresses.get(vlan=self.vlan_a).address
-        assert switch_address is not None
-
-        plain_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="Switch Duplicator")
-        duplicate_device = NetworkDevice.objects.create(
-            device_type=plain_type, rack=self.rack, rack_slot=15, hostname="Duplicator-1"
-        )
-        duplicate_port = duplicate_device.ports.get()
-        # Bypassed write (ADR 0027 decision 5) — see this class's other
-        # tests for why a legitimate save() can no longer reach this state.
-        NetworkDevicePort.objects.filter(pk=duplicate_port.pk).update(address=switch_address)
-
-        response = self.client.get(f"/racks/{self.rack.pk}/")
-        row10 = _row_html(response.content.decode(), 10)
-        # A switch materializes an address on every rack VLAN range, so
-        # both columns are "occupied" here — not "absent" the way a
-        # device's unused-VLAN column would be.
-        self.assertEqual(_cell_states(row10), ["occupied", "occupied"])
-        self.assertNotIn("taken-by-label", row10)
-        self.assertNotIn("cell-taken", row10)
-        self.assertNotIn("tag-address-taken", row10)
-
-    def test_taken_address_on_a_conflict_ordinal_keeps_its_state_and_no_marker(self) -> None:
-        plain_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="Conflict Plain")
-        switch_type = _make_switch_type(port_count=0)
-        # Neither call runs full_clean(), so the DB's own unique(rack,
-        # rack_slot) is the only thing checked — both land at ordinal 3.
-        NetworkDevice.objects.create(  # type: ignore[misc]
-            device_type=plain_type,
-            rack=self.rack,
-            rack_slot=3,
-            hostname="ConflictDevice",
-            port_addressing="dhcp",
-        )
-        NetworkSwitch.objects.create(
-            switch_type=switch_type, rack=self.rack, rack_slot=3, hostname="ConflictSwitch"
-        )
-
-        conflict_address = suggest_slot_address(self.range_a.address_range, 3)
-        holder_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="Conflict Holder")
-        holder = NetworkDevice.objects.create(
-            device_type=holder_type, rack=self.rack, rack_slot=16, hostname="Holder-1"
-        )
-        holder_port = holder.ports.get()
-        # Bypassed write (ADR 0027 decision 5) — see this class's other
-        # tests for why a legitimate save() can no longer reach this state.
-        NetworkDevicePort.objects.filter(pk=holder_port.pk).update(address=conflict_address)
-
-        response = self.client.get(f"/racks/{self.rack.pk}/")
-        row3 = _row_html(response.content.decode(), 3)
-        self.assertIn("row-conflict", row3)
-        self.assertEqual(_cell_states(row3), ["conflict", "conflict"])
-        self.assertNotIn("taken-by-label", row3)
-        self.assertNotIn("cell-taken", row3)
-        self.assertNotIn("tag-address-taken", row3)
-
-    def test_dhcp_port_marks_nothing(self) -> None:
-        plain_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="Dhcp Marker")
-        device = NetworkDevice.objects.create(  # type: ignore[misc]
-            device_type=plain_type, rack=self.rack, rack_slot=8, hostname="DhcpDevice", port_addressing="dhcp"
-        )
-        port = device.ports.get()
-        self.assertTrue(port.is_dhcp)
-        self.assertIsNone(port.address)
-
-        response = self.client.get(f"/racks/{self.rack.pk}/")
-        self.assertEqual(response.status_code, 200)
-        self.assertNotIn("taken-by-label", response.content.decode())
-
-    def test_port_on_a_vlan_the_rack_has_no_range_for_marks_nothing(self) -> None:
-        vlan_c = VLAN.objects.create(name="No Range", vlan_id=202, subnet="10.202.0.0/21")
-        # Deliberately equal to vlan_a ordinal 6's would-be address — if
-        # the map ever ignored VLAN identity, this would wrongly mark it.
-        collision_address = suggest_slot_address(self.range_a.address_range, 6)
-        bare_type = NetworkDeviceType.objects.create(
-            device_model=_device_model("Test", "Bare"), name="No Range Bare", port_count=0
-        )
-        device = NetworkDevice.objects.create(
-            device_type=bare_type, rack=self.rack, rack_slot=9, hostname="NoRangeDevice"
-        )
-        NetworkDevicePort.objects.create(
-            device=device, description="Hand Wired", vlan=vlan_c, address=collision_address
-        )
-
-        response = self.client.get(f"/racks/{self.rack.pk}/")
-        self.assertEqual(response.status_code, 200)
-        row6 = _row_html(response.content.decode(), 6)
-        self.assertNotIn("taken-by-label", row6)
-
-    def test_address_outside_the_racks_range_marks_nothing(self) -> None:
-        bare_type = NetworkDeviceType.objects.create(
-            device_model=_device_model("Test", "Bare"), name="Outside Range Bare", port_count=0
-        )
-        device = NetworkDevice.objects.create(
-            device_type=bare_type, rack=self.rack, rack_slot=9, hostname="OutsideRangeDevice"
-        )
-        NetworkDevicePort.objects.create(
-            device=device, description="Hand Wired", vlan=self.vlan_a, address="10.250.250.250"
-        )
-
-        response = self.client.get(f"/racks/{self.rack.pk}/")
-        self.assertEqual(response.status_code, 200)
-        self.assertNotIn("taken-by-label", response.content.decode())
-
-    def test_own_derived_address_equal_to_its_own_ordinal_marks_nothing(self) -> None:
-        """A device's own address, at its own claimed ordinal, is
-        obviously never "held elsewhere" — it *is* the occupant there.
-        """
-        device_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="Solo")
-        NetworkDevice.objects.create(device_type=device_type, rack=self.rack, rack_slot=7, hostname="Solo-1")
-        response = self.client.get(f"/racks/{self.rack.pk}/")
-        self.assertEqual(response.status_code, 200)
-        self.assertNotIn("taken-by-label", response.content.decode())
-
-    def test_taken_address_on_one_vlan_does_not_mark_the_same_ordinal_on_another_vlan(self) -> None:
-        plain_type = _make_device_type(port_count=1, vlan=self.vlan_a, name="VlanScoped")
-        held_address_a = suggest_slot_address(self.range_a.address_range, 4)
-        device = NetworkDevice.objects.create(
-            device_type=plain_type, rack=self.rack, rack_slot=5, hostname="VlanScoped-1"
-        )
-        port = device.ports.get()
-        # Bypassed write (ADR 0027 decision 5) — see this class's other
-        # tests for why a legitimate save() can no longer reach this state.
-        NetworkDevicePort.objects.filter(pk=port.pk).update(address=held_address_a)
-
-        response = self.client.get(f"/racks/{self.rack.pk}/")
-        row4 = _row_html(response.content.decode(), 4)
-        vlan_a_cell = _cell_html(row4, 0)
-        vlan_b_cell = _cell_html(row4, 1)
-        self.assertIn("taken-by-label", vlan_a_cell)
-        self.assertNotIn("taken-by-label", vlan_b_cell)
 
 
 class OccupancyConflictTests(TestCase):
@@ -1891,17 +1581,18 @@ class QueryBudgetTests(TestCase):
         self.assertEqual(small_response.status_code, 200)
         self.assertEqual(big_response.status_code, 200)
         self.assertEqual(len(small_ctx.captured_queries), len(big_ctx.captured_queries))
-        # Issue #60's taken-address map is built entirely from data this
-        # view already prefetches (PLAN-consumed-slot-addresses.md decision
-        # 4) — it must add exactly zero queries. 13 is the absolute count
-        # recorded on this tree (both rack sizes; bumped from 12 by ADR
-        # 0027 PR 1 review's resolve_claimed_offsets, one flat query
-        # alongside resolve_slot_spans's own); an implementation that
-        # reaches for a fresh NetworkDevicePort.objects.filter(...), or
-        # that touches port.source_type_port while building the map
-        # (prefetched in device_detail(), not here — see
-        # _build_taken_address_map's docstring), would pass the equality
-        # assertion above while quietly moving this number.
+        # 13 is the absolute count recorded on this tree (both rack sizes):
+        # the two prefetches _switch_row/_device_port_index consume
+        # (switches__addresses__vlan, devices__ports__vlan), plus
+        # resolve_slot_spans and resolve_claimed_offsets each resolving
+        # every device's span/claimed-offset set in one grouped query
+        # (bumped from 12 to 13 by ADR 0027 PR 1 review's resolve_claimed_
+        # offsets). ADR 0027 PR 2 deleted _build_taken_address_map(),
+        # which was already built entirely from this same prefetched data
+        # and so never added a query of its own — the count is unchanged
+        # by that deletion. An implementation that reaches for a fresh
+        # query anywhere in this path would pass the equality assertion
+        # above while quietly moving this number.
         self.assertEqual(len(small_ctx.captured_queries), 13)
         self.assertEqual(len(big_ctx.captured_queries), 13)
 

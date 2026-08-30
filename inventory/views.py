@@ -271,21 +271,19 @@ class ElevationCell:
       one's data belongs in this cell, so the cell says nothing rather
       than guessing.
 
-    ``taken_by`` is an orthogonal axis, not a sixth state (issue #60,
-    PLAN-consumed-slot-addresses.md decision 1): the slot really is empty
-    — no occupant claims it — it's the *address* ``would_be_address``
-    names that is already held by something else in the rack, static and
-    on this same VLAN. Populated only when ``state == "empty"``; sorted
-    for deterministic rendering, and a list rather than a single label
-    because device-port and switch-address uniqueness are separate
-    constraints and a bypassed write can leave both a switch and a device
-    holding one address (decision 2).
+    An ordinal's ``would_be_address`` can still be held by something else
+    in the rack — a racked switch's address is admin-editable and never
+    re-derived (ADR 0027, amended consequence, issue #103) — but that is
+    unreachable **for device ports**, which this cell otherwise renders:
+    every static device-port address is derived from the device's own
+    rack slot, so a device can never hold another ordinal's address. This
+    project no longer marks that case in the grid (issue #60); it was the
+    ``taken_by`` axis this dataclass carried until ADR 0027 PR 2.
     """
 
     state: str
     addresses: list[SlotAddress] = field(default_factory=list)
     would_be_address: str | None = None
-    taken_by: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -346,15 +344,6 @@ class ElevationRow:
     # — see _build_occupancy's docstring for how that becomes reachable
     # despite the DB's own unique-slot constraints.
     conflicts: list[ConflictOccupant] = field(default_factory=list)
-
-    @property
-    def has_taken_address(self) -> bool:
-        """Whether any of this row's cells carry a ``taken_by`` marker
-        (issue #60) — derived from ``self.cells`` rather than stored, so
-        there's no second walk of the grid to keep in sync with the cells
-        that were actually built.
-        """
-        return any(cell.taken_by for cell in self.cells)
 
 
 @dataclass(frozen=True)
@@ -456,56 +445,9 @@ def _device_port_index(
     return by_offset_vlan, vlans_with_port
 
 
-def _build_taken_address_map(
-    switches: Iterable[NetworkSwitch], devices: Iterable[NetworkDevice]
-) -> dict[tuple[int, str], list[str]]:
-    """``{(vlan_id, address): [holder labels]}`` for every static address
-    already held by this rack's own switches and devices (issue #60,
-    PLAN-consumed-slot-addresses.md decisions 3/4/6) — so an empty
-    ordinal's ``would_be_address`` can be checked against what's actually
-    taken, not just what's stored at that ordinal's own offset.
-
-    Built entirely from ``switches``/``devices`` as already prefetched by
-    ``rack_detail()`` (``switches__addresses__vlan``,
-    ``devices__ports__vlan``) — this issues no query of its own, and
-    ``port.source_type_port`` is deliberately never touched: that relation
-    is prefetched in ``device_detail()``, a different view, and reading it
-    here would be an N+1.
-
-    Every static address counts, not just ``OPERATOR``-sourced ones
-    (decision 3): an ordinary ``SLOT`` port's address stays editable after
-    creation (ADR 0003), so a hand-moved ordinary address consumes an
-    ordinal's would-be address exactly the same way an operator-set one
-    does. A DHCP port's ``address`` is ``None`` and is naturally excluded.
-
-    Labels come from the enclosing device/switch — ``str(switch)``/
-    ``str(device)``, the same values already used for ``Occupant.label``
-    in ``_switch_row``/``_device_row`` — already-loaded scalars, not a
-    fresh lookup. Scope is this rack's own occupants only (decision 6): an
-    address held by equipment in another rack is not consulted.
-    """
-    taken: dict[tuple[int, str], list[str]] = defaultdict(list)
-    for switch in switches:
-        label = str(switch)
-        for address in switch.addresses.all():
-            if address.address is not None:
-                taken[(address.vlan_id, address.address)].append(label)
-    for device in devices:
-        label = str(device)
-        for port in device.ports.all():
-            if port.address is not None:
-                taken[(port.vlan_id, port.address)].append(label)
-    return dict(taken)
-
-
-def _empty_cell(
-    column: RackVlanRange, ordinal: int, taken: dict[tuple[int, str], list[str]]
-) -> ElevationCell:
+def _empty_cell(column: RackVlanRange, ordinal: int) -> ElevationCell:
     would_be_address = safe_slot_address(column.address_range, ordinal)
-    taken_by: list[str] = []
-    if would_be_address is not None:
-        taken_by = sorted(taken.get((column.vlan_id, would_be_address), []))
-    return ElevationCell(state="empty", would_be_address=would_be_address, taken_by=taken_by)
+    return ElevationCell(state="empty", would_be_address=would_be_address)
 
 
 def _switch_row(columns: list[RackVlanRange], switch: NetworkSwitch) -> tuple[Occupant, list[ElevationCell]]:
@@ -605,12 +547,11 @@ def _build_elevation_rows(
     sparse claim).
     """
     occupancy = _build_occupancy(switches, devices, claimed_offsets)
-    taken = _build_taken_address_map(switches, devices)
     rows = []
     for ordinal in range(1, rack.slot_count + 1):
         entries = occupancy.get(ordinal, [])
         if not entries:
-            cells = [_empty_cell(column, ordinal, taken) for column in columns]
+            cells = [_empty_cell(column, ordinal) for column in columns]
             add_url = (
                 f"{reverse('admin:inventory_networkdevice_add')}?"
                 f"{urlencode({'rack': rack.pk, 'rack_slot': ordinal})}"

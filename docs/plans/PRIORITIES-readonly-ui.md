@@ -53,6 +53,12 @@ holds. ADR 0027 is that work; it just goes deeper than the issues suggested.
 
 **Do this one first.** Genuinely small.
 
+> The code this section walks through is gone. ADR 0027 PR 2
+> (`docs/plans/PLAN-adr-0027.md`) deleted `_build_elevation_rows`'s `taken_by` computation,
+> `_empty_cell`'s `taken` parameter, and the `has_taken_address`/`taken-by-label`/`tag-address-taken`
+> template and CSS it fed — #84 closes as a side effect of ADR 0027 PR 1's derivation rather than by
+> the fix this section describes.
+
 `_build_elevation_rows` (`inventory/views.py:546`) attaches `add_url` to any ordinal with
 no *occupant*, while `_empty_cell` (`views.py:438`) separately computes `taken_by` for the
 same row. The template therefore prints "address used by …" (`rack_detail.html:105`)

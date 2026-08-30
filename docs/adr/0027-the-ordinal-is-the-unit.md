@@ -217,7 +217,11 @@ reality, and this estate has none.
   goes; you no longer choose its address independently of that.
 - **#60's `taken_by` axis is deleted** — `taken_by`, `taken-by-label`, `cell-taken`,
   `_build_taken_address_map()` and their tests. The state it renders becomes unreachable by
-  construction. The operator-set-port tag in the device port table goes with `OPERATOR` itself.
+  construction **for device ports** — every static device-port address is derived from the device's
+  own rack slot. It is not unreachable for `NetworkSwitchAddress`, which this ADR does not touch: a
+  racked switch's address is admin-editable and never re-derived, so an operator can still set it to
+  the value another ordinal would offer. Whether that gap should be closed is **#103**, open. The
+  operator-set-port tag in the device port table goes with `OPERATOR` itself.
 - **#84 closes with no UI code.** `add_url` is set only where an ordinal has no occupant
   (`views.py:544-546`); once the ordinal is genuinely claimed, the link is simply absent.
 - **A latent production question becomes a hard refusal.** `PROD-DATA-ANALYSIS.md:292-295` flagged
