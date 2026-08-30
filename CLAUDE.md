@@ -51,16 +51,29 @@ with `ImproperlyConfigured: SECRET_KEY environment variable must be set`. Always
 
 ```bash
 set -a; source .env; set +a
-python manage.py test inventory
+python manage.py test inventory --noinput
 ```
+
+**`--noinput` is not optional here.** If a previous run was interrupted its test
+database survives, and Django then asks `Type 'yes' to delete it:` — a prompt the
+Bash tool's non-interactive shell cannot answer, so the run dies with `EOFError:
+EOF when reading a line` before a single test executes. It reads like a crash and
+it is easy to mistake for a broken environment. This cost a subagent an entire run
+on 2026-08-29, following this section exactly as it was then written.
+
+Run the suite in the **foreground** with a generous timeout — it takes ~210
+seconds, well inside the Bash tool's 600 s ceiling. Backgrounding it and waiting on
+an event is how the same run got stuck twice.
 
 That is the whole command in a worktree too — **do not** add a `DB_NAME=` override.
 Worktrees get `.env` as a *symlink* to the main checkout's copy (via
-`worktree.symlinkDirectories`), so they all resolve to the same `DB_NAME`, which
-would let two parallel test runs fight over one `test_<DB_NAME>` database and
-destroy each other's data under `--noinput`. `config/settings.py` already handles
-this: when `BASE_DIR` is under `.claude/worktrees/`, it sets `TEST.NAME` to
-`test_na9k_wt_<worktree>`. Nothing to remember at the command line.
+`worktree.symlinkDirectories`), so they all resolve to the same `DB_NAME`. Under a
+`DB_NAME=` override two parallel runs would fight over one `test_<DB_NAME>`
+database and destroy each other's data — `--noinput` is what makes that silent
+rather than merely annoying, which is why the override is the thing to avoid, not
+the flag. `config/settings.py` already handles this: when `BASE_DIR` is under
+`.claude/worktrees/`, it sets `TEST.NAME` to `test_na9k_wt_<worktree>`, so each
+worktree drops and recreates only its own. Nothing to remember at the command line.
 
 That needs a one-time grant on the dev MariaDB, because `na9000` holds only
 `CREATE, DROP` globally plus per-database grants — enough to *create* a test
