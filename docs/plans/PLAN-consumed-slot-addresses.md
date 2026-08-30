@@ -1,3 +1,18 @@
+> **Superseded, 2026-08-29.** ADR 0027 (`docs/adr/0027-the-ordinal-is-the-unit.md`) makes every
+> static device-port address derived from the device's own rack slot, which makes decisions 1-4 of
+> this plan, its `## View`, `## Templates and CSS` and `## Tests` sections, and review notes 1, 2, 4,
+> 5, 6 and 8 moot: the state this plan's marker exists to surface — an empty ordinal whose would-be
+> address is already held by another *device* — is no longer reachable through the admin. **PR 1**
+> (`docs/plans/PLAN-adr-0027.md`) built the derivation; its decision 5 and this plan's
+> `is_operator_addressed` property and `operator-set` tag went with it, without a note left here at
+> the time. **PR 2** deleted the marker itself — `taken_by`, `taken-by-label`, `cell-taken`,
+> `tag-address-taken`, `_build_taken_address_map()`, `ElevationRow.has_taken_address`, and
+> `TakenAddressMarkerTests` — since the state it existed to show no longer arises for the case it
+> was built for. The gap is **not** fully closed: `NetworkSwitchAddress` is untouched by ADR 0027
+> and can still be hand-set to another ordinal's address (issue **#103**, ADR 0027's amended
+> consequence bullet). This document is kept for its historical decisions and review record, not as
+> a live spec.
+
 > **Revision 2** — incorporates review notes from `REVIEW-1-PLAN-consumed-slot-addresses.md`.
 > See "Review response" for the mapping.
 

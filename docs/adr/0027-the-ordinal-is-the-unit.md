@@ -215,11 +215,14 @@ reality, and this estate has none.
   replacement in the same slot and the address follows.
 - **ADR 0001's override narrows** to the slot rather than the address. You still choose where a device
   goes; you no longer choose its address independently of that.
-- **#60's `taken_by` axis is deleted** — `taken_by`, `taken-by-label`, `cell-taken`,
-  `_build_taken_address_map()` and their tests. The state it renders becomes unreachable by
-  construction. The operator-set-port tag in the device port table goes with `OPERATOR` itself.
+- **#60's `taken_by` axis is deleted** — `taken_by`, `taken-by-label`, `tag-address-taken`,
+  `cell-taken`, `_build_taken_address_map()`, `ElevationRow.has_taken_address` and their tests.
+  Derivation removes the state it existed to show wherever an address is set the ordinary way —
+  through the admin (a device port's address field is read-only) or at materialization. It does not
+  remove it everywhere; see "Known gaps" for the two residues (#99, #103) this deletion leaves open
+  rather than closes. The operator-set-port tag in the device port table goes with `OPERATOR` itself.
 - **#84 closes with no UI code.** `add_url` is set only where an ordinal has no occupant
-  (`views.py:544-546`); once the ordinal is genuinely claimed, the link is simply absent.
+  (`views.py:555-558`); once the ordinal is genuinely claimed, the link is simply absent.
 - **A latent production question becomes a hard refusal.** `PROD-DATA-ANALYSIS.md:292-295` flagged
   that if `mps-sd9-1` (CONSOLES slot 11) has an engine, it needs ordinal 12, which `mps-sd11-1`
   holds. Today that is latent. Under this ADR, adding the engine port is refused outright — which is
@@ -235,3 +238,17 @@ reality, and this estate has none.
   claim renders as two marked rows with a bracket asserting a contiguity that is not there.
 - **The DMI-DANTE hardware divergence (#41) is unaffected.** The database is already the correct side;
   the cards still need re-addressing on the hardware.
+- **A device port created directly with an explicit address bypasses derivation** (#99, open, planned
+  immediately after this PR). `NetworkDevicePort.clean()` (`models.py:5101`) derives an address only
+  when none was supplied; a programmatic `objects.create()` that supplies one in range keeps it,
+  validated for containment and cross-table uniqueness but never checked against
+  `range_base + rack_slot + slot_offset`. The admin's own address field is read-only, so this is
+  reachable only by code that constructs a port directly rather than through the admin — but until
+  #99 lands, the #60 marker's scenario (an empty ordinal whose would-be address is already held) is
+  still reachable for a device, not only for a switch.
+- **A switch address stays admin-editable and is never re-derived** (#103, open).
+  `NetworkSwitchAddress.clean()` only auto-fills a blank address on insert
+  (`models.py:3339-3369`) and validates by containment and cross-table uniqueness only, never
+  against `range_base + rack_slot`; the admin inline declares no `readonly_fields`. An operator
+  can therefore set a racked switch's address to the value another ordinal would offer, through
+  the ordinary admin with full validation running.
